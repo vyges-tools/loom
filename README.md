@@ -12,7 +12,7 @@ Loom is the **data plane**. The sign-off/analysis engines (`vyges-char`,
 the front door. Loom is **not** an engine and **not** an RTL elaborator.
 
 Std-only Rust — builds and tests offline, runs on any modern silicon (Apple
-Silicon / Graviton / x86_64), no CUDA.
+Silicon / Graviton / x86_64), and you can experiment with GPUs too via [rust-gpu](https://rust-gpu.github.io/).
 
 ## Use as a library
 
