@@ -10,6 +10,8 @@
 //! (DBU, `i64`) run over the same token stream. `( * y )` / `( x * )` shorthand is
 //! resolved in both. Pure std — unit-tested offline.
 
+use std::collections::BTreeMap;
+
 // ─────────────────────────── signal view (extraction, µm) ──────────────────────
 
 #[derive(Debug, Clone)]
@@ -19,9 +21,17 @@ pub struct Segment {
     pub y0: f64,
     pub x1: f64,
     pub y1: f64,
+    /// Drawn routing width (µm) when a non-default rule (NDR / `TAPERRULE`) sets
+    /// one; `0.0` means "use the layer's default width" (the LEF routing width).
+    pub width_um: f64,
 }
 
 impl Segment {
+    /// A wire segment with the layer's default width (`width_um == 0`).
+    pub fn wire(layer: impl Into<String>, x0: f64, y0: f64, x1: f64, y1: f64) -> Segment {
+        Segment { layer: layer.into(), x0, y0, x1, y1, width_um: 0.0 }
+    }
+
     /// Manhattan length in microns.
     pub fn len_um(&self) -> f64 {
         (self.x1 - self.x0).abs() + (self.y1 - self.y0).abs()
@@ -117,7 +127,8 @@ impl Def {
     pub fn parse(text: &str) -> Result<Def, DefError> {
         let tv = tokenize(text);
         let scale = units(&tv);
-        let nets = parse_signal(&tv, scale)?;
+        let ndr = parse_ndr(&tv, scale);
+        let nets = parse_signal(&tv, scale, &ndr)?;
         let tref: Vec<&str> = tv.iter().map(|s| s.as_str()).collect();
         let power_nets = match tref.iter().position(|&t| t == "SPECIALNETS") {
             Some(s) => {
@@ -208,7 +219,51 @@ fn coord(tok: &str, prev: f64, scale: f64) -> Result<f64, DefError> {
     }
 }
 
-fn parse_signal(t: &[String], scale: f64) -> Result<Vec<DefNet>, DefError> {
+/// Parse the `NONDEFAULTRULES` section into `rule -> layer -> width (µm)`. A net or
+/// wire that references one of these rules draws wider/narrower than the default, so
+/// its resistance differs — the extractor reads the width off each segment.
+fn parse_ndr(t: &[String], scale: f64) -> BTreeMap<String, BTreeMap<String, f64>> {
+    let mut out: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+    let Some(start) = t.iter().position(|x| x == "NONDEFAULTRULES") else { return out };
+    let end = (start..t.len())
+        .find(|&i| t[i] == "END" && t.get(i + 1).map(String::as_str) == Some("NONDEFAULTRULES"))
+        .unwrap_or(t.len());
+    let mut rule: Option<String> = None;
+    let mut pend_layer: Option<String> = None;
+    let mut i = start + 1;
+    while i < end {
+        match t[i].as_str() {
+            "-" => {
+                rule = t.get(i + 1).cloned();
+                pend_layer = None;
+                i += 2;
+            }
+            "LAYER" => {
+                pend_layer = t.get(i + 1).cloned();
+                i += 2;
+            }
+            "WIDTH" => {
+                if let (Some(r), Some(l)) = (&rule, &pend_layer) {
+                    if let Some(w) =
+                        t.get(i + 1).and_then(|s| s.trim_end_matches(';').parse::<f64>().ok())
+                    {
+                        out.entry(r.clone()).or_default().insert(l.clone(), w / scale);
+                    }
+                }
+                pend_layer = None;
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+fn parse_signal(
+    t: &[String],
+    scale: f64,
+    ndr: &BTreeMap<String, BTreeMap<String, f64>>,
+) -> Result<Vec<DefNet>, DefError> {
     let mut nets = Vec::new();
     let mut i = match t.iter().position(|x| x == "NETS") {
         Some(p) => p,
@@ -235,6 +290,18 @@ fn parse_signal(t: &[String], scale: f64) -> Result<Vec<DefNet>, DefError> {
         let mut in_routing = false;
         let mut layer: Option<String> = None;
         let mut prev: Option<(f64, f64)> = None;
+        // non-default routing rule: net-level (`+ NONDEFAULTRULE r`) or per-wire
+        // (`TAPERRULE r`); the per-wire override wins while it is in effect.
+        let mut net_rule: Option<String> = None;
+        let mut wire_rule: Option<String> = None;
+        // width (µm) for the current layer under the effective rule (0 = default)
+        let width_of = |layer: &Option<String>, wire: &Option<String>, net: &Option<String>| {
+            let rule = wire.as_ref().or(net.as_ref());
+            match (rule, layer) {
+                (Some(r), Some(l)) => ndr.get(r).and_then(|m| m.get(l)).copied().unwrap_or(0.0),
+                _ => 0.0,
+            }
+        };
 
         while i < t.len() && t[i] != ";" {
             match t[i].as_str() {
@@ -244,6 +311,10 @@ fn parse_signal(t: &[String], scale: f64) -> Result<Vec<DefNet>, DefError> {
                         in_routing = true;
                         layer = t.get(i + 2).cloned();
                         prev = None;
+                        wire_rule = None;
+                        i += 3;
+                    } else if status == "NONDEFAULTRULE" {
+                        net_rule = t.get(i + 2).cloned();
                         i += 3;
                     } else {
                         i += 1;
@@ -252,6 +323,11 @@ fn parse_signal(t: &[String], scale: f64) -> Result<Vec<DefNet>, DefError> {
                 "NEW" => {
                     layer = t.get(i + 1).cloned();
                     prev = None;
+                    wire_rule = None;
+                    i += 2;
+                }
+                "TAPERRULE" => {
+                    wire_rule = t.get(i + 1).cloned();
                     i += 2;
                 }
                 "(" => {
@@ -277,6 +353,7 @@ fn parse_signal(t: &[String], scale: f64) -> Result<Vec<DefNet>, DefError> {
                                     y0: oy,
                                     x1: x,
                                     y1: y,
+                                    width_um: width_of(&layer, &wire_rule, &net_rule),
                                 });
                             }
                         }
@@ -465,6 +542,34 @@ END NETS
         assert_eq!(n.pins.len(), 2);
         assert!(n.vias >= 1);
         assert!(n.segments.iter().any(|s| (s.len_um() - 1.0).abs() < 1e-9)); // 1000 dbu = 1 um
+        assert!(n.segments.iter().all(|s| s.width_um == 0.0), "default width without an NDR");
+    }
+
+    #[test]
+    fn nondefault_rule_sets_segment_width() {
+        // a clock net on a 2x-wide non-default rule: segments carry the NDR width;
+        // a TAPERRULE reference (which used to be miscounted as a via) is honoured.
+        let def = "\
+UNITS DISTANCE MICRONS 1000 ;
+NONDEFAULTRULES 1 ;
+- DBL
+  + LAYER met1 WIDTH 280
+  + LAYER met2 WIDTH 280 ;
+END NONDEFAULTRULES
+NETS 2 ;
+- clk ( u1 A ) ( u2 Z )
+  + NONDEFAULTRULE DBL
+  + ROUTED met1 ( 0 0 ) ( 1000 0 ) ;
+- sig ( u3 A )
+  + ROUTED met1 TAPERRULE DBL ( 0 0 ) ( 1000 0 ) ;
+END NETS
+";
+        let d = Def::parse(def).unwrap();
+        let clk = d.nets.iter().find(|n| n.name == "clk").unwrap();
+        assert!(clk.segments.iter().all(|s| (s.width_um - 0.28).abs() < 1e-9), "280 dbu = 0.28 um");
+        let sig = d.nets.iter().find(|n| n.name == "sig").unwrap();
+        assert!((sig.segments[0].width_um - 0.28).abs() < 1e-9, "TAPERRULE width applied");
+        assert_eq!(sig.vias, 0, "the TAPERRULE rule name must not be miscounted as a via");
     }
 
     #[test]
