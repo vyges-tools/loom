@@ -7,7 +7,7 @@
 
 [package]
 name = "vyges-loom-py"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 description = "Python bindings for vyges-loom: the parse-once / query-many design database for the Vyges EDA toolchain."
 license = "Apache-2.0"
