@@ -1,0 +1,11 @@
+# Rust build output for the bindings crate
+/target
+
+# Python build / virtualenv / caches
+.venv/
+dist/
+build/
+*.so
+*.egg-info/
+__pycache__/
+.pytest_cache/

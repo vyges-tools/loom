@@ -42,6 +42,25 @@ Common commands live here; **tool-specific verbs (timing, power, extraction, …
 belong to the engines**, which build on the `vyges_loom` library and — in the
 two-utility packaging — attach as `vyges-loom <engine>` subcommands.
 
+## Use from Python
+
+The same parse-once / query-many database is available to Python (notebooks,
+`cocotb`, Python EDA flows) via optional bindings in [`python/`](python/):
+
+```sh
+pip install vyges-loom
+```
+
+```python
+import vyges_loom
+d = vyges_loom.Design()
+d.load("top.v"); d.load("cells.lib")   # dispatch is by extension
+print(d.netlist.module, len(d.netlist.instances), d.lib_cell_count)
+```
+
+The Rust core stays std-only and dependency-free; the bindings crate (PyO3 + maturin,
+built `abi3-py39`) is a thin, additive layer over it — see [`python/README.md`](python/README.md).
+
 ## Modules
 
 | Module | What it reads / holds |

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "vyges-loom"
+version = "0.0.1"
+description = "Parse-once / query-many design database for the Vyges EDA toolchain — read structural Verilog, Liberty, SDC, SPEF, LEF/DEF into one shared in-memory design and query it from Python."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Vyges", email = "contact@vyges.com" }]
+keywords = ["eda", "vlsi", "netlist", "liberty", "sdc", "spef", "lef", "def", "asic"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+]
+
+[project.urls]
+Homepage = "https://vyges.com"
+Documentation = "https://docs.vyges.com"
+Repository = "https://github.com/vyges-tools/loom"
+
+[tool.maturin]
+manifest-path = "Cargo.toml"
+module-name = "vyges_loom"
+# abi3 wheels: one build serves CPython 3.9+
+features = ["pyo3/abi3-py39"]

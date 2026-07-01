@@ -1,0 +1,28 @@
+# Python bindings for vyges-loom. This is a SEPARATE crate: the loom core stays
+# std-only and builds offline; only this optional binding pulls in PyO3.
+#
+# The empty [workspace] table detaches this crate from the parent package so the
+# core Cargo.toml needs no changes.
+[workspace]
+
+[package]
+name = "vyges-loom-py"
+version = "0.0.1"
+edition = "2021"
+description = "Python bindings for vyges-loom: the parse-once / query-many design database for the Vyges EDA toolchain."
+license = "Apache-2.0"
+authors = ["Vyges <https://vyges.com/contact>"]
+homepage = "https://vyges.com"
+repository = "https://github.com/vyges-tools/loom"
+
+[lib]
+# The compiled extension module must be importable as `vyges_loom`.
+name = "vyges_loom"
+crate-type = ["cdylib"]
+
+[dependencies]
+# The loom core, imported under an alias so it does not clash with the
+# `vyges_loom` pymodule function name.
+loom_core = { path = "..", package = "vyges-loom" }
+# abi3-py39: one wheel works on CPython 3.9+ (forward-compatible with newer 3.x).
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
