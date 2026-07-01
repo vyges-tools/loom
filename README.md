@@ -2,8 +2,8 @@
 
 **The shared design-data foundation for the Vyges EDA toolchain — the *loom* the
 engines weave on.** Parse-once / query-many: one set of readers for the standard
-formats (structural Verilog, Liberty, SDC, SPEF) feeding one in-memory **design
-database** that every engine queries, plus the **cross-step state** (provenance)
+formats (structural Verilog **or Yosys JSON**, Liberty, SDC, SPEF, LEF/DEF) feeding
+one in-memory **design database** that every engine queries, plus the **cross-step state** (provenance)
 the orchestrator builds on.
 
 Loom is the **data plane**. The sign-off/analysis engines (`vyges-char`,
@@ -45,7 +45,9 @@ two-utility packaging — attach as `vyges-loom <engine>` subcommands.
 ## Use from Python
 
 The same parse-once / query-many database is available to Python (notebooks,
-`cocotb`, Python EDA flows) via optional bindings in [`python/`](python/):
+`cocotb`, Python EDA flows) via optional bindings in [`python/`](python/). Until the
+wheel is published to PyPI, build from source (`cd python && maturin develop`); the
+published path will be:
 
 ```sh
 pip install vyges-loom
@@ -66,6 +68,7 @@ built `abi3-py39`) is a thin, additive layer over it — see [`python/README.md`
 | Module | What it reads / holds |
 | --- | --- |
 | `netlist` | structural (gate-level) Verilog |
+| `yosys_json` | Yosys `write_json` netlist → same `netlist` model |
 | `liberty` + `ccs` | Liberty timing/power libraries (NLDM + CCS data model) |
 | `sdc` | SDC timing constraints (self-contained model) |
 | `spef` | parasitic RC |

@@ -37,7 +37,29 @@ fn loads_full_design_from_standard_files() {
 fn load_dispatches_by_extension() {
     let mut d = Design::new();
     assert_eq!(d.load(&ex("top.v")).unwrap(), "netlist");
+    assert_eq!(d.load(&ex("top.json")).unwrap(), "netlist");
     assert_eq!(d.load(&ex("cells.lib")).unwrap(), "liberty");
     assert_eq!(d.load(&ex("top.sdc")).unwrap(), "sdc");
     assert_eq!(d.load(&ex("top.spef")).unwrap(), "spef");
+}
+
+#[test]
+fn yosys_json_matches_the_verilog_front_end() {
+    // The same design read two ways must produce the same netlist.
+    let mut dv = Design::new();
+    dv.load(&ex("top.v")).unwrap();
+    let mut dj = Design::new();
+    dj.load(&ex("top.json")).unwrap();
+
+    let (v, j) = (dv.netlist.unwrap(), dj.netlist.unwrap());
+    assert_eq!(v.module, j.module);
+    assert_eq!(v.inputs, j.inputs);
+    assert_eq!(v.outputs, j.outputs);
+
+    // same instances (cell + name), order-independent
+    let mut vi: Vec<_> = v.insts.iter().map(|i| (&i.cell, &i.name)).collect();
+    let mut ji: Vec<_> = j.insts.iter().map(|i| (&i.cell, &i.name)).collect();
+    vi.sort();
+    ji.sort();
+    assert_eq!(vi, ji);
 }

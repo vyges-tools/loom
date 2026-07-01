@@ -1,0 +1,23 @@
+{
+  "creator": "example (matches top.v): three-inverter chain a -> g1 -> g2 -> g3 -> y",
+  "modules": {
+    "top": {
+      "attributes": { "top": "00000000000000000000000000000001" },
+      "ports": {
+        "a": { "direction": "input",  "bits": [2] },
+        "y": { "direction": "output", "bits": [5] }
+      },
+      "cells": {
+        "g1": { "type": "INV", "port_directions": { "A": "input", "Y": "output" }, "connections": { "A": [2], "Y": [3] } },
+        "g2": { "type": "INV", "port_directions": { "A": "input", "Y": "output" }, "connections": { "A": [3], "Y": [4] } },
+        "g3": { "type": "INV", "port_directions": { "A": "input", "Y": "output" }, "connections": { "A": [4], "Y": [5] } }
+      },
+      "netnames": {
+        "a":  { "bits": [2] },
+        "n1": { "bits": [3] },
+        "n2": { "bits": [4] },
+        "y":  { "bits": [5] }
+      }
+    }
+  }
+}

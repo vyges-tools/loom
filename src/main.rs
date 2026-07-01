@@ -43,8 +43,9 @@ COMMANDS:
   help                 print this help
 
 FILE TYPES (by extension):
-  .v / .sv   netlist       .lib   liberty
-  .sdc       constraints   .spef  parasitics
+  .v / .sv   netlist       .json  netlist (Yosys write_json)
+  .lib       liberty       .sdc   constraints
+  .spef      parasitics    .lef/.tlef  tech-LEF   .def  DEF
 
 OPTIONS:
   --json        machine-readable output (inspect)

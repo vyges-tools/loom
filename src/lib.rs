@@ -31,6 +31,9 @@ pub mod liberty;
 /// to the timing engine (`vyges-sta-si`); loom holds + can evaluate the curves.
 pub mod ccs;
 pub mod netlist;
+/// Yosys `write_json` netlist reader — an alternate front-end that maps onto the
+/// same [`netlist::Netlist`] the structural-Verilog reader produces.
+pub mod yosys_json;
 pub mod sdc;
 pub mod spef;
 /// Unified tech-LEF reader (per-layer width/thickness/resistance/EM limits) —

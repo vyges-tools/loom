@@ -11,9 +11,12 @@ layer over it (built with [PyO3](https://pyo3.rs) + [maturin](https://www.maturi
 
 ## Install
 
-```sh
-pip install vyges-loom
-```
+> **Status:** the multi-platform wheel is being wired up — until it lands on PyPI,
+> install from source with the [build steps below](#build-from-source). Once published:
+>
+> ```sh
+> pip install vyges-loom
+> ```
 
 ## Use
 

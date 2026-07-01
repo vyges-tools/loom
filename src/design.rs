@@ -9,7 +9,7 @@
 //! loaded, in order, with a one-line summary — the runtime sibling of
 //! `vyges-metadata.json`, and the seed of the provenance/caching `sley` will use.
 
-use crate::{def, lef, liberty, netlist, sdc, spef};
+use crate::{def, lef, liberty, netlist, sdc, spef, yosys_json};
 
 /// One recorded load/step — the seed of loom's cross-step state (provenance).
 #[derive(Debug, Clone)]
@@ -53,6 +53,22 @@ impl Design {
     /// Load a structural Verilog netlist (`.v`/`.sv`).
     pub fn load_netlist(&mut self, path: &str) -> Result<(), DesignError> {
         let nl = netlist::load(path).map_err(|e| DesignError(e.to_string()))?;
+        let summary = format!(
+            "module {} — {} inputs, {} outputs, {} instances",
+            nl.module,
+            nl.inputs.len(),
+            nl.outputs.len(),
+            nl.insts.len()
+        );
+        self.steps.push(Step { kind: "netlist", path: path.into(), summary });
+        self.netlist = Some(nl);
+        Ok(())
+    }
+
+    /// Load a Yosys JSON netlist (`.json`, from `write_json`). Sets the netlist,
+    /// like [`Design::load_netlist`] but from Yosys's JSON instead of Verilog.
+    pub fn load_netlist_json(&mut self, path: &str) -> Result<(), DesignError> {
+        let nl = yosys_json::load(path).map_err(|e| DesignError(e.to_string()))?;
         let summary = format!(
             "module {} — {} inputs, {} outputs, {} instances",
             nl.module,
@@ -131,13 +147,14 @@ impl Design {
             .to_ascii_lowercase();
         match ext.as_str() {
             "v" | "sv" | "vg" => self.load_netlist(path).map(|_| "netlist"),
+            "json" => self.load_netlist_json(path).map(|_| "netlist"),
             "lib" => self.load_liberty(path).map(|_| "liberty"),
             "sdc" => self.load_sdc(path).map(|_| "sdc"),
             "spef" => self.load_spef(path).map(|_| "spef"),
             "lef" | "tlef" => self.load_lef(path).map(|_| "lef"),
             "def" => self.load_def(path).map(|_| "def"),
             other => Err(DesignError(format!(
-                "{path}: unknown extension '.{other}' (expected .v/.sv, .lib, .sdc, .spef, .lef, .def)"
+                "{path}: unknown extension '.{other}' (expected .v/.sv, .json, .lib, .sdc, .spef, .lef, .def)"
             ))),
         }
     }
