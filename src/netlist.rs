@@ -50,8 +50,28 @@ fn tokenize(text: &str) -> Vec<String> {
             out.push(std::mem::take(cur));
         }
     };
+    // A Verilog *escaped identifier* starts with `\` and runs until the next
+    // whitespace, which terminates it (and is not part of the name). Punctuation
+    // inside it — `\clkbuf_0_gpio_in[0]`, `\ANTENNA_u_cpu.foo[1]` — is part of the
+    // name, so it must NOT be split on `[`/`]`/`.`; otherwise the real instance is
+    // missed and the leftover `0 ] (` fragment mis-parses as a bogus cell.
+    let mut escaped = false;
     for ch in clean.chars() {
+        if escaped {
+            if ch.is_whitespace() {
+                flush(&mut cur, &mut out);
+                escaped = false;
+            } else {
+                cur.push(ch);
+            }
+            continue;
+        }
         match ch {
+            '\\' => {
+                flush(&mut cur, &mut out);
+                cur.push(ch);
+                escaped = true;
+            }
             '(' | ')' | ';' | ',' | '.' | '[' | ']' | '=' => {
                 flush(&mut cur, &mut out);
                 out.push(ch.to_string());
@@ -74,6 +94,14 @@ fn is_keyword(t: &str) -> bool {
 
 fn is_const(net: &str) -> bool {
     net.contains('\'') // 1'b0, 1'b1, etc.
+}
+
+/// A token that can begin a Verilog identifier (module / cell / instance / net
+/// name): a letter, `_`, or the `\` of an escaped identifier. Numeric tokens
+/// (bus indices like `0`, sized constants) are NOT identifiers — used so a stray
+/// numeric token sitting before `(` is not mis-read as a cell instance.
+fn is_ident(t: &str) -> bool {
+    matches!(t.chars().next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '\\')
 }
 
 pub fn parse(text: &str) -> Result<Netlist, NetlistError> {
@@ -166,7 +194,14 @@ pub fn parse(text: &str) -> Result<Netlist, NetlistError> {
             ";" | ")" | "(" | "," | "." | "=" | "[" | "]" => i += 1,
             _ => {
                 // candidate instance:  CELL  INST  ( .pin(net), ... ) ;
-                if i + 2 < n && !is_keyword(&t[i]) && !is_keyword(&t[i + 1]) && t[i + 2] == "(" {
+                // the cell must be a real identifier — a stray numeric token before
+                // `(` is never a cell (defensive net around tokenizer edge cases).
+                if i + 2 < n
+                    && is_ident(&t[i])
+                    && !is_keyword(&t[i])
+                    && !is_keyword(&t[i + 1])
+                    && t[i + 2] == "("
+                {
                     let cell = t[i].clone();
                     let name = t[i + 1].clone();
                     i += 3; // past CELL INST (
@@ -225,4 +260,33 @@ pub fn parse(text: &str) -> Result<Netlist, NetlistError> {
 pub fn load(path: &str) -> Result<Netlist, NetlistError> {
     let text = std::fs::read_to_string(path).map_err(|e| NetlistError(format!("{path}: {e}")))?;
     parse(&text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escaped_identifier_instance_names() {
+        // Post-route netlists name buffered/antenna instances with Verilog escaped
+        // identifiers that embed `[`, `]`, and `.` — `\clkbuf_0_gpio_in[0]`,
+        // `\ANTENNA_u_cpu.irq[1]`. These must parse as ONE instance name; splitting
+        // them shatters the real instance and mis-parses the `0 ] (` leftover as a
+        // bogus cell named "0" (regression: "cell not in any .lib: 0").
+        let src = r#"
+module top (input a, output y);
+  wire n1;
+  sky130_fd_sc_hd__clkbuf_16 \clkbuf_0_gpio_in[0] (.A(a), .X(n1));
+  sky130_fd_sc_hd__inv_2 \ANTENNA_u_cpu.irq[1] (.A(n1), .Y(y));
+endmodule
+"#;
+        let nl = parse(src).unwrap();
+        assert_eq!(nl.insts.len(), 2, "both escaped-id instances parse");
+        assert_eq!(nl.insts[0].cell, "sky130_fd_sc_hd__clkbuf_16");
+        assert_eq!(nl.insts[0].name, "\\clkbuf_0_gpio_in[0]");
+        assert_eq!(nl.insts[1].cell, "sky130_fd_sc_hd__inv_2");
+        assert_eq!(nl.insts[1].name, "\\ANTENNA_u_cpu.irq[1]");
+        // no bogus numeric-cell instance leaked in
+        assert!(nl.insts.iter().all(|inst| is_ident(&inst.cell)));
+    }
 }
