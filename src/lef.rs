@@ -19,9 +19,13 @@ use std::collections::BTreeMap;
 /// Per-layer attributes (union of the timing-extraction and PDN/EM views).
 #[derive(Debug, Clone, Default)]
 pub struct Layer {
+    pub routing: bool,     // TYPE ROUTING (vs CUT / other) — the metal stack
     pub width_um: f64,     // default routing width (um)
     pub thickness_um: f64, // metal thickness (um) — field kernel
-    pub rpersq: f64,       // sheet resistance (ohm/square) — PDN
+    pub rpersq: f64,       // sheet resistance (ohm/square) — PDN + RC
+    pub cpersqdist: f64,   // area capacitance to the plane below (per unit^2) — RC
+    pub edge_cap: f64,     // fringe / edge capacitance (per unit length) — RC
+    pub cut_res: f64,      // per-cut resistance (ohm) on a CUT layer — via RC
     pub dc_jmax: f64,      // DC average current-density limit (mA/um) — EM
     pub ac_rms: f64,       // AC RMS current-density limit (mA/um)
     pub ac_peak: f64,      // AC peak current-density limit (mA/um)
@@ -79,9 +83,26 @@ impl Lef {
                                     l.thickness_um = v;
                                 }
                             }
+                            ["TYPE", "ROUTING", ..] => l.routing = true,
                             ["RESISTANCE", "RPERSQ", v, ..] => {
                                 if let Some(x) = num(v) {
                                     l.rpersq = x;
+                                }
+                            }
+                            // plain RESISTANCE <ohm> on a CUT layer = per-cut via resistance
+                            ["RESISTANCE", v, ..] => {
+                                if let Some(x) = num(v) {
+                                    l.cut_res = x;
+                                }
+                            }
+                            ["CAPACITANCE", "CPERSQDIST", v, ..] => {
+                                if let Some(x) = num(v) {
+                                    l.cpersqdist = x;
+                                }
+                            }
+                            ["EDGECAPACITANCE", v, ..] => {
+                                if let Some(x) = num(v) {
+                                    l.edge_cap = x;
                                 }
                             }
                             ["DCCURRENTDENSITY", "AVERAGE", v, ..] => {
