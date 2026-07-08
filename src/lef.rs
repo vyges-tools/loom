@@ -34,6 +34,10 @@ pub struct Layer {
 #[derive(Debug, Clone, Default)]
 pub struct Lef {
     pub layers: BTreeMap<String, Layer>,
+    /// routing layers in LEF **declaration order** (the metal stack, bottom→top) —
+    /// so consumers that index by stack position (e.g. an OpenRCX captable's
+    /// `Metal N`) map correctly even when names don't sort (metal2 vs metal10).
+    pub routing_order: Vec<String>,
     /// layer → default routing width (um) — projection of `layers`.
     pub widths: BTreeMap<String, f64>,
     /// layer → metal thickness (um) — projection of `layers`.
@@ -55,6 +59,7 @@ impl Lef {
     /// "no LEF" path use `Lef::default()` instead of parsing an empty string.
     pub fn parse(text: &str) -> Result<Lef, LefError> {
         let mut layers: BTreeMap<String, Layer> = BTreeMap::new();
+        let mut routing_order: Vec<String> = Vec::new();
         let mut cur: Option<(String, Layer)> = None;
         for raw in text.lines() {
             let line = match raw.find('#') {
@@ -66,6 +71,9 @@ impl Lef {
                 ["LAYER", name, ..] => cur = Some((name.to_string(), Layer::default())),
                 ["END", name, ..] if cur.as_ref().map(|(n, _)| n == name).unwrap_or(false) => {
                     if let Some((n, l)) = cur.take() {
+                        if l.routing {
+                            routing_order.push(n.clone());
+                        }
                         layers.insert(n, l);
                     }
                 }
@@ -139,7 +147,7 @@ impl Lef {
                 thicknesses.insert(n.clone(), l.thickness_um);
             }
         }
-        Ok(Lef { layers, widths, thicknesses })
+        Ok(Lef { layers, routing_order, widths, thicknesses })
     }
 
     pub fn load(path: &str) -> Result<Lef, LefError> {
