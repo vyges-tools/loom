@@ -73,6 +73,10 @@ pub struct Sdc {
     pub late_derate: Option<f64>,
     pub early_derate: Option<f64>,
     pub exceptions: Vec<Exception>,
+    /// `set_clock_groups -asynchronous`: each inner vec is one `-group` of clock
+    /// names. Two clocks in *different* groups are mutually asynchronous — paths
+    /// that launch and capture across them are cut (no setup **or** hold check).
+    pub async_groups: Vec<Vec<String>>,
     pub ignored: Vec<String>, // commands we recognised but do not model
 }
 
@@ -455,6 +459,29 @@ impl Sdc {
                         sdc.early_derate = Some(v);
                     }
                 }
+                "set_clock_groups" => {
+                    // -asynchronous / -exclusive: clocks in different -group blocks are
+                    // unrelated. Collect each -group's resolved clock names.
+                    let mut groups: Vec<Vec<String>> = Vec::new();
+                    let mut i = 0;
+                    while i < toks.len() {
+                        if toks[i] == "-group" {
+                            if let Some(v) = toks.get(i + 1) {
+                                let names: Vec<String> =
+                                    resolve_objs(v).into_iter().filter(|o| !o.starts_with('*')).collect();
+                                if !names.is_empty() {
+                                    groups.push(names);
+                                }
+                                i += 2;
+                                continue;
+                            }
+                        }
+                        i += 1;
+                    }
+                    if groups.len() >= 2 {
+                        sdc.async_groups.extend(groups);
+                    }
+                }
                 "set_false_path" => {
                     let (from, to) = from_to(&toks);
                     sdc.exceptions.push(Exception { kind: ExcKind::FalsePath, from, to });
@@ -506,4 +533,19 @@ fn from_to(toks: &[String]) -> (String, String) {
         "*".to_string()
     };
     (pick(&["-from", "-rise_from", "-fall_from"]), pick(&["-to", "-rise_to", "-fall_to"]))
+}
+
+#[cfg(test)]
+mod async_group_tests {
+    use super::*;
+    #[test]
+    fn clock_groups_asynchronous_parses_groups() {
+        let s = "create_clock -name a -period 10 [get_ports ca]\n\
+                 create_clock -name b -period 3 [get_ports cb]\n\
+                 set_clock_groups -asynchronous -group [get_clocks a] -group [get_clocks b]\n";
+        let sdc = Sdc::parse(s).unwrap();
+        assert_eq!(sdc.async_groups.len(), 2, "two groups");
+        assert!(sdc.async_groups.iter().any(|g| g == &vec!["a".to_string()]));
+        assert!(sdc.async_groups.iter().any(|g| g == &vec!["b".to_string()]));
+    }
 }
