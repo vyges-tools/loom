@@ -534,6 +534,30 @@ Xu0 A Y VPWR VGND VPB VNB inv
         assert!(n.devices.iter().all(|d| d.kind == 'M'));
     }
 
+    // Real CDL flavour (sky130 std-cell library): uppercase `.SUBCKT`/`.ENDS`, a
+    // `*.PININFO` comment pragma, and M-devices with many params (incl. a non-numeric
+    // `topography=normal`) across a `+` continuation. Confirmed against the full
+    // 437-cell sky130_fd_sc_hd.cdl (all parse; this is the minimal smoke test).
+    #[test]
+    fn parses_cdl_uppercase_pininfo_and_params() {
+        let cdl = "\
+.SUBCKT sky130_fd_sc_hd__inv_1 A VGND VNB VPB VPWR Y
+*.PININFO A:I VGND:I VNB:I VPB:I VPWR:I Y:O
+MMIN1 Y A VGND VNB nfet_01v8 m=1 w=0.65 l=0.15 mult=1 sa=0.265
++ sb=0.265 sd=0.28 topography=normal area=0.063 perim=1.14
+MMIP1 Y A VPWR VPB pfet_01v8_hvt m=1 w=1.0 l=0.15
+.ENDS
+";
+        let n = Netlist::parse(cdl, Some("sky130_fd_sc_hd__inv_1")).unwrap();
+        assert_eq!(n.devices.len(), 2);
+        assert!(n.devices.iter().all(|d| d.kind == 'M'));
+        assert_eq!(n.devices[0].model, "nfet_01v8");
+        assert_eq!(n.devices[0].nodes, ["Y", "A", "VGND", "VNB"]);
+        assert!((n.devices[0].params.get("w").copied().unwrap() - 0.65).abs() < 1e-12);
+        assert!((n.devices[0].params.get("l").copied().unwrap() - 0.15).abs() < 1e-12);
+        assert!(n.devices[0].params.get("topography").is_none(), "non-numeric param skipped");
+    }
+
     #[test]
     fn undefined_subckt_stays_opaque() {
         let t = "\
