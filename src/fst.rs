@@ -102,7 +102,17 @@ impl Fst {
         let end_time = be_u64(hdr, 8)?;
         let ts_exp = *hdr.get(64).ok_or_else(|| FstError("short header".into()))? as i8;
         let timescale_s = 10f64.powi(ts_exp as i32);
-        let sim_time_s = end_time as f64 * timescale_s;
+        // Rate denominator: the full dump, or the window duration when windowed (so a
+        // windowed FST rate is defined the same way as a windowed VCD rate).
+        let end_s = end_time as f64 * timescale_s;
+        let sim_time_s = match window {
+            None => end_s,
+            Some((f, t)) => {
+                let eff_from = f.clamp(0.0, end_s);
+                let eff_to = t.unwrap_or(end_s).clamp(eff_from, end_s);
+                eff_to - eff_from
+            }
+        };
 
         // ---- hierarchy: scopes / vars / handles ------------------------------------
         let mut idx = NetIndex::default();
