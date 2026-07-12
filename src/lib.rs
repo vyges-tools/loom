@@ -36,6 +36,13 @@ pub mod netlist;
 pub mod yosys_json;
 pub mod sdc;
 pub mod spef;
+/// Simulation **activity** readers: [`vcd`] (VCD text) and [`saif`] (cumulative SAIF)
+/// turn a waveform into per-net toggle counts, and [`names`] resolves them to netlist
+/// nets (scope-aware, bit-level). The switching-activity source for `vyges-power` and
+/// `vyges-em-ir`. (An FST reader lands behind the `fst` feature.)
+pub mod names;
+pub mod saif;
+pub mod vcd;
 /// Unified tech-LEF reader (per-layer width/thickness/resistance/EM limits) —
 /// the superset of the extraction and PDN/EM views.
 pub mod lef;
