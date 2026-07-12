@@ -34,6 +34,10 @@ pub mod netlist;
 /// Yosys `write_json` netlist reader — an alternate front-end that maps onto the
 /// same [`netlist::Netlist`] the structural-Verilog reader produces.
 pub mod yosys_json;
+/// SPICE **transistor-level** netlist reader (its own device-level `Netlist`, distinct
+/// from the gate-level [`netlist`]) — hierarchical flatten + PDK device recognition.
+/// The netlist front end LVS compares against an extracted layout.
+pub mod spice;
 pub mod sdc;
 pub mod spef;
 /// Simulation **activity** readers: [`vcd`] (VCD text) and [`saif`] (cumulative SAIF)
