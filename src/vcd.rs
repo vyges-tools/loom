@@ -240,9 +240,10 @@ fn parse_timescale(s: &str) -> f64 {
     1.0e-9
 }
 
-/// How a `$var` symbol maps to netlist nets: a single scalar net, or the per-bit
-/// nets of a vector (`data` with `[3:0]` → `data[3]…data[0]`, indexed left→right).
-enum Sig {
+/// How a signal maps to netlist nets: a single scalar net, or the per-bit nets of a
+/// vector (`data` with `[3:0]` → `data[3]…data[0]`, indexed left→right). Shared with the
+/// FST reader.
+pub(crate) enum Sig {
     Scalar(String),
     Vector { bits: Vec<String> },
 }
@@ -250,7 +251,7 @@ enum Sig {
 /// Build a [`Sig`] for a `$var` and declare its net(s) in `idx`. Reals and 1-bit
 /// signals are scalars; wider signals expand to per-bit nets so a gate-level netlist's
 /// per-bit nets (`data[0]`) resolve and each bit's toggles are counted independently.
-fn build_sig(ty: &str, width: usize, base: &str, range: Option<&str>, idx: &mut NetIndex) -> Sig {
+pub(crate) fn build_sig(ty: &str, width: usize, base: &str, range: Option<&str>, idx: &mut NetIndex) -> Sig {
     if ty.eq_ignore_ascii_case("real") || width <= 1 {
         idx.declare(base);
         return Sig::Scalar(base.to_string());
@@ -284,7 +285,7 @@ fn parse_range(range: Option<&str>) -> Option<(i64, i64)> {
 
 /// Left-extend a VCD vector value to `width` bits (VCD pads with `0`, or the leading
 /// `x`/`z`), returning it MSB-first as chars.
-fn pad_bits(value: &str, width: usize) -> Vec<char> {
+pub(crate) fn pad_bits(value: &str, width: usize) -> Vec<char> {
     let chars: Vec<char> = value.chars().collect();
     if chars.len() >= width {
         return chars[chars.len() - width..].to_vec();

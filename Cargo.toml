@@ -9,7 +9,17 @@ homepage = "https://vyges.com"
 repository = "https://github.com/vyges-tools/loom"
 build = "build.rs"
 
-# std-only (no external dependencies) so the core builds/tests offline.
+# std-only by default (no external dependencies) so the core builds/tests offline.
+# The optional `fst` feature adds the FST binary-waveform reader, which needs a zlib
+# decoder — miniz_oxide (pure-Rust, already used in the suite by vyges-layout). LZ4 is
+# clean-roomed in-tree, so `fst` pulls exactly one third-party crate, and only for
+# consumers that enable it (vyges-power). Default consumers stay std-only.
+[features]
+default = []
+fst = ["dep:miniz_oxide"]
+
+[dependencies]
+miniz_oxide = { version = "0.8", optional = true }
 
 [lib]
 name = "vyges_loom"

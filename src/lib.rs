@@ -43,6 +43,13 @@ pub mod spef;
 pub mod names;
 pub mod saif;
 pub mod vcd;
+/// FST (GTKWave binary waveform) activity reader — same `NetIndex` output as [`vcd`].
+/// Behind the `fst` feature because it needs a zlib decoder (`miniz_oxide`); LZ4 is
+/// clean-roomed in-tree. Off by default so loom's core stays std-only.
+#[cfg(feature = "fst")]
+pub mod fst;
+#[cfg(feature = "fst")]
+mod lz4;
 /// Unified tech-LEF reader (per-layer width/thickness/resistance/EM limits) —
 /// the superset of the extraction and PDN/EM views.
 pub mod lef;
