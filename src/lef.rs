@@ -31,9 +31,36 @@ pub struct Layer {
     pub ac_peak: f64,      // AC peak current-density limit (mA/um)
 }
 
+/// Pin direction from a cell-LEF `MACRO`/`PIN` (`DIRECTION INPUT|OUTPUT|INOUT`).
+/// Drives SPEF `*CONN` driver/load marking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PinDir {
+    #[default]
+    Unknown,
+    Input,
+    Output,
+    Inout,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MacroPin {
+    pub name: String,
+    pub direction: PinDir,
+}
+
+/// A std-cell abstract from the cell LEF `MACRO` section — the pin list + each
+/// pin's direction (PORT geometry is skipped; RC comes from the tech LEF/liberty).
+#[derive(Debug, Clone, Default)]
+pub struct Macro {
+    pub name: String,
+    pub pins: BTreeMap<String, MacroPin>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Lef {
     pub layers: BTreeMap<String, Layer>,
+    /// Cell abstracts (MACRO section) — empty for a pure tech LEF.
+    pub macros: BTreeMap<String, Macro>,
     /// routing layers in LEF **declaration order** (the metal stack, bottom→top) —
     /// so consumers that index by stack position (e.g. an OpenRCX captable's
     /// `Metal N`) map correctly even when names don't sort (metal2 vs metal10).
@@ -61,12 +88,53 @@ impl Lef {
         let mut layers: BTreeMap<String, Layer> = BTreeMap::new();
         let mut routing_order: Vec<String> = Vec::new();
         let mut cur: Option<(String, Layer)> = None;
+        let mut macros: BTreeMap<String, Macro> = BTreeMap::new();
+        // Macro-section state. While inside a MACRO we must NOT treat its inner
+        // `LAYER <m> ;` (PIN PORT geometry) lines as tech-layer starts.
+        let mut cur_macro: Option<Macro> = None;
+        let mut cur_pin: Option<MacroPin> = None;
         for raw in text.lines() {
             let line = match raw.find('#') {
                 Some(i) => &raw[..i],
                 None => raw,
             };
             let toks: Vec<&str> = line.split_whitespace().collect();
+
+            // ---- macro mode: consume MACRO/PIN/DIRECTION, shield tech parsing ----
+            if let Some(m) = cur_macro.as_mut() {
+                match toks.as_slice() {
+                    ["PIN", name, ..] => {
+                        cur_pin = Some(MacroPin { name: name.to_string(), direction: PinDir::default() });
+                    }
+                    ["DIRECTION", d, ..] => {
+                        if let Some(p) = cur_pin.as_mut() {
+                            p.direction = match d.trim_end_matches(';').to_ascii_uppercase().as_str() {
+                                "INPUT" => PinDir::Input,
+                                "OUTPUT" | "OUTPUT_TRISTATE" => PinDir::Output,
+                                "INOUT" => PinDir::Inout,
+                                _ => PinDir::Unknown,
+                            };
+                        }
+                    }
+                    ["END", name, ..] => {
+                        if cur_pin.as_ref().map(|p| &p.name == name).unwrap_or(false) {
+                            let p = cur_pin.take().unwrap();
+                            m.pins.insert(p.name.clone(), p);
+                        } else if &m.name == name {
+                            let done = cur_macro.take().unwrap();
+                            macros.insert(done.name.clone(), done);
+                        }
+                    }
+                    _ => {} // SIZE/ORIGIN/FOREIGN/PORT/LAYER/RECT... ignored
+                }
+                continue;
+            }
+            if let ["MACRO", name, ..] = toks.as_slice() {
+                cur_macro = Some(Macro { name: name.to_string(), pins: BTreeMap::new() });
+                cur_pin = None;
+                continue;
+            }
+
             match toks.as_slice() {
                 ["LAYER", name, ..] => cur = Some((name.to_string(), Layer::default())),
                 ["END", name, ..] if cur.as_ref().map(|(n, _)| n == name).unwrap_or(false) => {
@@ -134,8 +202,10 @@ impl Lef {
                 }
             }
         }
-        if layers.is_empty() {
-            return Err(LefError("no LAYER blocks found".into()));
+        // A pure cell LEF has MACROs but no LAYER blocks — that's valid. Only a LEF
+        // with neither (a wrong/empty file) is an error.
+        if layers.is_empty() && macros.is_empty() {
+            return Err(LefError("no LAYER or MACRO blocks found".into()));
         }
         let mut widths = BTreeMap::new();
         let mut thicknesses = BTreeMap::new();
@@ -147,12 +217,21 @@ impl Lef {
                 thicknesses.insert(n.clone(), l.thickness_um);
             }
         }
-        Ok(Lef { layers, routing_order, widths, thicknesses })
+        Ok(Lef { layers, macros, routing_order, widths, thicknesses })
     }
 
     pub fn load(path: &str) -> Result<Lef, LefError> {
         let text = std::fs::read_to_string(path).map_err(|e| LefError(format!("{path}: {e}")))?;
         Lef::parse(&text)
+    }
+
+    /// Direction of `pin` on cell `cell` from the MACRO section (Unknown if absent).
+    pub fn pin_dir(&self, cell: &str, pin: &str) -> PinDir {
+        self.macros
+            .get(cell)
+            .and_then(|m| m.pins.get(pin))
+            .map(|p| p.direction)
+            .unwrap_or(PinDir::Unknown)
     }
 
     /// Default routing width for a layer (0.0 if unknown).
@@ -200,5 +279,44 @@ END met1
     #[test]
     fn empty_errors() {
         assert!(Lef::parse("# no layers here\n").is_err());
+    }
+
+    #[test]
+    fn parses_macro_pins_with_direction() {
+        // cell LEF: MACRO/PIN with DIRECTION, incl. a PORT `LAYER` that must NOT be
+        // mistaken for a tech layer.
+        let text = "\
+MACRO INV_X1
+  SIZE 1.2 BY 2.0 ;
+  PIN A
+    DIRECTION INPUT ;
+    PORT
+      LAYER met1 ;
+      RECT 0.1 0.1 0.2 0.3 ;
+    END
+  END A
+  PIN Y
+    DIRECTION OUTPUT ;
+    PORT
+      LAYER met1 ;
+    END
+  END Y
+END INV_X1
+MACRO DFF_X1
+  PIN CK
+    DIRECTION INPUT ;
+  END CK
+  PIN Q
+    DIRECTION OUTPUT ;
+  END Q
+END DFF_X1
+";
+        let lef = Lef::parse(text).unwrap();
+        assert_eq!(lef.layers.len(), 0); // PORT `LAYER met1` did NOT leak into layers
+        assert_eq!(lef.macros.len(), 2);
+        assert_eq!(lef.pin_dir("INV_X1", "A"), PinDir::Input);
+        assert_eq!(lef.pin_dir("INV_X1", "Y"), PinDir::Output);
+        assert_eq!(lef.pin_dir("DFF_X1", "Q"), PinDir::Output);
+        assert_eq!(lef.pin_dir("INV_X1", "ZZ"), PinDir::Unknown);
     }
 }

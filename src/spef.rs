@@ -23,6 +23,21 @@ pub struct NetRc {
     pub ground: Vec<(String, f64)>,       // (node, grounded cap fF)
     pub res: Vec<(String, String, f64)>,  // (node a, node b, ohm)
     pub pins: Vec<(String, String, String)>, // (instance, pin, node) from *CONN
+    /// Rich `*CONN` with direction + per-pin load cap (when a cell LEF / liberty
+    /// resolved them). Parallel to `pins` (kept for back-compat); the writer emits
+    /// from `conns` when non-empty, so driver (`O`) / load (`I`) marking + `*L cap`
+    /// survive. Empty on a bare read with no direction/cap.
+    pub conns: Vec<PinConn>,
+}
+
+/// A `*CONN` entry with direction and input-pin load capacitance (fF).
+#[derive(Debug, Clone, Default)]
+pub struct PinConn {
+    pub inst: String,
+    pub pin: String,
+    pub node: String,
+    pub dir: crate::lef::PinDir,
+    pub cap_ff: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -432,11 +447,32 @@ impl Spef {
                         }
                     }
                 }
-                "conn" if toks.first() == Some(&"*I") => {
+                "conn" if toks.first() == Some(&"*I") || toks.first() == Some(&"*P") => {
                     if let Some(node) = toks.get(1) {
                         if let Some((inst, pin)) = pin_of(node, &names) {
+                            let dir = match toks.get(2).copied() {
+                                Some("O") => crate::lef::PinDir::Output,
+                                Some("B") => crate::lef::PinDir::Inout,
+                                Some("I") => crate::lef::PinDir::Input,
+                                _ => crate::lef::PinDir::Unknown,
+                            };
+                            // optional `*L <cap>` load capacitance
+                            let cap_ff = toks
+                                .iter()
+                                .position(|&t| t == "*L")
+                                .and_then(|i| toks.get(i + 1))
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .map(|c| c * c_scale)
+                                .unwrap_or(0.0);
                             if let Some((_, _, rc)) = cur.as_mut() {
-                                rc.pins.push((inst, pin, node_tok(node)));
+                                rc.pins.push((inst.clone(), pin.clone(), node_tok(node)));
+                                rc.conns.push(PinConn {
+                                    inst,
+                                    pin,
+                                    node: node_tok(node),
+                                    dir,
+                                    cap_ff,
+                                });
                             }
                         }
                     }
@@ -531,6 +567,11 @@ impl Spef {
                     insts.push(inst.clone());
                 }
             }
+            for c in &rc.conns {
+                if !insts.contains(&c.inst) {
+                    insts.push(c.inst.clone());
+                }
+            }
         }
         insts.sort();
         for inst in &insts {
@@ -564,7 +605,22 @@ impl Spef {
         for (net, rc) in &self.nets {
             let nid = id_of[net];
             body.push_str(&format!("\n*D_NET *{nid} {}\n", fmtf(rc.cap_ff)));
-            if !rc.pins.is_empty() {
+            if !rc.conns.is_empty() {
+                body.push_str("*CONN\n");
+                for c in &rc.conns {
+                    let iid = id_of[&c.inst];
+                    let d = match c.dir {
+                        crate::lef::PinDir::Output => "O",
+                        crate::lef::PinDir::Inout => "B",
+                        _ => "I", // input / unknown → load
+                    };
+                    if c.cap_ff > 0.0 {
+                        body.push_str(&format!("*I *{iid}:{} {d} *L {}\n", c.pin, fmtf(c.cap_ff)));
+                    } else {
+                        body.push_str(&format!("*I *{iid}:{} {d}\n", c.pin));
+                    }
+                }
+            } else if !rc.pins.is_empty() {
                 body.push_str("*CONN\n");
                 for (inst, pin, _) in &rc.pins {
                     let iid = id_of[inst];
@@ -662,6 +718,7 @@ mod writer_tests {
                 ground: vec![("neta".to_string(), 8.0)],
                 res: vec![("neta".to_string(), "u1:A".to_string(), 100.0)],
                 pins: vec![("u1".to_string(), "A".to_string(), "u1:A".to_string())],
+                conns: vec![],
             },
         );
         nets.insert(
@@ -675,6 +732,7 @@ mod writer_tests {
                 ground: vec![("netb".to_string(), 5.0)],
                 res: vec![("netb".to_string(), "u2:Y".to_string(), 50.0)],
                 pins: vec![("u2".to_string(), "Y".to_string(), "u2:Y".to_string())],
+                conns: vec![],
             },
         );
         Spef { nets }
@@ -700,6 +758,36 @@ mod writer_tests {
         assert_eq!(a.coupling_ff, 2.0);
         assert_eq!(back.nets.get("netb").unwrap().coupling_ff, 2.0);
         assert_eq!(back.nets.get("netb").unwrap().res_ohm, 50.0);
+    }
+
+    #[test]
+    fn conn_direction_and_cin_roundtrip() {
+        use crate::lef::PinDir;
+        let mut nets = BTreeMap::new();
+        nets.insert(
+            "n0".to_string(),
+            NetRc {
+                cap_ff: 5.0,
+                net_node: "n0".to_string(),
+                ground: vec![("n0".to_string(), 5.0)],
+                res: vec![("n0".to_string(), "u1:Y".to_string(), 20.0)],
+                conns: vec![
+                    PinConn { inst: "u1".into(), pin: "Y".into(), node: "u1:Y".into(), dir: PinDir::Output, cap_ff: 0.0 },
+                    PinConn { inst: "u2".into(), pin: "A".into(), node: "u2:A".into(), dir: PinDir::Input, cap_ff: 1.5 },
+                ],
+                ..Default::default()
+            },
+        );
+        let text = Spef { nets }.to_spef(&WriteOpts::default());
+        assert!(text.contains(" O\n") || text.contains(" O *L")); // driver marked O
+        assert!(text.contains("*L 1.5")); // load cap emitted
+        let back = Spef::parse(&text);
+        let c = &back.nets.get("n0").unwrap().conns;
+        let y = c.iter().find(|c| c.pin == "Y").expect("Y pin");
+        assert_eq!(y.dir, PinDir::Output);
+        let a = c.iter().find(|c| c.pin == "A").expect("A pin");
+        assert_eq!(a.dir, PinDir::Input);
+        assert_eq!(a.cap_ff, 1.5);
     }
 
     #[test]
