@@ -953,6 +953,7 @@ library (demo) {
 
     #[test]
     fn load_opts_is_consistent_and_opts_keyed() {
+        std::env::set_var("VYGES_LIB_CACHE", "0"); // keep this test off the real ~/.vyges
         let path = std::env::temp_dir().join(format!("vyges_loom_cache_{}.lib", std::process::id()));
         std::fs::write(&path, CACHE_LIB).unwrap();
         let p = path.to_str().unwrap();

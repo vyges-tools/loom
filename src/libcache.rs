@@ -5,9 +5,9 @@
 //! skip re-parsing it. Sits behind `Lib::load_opts`, *below* the in-process cache
 //! (#37): in-process → on-disk → parse.
 //!
-//! **Off by default** — enable with `VYGES_LIB_CACHE=1`. Shipping the mechanism this
-//! way can never regress anyone; flip it on once the box benchmark confirms decode is
-//! meaningfully faster than a Liberty re-parse (the issue's ship gate).
+//! **On by default** (decode benchmarked ~20× faster than a Liberty re-parse); disable
+//! with `VYGES_LIB_CACHE=0`. Bounded by a size cap (`VYGES_LIB_CACHE_MB`, default 512),
+//! pruned oldest-first on write, so the directory can't grow without limit.
 //!
 //! Format: a hand-rolled little-endian binary codec (loom is std-only — no serde),
 //! magic-tagged and versioned so a format change invalidates rather than misreads.
@@ -340,17 +340,59 @@ pub fn decode(bytes: &[u8]) -> Option<Lib> {
 
 // ── on-disk cache ────────────────────────────────────────────────────────────────
 
-/// Resolve the cache directory, or `None` when the cache is disabled (default) or no
-/// HOME. Enable with `VYGES_LIB_CACHE` set to anything non-empty.
+/// Resolve the cache directory, or `None` when disabled or there is no HOME. On by
+/// default; disable with `VYGES_LIB_CACHE` set to a falsey value (`0`/`false`/`off`/`no`).
 fn cache_dir() -> Option<PathBuf> {
-    match std::env::var_os("VYGES_LIB_CACHE") {
-        Some(v) if !v.is_empty() => {}
-        _ => return None,
+    if let Some(v) = std::env::var_os("VYGES_LIB_CACHE") {
+        let s = v.to_string_lossy().to_ascii_lowercase();
+        if matches!(s.as_str(), "0" | "false" | "off" | "no" | "") {
+            return None;
+        }
     }
     let home = std::env::var_os("HOME")?;
     let dir = Path::new(&home).join(".vyges").join("cache").join("liberty");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
+}
+
+/// Cache size cap in bytes — `VYGES_LIB_CACHE_MB` (default 512 MB).
+fn cache_cap_bytes() -> u64 {
+    std::env::var("VYGES_LIB_CACHE_MB")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(512)
+        .saturating_mul(1024 * 1024)
+}
+
+/// Keep the cache directory under `cap_bytes` by deleting oldest-written `.vlc`
+/// entries first. Content-addressed entries are cheap to regenerate, so evicting the
+/// oldest on overflow is a safe FIFO/LRU-ish bound. Best-effort; ignores errors.
+fn prune_in(dir: &Path, cap_bytes: u64) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut entries: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+    let mut total: u64 = 0;
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("vlc") {
+            continue;
+        }
+        let Ok(md) = e.metadata() else { continue };
+        let sz = md.len();
+        total = total.saturating_add(sz);
+        entries.push((md.modified().unwrap_or(std::time::UNIX_EPOCH), sz, p));
+    }
+    if total <= cap_bytes {
+        return;
+    }
+    entries.sort_by_key(|(t, _, _)| *t); // oldest first
+    for (_, sz, p) in entries {
+        if total <= cap_bytes {
+            break;
+        }
+        if std::fs::remove_file(&p).is_ok() {
+            total = total.saturating_sub(sz);
+        }
+    }
 }
 
 fn entry_path(dir: &Path, key: (u64, u64, bool)) -> PathBuf {
@@ -372,15 +414,16 @@ pub fn disk_put_in(dir: &Path, key: (u64, u64, bool), lib: &Lib) {
     }
 }
 
-/// Env-gated disk lookup (no-op unless `VYGES_LIB_CACHE` is set).
+/// Disk lookup (default-on; `None` if disabled or a miss).
 pub fn disk_get(key: (u64, u64, bool)) -> Option<Lib> {
     disk_get_in(&cache_dir()?, key)
 }
 
-/// Env-gated disk store (no-op unless `VYGES_LIB_CACHE` is set).
+/// Disk store (default-on; no-op if disabled). Prunes to the size cap after writing.
 pub fn disk_put(key: (u64, u64, bool), lib: &Lib) {
     if let Some(dir) = cache_dir() {
         disk_put_in(&dir, key, lib);
+        prune_in(&dir, cache_cap_bytes());
     }
 }
 
@@ -506,6 +549,29 @@ library (demo) {
         disk_put_in(&dir, nldm_key, &Lib::parse_opts(LIB, LibOpts { skip_ccs: true }).unwrap());
         assert!(disk_get_in(&dir, nldm_key).is_some());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prune_bounds_cache_size() {
+        let lib = Lib::parse(LIB).unwrap();
+        let one = encode(&lib).len() as u64;
+        let dir =
+            std::env::temp_dir().join(format!("vyges_libcache_prune_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..6u64 {
+            disk_put_in(&dir, (i, LIB.len() as u64, false), &lib);
+        }
+        // Cap at ~3 entries → prune must bring the directory back under the cap.
+        let cap = one * 3 + one / 2;
+        prune_in(&dir, cap);
+        let total: u64 = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("vlc"))
+            .map(|e| e.metadata().unwrap().len())
+            .sum();
+        assert!(total <= cap, "pruned total {total} must be <= cap {cap}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
