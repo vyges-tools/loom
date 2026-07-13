@@ -346,7 +346,7 @@ fn next_paren_after(s: &str, kw: &str) -> Option<String> {
     }
 }
 
-fn parse_arc(timing_body: &str) -> Arc {
+fn parse_arc(timing_body: &str, skip_ccs: bool) -> Arc {
     let tbl = |name: &str| {
         next_block(timing_body, 0, name).map(|(_, body, _)| parse_table(&body)).unwrap_or_default()
     };
@@ -357,7 +357,8 @@ fn parse_arc(timing_body: &str) -> Arc {
         cell_fall: tbl("cell_fall"),
         rise_transition: tbl("rise_transition"),
         fall_transition: tbl("fall_transition"),
-        ccs: parse_ccs(timing_body),
+        // CCS output_current waveforms — skipped (empty) for NLDM-only parses.
+        ccs: if skip_ccs { crate::ccs::CcsArc::default() } else { parse_ccs(timing_body) },
         sigma_rise: tbl("ocv_sigma_cell_rise"),
         sigma_fall: tbl("ocv_sigma_cell_fall"),
     }
@@ -406,7 +407,7 @@ fn parse_constraint(timing_body: &str) -> Constraint {
     Constraint { rise: tbl("rise_constraint"), fall: tbl("fall_constraint") }
 }
 
-fn parse_pin(name: String, body: &str, cap_unit_f: f64) -> Pin {
+fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
     let direction = match simple_attr(body, "direction").as_deref() {
         Some("input") => Dir::In,
         Some("output") => Dir::Out,
@@ -417,17 +418,22 @@ fn parse_pin(name: String, body: &str, cap_unit_f: f64) -> Pin {
         simple_attr(body, "capacitance").and_then(|s| s.parse().ok()).unwrap_or(0.0);
     let cap_f = capacitance * cap_unit_f;
     // CCS receiver capacitance group (input pins): the Miller-aware two-segment load.
-    let recv = next_block(body, 0, "receiver_capacitance").map(|(_, rbody, _)| {
-        let tbl = |name: &str| {
-            next_block(&rbody, 0, name).map(|(_, b, _)| parse_table(&b)).unwrap_or_default()
-        };
-        RecvCap {
-            c1_rise: tbl("receiver_capacitance1_rise"),
-            c2_rise: tbl("receiver_capacitance2_rise"),
-            c1_fall: tbl("receiver_capacitance1_fall"),
-            c2_fall: tbl("receiver_capacitance2_fall"),
-        }
-    });
+    // Skipped for NLDM-only parses (consumers fall back to lumped Ceff).
+    let recv = if skip_ccs {
+        None
+    } else {
+        next_block(body, 0, "receiver_capacitance").map(|(_, rbody, _)| {
+            let tbl = |name: &str| {
+                next_block(&rbody, 0, name).map(|(_, b, _)| parse_table(&b)).unwrap_or_default()
+            };
+            RecvCap {
+                c1_rise: tbl("receiver_capacitance1_rise"),
+                c2_rise: tbl("receiver_capacitance2_rise"),
+                c1_fall: tbl("receiver_capacitance1_fall"),
+                c2_fall: tbl("receiver_capacitance2_fall"),
+            }
+        })
+    };
     let clock = simple_attr(body, "clock").as_deref() == Some("true");
     let mut arcs = Vec::new();
     let mut setup: Vec<Constraint> = Vec::new();
@@ -446,18 +452,18 @@ fn parse_pin(name: String, body: &str, cap_unit_f: f64) -> Pin {
                     || tt.starts_with("recovery")
                     || tt.starts_with("removal")
                     || tt.contains("pulse_width") => {}
-            _ => arcs.push(parse_arc(&tbody)), // delay arc (incl. rising_edge CK->Q)
+            _ => arcs.push(parse_arc(&tbody, skip_ccs)), // delay arc (incl. rising_edge CK->Q)
         }
         at = after;
     }
     Pin { name, direction, capacitance, cap_f, recv, clock, setup, hold, arcs }
 }
 
-fn parse_cell(name: String, body: &str, units: &Units) -> Cell {
+fn parse_cell(name: String, body: &str, units: &Units, skip_ccs: bool) -> Cell {
     let mut pins = BTreeMap::new();
     let mut at = 0;
     while let Some((pname, pbody, after)) = next_block(body, at, "pin") {
-        let pin = parse_pin(pname.clone(), &pbody, units.cap_f);
+        let pin = parse_pin(pname.clone(), &pbody, units.cap_f, skip_ccs);
         pins.insert(pname, pin);
         at = after;
     }
@@ -477,14 +483,31 @@ fn parse_cell(name: String, body: &str, units: &Units) -> Cell {
     Cell { name, pins, is_seq, clock_pin, leakage_w, int_energy_j }
 }
 
+/// Options controlling how much of a Liberty file is parsed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LibOpts {
+    /// Skip CCS `receiver_capacitance` + `output_current` groups at parse time.
+    /// For NLDM-only runs (cell delay/transition tables) this cuts parse time and
+    /// peak memory on large multi-corner libs. Consuming engines then fall back to
+    /// the NLDM delay path + lumped Ceff, so results match a full-CCS load only when
+    /// CCS was not going to be used — otherwise it is a deliberate speed/accuracy
+    /// trade the caller opts into (never the default).
+    pub skip_ccs: bool,
+}
+
 impl Lib {
     pub fn parse(text: &str) -> Result<Lib, LibError> {
+        Lib::parse_opts(text, LibOpts::default())
+    }
+
+    /// Like [`Lib::parse`] but honoring [`LibOpts`] (e.g. `skip_ccs` for NLDM-only).
+    pub fn parse_opts(text: &str, opts: LibOpts) -> Result<Lib, LibError> {
         let units = Units::from_lib(text);
         let voltage = lib_voltage(text).unwrap_or(1.8);
         let mut cells = BTreeMap::new();
         let mut at = 0;
         while let Some((cname, cbody, after)) = next_block(text, at, "cell") {
-            cells.insert(cname.clone(), parse_cell(cname, &cbody, &units));
+            cells.insert(cname.clone(), parse_cell(cname, &cbody, &units, opts.skip_ccs));
             at = after;
         }
         if cells.is_empty() {
@@ -494,8 +517,13 @@ impl Lib {
     }
 
     pub fn load(path: &str) -> Result<Lib, LibError> {
+        Lib::load_opts(path, LibOpts::default())
+    }
+
+    /// Like [`Lib::load`] but honoring [`LibOpts`] (e.g. `skip_ccs` for NLDM-only).
+    pub fn load_opts(path: &str, opts: LibOpts) -> Result<Lib, LibError> {
         let text = std::fs::read_to_string(path).map_err(|e| LibError(format!("{path}: {e}")))?;
-        Lib::parse(&text)
+        Lib::parse_opts(&text, opts)
     }
 
     pub fn cell(&self, name: &str) -> Option<&Cell> {
@@ -666,5 +694,64 @@ library (demo) {
         assert!((inv.int_energy_j - 0.010e-9).abs() < 1e-13);
         assert_eq!(inv.outputs().count(), 1);
         assert_eq!(inv.pins.get("A").unwrap().direction, Dir::In);
+    }
+}
+
+#[cfg(test)]
+mod ccs_skip_tests {
+    use super::*;
+
+    // A cell carrying both CCS groups: input receiver_capacitance + an output_current arc.
+    const CCS_LIB: &str = r#"
+library (demo) {
+  capacitive_load_unit (1, pf);
+  cell (INV) {
+    pin (A) {
+      direction : input;
+      capacitance : 0.004;
+      receiver_capacitance () {
+        receiver_capacitance1_rise (t) { values("0.001, 0.002"); }
+        receiver_capacitance2_rise (t) { values("0.003, 0.004"); }
+        receiver_capacitance1_fall (t) { values("0.001, 0.002"); }
+        receiver_capacitance2_fall (t) { values("0.003, 0.004"); }
+      }
+    }
+    pin (Y) {
+      direction : output;
+      timing () {
+        related_pin : "A";
+        cell_rise (t) { values("0.1, 0.2"); }
+        cell_fall (t) { values("0.1, 0.2"); }
+        output_current_rise () {
+          vector (v) {
+            index_1("0.01");
+            index_2("0.005");
+            index_3("0.0, 0.1, 0.2");
+            values("0.0, 0.5, 1.0");
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+
+    #[test]
+    fn skip_ccs_drops_receiver_and_output_current_keeps_nldm() {
+        // Default parse keeps CCS (receiver_capacitance + output_current).
+        let full = Lib::parse(CCS_LIB).unwrap();
+        let a = full.cell("INV").unwrap().pins.get("A").unwrap();
+        let y = full.cell("INV").unwrap().pins.get("Y").unwrap();
+        assert!(a.recv.is_some(), "receiver_capacitance present on full parse");
+        assert_eq!(y.arcs.len(), 1);
+        assert!(!y.arcs[0].ccs.is_empty(), "output_current present on full parse");
+
+        // skip_ccs drops both CCS groups but leaves the NLDM delay arc intact.
+        let nldm = Lib::parse_opts(CCS_LIB, LibOpts { skip_ccs: true }).unwrap();
+        let a2 = nldm.cell("INV").unwrap().pins.get("A").unwrap();
+        let y2 = nldm.cell("INV").unwrap().pins.get("Y").unwrap();
+        assert!(a2.recv.is_none(), "receiver_capacitance skipped");
+        assert_eq!(y2.arcs.len(), 1, "NLDM delay arc preserved");
+        assert!(y2.arcs[0].ccs.is_empty(), "output_current skipped");
     }
 }
