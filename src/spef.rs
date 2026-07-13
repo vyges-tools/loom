@@ -30,6 +30,28 @@ pub struct Spef {
     pub nets: BTreeMap<String, NetRc>,
 }
 
+/// Options for the SPEF writer ([`Spef::to_spef`]). Kept minimal and
+/// deterministic — no wall-clock timestamp unless `date` is supplied, so the
+/// same design extracts byte-identically (the suite's reproducibility contract).
+#[derive(Debug, Clone)]
+pub struct WriteOpts {
+    pub design: String,  // *DESIGN "<name>"
+    pub program: String, // *PROGRAM "<tool>"
+    pub version: String, // *VERSION "<ver>"
+    pub date: Option<String>, // *DATE "<iso>" — omitted when None
+}
+
+impl Default for WriteOpts {
+    fn default() -> Self {
+        WriteOpts {
+            design: "top".into(),
+            program: "vyges-loom".into(),
+            version: "0".into(),
+            date: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SpefError(pub String);
 impl std::fmt::Display for SpefError {
@@ -476,5 +498,215 @@ impl Spef {
     /// Lumped Elmore interconnect delay for a net, in ns (R[Ω]·C[fF] → ns).
     pub fn net_delay_ns(&self, net: &str) -> f64 {
         self.nets.get(net).map(|rc| rc.res_ohm * rc.cap_ff * 1e-6).unwrap_or(0.0)
+    }
+
+    /// Serialize to standard SPEF text (IEEE-1481, fF / Ω / PS units). The output
+    /// is name-mapped and round-trips through [`Spef::parse`] at the semantic level
+    /// (net names, caps, resistances, pin hookup, coupling). Deterministic: no
+    /// timestamp unless `opts.date` is set.
+    ///
+    /// Node identity: net nodes and instance pins are emitted as name-map indices
+    /// (`*<id>` / `*<id>:<pin>`); any other node string is name-mapped verbatim.
+    /// Grounded cap / resistor node strings equal to a net name resolve to that
+    /// net's node, so a star network built as `(net_name → pin)` writes cleanly.
+    pub fn to_spef(&self, opts: &WriteOpts) -> String {
+        // Name map: nets first (so a net's node index is stable), then instances,
+        // then any leftover named nodes appearing in the RC network.
+        let mut id_of: BTreeMap<String, usize> = BTreeMap::new();
+        let mut order: Vec<String> = Vec::new();
+        let intern = |name: &str, id_of: &mut BTreeMap<String, usize>, order: &mut Vec<String>| {
+            if !id_of.contains_key(name) {
+                order.push(name.to_string());
+                id_of.insert(name.to_string(), order.len());
+            }
+        };
+        for net in self.nets.keys() {
+            intern(net, &mut id_of, &mut order);
+        }
+        // instances (from *CONN pins), deterministic order
+        let mut insts: Vec<String> = Vec::new();
+        for rc in self.nets.values() {
+            for (inst, _, _) in &rc.pins {
+                if !insts.contains(inst) {
+                    insts.push(inst.clone());
+                }
+            }
+        }
+        insts.sort();
+        for inst in &insts {
+            intern(inst, &mut id_of, &mut order);
+        }
+        let inst_set: std::collections::BTreeSet<&String> = insts.iter().collect();
+
+        // Resolve an RC-network node string to a SPEF node token.
+        let node_tok = |s: &str,
+                        id_of: &mut BTreeMap<String, usize>,
+                        order: &mut Vec<String>|
+         -> String {
+            if let Some(id) = id_of.get(s) {
+                return format!("*{id}"); // net node (or already-interned node)
+            }
+            if let Some((pre, suf)) = s.split_once(':') {
+                if inst_set.contains(&pre.to_string()) {
+                    let id = id_of[pre];
+                    return format!("*{id}:{suf}");
+                }
+            }
+            // opaque internal node — intern it and emit its index
+            order.push(s.to_string());
+            let id = order.len();
+            id_of.insert(s.to_string(), id);
+            format!("*{id}")
+        };
+
+        // Body first (it grows the name map with internal nodes), header after.
+        let mut body = String::new();
+        for (net, rc) in &self.nets {
+            let nid = id_of[net];
+            body.push_str(&format!("\n*D_NET *{nid} {}\n", fmtf(rc.cap_ff)));
+            if !rc.pins.is_empty() {
+                body.push_str("*CONN\n");
+                for (inst, pin, _) in &rc.pins {
+                    let iid = id_of[inst];
+                    body.push_str(&format!("*I *{iid}:{pin} I\n"));
+                }
+            }
+            // *CAP: grounded entries then coupling entries (each coupling once).
+            let mut cap_lines: Vec<String> = Vec::new();
+            if rc.ground.is_empty() {
+                let grounded = (rc.cap_ff - rc.coupling_ff).max(0.0);
+                if grounded > 0.0 {
+                    cap_lines.push(format!("*{nid} {}", fmtf(grounded)));
+                }
+            } else {
+                for (node, c) in &rc.ground {
+                    let tok = node_tok(node, &mut id_of, &mut order);
+                    cap_lines.push(format!("{tok} {}", fmtf(*c)));
+                }
+            }
+            for (other, cc) in &rc.coupling {
+                if net.as_str() < other.as_str() {
+                    // emit under the lexicographically-smaller net only (dedupe)
+                    if let Some(oid) = id_of.get(other).copied() {
+                        cap_lines.push(format!("*{nid} *{oid} {}", fmtf(*cc)));
+                    }
+                }
+            }
+            if !cap_lines.is_empty() {
+                body.push_str("*CAP\n");
+                for (i, line) in cap_lines.iter().enumerate() {
+                    body.push_str(&format!("{} {line}\n", i + 1));
+                }
+            }
+            // *RES
+            if !rc.res.is_empty() {
+                body.push_str("*RES\n");
+                for (i, (a, b, r)) in rc.res.iter().enumerate() {
+                    let ta = node_tok(a, &mut id_of, &mut order);
+                    let tb = node_tok(b, &mut id_of, &mut order);
+                    body.push_str(&format!("{} {ta} {tb} {}\n", i + 1, fmtf(*r)));
+                }
+            }
+            body.push_str("*END\n");
+        }
+
+        let mut out = String::new();
+        out.push_str("*SPEF \"IEEE 1481-1999\"\n");
+        out.push_str(&format!("*DESIGN \"{}\"\n", opts.design));
+        if let Some(d) = &opts.date {
+            out.push_str(&format!("*DATE \"{d}\"\n"));
+        }
+        out.push_str("*VENDOR \"Vyges\"\n");
+        out.push_str(&format!("*PROGRAM \"{}\"\n", opts.program));
+        out.push_str(&format!("*VERSION \"{}\"\n", opts.version));
+        out.push_str("*DESIGN_FLOW \"\"\n");
+        out.push_str("*DIVIDER /\n*DELIMITER :\n*BUS_DELIMITER [ ]\n");
+        out.push_str("*T_UNIT 1 PS\n*C_UNIT 1 FF\n*R_UNIT 1 OHM\n*L_UNIT 1 HENRY\n");
+        out.push_str("\n*NAME_MAP\n");
+        for (i, name) in order.iter().enumerate() {
+            out.push_str(&format!("*{} {}\n", i + 1, name));
+        }
+        out.push_str(&body);
+        out
+    }
+}
+
+/// Compact fixed-ish float for SPEF numbers: integers stay integer, otherwise up
+/// to 6 significant decimals with trailing zeros trimmed (stable, no exponent).
+fn fmtf(v: f64) -> String {
+    if v == 0.0 {
+        return "0".into();
+    }
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        return format!("{}", v as i64);
+    }
+    let s = format!("{v:.6}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    s.to_string()
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use super::*;
+
+    fn sample() -> Spef {
+        let mut nets = BTreeMap::new();
+        nets.insert(
+            "neta".to_string(),
+            NetRc {
+                cap_ff: 10.0,
+                res_ohm: 100.0,
+                coupling_ff: 2.0,
+                coupling: vec![("netb".to_string(), 2.0)],
+                net_node: "neta".to_string(),
+                ground: vec![("neta".to_string(), 8.0)],
+                res: vec![("neta".to_string(), "u1:A".to_string(), 100.0)],
+                pins: vec![("u1".to_string(), "A".to_string(), "u1:A".to_string())],
+            },
+        );
+        nets.insert(
+            "netb".to_string(),
+            NetRc {
+                cap_ff: 7.0,
+                res_ohm: 50.0,
+                coupling_ff: 2.0,
+                coupling: vec![("neta".to_string(), 2.0)],
+                net_node: "netb".to_string(),
+                ground: vec![("netb".to_string(), 5.0)],
+                res: vec![("netb".to_string(), "u2:Y".to_string(), 50.0)],
+                pins: vec![("u2".to_string(), "Y".to_string(), "u2:Y".to_string())],
+            },
+        );
+        Spef { nets }
+    }
+
+    #[test]
+    fn roundtrip_semantic() {
+        let spef = sample();
+        let text = spef.to_spef(&WriteOpts { design: "blk".into(), ..Default::default() });
+        // sanity: header + name map present, no wall-clock date
+        assert!(text.contains("*SPEF \"IEEE 1481-1999\""));
+        assert!(text.contains("*DESIGN \"blk\""));
+        assert!(!text.contains("*DATE"));
+        assert!(text.contains("*NAME_MAP"));
+
+        let back = Spef::parse(&text);
+        assert_eq!(back.nets.len(), 2);
+        let a = back.nets.get("neta").expect("neta round-trips");
+        assert_eq!(a.cap_ff, 10.0);
+        assert_eq!(a.res_ohm, 100.0);
+        assert!(a.pins.iter().any(|(i, p, _)| i == "u1" && p == "A"));
+        // coupling emitted once, applied to both nets
+        assert_eq!(a.coupling_ff, 2.0);
+        assert_eq!(back.nets.get("netb").unwrap().coupling_ff, 2.0);
+        assert_eq!(back.nets.get("netb").unwrap().res_ohm, 50.0);
+    }
+
+    #[test]
+    fn deterministic_and_dated() {
+        let spef = sample();
+        let o = WriteOpts { date: Some("2026-07-13T00:00:00Z".into()), ..Default::default() };
+        assert_eq!(spef.to_spef(&o), spef.to_spef(&o)); // stable
+        assert!(spef.to_spef(&o).contains("*DATE \"2026-07-13T00:00:00Z\""));
     }
 }

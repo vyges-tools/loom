@@ -42,6 +42,12 @@ pub mod yosys_json;
 pub mod spice;
 pub mod sdc;
 pub mod spef;
+/// EM geometry sidecar (per-segment layer/width/length) — the physical dimensions
+/// standard SPEF omits but current-density sign-off needs. Companion to [`spef`].
+pub mod emgeom;
+/// KLayout net-dump reader — turns a headless-KLayout extraction dump into a
+/// [`spef::Spef`] + [`emgeom::EmGeom`]. The data boundary for the RCX front-end.
+pub mod klayout;
 /// Simulation **activity** readers: [`vcd`] (VCD text) and [`saif`] (cumulative SAIF)
 /// turn a waveform into per-net toggle counts, and [`names`] resolves them to netlist
 /// nets (scope-aware, bit-level). The switching-activity source for `vyges-power` and
