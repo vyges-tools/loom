@@ -495,6 +495,33 @@ pub struct LibOpts {
     pub skip_ccs: bool,
 }
 
+// ── In-process parse-once cache for `Lib::load_opts` (#37) ────────────────────────
+// Content-addressed (hash of the file bytes) so a changed file is always re-parsed —
+// robust against coarse mtime granularity. Keyed on `LibOpts` too, since a `skip_ccs`
+// parse yields a different (smaller) Lib. Reading the file is cheap; parsing large
+// multi-corner Liberty is the cost this removes when the same lib is loaded more than
+// once in a process (a run emitting report + SDF + liberty-json, or repeated corners).
+// Bounded (coarse clear-on-overflow) so a long-running process can't grow unbounded.
+
+const LIB_CACHE_CAP: usize = 256;
+
+type LibCacheKey = (u64, u64, bool); // (content hash, byte length, skip_ccs)
+
+fn lib_cache() -> &'static std::sync::Mutex<std::collections::HashMap<LibCacheKey, std::sync::Arc<Lib>>>
+{
+    static C: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<LibCacheKey, std::sync::Arc<Lib>>>,
+    > = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn lib_cache_key(text: &str, opts: LibOpts) -> LibCacheKey {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    (h.finish(), text.len() as u64, opts.skip_ccs)
+}
+
 impl Lib {
     pub fn parse(text: &str) -> Result<Lib, LibError> {
         Lib::parse_opts(text, LibOpts::default())
@@ -521,9 +548,22 @@ impl Lib {
     }
 
     /// Like [`Lib::load`] but honoring [`LibOpts`] (e.g. `skip_ccs` for NLDM-only).
+    /// Memoized in-process (content-addressed) so loading the same lib more than once
+    /// in a process parses it once — see the parse-once cache above (#37).
     pub fn load_opts(path: &str, opts: LibOpts) -> Result<Lib, LibError> {
         let text = std::fs::read_to_string(path).map_err(|e| LibError(format!("{path}: {e}")))?;
-        Lib::parse_opts(&text, opts)
+        let key = lib_cache_key(&text, opts);
+        if let Some(hit) = lib_cache().lock().ok().and_then(|m| m.get(&key).cloned()) {
+            return Ok((*hit).clone());
+        }
+        let lib = std::sync::Arc::new(Lib::parse_opts(&text, opts)?);
+        if let Ok(mut m) = lib_cache().lock() {
+            if m.len() >= LIB_CACHE_CAP {
+                m.clear(); // bounded: coarse, but keeps a long-running process in check
+            }
+            m.insert(key, lib.clone());
+        }
+        Ok((*lib).clone())
     }
 
     pub fn cell(&self, name: &str) -> Option<&Cell> {
@@ -877,5 +917,43 @@ library (demo) {
         let js2 = Lib::parse_opts(CCS_LIB, LibOpts { skip_ccs: true }).unwrap().to_json();
         assert!(js2.contains("\"has_recv_ccs\":false"));
         assert!(js2.contains("\"has_ccs\":false"));
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    const CACHE_LIB: &str = r#"
+library (demo) {
+  capacitive_load_unit (1, pf);
+  cell (INV) {
+    pin (A) {
+      direction : input;
+      capacitance : 0.004;
+      receiver_capacitance () { receiver_capacitance1_rise (t) { values("0.001, 0.002"); } }
+    }
+    pin (Y) { direction : output; timing () { related_pin : "A"; cell_rise (t) { values("0.1, 0.2"); } } }
+  }
+}
+"#;
+
+    #[test]
+    fn load_opts_is_consistent_and_opts_keyed() {
+        let path = std::env::temp_dir().join(format!("vyges_loom_cache_{}.lib", std::process::id()));
+        std::fs::write(&path, CACHE_LIB).unwrap();
+        let p = path.to_str().unwrap();
+
+        // Two loads of the same file → identical Lib (cache hit is transparent).
+        let a = Lib::load_opts(p, LibOpts::default()).unwrap();
+        let b = Lib::load_opts(p, LibOpts::default()).unwrap();
+        assert_eq!(a.cells.len(), b.cells.len());
+        assert!(a.cell("INV").unwrap().pins.get("A").unwrap().recv.is_some());
+
+        // skip_ccs is part of the cache key → a distinct entry with CCS pruned.
+        let nldm = Lib::load_opts(p, LibOpts { skip_ccs: true }).unwrap();
+        assert!(nldm.cell("INV").unwrap().pins.get("A").unwrap().recv.is_none());
+
+        std::fs::remove_file(&path).ok();
     }
 }
