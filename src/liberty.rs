@@ -522,6 +522,18 @@ fn lib_cache_key(text: &str, opts: LibOpts) -> LibCacheKey {
     (h.finish(), text.len() as u64, opts.skip_ccs)
 }
 
+/// Insert `lib` into the in-process cache under `key` (bounded) and return a clone.
+fn cache_store(key: LibCacheKey, lib: Lib) -> Lib {
+    let arc = std::sync::Arc::new(lib);
+    if let Ok(mut m) = lib_cache().lock() {
+        if m.len() >= LIB_CACHE_CAP {
+            m.clear(); // bounded: coarse, but keeps a long-running process in check
+        }
+        m.insert(key, arc.clone());
+    }
+    (*arc).clone()
+}
+
 impl Lib {
     pub fn parse(text: &str) -> Result<Lib, LibError> {
         Lib::parse_opts(text, LibOpts::default())
@@ -548,22 +560,23 @@ impl Lib {
     }
 
     /// Like [`Lib::load`] but honoring [`LibOpts`] (e.g. `skip_ccs` for NLDM-only).
-    /// Memoized in-process (content-addressed) so loading the same lib more than once
-    /// in a process parses it once — see the parse-once cache above (#37).
+    /// Cached content-addressed so the same lib parses once: in-process (#37) →
+    /// on-disk cross-process (`VYGES_LIB_CACHE`, #37/#38) → parse.
     pub fn load_opts(path: &str, opts: LibOpts) -> Result<Lib, LibError> {
         let text = std::fs::read_to_string(path).map_err(|e| LibError(format!("{path}: {e}")))?;
         let key = lib_cache_key(&text, opts);
+        // 1) in-process cache
         if let Some(hit) = lib_cache().lock().ok().and_then(|m| m.get(&key).cloned()) {
             return Ok((*hit).clone());
         }
-        let lib = std::sync::Arc::new(Lib::parse_opts(&text, opts)?);
-        if let Ok(mut m) = lib_cache().lock() {
-            if m.len() >= LIB_CACHE_CAP {
-                m.clear(); // bounded: coarse, but keeps a long-running process in check
-            }
-            m.insert(key, lib.clone());
+        // 2) cross-process on-disk cache (env-gated; no-op unless enabled)
+        if let Some(lib) = crate::libcache::disk_get(key) {
+            return Ok(cache_store(key, lib));
         }
-        Ok((*lib).clone())
+        // 3) parse, then populate both the disk and in-process caches
+        let lib = Lib::parse_opts(&text, opts)?;
+        crate::libcache::disk_put(key, &lib);
+        Ok(cache_store(key, lib))
     }
 
     pub fn cell(&self, name: &str) -> Option<&Cell> {

@@ -30,6 +30,8 @@ pub mod liberty;
 /// reader populates (NLDM + CCS). The current-source delay *calculation* belongs
 /// to the timing engine (`vyges-sta-si`); loom holds + can evaluate the curves.
 pub mod ccs;
+/// Cross-process on-disk parse cache for `Lib` (behind `Lib::load_opts`; #38).
+pub mod libcache;
 pub mod netlist;
 /// Yosys `write_json` netlist reader — an alternate front-end that maps onto the
 /// same [`netlist::Netlist`] the structural-Verilog reader produces.
