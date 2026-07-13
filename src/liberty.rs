@@ -539,6 +539,112 @@ impl Lib {
             self.cells.entry(k).or_insert(v);
         }
     }
+
+    /// Serialize the parsed IR to a structured JSON view (std-only, no deps) — the
+    /// shared Liberty intermediate that sta-si and vyges-power both consume, made
+    /// inspectable for tooling / debug / MCP (sta-si `--emit-liberty-json`). Emits
+    /// per-cell pin directions, capacitances, CCS presence and per-arc table shapes
+    /// (`[slews, loads]`) — a structural summary, not the full NLDM table values, to
+    /// stay tractable on real PDKs.
+    pub fn to_json(&self) -> String {
+        let mut s = String::new();
+        s.push('{');
+        s.push_str(&format!("\"voltage\":{},", jnum(self.voltage)));
+        s.push_str(&format!("\"cell_count\":{},", self.cells.len()));
+        s.push_str("\"cells\":{");
+        for (ci, (cname, cell)) in self.cells.iter().enumerate() {
+            if ci > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("{}:{{", jstr(cname)));
+            s.push_str(&format!("\"is_seq\":{},", cell.is_seq));
+            s.push_str(&format!(
+                "\"clock_pin\":{},",
+                cell.clock_pin.as_deref().map(jstr).unwrap_or_else(|| "null".into())
+            ));
+            s.push_str(&format!("\"leakage_w\":{},", jnum(cell.leakage_w)));
+            s.push_str(&format!("\"int_energy_j\":{},", jnum(cell.int_energy_j)));
+            s.push_str("\"pins\":{");
+            for (pi, (pname, pin)) in cell.pins.iter().enumerate() {
+                if pi > 0 {
+                    s.push(',');
+                }
+                s.push_str(&format!("{}:{{", jstr(pname)));
+                s.push_str(&format!("\"direction\":{},", jstr(dir_str(pin.direction))));
+                s.push_str(&format!("\"capacitance\":{},", jnum(pin.capacitance)));
+                s.push_str(&format!("\"cap_f\":{},", jnum(pin.cap_f)));
+                s.push_str(&format!("\"clock\":{},", pin.clock));
+                let has_recv = pin.recv.as_ref().map(|r| !r.is_empty()).unwrap_or(false);
+                s.push_str(&format!("\"has_recv_ccs\":{},", has_recv));
+                s.push_str(&format!("\"setup_groups\":{},", pin.setup.len()));
+                s.push_str(&format!("\"hold_groups\":{},", pin.hold.len()));
+                s.push_str("\"arcs\":[");
+                for (ai, arc) in pin.arcs.iter().enumerate() {
+                    if ai > 0 {
+                        s.push(',');
+                    }
+                    s.push_str(&format!(
+                        "{{\"related_pin\":{},\"sense\":{},\"has_ccs\":{},\"cell_rise\":{},\"cell_fall\":{},\"rise_transition\":{},\"fall_transition\":{}}}",
+                        jstr(&arc.related_pin),
+                        jstr(&arc.sense),
+                        !arc.ccs.is_empty(),
+                        dims(&arc.cell_rise),
+                        dims(&arc.cell_fall),
+                        dims(&arc.rise_transition),
+                        dims(&arc.fall_transition),
+                    ));
+                }
+                s.push_str("]}"); // arcs, pin
+            }
+            s.push_str("}}"); // pins, cell
+        }
+        s.push_str("}}\n"); // cells, root
+        s
+    }
+}
+
+// ── JSON helpers for `Lib::to_json` (std-only) ───────────────────────────────────
+
+/// A finite f64 as a JSON number (full round-trippable decimal, so tiny physical
+/// quantities like leakage_w / cap_f keep their magnitude); non-finite → `null`.
+fn jnum(v: f64) -> String {
+    if v.is_finite() {
+        format!("{v}")
+    } else {
+        "null".to_string()
+    }
+}
+
+/// A JSON-escaped, double-quoted string.
+fn jstr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn dir_str(d: Dir) -> &'static str {
+    match d {
+        Dir::In => "input",
+        Dir::Out => "output",
+        Dir::Inout => "inout",
+        Dir::Other => "other",
+    }
+}
+
+/// A table's shape as `[slews, loads]` (index_1 × index_2).
+fn dims(t: &Table) -> String {
+    format!("[{},{}]", t.index_1.len(), t.index_2.len())
 }
 
 // ── Library units (power) ───────────────────────────────────────────────────────
@@ -753,5 +859,23 @@ library (demo) {
         assert!(a2.recv.is_none(), "receiver_capacitance skipped");
         assert_eq!(y2.arcs.len(), 1, "NLDM delay arc preserved");
         assert!(y2.arcs[0].ccs.is_empty(), "output_current skipped");
+    }
+
+    #[test]
+    fn to_json_emits_structured_ir() {
+        let js = Lib::parse(CCS_LIB).unwrap().to_json();
+        assert!(js.starts_with('{') && js.trim_end().ends_with('}'));
+        assert!(js.contains("\"cell_count\":1"));
+        assert!(js.contains("\"INV\""));
+        assert!(js.contains("\"direction\":\"input\""));
+        assert!(js.contains("\"direction\":\"output\""));
+        assert!(js.contains("\"has_recv_ccs\":true")); // pin A: receiver_capacitance
+        assert!(js.contains("\"has_ccs\":true")); // pin Y arc: output_current
+        assert!(js.contains("\"related_pin\":\"A\""));
+
+        // NLDM-only parse flips the CCS presence flags to false.
+        let js2 = Lib::parse_opts(CCS_LIB, LibOpts { skip_ccs: true }).unwrap().to_json();
+        assert!(js2.contains("\"has_recv_ccs\":false"));
+        assert!(js2.contains("\"has_ccs\":false"));
     }
 }
