@@ -436,4 +436,37 @@ b0101 !
         // the old behaviour (one toggle for the whole vector) is gone — bits are independent
         assert_eq!(v.collisions(), 0);
     }
+
+    // A bus that changes *twice within one timestep* — bit 0 goes 0->1->0 at #5.
+    // A first-vs-last reader (comparing only the timestep's final value against the
+    // previous timestep's) would drop both of those toggles; per-assignment Hamming
+    // counting must record them. This is the SNUG-2010 dropped-toggle concern
+    // (multiple transitions of a bus within a single time step).
+    const VCD_VEC_GLITCH: &str = r#"
+$timescale 1ns $end
+$scope module top $end
+$var wire 4 ! data [3:0] $end
+$upscope $end
+$enddefinitions $end
+#0
+b0000 !
+#5
+b0001 !
+b0000 !
+#10
+b0001 !
+"#;
+
+    #[test]
+    fn vector_multi_transition_within_timestep_all_counted() {
+        let v = Vcd::parse(VCD_VEC_GLITCH).unwrap();
+        // bit0: +1 (0->1) and +1 (1->0) at #5, then +1 (0->1) at #10 = 3 total.
+        // A first-vs-last reader would see only 0000->0000 (#5) then 0000->0001 (#10) = 1.
+        assert_eq!(*v.idx.toggles.get("top.data[0]").unwrap(), 3);
+        assert_eq!(v.idx.toggles.get("top.data[1]").copied().unwrap_or(0), 0);
+        assert_eq!(v.idx.toggles.get("top.data[2]").copied().unwrap_or(0), 0);
+        assert_eq!(v.idx.toggles.get("top.data[3]").copied().unwrap_or(0), 0);
+        // 3 transitions over the 10 ns dump.
+        assert!((v.toggle_rate("data[0]") - 3.0e8).abs() < 1.0);
+    }
 }
