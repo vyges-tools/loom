@@ -1,6 +1,6 @@
 [package]
 name = "vyges-loom"
-version = "0.1.15"
+version = "0.1.17"
 edition = "2021"
 description = "The shared design-data foundation for the Vyges EDA toolchain: parse-once / query-many readers (Verilog, Liberty, SDC, SPEF) + an in-memory design database. The loom the engines weave on."
 license = "Apache-2.0"
