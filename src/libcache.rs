@@ -19,8 +19,9 @@ use crate::liberty::{Arc, Cell, Constraint, Dir, Lib, Pin, RecvCap, Table};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLC2"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLC3"; // Vyges Liberty Cache — bump the trailing digit on any format change
                                  // VLC2: pin `function`, cell `cell_footprint` + `area`.
+                                 // VLC3: library `Thresholds` (slew/delay measurement points).
 
 // ── byte writer / reader (little-endian, std-only) ───────────────────────────────
 
@@ -340,6 +341,15 @@ pub fn encode(lib: &Lib) -> Vec<u8> {
     let mut w = W::default();
     w.b.extend_from_slice(MAGIC);
     w.f64(lib.voltage);
+    // Thresholds: without these here, a field parsed but not cached silently reverts to
+    // the default on the SECOND load — working once and then quietly not.
+    let t = &lib.thresholds;
+    for v in [
+        t.slew_lower_rise, t.slew_upper_rise, t.slew_lower_fall, t.slew_upper_fall,
+        t.input_rise, t.input_fall, t.output_rise, t.output_fall, t.slew_derate,
+    ] {
+        w.f64(v);
+    }
     w.u64(lib.cells.len() as u64);
     for (k, c) in &lib.cells {
         w.s(k);
@@ -356,13 +366,24 @@ pub fn decode(bytes: &[u8]) -> Option<Lib> {
     }
     let mut r = R { b: bytes, i: 4 };
     let voltage = r.f64()?;
+    let thresholds = crate::liberty::Thresholds {
+        slew_lower_rise: r.f64()?,
+        slew_upper_rise: r.f64()?,
+        slew_lower_fall: r.f64()?,
+        slew_upper_fall: r.f64()?,
+        input_rise: r.f64()?,
+        input_fall: r.f64()?,
+        output_rise: r.f64()?,
+        output_fall: r.f64()?,
+        slew_derate: r.f64()?,
+    };
     let n = r.u64()? as usize;
     let mut cells = BTreeMap::new();
     for _ in 0..n {
         let k = r.s()?;
         cells.insert(k, dec_cell(&mut r)?);
     }
-    Some(Lib { cells, voltage })
+    Some(Lib { cells, voltage, thresholds })
 }
 
 // ── on-disk cache ────────────────────────────────────────────────────────────────
@@ -490,6 +511,10 @@ library (demo) {
         assert_eq!(bytes, encode(&back));
         assert_eq!(back.cells.len(), lib.cells.len());
         assert!((back.voltage - lib.voltage).abs() < 1e-12);
+        // Thresholds must survive the cache. A field parsed but not encoded works on the
+        // FIRST load and silently reverts to the default on every one after — the worst
+        // shape of bug, because it passes any test that parses and uses in one breath.
+        assert_eq!(back.thresholds, lib.thresholds, "thresholds lost across the cache");
     }
 
     #[test]

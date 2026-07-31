@@ -258,6 +258,95 @@ impl Cell {
 pub struct Lib {
     pub cells: BTreeMap<String, Cell>,
     pub voltage: f64, // nominal supply (V) — power; 0.0 if unknown
+    /// How this library measures transitions and delays. Needed by any consumer that
+    /// builds a *waveform* from a Liberty slew: the number is only meaningful together
+    /// with the two percentage points it was measured between.
+    pub thresholds: Thresholds,
+}
+
+/// Waveform measurement conventions declared in the library header.
+///
+/// A Liberty transition time is the time to move between `slew_lower_*` and
+/// `slew_upper_*` — **not** a full 0→100 % edge. Reconstructing a ramp from it, or
+/// reporting a slew back, requires these numbers; assuming 0→100 % makes the edge
+/// `1/(upper-lower)` too fast, and measuring the result between different points
+/// rescales it again. sky130 uses 20/80, but 10/90 and 30/70 are all in the wild, so
+/// this is read from the library rather than assumed.
+///
+/// Values are **fractions** (0.2, not 20). Defaults are the Liberty defaults: 20/80
+/// for slew, 50 % for delay, derate 1.0.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Thresholds {
+    pub slew_lower_rise: f64,
+    pub slew_upper_rise: f64,
+    pub slew_lower_fall: f64,
+    pub slew_upper_fall: f64,
+    /// Delay measurement point on an input edge (`input_threshold_pct_*`).
+    pub input_rise: f64,
+    pub input_fall: f64,
+    /// Delay measurement point on an output edge (`output_threshold_pct_*`).
+    pub output_rise: f64,
+    pub output_fall: f64,
+    /// `slew_derate_from_library` — table transition values are scaled by this to get
+    /// the real edge. sky130 declares 1.0; some libraries use 0.5.
+    pub slew_derate: f64,
+}
+
+impl Default for Thresholds {
+    fn default() -> Self {
+        Thresholds {
+            slew_lower_rise: 0.2,
+            slew_upper_rise: 0.8,
+            slew_lower_fall: 0.2,
+            slew_upper_fall: 0.8,
+            input_rise: 0.5,
+            input_fall: 0.5,
+            output_rise: 0.5,
+            output_fall: 0.5,
+            slew_derate: 1.0,
+        }
+    }
+}
+
+impl Thresholds {
+    /// Fraction of a full 0→100 % edge that a declared transition time spans, averaged
+    /// over rise and fall. For 20/80 this is 0.6, so a full edge lasts `slew / 0.6`.
+    pub fn slew_span(&self) -> f64 {
+        let r = self.slew_upper_rise - self.slew_lower_rise;
+        let f = self.slew_upper_fall - self.slew_lower_fall;
+        let s = (r + f) / 2.0;
+        if s > 0.0 && s <= 1.0 {
+            s
+        } else {
+            0.6 // a nonsense declaration should not silently scale every delay
+        }
+    }
+
+    fn from_lib(text: &str) -> Thresholds {
+        let d = Thresholds::default();
+        // Liberty states these as percentages; store fractions.
+        let pct = |key: &str, fallback: f64| -> f64 {
+            simple_attr(text, key)
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .map(|v| v / 100.0)
+                .filter(|v| (0.0..=1.0).contains(v))
+                .unwrap_or(fallback)
+        };
+        Thresholds {
+            slew_lower_rise: pct("slew_lower_threshold_pct_rise", d.slew_lower_rise),
+            slew_upper_rise: pct("slew_upper_threshold_pct_rise", d.slew_upper_rise),
+            slew_lower_fall: pct("slew_lower_threshold_pct_fall", d.slew_lower_fall),
+            slew_upper_fall: pct("slew_upper_threshold_pct_fall", d.slew_upper_fall),
+            input_rise: pct("input_threshold_pct_rise", d.input_rise),
+            input_fall: pct("input_threshold_pct_fall", d.input_fall),
+            output_rise: pct("output_threshold_pct_rise", d.output_rise),
+            output_fall: pct("output_threshold_pct_fall", d.output_fall),
+            slew_derate: simple_attr(text, "slew_derate_from_library")
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .filter(|v| *v > 0.0)
+                .unwrap_or(d.slew_derate),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -646,6 +735,7 @@ impl Lib {
     pub fn parse_opts(text: &str, opts: LibOpts) -> Result<Lib, LibError> {
         let units = Units::from_lib(text);
         let voltage = lib_voltage(text).unwrap_or(1.8);
+        let thresholds = Thresholds::from_lib(text);
         let mut cells = BTreeMap::new();
         let mut at = 0;
         while let Some((cname, cbody, after)) = next_block(text, at, "cell") {
@@ -655,7 +745,7 @@ impl Lib {
         if cells.is_empty() {
             return Err(LibError("no cells found".into()));
         }
-        Ok(Lib { cells, voltage })
+        Ok(Lib { cells, voltage, thresholds })
     }
 
     pub fn load(path: &str) -> Result<Lib, LibError> {
@@ -1072,5 +1162,57 @@ library (demo) {
         assert!(nldm.cell("INV").unwrap().pins.get("A").unwrap().recv.is_none());
 
         std::fs::remove_file(&path).ok();
+    }
+}
+
+#[cfg(test)]
+mod threshold_tests {
+    use super::*;
+
+    const BODY: &str = r#"
+  cell (INV) { pin(A) { direction : input; capacitance : 0.001; }
+               pin(Y) { direction : output; } }
+}"#;
+
+    #[test]
+    fn slew_thresholds_are_read_from_the_library_not_assumed() {
+        // A Liberty transition time is measured BETWEEN two percentage points, so the number
+        // is meaningless without them. sky130 uses 20/80; 10/90 and 30/70 exist too, and
+        // assuming one silently rescales every delay built from a slew.
+        let text = format!(
+            "library(t) {{\n  time_unit : \"1ns\";\n  capacitive_load_unit (1, pf);\n\
+             slew_lower_threshold_pct_rise : 10.0;\n  slew_upper_threshold_pct_rise : 90.0;\n\
+             slew_lower_threshold_pct_fall : 10.0;\n  slew_upper_threshold_pct_fall : 90.0;\n\
+             slew_derate_from_library : 0.5;\n{BODY}"
+        );
+        let t = Lib::parse(&text).unwrap().thresholds;
+        assert_eq!(t.slew_lower_rise, 0.10, "stored as a FRACTION, not a percentage");
+        assert_eq!(t.slew_upper_rise, 0.90);
+        assert_eq!(t.slew_derate, 0.5);
+        assert!((t.slew_span() - 0.8).abs() < 1e-12, "10/90 spans 80% of a full edge");
+    }
+
+    #[test]
+    fn a_library_that_declares_nothing_gets_the_liberty_defaults() {
+        let text =
+            format!("library(t) {{\n  time_unit : \"1ns\";\n  capacitive_load_unit (1, pf);\n{BODY}");
+        let t = Lib::parse(&text).unwrap().thresholds;
+        assert_eq!((t.slew_lower_rise, t.slew_upper_rise), (0.2, 0.8));
+        assert!((t.slew_span() - 0.6).abs() < 1e-12);
+        assert_eq!(t.slew_derate, 1.0);
+    }
+
+    #[test]
+    fn a_nonsense_threshold_declaration_does_not_rescale_every_delay() {
+        // slew_span divides the driver ramp, so a zero or inverted span would scale every
+        // delay in the design by infinity. Refuse it rather than propagate it.
+        let t = Thresholds {
+            slew_lower_rise: 0.9,
+            slew_upper_rise: 0.1, // inverted
+            slew_lower_fall: 0.9,
+            slew_upper_fall: 0.1,
+            ..Thresholds::default()
+        };
+        assert!((t.slew_span() - 0.6).abs() < 1e-12, "falls back rather than returning <= 0");
     }
 }

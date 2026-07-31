@@ -147,18 +147,29 @@ impl NetRc {
         Some(delay)
     }
 
-    /// Transient node response: drive the RC tree with the driver's output edge (a
-    /// saturated ramp 0→1 over `driver_slew_ns`, from t=0) as a forced source,
-    /// integrate with backward Euler over the rooted tree (an O(N) up/down sweep per
-    /// step), and read each node's 50% delay (relative to the driver's 50%) and
-    /// 30→70% slew. `xtalk_cap_ff` adds at the net node. This is the waveform-into-RC
-    /// convolution — more accurate than Elmore (a single RC gives 0.69·RC, not R·C).
+    /// Transient node response: drive the RC tree with the driver's output edge as a
+    /// forced saturated ramp from t=0, integrate with backward Euler over the rooted
+    /// tree (an O(N) up/down sweep per step), and read each node's delay and slew at the
+    /// **library's own measurement thresholds** (`th`). `xtalk_cap_ff` adds at the net
+    /// node. This is the waveform-into-RC convolution — more accurate than Elmore (a
+    /// single RC gives 0.69·RC, not R·C).
+    ///
+    /// `driver_slew_ns` is a **Liberty transition time**, i.e. the time to cross from
+    /// `th.slew_lower_*` to `th.slew_upper_*` — *not* a full 0→100 % edge. The ramp is
+    /// therefore stretched by `1/th.slew_span()`, and the result is read back between the
+    /// same two thresholds so it is directly comparable to a Liberty slew.
+    ///
+    /// Getting either end wrong rescales every delay in the design: treating a 20–80 %
+    /// slew as a full edge and reading 30→70 % out returns `0.4×` the input on a lightly
+    /// loaded net, so a sink looks *sharper* than its driver — which RC can never do.
+    ///
     /// Returns node → (delay_ns, slew_ns), or None if not a tree from `driver`.
     pub fn transient(
         &self,
         driver: &str,
         driver_slew_ns: f64,
         xtalk_cap_ff: f64,
+        th: crate::liberty::Thresholds,
     ) -> Option<BTreeMap<String, (f64, f64)>> {
         if self.res.is_empty() {
             return None;
@@ -216,14 +227,23 @@ impl NetRc {
         let total_c: f64 = cvec.iter().sum();
         let total_r: f64 = self.res.iter().map(|(_, _, r)| r).sum();
         let tau_lump = (total_r * total_c * 1e-6).max(1e-6); // ns
-        let tr = driver_slew_ns.max(1e-4); // ramp duration
+        // A Liberty slew spans only `slew_span` of the full swing, so the 0→100 % ramp
+        // that produced it lasts proportionally longer.
+        let span = th.slew_span();
+        let tr = (driver_slew_ns / span).max(1e-4); // full 0->100% ramp duration
         let nsteps = 800usize;
         let dt = ((tr + 6.0 * tau_lump) / nsteps as f64).max(1e-7);
         let vdrv = |t: f64| if t <= 0.0 { 0.0 } else if t >= tr { 1.0 } else { t / tr };
 
+        // measurement points, from the library (normalized rising edge: the tree is
+        // linear, so a falling edge is the mirror image and shares these spans)
+        let (v_lo, v_hi) = (th.slew_lower_rise, th.slew_upper_rise);
+        let (v_lo, v_hi) = if v_hi > v_lo { (v_lo, v_hi) } else { (0.2, 0.8) };
+        let v_mid = th.output_rise.clamp(0.01, 0.99);
+
         let didx = idx[driver];
         let mut v = vec![0.0f64; nn];
-        let (mut t30, mut t50, mut t70) =
+        let (mut t_lo, mut t_mid, mut t_hi) =
             (vec![f64::INFINITY; nn], vec![f64::INFINITY; nn], vec![f64::INFINITY; nn]);
         let mut a_co = vec![0.0f64; nn];
         let mut b_co = vec![0.0f64; nn];
@@ -261,24 +281,26 @@ impl NetRc {
             // record threshold crossings (linear interp within the step)
             for i in 0..nn {
                 let cross = |thr: f64| (t - dt) + (thr - v[i]) / (vnew[i] - v[i]).max(1e-12) * dt;
-                if t30[i].is_infinite() && vnew[i] >= 0.3 && v[i] < 0.3 {
-                    t30[i] = cross(0.3);
+                if t_lo[i].is_infinite() && vnew[i] >= v_lo && v[i] < v_lo {
+                    t_lo[i] = cross(v_lo);
                 }
-                if t50[i].is_infinite() && vnew[i] >= 0.5 && v[i] < 0.5 {
-                    t50[i] = cross(0.5);
+                if t_mid[i].is_infinite() && vnew[i] >= v_mid && v[i] < v_mid {
+                    t_mid[i] = cross(v_mid);
                 }
-                if t70[i].is_infinite() && vnew[i] >= 0.7 && v[i] < 0.7 {
-                    t70[i] = cross(0.7);
+                if t_hi[i].is_infinite() && vnew[i] >= v_hi && v[i] < v_hi {
+                    t_hi[i] = cross(v_hi);
                 }
             }
             std::mem::swap(&mut v, &mut vnew);
         }
-        let td50 = tr * 0.5; // forced ramp midpoint
+        let td_mid = tr * v_mid; // the forced ramp crosses v_mid here, by construction
         let mut out = BTreeMap::new();
         for (i, &n) in order.iter().enumerate() {
-            let d = if t50[i].is_finite() { (t50[i] - td50).max(0.0) } else { 0.0 };
-            let s = if t70[i].is_finite() && t30[i].is_finite() {
-                (t70[i] - t30[i]).max(0.0)
+            let d = if t_mid[i].is_finite() { (t_mid[i] - td_mid).max(0.0) } else { 0.0 };
+            // returned in the SAME convention as a Liberty slew (lower->upper), so the
+            // caller can feed it straight back into an NLDM index_1 lookup
+            let s = if t_hi[i].is_finite() && t_lo[i].is_finite() {
+                (t_hi[i] - t_lo[i]).max(0.0)
             } else {
                 0.0
             };
