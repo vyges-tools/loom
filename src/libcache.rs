@@ -19,7 +19,8 @@ use crate::liberty::{Arc, Cell, Constraint, Dir, Lib, Pin, RecvCap, Table};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLC1"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLC2"; // Vyges Liberty Cache — bump the trailing digit on any format change
+                                 // VLC2: pin `function`, cell `cell_footprint` + `area`.
 
 // ── byte writer / reader (little-endian, std-only) ───────────────────────────────
 
@@ -229,6 +230,13 @@ fn enc_pin(w: &mut W, p: &Pin) {
         None => w.u8(0),
     }
     w.u8(p.clock as u8);
+    match &p.function {
+        Some(f) => {
+            w.u8(1);
+            w.s(f);
+        }
+        None => w.u8(0),
+    }
     w.u64(p.setup.len() as u64);
     for c in &p.setup {
         enc_constraint(w, c);
@@ -253,6 +261,11 @@ fn dec_pin(r: &mut R) -> Option<Pin> {
         _ => return None,
     };
     let clock = r.u8()? != 0;
+    let function = match r.u8()? {
+        0 => None,
+        1 => Some(r.s()?),
+        _ => return None,
+    };
     let ns = r.u64()? as usize;
     let mut setup = Vec::with_capacity(ns.min(1 << 12));
     for _ in 0..ns {
@@ -268,7 +281,7 @@ fn dec_pin(r: &mut R) -> Option<Pin> {
     for _ in 0..na {
         arcs.push(dec_arc(r)?);
     }
-    Some(Pin { name, direction, capacitance, cap_f, recv, clock, setup, hold, arcs })
+    Some(Pin { name, direction, capacitance, cap_f, recv, clock, function, setup, hold, arcs })
 }
 
 fn enc_cell(w: &mut W, c: &Cell) {
@@ -288,6 +301,14 @@ fn enc_cell(w: &mut W, c: &Cell) {
     }
     w.f64(c.leakage_w);
     w.f64(c.int_energy_j);
+    match &c.cell_footprint {
+        Some(s) => {
+            w.u8(1);
+            w.s(s);
+        }
+        None => w.u8(0),
+    }
+    w.f64(c.area);
 }
 fn dec_cell(r: &mut R) -> Option<Cell> {
     let name = r.s()?;
@@ -305,7 +326,13 @@ fn dec_cell(r: &mut R) -> Option<Cell> {
     };
     let leakage_w = r.f64()?;
     let int_energy_j = r.f64()?;
-    Some(Cell { name, pins, is_seq, clock_pin, leakage_w, int_energy_j })
+    let cell_footprint = match r.u8()? {
+        0 => None,
+        1 => Some(r.s()?),
+        _ => return None,
+    };
+    let area = r.f64()?;
+    Some(Cell { name, pins, is_seq, clock_pin, leakage_w, int_energy_j, cell_footprint, area })
 }
 
 /// Serialize a `Lib` to the cache byte format (magic + version + payload).

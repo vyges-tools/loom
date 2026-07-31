@@ -29,6 +29,28 @@ let nl = d.netlist.as_ref().unwrap();
 println!("{} instances, {} cells", nl.insts.len(), d.lib_cell_count());
 ```
 
+### Which cells can stand in for which — `equivalence_class`
+
+A resize move (upsize a critical driver, downsize for hold or leakage, Vt-swap) is only safe if
+the replacement computes the same thing. A physical database will refuse a swap whose *pins* do
+not match, but nothing checks *function* — so the Liberty layer answers it:
+
+```rust
+let lib = vyges_loom::liberty::Lib::load("cells.lib")?;
+lib.equivalence_class("INV_X2");   // the drive ladder, ranked by area: [INV_X1, INV_X2, INV_X4]
+lib.upsize_candidates("INV_X2");   // [INV_X4]
+lib.downsize_candidates("INV_X2"); // [INV_X1]
+```
+
+Equivalence is decided by how much the library actually tells us: **`cell_footprint`** first —
+that is the vendor asserting the cells are drop-in — and otherwise identical pin names plus
+identical output `function`. Sequential cells are matched by footprint only, since a flop's
+behaviour lives in an `ff` group rather than a pin function.
+
+A timing-only library (no `function`, no `cell_footprint`) reports no equivalents rather than
+guessing. Same pins is not evidence: an inverter and a buffer are indistinguishable by shape,
+and swapping one for the other silently inverts the design.
+
 ## Use as a CLI (common, design-wide commands)
 
 ```sh

@@ -1,0 +1,59 @@
+/* A drive-strength ladder, for the resize-move equivalence query.
+ *
+ * INV_X1/X2/X4 share a cell_footprint AND a function — the easy case, and the one where the
+ * vendor is telling us directly. BUF_X1/X2 have a function but no footprint, so they must be
+ * matched structurally. NAND2_X1 is a different function with the same pin count as BUF, which
+ * is exactly the confusion a structural match has to avoid. NOPE has neither function nor
+ * footprint — a timing-only cell, where equivalence is simply not knowable.
+ */
+library (equiv_demo) {
+  delay_model : table_lookup;
+  time_unit : "1ns";
+  capacitive_load_unit (1, "pf");
+
+  cell (INV_X1) { cell_footprint : "inv"; area : 1.0;
+    pin (A) { direction : input; capacitance : 0.001; }
+    pin (Y) { direction : output; function : "!A"; }
+  }
+  cell (INV_X2) { cell_footprint : "inv"; area : 2.0;
+    pin (A) { direction : input; capacitance : 0.002; }
+    pin (Y) { direction : output; function : "!A"; }
+  }
+  cell (INV_X4) { cell_footprint : "inv"; area : 4.0;
+    pin (A) { direction : input; capacitance : 0.004; }
+    pin (Y) { direction : output; function : "!A"; }
+  }
+
+  cell (BUF_X1) { area : 1.5;
+    pin (A) { direction : input; capacitance : 0.001; }
+    pin (Y) { direction : output; function : "A"; }
+  }
+  cell (BUF_X2) { area : 3.0;
+    pin (A) { direction : input; capacitance : 0.002; }
+    pin (Y) { direction : output; function : "A"; }
+  }
+
+  cell (NAND2_X1) { area : 2.5;
+    pin (A) { direction : input; capacitance : 0.001; }
+    pin (B) { direction : input; capacitance : 0.001; }
+    pin (Y) { direction : output; function : "!(A B)"; }
+  }
+
+  cell (NOPE) { area : 1.0;
+    pin (A) { direction : input; capacitance : 0.001; }
+    pin (Y) { direction : output; }
+  }
+
+  cell (DFF_X1) { cell_footprint : "dff"; area : 5.0;
+    ff (IQ, IQN) { clocked_on : "CK"; next_state : "D"; }
+    pin (CK) { direction : input; clock : true; capacitance : 0.001; }
+    pin (D)  { direction : input; capacitance : 0.001; }
+    pin (Q)  { direction : output; }
+  }
+  cell (DFF_X2) { cell_footprint : "dff"; area : 8.0;
+    ff (IQ, IQN) { clocked_on : "CK"; next_state : "D"; }
+    pin (CK) { direction : input; clock : true; capacitance : 0.002; }
+    pin (D)  { direction : input; capacitance : 0.002; }
+    pin (Q)  { direction : output; }
+  }
+}

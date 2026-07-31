@@ -119,6 +119,10 @@ pub struct Pin {
     pub cap_f: f64,              // same capacitance in Farads (power: net-load summation)
     pub recv: Option<RecvCap>,   // CCS receiver model (input pins); None -> use `capacitance`
     pub clock: bool,             // `clock : true` — the cell's clock pin
+    /// Boolean `function` of an output pin, verbatim from Liberty (e.g. `"!A"`, `"A&B"`).
+    /// `None` on inputs, and on outputs in libraries that omit it — a timing-only library is
+    /// perfectly valid, so absence is not an error.
+    pub function: Option<String>,
     pub setup: Vec<Constraint>,  // setup constraint group(s) vs the clock
     pub hold: Vec<Constraint>,   // hold constraint group(s) vs the clock
     pub arcs: Vec<Arc>,          // delay arcs (e.g. CK->Q on a flop output)
@@ -143,6 +147,100 @@ pub struct Cell {
     pub clock_pin: Option<String>,   // the pin marked `clock : true`
     pub leakage_w: f64,              // cell_leakage_power → Watts (power)
     pub int_energy_j: f64,           // representative per-transition internal energy → Joules (power)
+    /// `cell_footprint` — the vendor's own grouping of interchangeable cells. When a library
+    /// provides it, it is the most reliable equivalence key there is: the foundry is asserting
+    /// these cells are drop-in for one another.
+    pub cell_footprint: Option<String>,
+    /// `area` in library units. Zero when absent. Ranks an equivalence class: for cells of the
+    /// same function, area is a good proxy for drive strength.
+    pub area: f64,
+}
+
+impl Lib {
+    /// The cells interchangeable with `cell`, **ranked by `area` ascending** — a drive-strength
+    /// ladder including `cell` itself, so a caller can see where it sits.
+    ///
+    /// This is what a resize move needs: swapping a cell only makes sense if the replacement
+    /// computes the same thing. OpenDB will refuse a swap whose pins do not match, but nothing
+    /// downstream checks *function*, so that check has to happen here.
+    ///
+    /// Equivalence is decided in order of how much the library is telling us:
+    ///
+    /// 1. **`cell_footprint`**, when both cells declare one. This is the vendor asserting the
+    ///    cells are drop-in for one another — better evidence than anything we can infer.
+    /// 2. Otherwise, **identical pin names and identical output functions**. Structural, and
+    ///    only as good as the library's `function` attributes.
+    ///
+    /// A **sequential** cell is only ever matched by footprint. Its behaviour lives in an `ff`
+    /// group rather than a pin function, so a structural match would be guessing — and guessing
+    /// wrong about a flop swaps a design's state element.
+    ///
+    /// Returns an empty vec if `cell` is unknown, and a single-element vec (the cell itself) if
+    /// nothing is interchangeable with it — including the common case of a timing-only library
+    /// with no `function` and no `cell_footprint`, where equivalence is simply not knowable.
+    pub fn equivalence_class(&self, cell: &str) -> Vec<&Cell> {
+        let Some(c) = self.cells.get(cell) else {
+            return Vec::new();
+        };
+        let mut out: Vec<&Cell> =
+            self.cells.values().filter(|o| interchangeable(c, o)).collect();
+        out.sort_by(|a, b| {
+            a.area.partial_cmp(&b.area).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.name.cmp(&b.name))
+        });
+        out
+    }
+
+    /// Interchangeable cells **larger** than `cell` — upsize candidates, weakest first. The
+    /// setup-repair move: a bigger drive on a critical arc.
+    pub fn upsize_candidates(&self, cell: &str) -> Vec<&Cell> {
+        let area = self.cells.get(cell).map(|c| c.area).unwrap_or(0.0);
+        self.equivalence_class(cell).into_iter().filter(|c| c.area > area && c.name != cell).collect()
+    }
+
+    /// Interchangeable cells **smaller** than `cell` — downsize candidates, smallest first. Adds
+    /// delay, so it is a hold-repair move as well as an area/leakage one.
+    pub fn downsize_candidates(&self, cell: &str) -> Vec<&Cell> {
+        let area = self.cells.get(cell).map(|c| c.area).unwrap_or(0.0);
+        self.equivalence_class(cell).into_iter().filter(|c| c.area < area && c.name != cell).collect()
+    }
+}
+
+/// Whether `b` can stand in for `a`. See [`Lib::equivalence_class`] for the ordering of evidence.
+fn interchangeable(a: &Cell, b: &Cell) -> bool {
+    // the vendor's own grouping wins whenever it is available
+    if let (Some(fa), Some(fb)) = (&a.cell_footprint, &b.cell_footprint) {
+        return fa == fb;
+    }
+    // a flop's behaviour is not in a pin function, so never match one structurally
+    if a.is_seq || b.is_seq {
+        return a.name == b.name;
+    }
+    if a.pins.len() != b.pins.len() {
+        return false;
+    }
+    let mut any_function = false;
+    for (name, pa) in &a.pins {
+        let Some(pb) = b.pins.get(name) else {
+            return false; // pin sets must match, or OpenDB would refuse the swap anyway
+        };
+        if pa.direction != pb.direction {
+            return false;
+        }
+        match (&pa.function, &pb.function) {
+            (Some(x), Some(y)) => {
+                any_function = true;
+                if x != y {
+                    return false;
+                }
+            }
+            // one declares a function and the other does not: not comparable
+            (Some(_), None) | (None, Some(_)) => return false,
+            (None, None) => {}
+        }
+    }
+    // Same pins and no function anywhere is NOT evidence of equivalence — it is the signature of
+    // a timing-only library, where every one-input/one-output cell would otherwise look alike.
+    any_function || a.name == b.name
 }
 
 impl Cell {
@@ -435,6 +533,9 @@ fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
         })
     };
     let clock = simple_attr(body, "clock").as_deref() == Some("true");
+    // Liberty puts `function` on the OUTPUT pin, not the cell. It is what makes two cells
+    // comparable: a resize must not change what a gate computes.
+    let function = simple_attr(body, "function").filter(|f| !f.is_empty());
     let mut arcs = Vec::new();
     let mut setup: Vec<Constraint> = Vec::new();
     let mut hold: Vec<Constraint> = Vec::new();
@@ -456,7 +557,7 @@ fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
         }
         at = after;
     }
-    Pin { name, direction, capacitance, cap_f, recv, clock, setup, hold, arcs }
+    Pin { name, direction, capacitance, cap_f, recv, clock, function, setup, hold, arcs }
 }
 
 fn parse_cell(name: String, body: &str, units: &Units, skip_ccs: bool) -> Cell {
@@ -480,7 +581,9 @@ fn parse_cell(name: String, body: &str, units: &Units, skip_ccs: bool) -> Cell {
     } else {
         (ivals.iter().sum::<f64>() / ivals.len() as f64) * units.energy_j
     };
-    Cell { name, pins, is_seq, clock_pin, leakage_w, int_energy_j }
+    let cell_footprint = simple_attr(body, "cell_footprint").filter(|f| !f.is_empty());
+    let area = simple_attr(body, "area").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    Cell { name, pins, is_seq, clock_pin, leakage_w, int_energy_j, cell_footprint, area }
 }
 
 /// Options controlling how much of a Liberty file is parsed.
