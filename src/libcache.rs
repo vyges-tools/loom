@@ -19,9 +19,10 @@ use crate::liberty::{Arc, Cell, Constraint, Dir, Lib, Pin, RecvCap, Table};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLC3"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLC4"; // Vyges Liberty Cache — bump the trailing digit on any format change
                                  // VLC2: pin `function`, cell `cell_footprint` + `area`.
                                  // VLC3: library `Thresholds` (slew/delay measurement points).
+                                 // VLC4: pin `recovery` + `removal` constraint groups.
 
 // ── byte writer / reader (little-endian, std-only) ───────────────────────────────
 
@@ -246,6 +247,14 @@ fn enc_pin(w: &mut W, p: &Pin) {
     for c in &p.hold {
         enc_constraint(w, c);
     }
+    w.u64(p.recovery.len() as u64);
+    for c in &p.recovery {
+        enc_constraint(w, c);
+    }
+    w.u64(p.removal.len() as u64);
+    for c in &p.removal {
+        enc_constraint(w, c);
+    }
     w.u64(p.arcs.len() as u64);
     for a in &p.arcs {
         enc_arc(w, a);
@@ -277,12 +286,22 @@ fn dec_pin(r: &mut R) -> Option<Pin> {
     for _ in 0..nh {
         hold.push(dec_constraint(r)?);
     }
+    let nrc = r.u64()? as usize;
+    let mut recovery = Vec::with_capacity(nrc.min(1 << 12));
+    for _ in 0..nrc {
+        recovery.push(dec_constraint(r)?);
+    }
+    let nrm = r.u64()? as usize;
+    let mut removal = Vec::with_capacity(nrm.min(1 << 12));
+    for _ in 0..nrm {
+        removal.push(dec_constraint(r)?);
+    }
     let na = r.u64()? as usize;
     let mut arcs = Vec::with_capacity(na.min(1 << 12));
     for _ in 0..na {
         arcs.push(dec_arc(r)?);
     }
-    Some(Pin { name, direction, capacitance, cap_f, recv, clock, function, setup, hold, arcs })
+    Some(Pin { name, direction, capacitance, cap_f, recv, clock, function, setup, hold, recovery, removal, arcs })
 }
 
 fn enc_cell(w: &mut W, c: &Cell) {
@@ -515,6 +534,15 @@ library (demo) {
         // FIRST load and silently reverts to the default on every one after — the worst
         // shape of bug, because it passes any test that parses and uses in one breath.
         assert_eq!(back.thresholds, lib.thresholds, "thresholds lost across the cache");
+        // recovery/removal likewise: an async pin whose checks vanish on the second
+        // load leaves the design silently unchecked, which is worse than not caching.
+        for (cn, c) in &lib.cells {
+            for (pn, p) in &c.pins {
+                let b = &back.cells[cn].pins[pn];
+                assert_eq!(b.recovery.len(), p.recovery.len(), "{cn}/{pn} recovery lost");
+                assert_eq!(b.removal.len(), p.removal.len(), "{cn}/{pn} removal lost");
+            }
+        }
     }
 
     #[test]

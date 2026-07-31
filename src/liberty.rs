@@ -125,6 +125,15 @@ pub struct Pin {
     pub function: Option<String>,
     pub setup: Vec<Constraint>,  // setup constraint group(s) vs the clock
     pub hold: Vec<Constraint>,   // hold constraint group(s) vs the clock
+    /// `recovery_*` — the async set/reset release must arrive early enough before the
+    /// clock edge. The asynchronous counterpart of setup, on the SET/RESET pin.
+    pub recovery: Vec<Constraint>,
+    /// `removal_*` — the async set/reset release must stay stable long enough after the
+    /// clock edge. The asynchronous counterpart of hold, on the SET/RESET pin.
+    ///
+    /// These are separate constraints with their own tables; applying a *data* setup/hold
+    /// table to an async pin is not an approximation, it is the wrong check.
+    pub removal: Vec<Constraint>,
     pub arcs: Vec<Arc>,          // delay arcs (e.g. CK->Q on a flop output)
 }
 
@@ -628,25 +637,30 @@ fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
     let mut arcs = Vec::new();
     let mut setup: Vec<Constraint> = Vec::new();
     let mut hold: Vec<Constraint> = Vec::new();
+    let mut recovery: Vec<Constraint> = Vec::new();
+    let mut removal: Vec<Constraint> = Vec::new();
     let mut at = 0;
     while let Some((_, tbody, after)) = next_block(body, at, "timing") {
         match simple_attr(&tbody, "timing_type").as_deref() {
             Some(tt) if tt.starts_with("setup") => setup.push(parse_constraint(&tbody)),
             Some(tt) if tt.starts_with("hold") => hold.push(parse_constraint(&tbody)),
-            // async set/reset (clear/preset) and check arcs (recovery/removal/
-            // pulse_width) are NOT max-delay data arcs — don't propagate data through
-            // them (e.g. dfrtp RESET_B->Q is an async clear, not a launch path).
+            // recovery/removal are CHECKS on the async set/reset pin, with their own
+            // tables — kept, and applied by the timer as the async counterparts of
+            // setup/hold. They are not max-delay data arcs.
+            Some(tt) if tt.starts_with("recovery") => recovery.push(parse_constraint(&tbody)),
+            Some(tt) if tt.starts_with("removal") => removal.push(parse_constraint(&tbody)),
+            // clear/preset are async *effect* arcs (dfrtp RESET_B->Q), not launch paths —
+            // propagating data through them would invent a path that cannot exist.
+            // min_pulse_width is a check we do not implement yet.
             Some(tt)
                 if tt.starts_with("clear")
                     || tt.starts_with("preset")
-                    || tt.starts_with("recovery")
-                    || tt.starts_with("removal")
                     || tt.contains("pulse_width") => {}
             _ => arcs.push(parse_arc(&tbody, skip_ccs)), // delay arc (incl. rising_edge CK->Q)
         }
         at = after;
     }
-    Pin { name, direction, capacitance, cap_f, recv, clock, function, setup, hold, arcs }
+    Pin { name, direction, capacitance, cap_f, recv, clock, function, setup, hold, recovery, removal, arcs }
 }
 
 fn parse_cell(name: String, body: &str, units: &Units, skip_ccs: bool) -> Cell {
@@ -1214,5 +1228,88 @@ mod threshold_tests {
             ..Thresholds::default()
         };
         assert!((t.slew_span() - 0.6).abs() < 1e-12, "falls back rather than returning <= 0");
+    }
+}
+
+#[cfg(test)]
+mod async_check_tests {
+    use super::*;
+
+    /// A flop with an async reset, shaped like sky130's `dfrtp`: RESET_B carries
+    /// recovery/removal checks and a clear *effect* arc, not data setup/hold.
+    const DFRTP: &str = r#"library(t) {
+  time_unit : "1ns";
+  capacitive_load_unit (1, pf);
+  cell (DFRTP) {
+    ff (IQ, IQN) { clocked_on : "CLK"; next_state : "D"; clear : "!RESET_B"; }
+    pin(CLK) { direction : input; clock : true; capacitance : 0.001; }
+    pin(D) { direction : input; capacitance : 0.001;
+      timing () { related_pin : "CLK"; timing_type : setup_rising;
+        rise_constraint(s) { index_1("0.01"); index_2("0.01"); values("0.05"); }
+        fall_constraint(s) { index_1("0.01"); index_2("0.01"); values("0.05"); } }
+      timing () { related_pin : "CLK"; timing_type : hold_rising;
+        rise_constraint(s) { index_1("0.01"); index_2("0.01"); values("0.02"); }
+        fall_constraint(s) { index_1("0.01"); index_2("0.01"); values("0.02"); } } }
+    pin(RESET_B) { direction : input; capacitance : 0.001;
+      timing () { related_pin : "CLK"; timing_type : recovery_rising;
+        rise_constraint(s) { index_1("0.01"); index_2("0.01"); values("0.11"); }
+        fall_constraint(s) { index_1("0.01"); index_2("0.01"); values("0.11"); } }
+      timing () { related_pin : "CLK"; timing_type : removal_rising;
+        rise_constraint(s) { index_1("0.01"); index_2("0.01"); values("0.07"); }
+        fall_constraint(s) { index_1("0.01"); index_2("0.01"); values("0.07"); } } }
+    pin(Q) { direction : output; function : "IQ";
+      timing () { related_pin : "CLK"; timing_type : rising_edge;
+        cell_rise(t) { index_1("0.01"); index_2("0.001"); values("0.30"); }
+        cell_fall(t) { index_1("0.01"); index_2("0.001"); values("0.30"); }
+        rise_transition(t) { index_1("0.01"); index_2("0.001"); values("0.04"); }
+        fall_transition(t) { index_1("0.01"); index_2("0.001"); values("0.04"); } }
+      timing () { related_pin : "RESET_B"; timing_type : clear;
+        cell_fall(t) { index_1("0.01"); index_2("0.001"); values("0.25"); }
+        fall_transition(t) { index_1("0.01"); index_2("0.001"); values("0.05"); } } }
+  }
+}"#;
+
+    #[test]
+    fn an_async_reset_pin_carries_recovery_and_removal_not_setup_and_hold() {
+        // These were previously parsed and DISCARDED, so an async pin got no check at
+        // all. Applying the D pin's setup/hold tables to it instead is not an
+        // approximation — it is a different constraint with different numbers.
+        let lib = Lib::parse(DFRTP).unwrap();
+        let rb = &lib.cells["DFRTP"].pins["RESET_B"];
+        assert_eq!(rb.recovery.len(), 1, "recovery must be kept");
+        assert_eq!(rb.removal.len(), 1, "removal must be kept");
+        assert!(rb.setup.is_empty() && rb.hold.is_empty(), "not data setup/hold");
+        assert!((rb.recovery[0].eval(0.01, 0.01) - 0.11).abs() < 1e-9);
+        assert!((rb.removal[0].eval(0.01, 0.01) - 0.07).abs() < 1e-9);
+
+        let d = &lib.cells["DFRTP"].pins["D"];
+        assert_eq!((d.setup.len(), d.hold.len()), (1, 1));
+        assert!(d.recovery.is_empty() && d.removal.is_empty(), "D is data, not async");
+        // and the numbers really do differ, or checking the wrong one would be harmless
+        assert_ne!(d.hold[0].eval(0.01, 0.01), rb.removal[0].eval(0.01, 0.01));
+    }
+
+    #[test]
+    fn a_clear_arc_is_still_not_a_data_launch_path() {
+        // RESET_B -> Q is an async *effect*, not a max-delay arc. Propagating data
+        // through it would invent a launch path that cannot exist.
+        let lib = Lib::parse(DFRTP).unwrap();
+        let q = &lib.cells["DFRTP"].pins["Q"];
+        assert_eq!(q.arcs.len(), 1, "only the CLK->Q edge arc: {:?}",
+                   q.arcs.iter().map(|a| &a.related_pin).collect::<Vec<_>>());
+        assert_eq!(q.arcs[0].related_pin, "CLK");
+    }
+
+    #[test]
+    fn the_real_sky130_flop_agrees_with_that_shape() {
+        // Guards against the fixture being wishful. Skips when the PDK is absent.
+        let path = concat!(env!("HOME"),
+            "/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib");
+        let Ok(lib) = Lib::load(path) else { return };
+        let Some(cell) = lib.cells.get("sky130_fd_sc_hd__dfrtp_1") else { return };
+        let rb = cell.pins.get("RESET_B").expect("dfrtp has RESET_B");
+        assert!(!rb.removal.is_empty(), "sky130 dfrtp RESET_B must carry removal");
+        assert!(!rb.recovery.is_empty(), "sky130 dfrtp RESET_B must carry recovery");
+        assert!(rb.hold.is_empty(), "and must NOT be a data hold pin");
     }
 }
