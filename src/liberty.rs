@@ -138,6 +138,27 @@ pub struct Pin {
 }
 
 impl Pin {
+    /// True when this output pin drives a **fixed logic level** — a tie cell, declared in
+    /// Liberty as `function : "1"` or `function : "0"` with no timing arcs (sky130's
+    /// `conb_1` has both, as `HI` and `LO`).
+    ///
+    /// A net driven only by such a pin can never switch, so it carries no timing at all:
+    /// no arrival to propagate and no check to apply. Treating one as an ordinary
+    /// undriven node instead makes it look like a path source at t=0, which manufactures
+    /// violations on wires that never toggle.
+    pub fn is_constant(&self) -> bool {
+        if !matches!(self.direction, Dir::Out | Dir::Inout) {
+            return false;
+        }
+        match self.function.as_deref() {
+            Some(f) => {
+                let f = f.trim().trim_matches('"').trim();
+                f == "0" || f == "1"
+            }
+            None => false,
+        }
+    }
+
     /// The capacitive load this input pin presents to its driver (pF): the
     /// Miller-aware receiver load when characterized, else the static `capacitance`.
     pub fn load_cap(&self) -> f64 {
@@ -1311,5 +1332,50 @@ mod async_check_tests {
         assert!(!rb.removal.is_empty(), "sky130 dfrtp RESET_B must carry removal");
         assert!(!rb.recovery.is_empty(), "sky130 dfrtp RESET_B must carry recovery");
         assert!(rb.hold.is_empty(), "and must NOT be a data hold pin");
+    }
+}
+
+#[cfg(test)]
+mod constant_tests {
+    use super::*;
+
+    #[test]
+    fn a_tie_cell_output_is_recognised_as_constant() {
+        // sky130's conb_1 shape: two outputs tied high and low, no timing arcs.
+        let lib = Lib::parse(
+            r#"library(t) {
+  time_unit : "1ns";
+  capacitive_load_unit (1, pf);
+  cell (CONB) {
+    pin("HI") { direction : "output"; function : "1"; }
+    pin("LO") { direction : "output"; function : "0"; }
+  }
+  cell (INV) {
+    pin(A) { direction : input; capacitance : 0.001; }
+    pin(Y) { direction : output; function : "!A"; }
+  }
+}"#,
+        )
+        .unwrap();
+        let c = &lib.cells["CONB"];
+        assert!(c.pins["HI"].is_constant(), "function \"1\" is a tie-high");
+        assert!(c.pins["LO"].is_constant(), "function \"0\" is a tie-low");
+        // an ordinary gate is not constant, however simple its function
+        assert!(!lib.cells["INV"].pins["Y"].is_constant());
+        // nor is an input pin, whatever it says
+        assert!(!lib.cells["INV"].pins["A"].is_constant());
+    }
+
+    #[test]
+    fn the_real_sky130_tie_cell_is_recognised() {
+        let path = concat!(env!("HOME"),
+            "/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib");
+        let Ok(lib) = Lib::load(path) else { return };
+        let Some(c) = lib.cells.get("sky130_fd_sc_hd__conb_1") else { return };
+        assert!(c.pins["HI"].is_constant() && c.pins["LO"].is_constant());
+        // and a real logic cell in the same library is not swept up by it
+        if let Some(inv) = lib.cells.get("sky130_fd_sc_hd__inv_2") {
+            assert!(!inv.pins["Y"].is_constant());
+        }
     }
 }
