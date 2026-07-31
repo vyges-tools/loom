@@ -393,19 +393,36 @@ impl Spef {
                 }
             }
         };
+        // A SPEF identifier is either a `*NAME_MAP` index (`*17`) or a **literal name**. The
+        // map is OPTIONAL in IEEE 1481 and extractors do write names directly, so resolving
+        // only the mapped form does not degrade — it discards the whole file: every net ends
+        // up keyed by the empty string, every `*CONN` pin is dropped, and the caller gets the
+        // no-parasitics answer back with no error and no warning.
+        //
+        // The leading `*` is the discriminator the format itself uses. Do NOT infer it from
+        // whether the body parses as a number: a literal net may legitimately be named `123`.
+        let resolve = |tok: &str, names: &BTreeMap<usize, String>| -> String {
+            match tok.strip_prefix('*') {
+                // an index with no map entry falls back to its own text rather than vanishing
+                Some(body) => body
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|i| names.get(&i).cloned())
+                    .unwrap_or_else(|| body.to_string()),
+                None => tok.to_string(),
+            }
+        };
         let netname = |tok: &str, names: &BTreeMap<usize, String>| -> Option<String> {
-            let body = tok.trim_start_matches('*');
-            if body.contains(':') {
+            // a node token (`name:3`) names a point on a net, not the net
+            if tok.trim_start_matches('*').contains(':') {
                 return None;
             }
-            body.parse::<usize>().ok().and_then(|i| names.get(&i).cloned())
+            Some(resolve(tok, names))
         };
         // resolve a pin token "iid:pin" -> (instance name, pin)
         let pin_of = |tok: &str, names: &BTreeMap<usize, String>| -> Option<(String, String)> {
-            let body = tok.trim_start_matches('*');
-            let (ids, pin) = body.split_once(':')?;
-            let inst = ids.parse::<usize>().ok().and_then(|i| names.get(&i).cloned())?;
-            Some((inst, pin.to_string()))
+            let (ids, pin) = tok.split_once(':')?;
+            Some((resolve(ids, names), pin.to_string()))
         };
 
         for raw in text.lines() {
@@ -429,9 +446,8 @@ impl Spef {
                 finish(&mut cur, &mut nets);
                 let toks: Vec<&str> = t.split_whitespace().collect();
                 let idtok = toks.get(1).copied().unwrap_or("");
-                let id = idtok.trim_start_matches('*').parse::<usize>().ok();
                 let cap = toks.get(2).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0) * c_scale;
-                let name = id.and_then(|i| names.get(&i).cloned()).unwrap_or_default();
+                let name = resolve(idtok, &names);
                 let net_node = node_tok(idtok);
                 cur = Some((
                     name,
@@ -512,7 +528,7 @@ impl Spef {
                     }
                 }
                 "cap" => {
-                    if toks.len() >= 4 && toks[1].starts_with('*') && toks[2].starts_with('*') {
+                    if toks.len() >= 4 {
                         // two-node coupling cap `<idx> *A *B <ff>`
                         if let (Some(a), Some(b), Ok(v)) =
                             (netname(toks[1], &names), netname(toks[2], &names), toks[3].parse::<f64>())
@@ -523,7 +539,7 @@ impl Spef {
                             coupling_list.entry(a.clone()).or_default().push((b.clone(), v));
                             coupling_list.entry(b).or_default().push((a, v));
                         }
-                    } else if toks.len() >= 3 && toks[1].starts_with('*') {
+                    } else if toks.len() >= 3 {
                         // grounded cap `<idx> *node <ff>`
                         if let Ok(v) = toks[2].parse::<f64>() {
                             if let Some((_, _, rc)) = cur.as_mut() {
@@ -818,5 +834,118 @@ mod writer_tests {
         let o = WriteOpts { date: Some("2026-07-13T00:00:00Z".into()), ..Default::default() };
         assert_eq!(spef.to_spef(&o), spef.to_spef(&o)); // stable
         assert!(spef.to_spef(&o).contains("*DATE \"2026-07-13T00:00:00Z\""));
+    }
+}
+
+#[cfg(test)]
+mod name_map_optional_tests {
+    use super::*;
+
+    // `*NAME_MAP` is OPTIONAL in IEEE 1481. These are the SAME net written the two ways the
+    // standard allows — through a map index, and with literal names. Extractors emit both;
+    // resolving only the mapped form did not degrade the answer, it discarded the file.
+    const MAPPED: &str = r#"*SPEF "IEEE 1481-1998"
+*DESIGN "t"
+*DIVIDER /
+*DELIMITER :
+*T_UNIT 1 PS
+*C_UNIT 1 FF
+*R_UNIT 1 OHM
+
+*NAME_MAP
+*1 sig
+*2 u_drv
+*3 u_snk
+
+*D_NET *1 12.5
+*CONN
+*I *2:Y O
+*I *3:A I
+*CAP
+1 *1:0 5.0
+2 *1:1 7.5
+*RES
+1 *2:Y *1:0 40.0
+2 *1:0 *1:1 10.0
+3 *1:1 *3:A 30.0
+*END
+"#;
+
+    const LITERAL: &str = r#"*SPEF "IEEE 1481-1998"
+*DESIGN "t"
+*DIVIDER /
+*DELIMITER :
+*T_UNIT 1 PS
+*C_UNIT 1 FF
+*R_UNIT 1 OHM
+
+*D_NET sig 12.5
+*CONN
+*I u_drv:Y O
+*I u_snk:A I
+*CAP
+1 sig:0 5.0
+2 sig:1 7.5
+*RES
+1 u_drv:Y sig:0 40.0
+2 sig:0 sig:1 10.0
+3 sig:1 u_snk:A 30.0
+*END
+"#;
+
+    #[test]
+    fn a_literal_named_spef_does_not_parse_to_nothing() {
+        // The failure this guards is silent: the file streams through, every net lands under
+        // the empty name, and the caller gets the no-parasitics answer with no error at all.
+        let s = Spef::parse(LITERAL);
+        assert_eq!(
+            s.nets.len(),
+            1,
+            "a SPEF without a *NAME_MAP must still yield its nets"
+        );
+        assert!(
+            s.nets.contains_key("sig"),
+            "and must be keyed by the net's own name"
+        );
+        let rc = &s.nets["sig"];
+        assert!(
+            !rc.pins.is_empty(),
+            "*CONN pins must survive a literal instance name"
+        );
+        assert!(
+            !rc.ground.is_empty(),
+            "*CAP entries must survive an unprefixed node token"
+        );
+    }
+
+    #[test]
+    fn both_forms_give_the_timer_the_same_delay() {
+        // The node TOKENS differ between the forms by construction (`1:0` vs `sig:0`), so
+        // comparing them would be comparing labels. Compare the physics instead, through the
+        // same public path the timer uses: driver pin -> Elmore -> sink pin.
+        let (m, l) = (Spef::parse(MAPPED), Spef::parse(LITERAL));
+        let delay = |s: &Spef| -> f64 {
+            let rc = s.nets.get("sig").expect("net present in both forms");
+            let drv = rc.pin_node("u_drv", "Y").expect("driver pin resolves");
+            let snk = rc.pin_node("u_snk", "A").expect("sink pin resolves");
+            *rc.elmore(drv, 0.0)
+                .expect("RC is a tree")
+                .get(snk)
+                .expect("sink is reachable")
+        };
+        let (dm, dl) = (delay(&m), delay(&l));
+        assert!(
+            dm > 0.0,
+            "the fixture must produce a real delay, else this proves nothing"
+        );
+        assert!(
+            (dm - dl).abs() < 1e-12,
+            "the two spellings of one net must time identically: mapped {dm}, literal {dl}"
+        );
+
+        // and the lumped values the caller reads directly
+        assert_eq!(m.nets["sig"].cap_ff, l.nets["sig"].cap_ff);
+        assert_eq!(m.nets["sig"].res_ohm, l.nets["sig"].res_ohm);
+        assert_eq!(m.wire_load_pf("sig"), l.wire_load_pf("sig"));
     }
 }
