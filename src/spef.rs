@@ -53,7 +53,9 @@ pub struct WriteOpts {
     pub design: String,  // *DESIGN "<name>"
     pub program: String, // *PROGRAM "<tool>"
     pub version: String, // *VERSION "<ver>"
-    pub date: Option<String>, // *DATE "<iso>" — omitted when None
+    /// `*DATE` — a FIXED default is used when None. Never the wall clock: the field is required
+    /// by the grammar, and output must stay byte-reproducible.
+    pub date: Option<String>,
 }
 
 impl Default for WriteOpts {
@@ -707,13 +709,20 @@ impl Spef {
         let mut out = String::new();
         out.push_str("*SPEF \"IEEE 1481-1999\"\n");
         out.push_str(&format!("*DESIGN \"{}\"\n", opts.design));
-        if let Some(d) = &opts.date {
-            out.push_str(&format!("*DATE \"{d}\"\n"));
-        }
+        // Always emitted: `*DATE` is REQUIRED by the SPEF grammar OpenSTA implements, so a file
+        // without it is a syntax error at that line to OpenROAD, LibreLane and anything built on
+        // them. It was optional here to keep output byte-reproducible; a FIXED default achieves
+        // that without dropping a required field. Measured — the sibling writer in vyges-extract
+        // had the same hole and its output was rejected outright.
+        out.push_str(&format!(
+            "*DATE \"{}\"\n",
+            opts.date.as_deref().unwrap_or("00:00:00 Thursday January 01, 1970")
+        ));
         out.push_str("*VENDOR \"Vyges\"\n");
         out.push_str(&format!("*PROGRAM \"{}\"\n", opts.program));
         out.push_str(&format!("*VERSION \"{}\"\n", opts.version));
-        out.push_str("*DESIGN_FLOW \"\"\n");
+        // States what the file carries: names local to the design, wire capacitance only.
+        out.push_str("*DESIGN_FLOW \"NAME_SCOPE LOCAL\" \"PIN_CAP NONE\"\n");
         out.push_str("*DIVIDER /\n*DELIMITER :\n*BUS_DELIMITER [ ]\n");
         out.push_str("*T_UNIT 1 PS\n*C_UNIT 1 FF\n*R_UNIT 1 OHM\n*L_UNIT 1 HENRY\n");
         out.push_str("\n*NAME_MAP\n");
@@ -783,7 +792,7 @@ mod writer_tests {
         // sanity: header + name map present, no wall-clock date
         assert!(text.contains("*SPEF \"IEEE 1481-1999\""));
         assert!(text.contains("*DESIGN \"blk\""));
-        assert!(!text.contains("*DATE"));
+        assert!(text.contains("*DATE"), "required by the grammar OpenSTA implements");
         assert!(text.contains("*NAME_MAP"));
 
         let back = Spef::parse(&text);
