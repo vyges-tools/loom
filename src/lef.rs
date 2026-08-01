@@ -69,6 +69,14 @@ pub struct Lef {
     pub widths: BTreeMap<String, f64>,
     /// layer → metal thickness (um) — projection of `layers`.
     pub thicknesses: BTreeMap<String, f64>,
+    /// via name → the layers its `VIA` block lists, in declaration order.
+    ///
+    /// A DEF net states a via by name at a point; only the LEF says which two routing
+    /// layers that via actually joins. Everything else is inference — the routing layer
+    /// in effect when the via is declared can be either side of the pair, so a consumer
+    /// guessing from that alone will connect the wrong two layers wherever three meet.
+    /// The list includes the cut layer, since a tech LEF is what tells routing from cut.
+    pub vias: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -93,6 +101,12 @@ impl Lef {
         // `LAYER <m> ;` (PIN PORT geometry) lines as tech-layer starts.
         let mut cur_macro: Option<Macro> = None;
         let mut cur_pin: Option<MacroPin> = None;
+        let mut vias: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        // VIA / VIARULE blocks carry their own `LAYER <l> ;` lines. Those are not tech-layer
+        // declarations and must not be read as such, so the block is shielded the same way
+        // a MACRO is. VIA blocks additionally record what they join; VIARULE is generated
+        // geometry and only needs shielding.
+        let mut cur_via: Option<(String, Vec<String>, bool)> = None;
         for raw in text.lines() {
             let line = match raw.find('#') {
                 Some(i) => &raw[..i],
@@ -100,20 +114,50 @@ impl Lef {
             };
             let toks: Vec<&str> = line.split_whitespace().collect();
 
+            // ---- via mode: record the layers a VIA joins, shield tech parsing ----
+            if let Some((name, ls, record)) = cur_via.as_mut() {
+                match toks.as_slice() {
+                    ["LAYER", l, ..] if *record => ls.push(l.trim_end_matches(';').to_string()),
+                    ["END", n, ..] if n == name => {
+                        let (n, ls, record) = cur_via.take().unwrap();
+                        if record {
+                            vias.insert(n, ls);
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            match toks.as_slice() {
+                ["VIA", name, ..] => {
+                    cur_via = Some((name.to_string(), Vec::new(), true));
+                    continue;
+                }
+                ["VIARULE", name, ..] => {
+                    cur_via = Some((name.to_string(), Vec::new(), false));
+                    continue;
+                }
+                _ => {}
+            }
+
             // ---- macro mode: consume MACRO/PIN/DIRECTION, shield tech parsing ----
             if let Some(m) = cur_macro.as_mut() {
                 match toks.as_slice() {
                     ["PIN", name, ..] => {
-                        cur_pin = Some(MacroPin { name: name.to_string(), direction: PinDir::default() });
+                        cur_pin = Some(MacroPin {
+                            name: name.to_string(),
+                            direction: PinDir::default(),
+                        });
                     }
                     ["DIRECTION", d, ..] => {
                         if let Some(p) = cur_pin.as_mut() {
-                            p.direction = match d.trim_end_matches(';').to_ascii_uppercase().as_str() {
-                                "INPUT" => PinDir::Input,
-                                "OUTPUT" | "OUTPUT_TRISTATE" => PinDir::Output,
-                                "INOUT" => PinDir::Inout,
-                                _ => PinDir::Unknown,
-                            };
+                            p.direction =
+                                match d.trim_end_matches(';').to_ascii_uppercase().as_str() {
+                                    "INPUT" => PinDir::Input,
+                                    "OUTPUT" | "OUTPUT_TRISTATE" => PinDir::Output,
+                                    "INOUT" => PinDir::Inout,
+                                    _ => PinDir::Unknown,
+                                };
                         }
                     }
                     ["END", name, ..] => {
@@ -130,7 +174,10 @@ impl Lef {
                 continue;
             }
             if let ["MACRO", name, ..] = toks.as_slice() {
-                cur_macro = Some(Macro { name: name.to_string(), pins: BTreeMap::new() });
+                cur_macro = Some(Macro {
+                    name: name.to_string(),
+                    pins: BTreeMap::new(),
+                });
                 cur_pin = None;
                 continue;
             }
@@ -217,7 +264,14 @@ impl Lef {
                 thicknesses.insert(n.clone(), l.thickness_um);
             }
         }
-        Ok(Lef { layers, macros, routing_order, widths, thicknesses })
+        Ok(Lef {
+            layers,
+            macros,
+            routing_order,
+            widths,
+            thicknesses,
+            vias,
+        })
     }
 
     pub fn load(path: &str) -> Result<Lef, LefError> {
@@ -279,6 +333,52 @@ END met1
     #[test]
     fn empty_errors() {
         assert!(Lef::parse("# no layers here\n").is_err());
+    }
+
+    #[test]
+    fn a_via_block_records_what_it_joins_and_does_not_leak_into_the_layers() {
+        // Verbatim from a sky130 tech LEF. The `LAYER via ;` / `LAYER met1 ;` lines inside a
+        // VIA block are not tech-layer declarations, and a reader that treats them as such
+        // parses a via's geometry into a layer record.
+        let lef = "\
+LAYER met1
+  TYPE ROUTING ;
+  WIDTH 0.14 ;
+END met1
+VIA M1M2_PR DEFAULT
+  LAYER via ;
+  RECT -0.075 -0.075 0.075 0.075 ;
+  LAYER met1 ;
+  RECT -0.16 -0.13 0.16 0.13 ;
+  LAYER met2 ;
+  RECT -0.13 -0.16 0.13 0.16 ;
+END M1M2_PR
+VIARULE via1_rule GENERATE
+  LAYER met1 ;
+  LAYER met2 ;
+END via1_rule
+LAYER met2
+  TYPE ROUTING ;
+  WIDTH 0.14 ;
+END met2
+";
+        let l = Lef::parse(lef).unwrap();
+        assert_eq!(
+            l.vias.get("M1M2_PR").map(|v| v.as_slice()),
+            Some(["via", "met1", "met2"].map(String::from).as_slice()),
+            "the layers the via joins, cut included"
+        );
+        assert!(
+            !l.vias.contains_key("via1_rule"),
+            "VIARULE is generated geometry, not a placeable via"
+        );
+        // and the real layers came through untouched, on both sides of the via blocks
+        assert_eq!(l.routing_order, vec!["met1", "met2"]);
+        assert!((l.widths["met1"] - 0.14).abs() < 1e-9);
+        assert!(
+            !l.layers.contains_key("via"),
+            "a via cut is not a tech layer here"
+        );
     }
 
     #[test]
