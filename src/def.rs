@@ -29,7 +29,14 @@ pub struct Segment {
 impl Segment {
     /// A wire segment with the layer's default width (`width_um == 0`).
     pub fn wire(layer: impl Into<String>, x0: f64, y0: f64, x1: f64, y1: f64) -> Segment {
-        Segment { layer: layer.into(), x0, y0, x1, y1, width_um: 0.0 }
+        Segment {
+            layer: layer.into(),
+            x0,
+            y0,
+            x1,
+            y1,
+            width_um: 0.0,
+        }
     }
 
     /// Manhattan length in microns.
@@ -57,12 +64,34 @@ impl Segment {
     }
 }
 
+/// A via placement inside a net's routing.
+///
+/// DEF states a via as a **point** plus the name of a LEF via, declared while routing on
+/// `layer` — `NEW met1 ( 230690 1040230 ) M1M2_PR`. That point is a connection between two
+/// layers, and it need not be an endpoint of the wire on the layer the via reaches: it very
+/// often lands **mid-span** of it.
+///
+/// So the location is load-bearing. Keeping only a count — which is all this reader used to do
+/// — leaves a consumer no way to know that a wire has to be split there, and the branch beyond
+/// the via silently becomes a separate, unreachable piece of the net.
 #[derive(Debug, Clone)]
+pub struct ViaPoint {
+    pub x: f64,
+    pub y: f64,
+    /// The routing layer in effect where the via was declared.
+    pub layer: String,
+    /// The LEF via name, e.g. `M1M2_PR`.
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct DefNet {
     pub name: String,
     pub pins: Vec<(String, String)>, // (instance, pin)
     pub segments: Vec<Segment>,
     pub vias: usize,
+    /// Where each of those vias sits. See [`ViaPoint`].
+    pub via_points: Vec<ViaPoint>,
 }
 
 // ─────────────────────────── power view (PDN, DBU) ─────────────────────────────
@@ -120,7 +149,11 @@ impl Def {
         self.power_nets
             .iter()
             .find(|n| n.use_power)
-            .or_else(|| self.power_nets.iter().find(|n| POWER_NAMES.contains(&n.name.as_str())))
+            .or_else(|| {
+                self.power_nets
+                    .iter()
+                    .find(|n| POWER_NAMES.contains(&n.name.as_str()))
+            })
             .or_else(|| self.power_nets.first())
     }
 
@@ -140,7 +173,13 @@ impl Def {
             None => Vec::new(),
         };
         let comps = parse_components(&tref);
-        Ok(Def { units_per_um: scale, dbu: scale, nets, power_nets, comps })
+        Ok(Def {
+            units_per_um: scale,
+            dbu: scale,
+            nets,
+            power_nets,
+            comps,
+        })
     }
 
     pub fn load(path: &str) -> Result<Def, DefError> {
@@ -206,7 +245,10 @@ fn units(t: &[String]) -> f64 {
 // ─────────────────────────── signal pass (extraction) ──────────────────────────
 
 fn is_decoration(tok: &str) -> bool {
-    matches!(tok, "TAPER" | "TAPERRULE" | "RECT" | "MASK" | "STYLE" | "VIRTUAL" | "ORIENT")
+    matches!(
+        tok,
+        "TAPER" | "TAPERRULE" | "RECT" | "MASK" | "STYLE" | "VIRTUAL" | "ORIENT"
+    )
 }
 
 fn coord(tok: &str, prev: f64, scale: f64) -> Result<f64, DefError> {
@@ -224,7 +266,9 @@ fn coord(tok: &str, prev: f64, scale: f64) -> Result<f64, DefError> {
 /// its resistance differs — the extractor reads the width off each segment.
 fn parse_ndr(t: &[String], scale: f64) -> BTreeMap<String, BTreeMap<String, f64>> {
     let mut out: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
-    let Some(start) = t.iter().position(|x| x == "NONDEFAULTRULES") else { return out };
+    let Some(start) = t.iter().position(|x| x == "NONDEFAULTRULES") else {
+        return out;
+    };
     let end = (start..t.len())
         .find(|&i| t[i] == "END" && t.get(i + 1).map(String::as_str) == Some("NONDEFAULTRULES"))
         .unwrap_or(t.len());
@@ -244,10 +288,13 @@ fn parse_ndr(t: &[String], scale: f64) -> BTreeMap<String, BTreeMap<String, f64>
             }
             "WIDTH" => {
                 if let (Some(r), Some(l)) = (&rule, &pend_layer) {
-                    if let Some(w) =
-                        t.get(i + 1).and_then(|s| s.trim_end_matches(';').parse::<f64>().ok())
+                    if let Some(w) = t
+                        .get(i + 1)
+                        .and_then(|s| s.trim_end_matches(';').parse::<f64>().ok())
                     {
-                        out.entry(r.clone()).or_default().insert(l.clone(), w / scale);
+                        out.entry(r.clone())
+                            .or_default()
+                            .insert(l.clone(), w / scale);
                     }
                 }
                 pend_layer = None;
@@ -286,7 +333,10 @@ fn parse_signal(
         let name = t.get(i).cloned().unwrap_or_default();
         i += 1;
 
-        let mut net = DefNet { name, pins: Vec::new(), segments: Vec::new(), vias: 0 };
+        let mut net = DefNet {
+            name,
+            ..DefNet::default()
+        };
         let mut in_routing = false;
         let mut layer: Option<String> = None;
         let mut prev: Option<(f64, f64)> = None;
@@ -367,6 +417,16 @@ fn parse_signal(
                 _ => {
                     if in_routing {
                         net.vias += 1;
+                        // `prev` is the point the via sits at: DEF writes the coordinate first
+                        // and the via name immediately after it.
+                        if let (Some((x, y)), Some(l)) = (prev, &layer) {
+                            net.via_points.push(ViaPoint {
+                                x,
+                                y,
+                                layer: l.clone(),
+                                name: t[i].clone(),
+                            });
+                        }
                     }
                     i += 1;
                 }
@@ -435,7 +495,10 @@ fn parse_specialnets(body: &[&str]) -> Vec<NetGeom> {
                     nets.push(n);
                 }
                 let name = body.get(i + 1).copied().unwrap_or("").to_string();
-                cur = Some(NetGeom { name, ..Default::default() });
+                cur = Some(NetGeom {
+                    name,
+                    ..Default::default()
+                });
                 last = None;
                 i += 2;
             }
@@ -472,8 +535,16 @@ fn parse_specialnets(body: &[&str]) -> Vec<NetGeom> {
                     i = next_i;
                     continue;
                 }
-                let x = if xr == "*" { prev.0 } else { xr.parse().unwrap_or(0) };
-                let y = if yr == "*" { prev.1 } else { yr.parse().unwrap_or(0) };
+                let x = if xr == "*" {
+                    prev.0
+                } else {
+                    xr.parse().unwrap_or(0)
+                };
+                let y = if yr == "*" {
+                    prev.1
+                } else {
+                    yr.parse().unwrap_or(0)
+                };
                 i = next_i;
                 if let Some(n) = cur.as_mut() {
                     if !layer.is_empty() {
@@ -496,7 +567,12 @@ fn parse_specialnets(body: &[&str]) -> Vec<NetGeom> {
             }
             "+" => i += 1,
             other => {
-                if other.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false) {
+                if other
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_alphabetic())
+                    .unwrap_or(false)
+                {
                     if let (Some(n), Some(p)) = (cur.as_mut(), last) {
                         if !is_qualifier(other) {
                             n.vias.push(p);
@@ -516,8 +592,21 @@ fn parse_specialnets(body: &[&str]) -> Vec<NetGeom> {
 fn is_qualifier(t: &str) -> bool {
     matches!(
         t,
-        "SHAPE" | "STRIPE" | "FOLLOWPIN" | "STYLE" | "FIXED" | "COVER" | "POWER" | "GROUND"
-            | "RECT" | "PIN" | "MASK" | "RING" | "BLOCKWIRE" | "PADRING" | "BLOCKAGEWIRE"
+        "SHAPE"
+            | "STRIPE"
+            | "FOLLOWPIN"
+            | "STYLE"
+            | "FIXED"
+            | "COVER"
+            | "POWER"
+            | "GROUND"
+            | "RECT"
+            | "PIN"
+            | "MASK"
+            | "RING"
+            | "BLOCKWIRE"
+            | "PADRING"
+            | "BLOCKAGEWIRE"
     )
 }
 
@@ -542,7 +631,54 @@ END NETS
         assert_eq!(n.pins.len(), 2);
         assert!(n.vias >= 1);
         assert!(n.segments.iter().any(|s| (s.len_um() - 1.0).abs() < 1e-9)); // 1000 dbu = 1 um
-        assert!(n.segments.iter().all(|s| s.width_um == 0.0), "default width without an NDR");
+        assert!(
+            n.segments.iter().all(|s| s.width_um == 0.0),
+            "default width without an NDR"
+        );
+    }
+
+    #[test]
+    fn a_via_keeps_its_location_not_just_a_tally() {
+        // Real geometry, from `_00768_` of an fft control block. The two vias here are the
+        // whole point: `M1M2_PR` at (230690, 1040230) sits **mid-span** of the met2 run from
+        // y=1035470 to y=1043460, so it is not an endpoint of anything on met2. A consumer
+        // that only knows "this net has 2 vias" cannot join those layers, and the met1 branch
+        // west of it becomes an unreachable island.
+        let def = "\
+UNITS DISTANCE MICRONS 1000 ;
+NETS 1 ;
+- n1 ( a A ) ( b Y )
+  + ROUTED met2 ( 230690 1035470 ) ( * 1043460 )
+    NEW met1 ( 226550 1040230 ) ( 230690 * )
+    NEW met1 ( 230690 1040230 ) M1M2_PR
+    NEW li1 ( 226550 1040230 ) L1M1_PR_MR ;
+END NETS
+";
+        let n = &Def::parse(def).unwrap().nets[0];
+        assert_eq!(n.vias, 2);
+        assert_eq!(
+            n.via_points.len(),
+            2,
+            "every counted via keeps its location"
+        );
+
+        let m1m2 = n.via_points.iter().find(|v| v.name == "M1M2_PR").unwrap();
+        assert!(
+            (m1m2.x - 230.690).abs() < 1e-9,
+            "microns, like the segments"
+        );
+        assert!((m1m2.y - 1040.230).abs() < 1e-9);
+        assert_eq!(
+            m1m2.layer, "met1",
+            "the layer in effect where it was declared"
+        );
+
+        // and it is genuinely mid-span of the met2 wire — the case that motivated all this
+        let met2 = n.segments.iter().find(|s| s.layer == "met2").unwrap();
+        assert!(
+            m1m2.y > met2.y0.min(met2.y1) && m1m2.y < met2.y0.max(met2.y1),
+            "strictly inside, so it is an endpoint of nothing"
+        );
     }
 
     #[test]
@@ -566,10 +702,21 @@ END NETS
 ";
         let d = Def::parse(def).unwrap();
         let clk = d.nets.iter().find(|n| n.name == "clk").unwrap();
-        assert!(clk.segments.iter().all(|s| (s.width_um - 0.28).abs() < 1e-9), "280 dbu = 0.28 um");
+        assert!(
+            clk.segments
+                .iter()
+                .all(|s| (s.width_um - 0.28).abs() < 1e-9),
+            "280 dbu = 0.28 um"
+        );
         let sig = d.nets.iter().find(|n| n.name == "sig").unwrap();
-        assert!((sig.segments[0].width_um - 0.28).abs() < 1e-9, "TAPERRULE width applied");
-        assert_eq!(sig.vias, 0, "the TAPERRULE rule name must not be miscounted as a via");
+        assert!(
+            (sig.segments[0].width_um - 0.28).abs() < 1e-9,
+            "TAPERRULE width applied"
+        );
+        assert_eq!(
+            sig.vias, 0,
+            "the TAPERRULE rule name must not be miscounted as a via"
+        );
     }
 
     #[test]
