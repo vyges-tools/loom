@@ -75,6 +75,8 @@ pub mod design;
 pub mod verbosity;
 
 pub use design::{Design, DesignError, Step};
+/// Minimal std-only JSON reading, shared rather than reimplemented per engine.
+pub use yosys_json::json;
 
 /// Crate version (`CARGO_PKG_VERSION`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

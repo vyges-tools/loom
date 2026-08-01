@@ -143,7 +143,13 @@ fn attr_truthy(v: &json::Value) -> bool {
 
 // ---- minimal std-only JSON parser --------------------------------------------
 
-mod json {
+/// A minimal std-only JSON reader.
+///
+/// Bundled here originally for the Yosys netlist format, and re-exported as `loom::json`
+/// because it is not Yosys-specific — `vyges-metadata.json` and any other small JSON the
+/// toolchain reads can use it rather than each engine growing its own parser or the whole
+/// suite taking a serde dependency for a few hundred lines of reading.
+pub mod json {
     /// A JSON value. Objects keep insertion order (deterministic iteration).
     #[derive(Debug, Clone)]
     pub enum Value {
