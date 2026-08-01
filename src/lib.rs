@@ -42,6 +42,7 @@ pub mod yosys_json;
 pub mod spice;
 pub mod sdc;
 pub mod spef;
+pub mod coverage;
 /// EM geometry sidecar (per-segment layer/width/length) — the physical dimensions
 /// standard SPEF omits but current-density sign-off needs. Companion to [`spef`].
 pub mod emgeom;
