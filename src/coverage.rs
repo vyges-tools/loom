@@ -40,7 +40,8 @@ pub struct NetlistCoverage {
 impl NetlistCoverage {
     /// Instances an analysis can actually act on.
     pub fn analysable(&self) -> usize {
-        self.instances.saturating_sub(self.physical_only + self.unresolved_signal)
+        self.instances
+            .saturating_sub(self.physical_only + self.unresolved_signal)
     }
 }
 
@@ -54,9 +55,8 @@ pub fn is_power_pin(pin: &str) -> bool {
     const RAILS: &[&str] = &[
         "VPWR", "VGND", "VPB", "VNB", "VDD", "VSS", "VDDA", "VSSA", "VCC", "VEE", "VPP", "GND",
         "VNEG", "VCCD", "VCCD1", "VCCD2", "VSSD", "VSSD1", "VSSD2", "VDDIO", "VSSIO", "VDDPST",
-        "VSSPST", "KAPWR", "VSWITCH", "VCCHIB", "VNW", "VPW", "VNWELL", "VPWELL", "VWELL",
-        "VSUBS", "VBP", "VBN", "VBB", "VBG", "VB", "VBODY", "AVDD", "AVSS", "DVDD", "DVSS",
-        "VPWRIN",
+        "VSSPST", "KAPWR", "VSWITCH", "VCCHIB", "VNW", "VPW", "VNWELL", "VPWELL", "VWELL", "VSUBS",
+        "VBP", "VBN", "VBB", "VBG", "VB", "VBODY", "AVDD", "AVSS", "DVDD", "DVSS", "VPWRIN",
     ];
     RAILS.contains(&p.as_str())
         || p.starts_with("VDD")
@@ -107,7 +107,10 @@ pub struct LibertyCoverage {
 
 pub fn liberty(nl: &Netlist, lib: &Lib) -> LibertyCoverage {
     let masters: BTreeSet<&str> = nl.insts.iter().map(|i| i.cell.as_str()).collect();
-    let mut c = LibertyCoverage { cells_in_lib: lib.cells.len(), ..Default::default() };
+    let mut c = LibertyCoverage {
+        cells_in_lib: lib.cells.len(),
+        ..Default::default()
+    };
     for m in masters {
         let Some(cell) = lib.cell(m) else { continue };
         c.resolved_masters += 1;
@@ -190,17 +193,40 @@ mod tests {
     fn analysable_never_underflows_on_inconsistent_counts() {
         // These counts come from separate passes in callers; a saturating subtraction is
         // cheaper than a panic in a diagnostic that exists to make failures visible.
-        let c = NetlistCoverage { instances: 2, physical_only: 5, ..Default::default() };
+        let c = NetlistCoverage {
+            instances: 2,
+            physical_only: 5,
+            ..Default::default()
+        };
         assert_eq!(c.analysable(), 0);
     }
 
     #[test]
     fn spef_percent_and_the_unmatched_case_are_distinct() {
-        let none_read = SpefCoverage { design_nets: 10, file_nets: 0, matched: 0 };
-        assert!(!none_read.read_but_unmatched(), "nothing was read — a different failure");
-        let read_unmatched = SpefCoverage { design_nets: 10, file_nets: 99, matched: 0 };
+        let none_read = SpefCoverage {
+            design_nets: 10,
+            file_nets: 0,
+            matched: 0,
+        };
+        assert!(
+            !none_read.read_but_unmatched(),
+            "nothing was read — a different failure"
+        );
+        let read_unmatched = SpefCoverage {
+            design_nets: 10,
+            file_nets: 99,
+            matched: 0,
+        };
         assert!(read_unmatched.read_but_unmatched());
         assert_eq!(read_unmatched.percent(), 0.0);
-        assert_eq!(SpefCoverage { design_nets: 0, file_nets: 0, matched: 0 }.percent(), 0.0);
+        assert_eq!(
+            SpefCoverage {
+                design_nets: 0,
+                file_nets: 0,
+                matched: 0
+            }
+            .percent(),
+            0.0
+        );
     }
 }
