@@ -203,6 +203,18 @@ fn resolve_objs(tok: &str) -> Vec<String> {
             "all_inputs" => return vec!["*INPUTS*".into()],
             "all_outputs" => return vec!["*OUTPUTS*".into()],
             "all_registers" => return vec!["*REGS*".into()],
+            // `[list [get_ports a] [get_ports b] ...]` — a Tcl list of object collections,
+            // which real sign-off SDCs use for wide exceptions. Resolve each element and
+            // concatenate. Without this the whole construct collapsed to the literal token
+            // `list`, which matches nothing in the design: the exception silently did not
+            // apply, and the timer went on timing paths the SDC meant to cut.
+            "list" | "concat" => {
+                let mut names = Vec::new();
+                for p in &parts[1..] {
+                    names.extend(resolve_objs(p));
+                }
+                return names;
+            }
             "get_ports" | "get_pins" | "get_clocks" | "get_nets" | "get_cells" => {
                 let mut names = Vec::new();
                 for p in &parts[1..] {
@@ -259,7 +271,9 @@ fn subst_vars(line: &str, vars: &HashMap<String, String>) -> String {
 
 /// Pull a flag's value: `-flag value`. Returns the token after the flag.
 fn flag_val<'a>(toks: &'a [String], flag: &str) -> Option<&'a String> {
-    toks.iter().position(|t| t == flag).and_then(|p| toks.get(p + 1))
+    toks.iter()
+        .position(|t| t == flag)
+        .and_then(|p| toks.get(p + 1))
 }
 
 fn has_flag(toks: &[String], flag: &str) -> bool {
@@ -294,9 +308,14 @@ fn trailing_obj(toks: &[String], valued_flags: &[&str]) -> Option<String> {
 /// to the engine's base (ns for time, pF for cap). Returns multiplier.
 fn unit_scale(spec: &str, time: bool) -> Option<f64> {
     let s = spec.trim().to_lowercase();
-    let (num, unit): (String, String) =
-        s.chars().partition(|c| c.is_ascii_digit() || *c == '.' || *c == 'e' || *c == '-' || *c == '+');
-    let mag: f64 = if num.is_empty() { 1.0 } else { num.parse().ok()? };
+    let (num, unit): (String, String) = s
+        .chars()
+        .partition(|c| c.is_ascii_digit() || *c == '.' || *c == 'e' || *c == '-' || *c == '+');
+    let mag: f64 = if num.is_empty() {
+        1.0
+    } else {
+        num.parse().ok()?
+    };
     let base = if time {
         match unit.as_str() {
             "s" => 1e9,
@@ -328,7 +347,7 @@ impl Sdc {
         let mut vars: HashMap<String, String> = HashMap::new();
         let mut t_scale = 1.0; // -> ns
         let mut c_scale = 1.0; // -> pF
-        // (name, source, divide, multiply) for generated clocks, resolved last.
+                               // (name, source, divide, multiply) for generated clocks, resolved last.
         let mut gen: Vec<(String, String, f64, f64)> = Vec::new();
 
         for line in logical_lines(text) {
@@ -364,28 +383,58 @@ impl Sdc {
                         .as_deref()
                         .map(|o| resolve_objs(o).first().cloned().unwrap_or_default())
                         .unwrap_or_default();
-                    let name = flag_val(&toks, "-name")
-                        .cloned()
-                        .unwrap_or_else(|| if source.is_empty() { "clk".into() } else { source.clone() });
-                    let src = if source.is_empty() { name.clone() } else { source };
-                    sdc.clocks.push(SdcClock { name, source: src, period: period * t_scale });
+                    let name = flag_val(&toks, "-name").cloned().unwrap_or_else(|| {
+                        if source.is_empty() {
+                            "clk".into()
+                        } else {
+                            source.clone()
+                        }
+                    });
+                    let src = if source.is_empty() {
+                        name.clone()
+                    } else {
+                        source
+                    };
+                    sdc.clocks.push(SdcClock {
+                        name,
+                        source: src,
+                        period: period * t_scale,
+                    });
                 }
                 "create_generated_clock" => {
                     let obj = trailing_obj(
                         &toks,
-                        &["-name", "-source", "-divide_by", "-multiply_by", "-edges", "-comment", "-master_clock"],
+                        &[
+                            "-name",
+                            "-source",
+                            "-divide_by",
+                            "-multiply_by",
+                            "-edges",
+                            "-comment",
+                            "-master_clock",
+                        ],
                     );
                     let target = obj
                         .as_deref()
                         .map(|o| resolve_objs(o).first().cloned().unwrap_or_default())
                         .unwrap_or_default();
-                    let name = flag_val(&toks, "-name").cloned().unwrap_or_else(|| target.clone());
+                    let name = flag_val(&toks, "-name")
+                        .cloned()
+                        .unwrap_or_else(|| target.clone());
                     let source = flag_val(&toks, "-source")
                         .map(|o| resolve_objs(o).first().cloned().unwrap_or_default())
                         .unwrap_or_default();
-                    let div: f64 = flag_val(&toks, "-divide_by").and_then(|v| v.parse().ok()).unwrap_or(1.0);
-                    let mul: f64 = flag_val(&toks, "-multiply_by").and_then(|v| v.parse().ok()).unwrap_or(1.0);
-                    let tgt = if target.is_empty() { name.clone() } else { target };
+                    let div: f64 = flag_val(&toks, "-divide_by")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(1.0);
+                    let mul: f64 = flag_val(&toks, "-multiply_by")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(1.0);
+                    let tgt = if target.is_empty() {
+                        name.clone()
+                    } else {
+                        target
+                    };
                     gen.push((name, tgt, div.max(1.0), mul.max(1.0)));
                     let _ = source;
                 }
@@ -396,13 +445,20 @@ impl Sdc {
                         .or_else(|| flag_val(&toks, "-max"))
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0.0);
-                    let obj = trailing_obj(&toks, &["-clock", "-max", "-min", "-reference_pin", "-comment"]);
+                    let obj = trailing_obj(
+                        &toks,
+                        &["-clock", "-max", "-min", "-reference_pin", "-comment"],
+                    );
                     let objs = obj.as_deref().map(resolve_objs).unwrap_or_default();
-                    let default = objs.is_empty()
-                        || objs.iter().any(|o| o == "*INPUTS*" || o == "*OUTPUTS*");
+                    let default =
+                        objs.is_empty() || objs.iter().any(|o| o == "*INPUTS*" || o == "*OUTPUTS*");
                     let ports: Vec<String> =
                         objs.into_iter().filter(|o| !o.starts_with('*')).collect();
-                    let d = IoDelay { value: val * t_scale, default, ports };
+                    let d = IoDelay {
+                        value: val * t_scale,
+                        default,
+                        ports,
+                    };
                     if toks[0] == "set_input_delay" {
                         sdc.input_delays.push(d);
                     } else {
@@ -413,7 +469,9 @@ impl Sdc {
                     let val: f64 = toks
                         .iter()
                         .skip(1)
-                        .find(|t| !t.starts_with('-') && !t.starts_with('[') && t.parse::<f64>().is_ok())
+                        .find(|t| {
+                            !t.starts_with('-') && !t.starts_with('[') && t.parse::<f64>().is_ok()
+                        })
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0.0);
                     let v = val * t_scale;
@@ -443,10 +501,13 @@ impl Sdc {
                     }
                 }
                 "set_load" => {
-                    let v = toks
-                        .iter()
-                        .skip(1)
-                        .find_map(|t| if t.starts_with('-') { None } else { t.parse::<f64>().ok() });
+                    let v = toks.iter().skip(1).find_map(|t| {
+                        if t.starts_with('-') {
+                            None
+                        } else {
+                            t.parse::<f64>().ok()
+                        }
+                    });
                     if let Some(v) = v {
                         sdc.load = Some(v * c_scale);
                     }
@@ -467,8 +528,10 @@ impl Sdc {
                     while i < toks.len() {
                         if toks[i] == "-group" {
                             if let Some(v) = toks.get(i + 1) {
-                                let names: Vec<String> =
-                                    resolve_objs(v).into_iter().filter(|o| !o.starts_with('*')).collect();
+                                let names: Vec<String> = resolve_objs(v)
+                                    .into_iter()
+                                    .filter(|o| !o.starts_with('*'))
+                                    .collect();
                                 if !names.is_empty() {
                                     groups.push(names);
                                 }
@@ -484,7 +547,11 @@ impl Sdc {
                 }
                 "set_false_path" => {
                     let (from, to) = from_to(&toks);
-                    sdc.exceptions.push(Exception { kind: ExcKind::FalsePath, from, to });
+                    sdc.exceptions.push(Exception {
+                        kind: ExcKind::FalsePath,
+                        from,
+                        to,
+                    });
                 }
                 "set_multicycle_path" => {
                     let n: u32 = toks
@@ -493,7 +560,11 @@ impl Sdc {
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(1);
                     let (from, to) = from_to(&toks);
-                    sdc.exceptions.push(Exception { kind: ExcKind::Multicycle(n), from, to });
+                    sdc.exceptions.push(Exception {
+                        kind: ExcKind::Multicycle(n),
+                        from,
+                        to,
+                    });
                 }
                 other => sdc.ignored.push(other.to_string()),
             }
@@ -503,7 +574,11 @@ impl Sdc {
         for (name, target, div, mul) in gen {
             let master = sdc.clocks.first().map(|c| c.period).unwrap_or(0.0);
             let period = master * div / mul;
-            sdc.clocks.push(SdcClock { name, source: target, period });
+            sdc.clocks.push(SdcClock {
+                name,
+                source: target,
+                period,
+            });
         }
         Ok(sdc)
     }
@@ -512,7 +587,6 @@ impl Sdc {
         let text = std::fs::read_to_string(path).map_err(|e| SdcError(format!("{path}: {e}")))?;
         Sdc::parse(&text)
     }
-
 }
 
 /// Extract `-from`/`-to` object names (first object of each), `*` if absent.
@@ -532,7 +606,10 @@ fn from_to(toks: &[String]) -> (String, String) {
         }
         "*".to_string()
     };
-    (pick(&["-from", "-rise_from", "-fall_from"]), pick(&["-to", "-rise_to", "-fall_to"]))
+    (
+        pick(&["-from", "-rise_from", "-fall_from"]),
+        pick(&["-to", "-rise_to", "-fall_to"]),
+    )
 }
 
 #[cfg(test)]
@@ -547,5 +624,43 @@ mod async_group_tests {
         assert_eq!(sdc.async_groups.len(), 2, "two groups");
         assert!(sdc.async_groups.iter().any(|g| g == &vec!["a".to_string()]));
         assert!(sdc.async_groups.iter().any(|g| g == &vec!["b".to_string()]));
+    }
+}
+
+#[cfg(test)]
+mod list_obj_tests {
+    use super::*;
+
+    /// `[list ...]` around object collections is ordinary in sign-off SDCs, and resolving it
+    /// to the literal token `list` makes the exception match nothing — so it silently does not
+    /// apply and the paths stay timed. Found on a real pad-wrapper SDC.
+    #[test]
+    fn a_tcl_list_of_object_collections_resolves_to_its_members() {
+        assert_eq!(
+            resolve_objs("[list [get_ports {a}] [get_ports {b}] [get_ports {c}]]"),
+            vec!["a", "b", "c"]
+        );
+    }
+
+    #[test]
+    fn a_false_path_from_a_list_names_a_real_port_not_the_word_list() {
+        let sdc = Sdc::parse(
+            "create_clock -name clk -period 10 [get_ports clk]\n\
+             set_false_path -from [list [get_ports {mask_rev[0]}] [get_ports {mask_rev[1]}]] \
+             -to [get_ports {out}]\n",
+        )
+        .unwrap();
+        assert_eq!(sdc.exceptions.len(), 1);
+        assert_eq!(
+            sdc.exceptions[0].from, "mask_rev[0]",
+            "must be a design object, not the Tcl command name"
+        );
+        assert_eq!(sdc.exceptions[0].to, "out");
+    }
+
+    #[test]
+    fn a_plain_get_ports_is_unaffected() {
+        assert_eq!(resolve_objs("[get_ports {clk}]"), vec!["clk"]);
+        assert_eq!(resolve_objs("[all_inputs]"), vec!["*INPUTS*"]);
     }
 }
