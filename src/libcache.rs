@@ -19,7 +19,8 @@ use crate::liberty::{Arc, Cell, Constraint, Dir, Lib, Pin, RecvCap, Table};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLC4"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLC5"; // Vyges Liberty Cache — bump the trailing digit on any format change
+                                 // VLC5: Cell gained `async_reset_pins` (the `ff` group's clear/preset pins), for RDC.
                                  // VLC2: pin `function`, cell `cell_footprint` + `area`.
                                  // VLC3: library `Thresholds` (slew/delay measurement points).
                                  // VLC4: pin `recovery` + `removal` constraint groups.
@@ -109,7 +110,11 @@ fn dec_table(r: &mut R) -> Option<Table> {
     for _ in 0..n {
         values.push(r.vf64()?);
     }
-    Some(Table { index_1, index_2, values })
+    Some(Table {
+        index_1,
+        index_2,
+        values,
+    })
 }
 
 fn enc_wave(w: &mut W, x: &CcsWaveform) {
@@ -158,7 +163,10 @@ fn enc_constraint(w: &mut W, c: &Constraint) {
     enc_table(w, &c.fall);
 }
 fn dec_constraint(r: &mut R) -> Option<Constraint> {
-    Some(Constraint { rise: dec_table(r)?, fall: dec_table(r)? })
+    Some(Constraint {
+        rise: dec_table(r)?,
+        fall: dec_table(r)?,
+    })
 }
 
 fn enc_recv(w: &mut W, rc: &RecvCap) {
@@ -301,7 +309,20 @@ fn dec_pin(r: &mut R) -> Option<Pin> {
     for _ in 0..na {
         arcs.push(dec_arc(r)?);
     }
-    Some(Pin { name, direction, capacitance, cap_f, recv, clock, function, setup, hold, recovery, removal, arcs })
+    Some(Pin {
+        name,
+        direction,
+        capacitance,
+        cap_f,
+        recv,
+        clock,
+        function,
+        setup,
+        hold,
+        recovery,
+        removal,
+        arcs,
+    })
 }
 
 fn enc_cell(w: &mut W, c: &Cell) {
@@ -318,6 +339,10 @@ fn enc_cell(w: &mut W, c: &Cell) {
             w.s(s);
         }
         None => w.u8(0),
+    }
+    w.u64(c.async_reset_pins.len() as u64);
+    for r in &c.async_reset_pins {
+        w.s(r);
     }
     w.f64(c.leakage_w);
     w.f64(c.int_energy_j);
@@ -344,6 +369,10 @@ fn dec_cell(r: &mut R) -> Option<Cell> {
         1 => Some(r.s()?),
         _ => return None,
     };
+    let mut async_reset_pins = Vec::new();
+    for _ in 0..r.u64()? {
+        async_reset_pins.push(r.s()?);
+    }
     let leakage_w = r.f64()?;
     let int_energy_j = r.f64()?;
     let cell_footprint = match r.u8()? {
@@ -352,7 +381,17 @@ fn dec_cell(r: &mut R) -> Option<Cell> {
         _ => return None,
     };
     let area = r.f64()?;
-    Some(Cell { name, pins, is_seq, clock_pin, leakage_w, int_energy_j, cell_footprint, area })
+    Some(Cell {
+        name,
+        pins,
+        is_seq,
+        clock_pin,
+        leakage_w,
+        int_energy_j,
+        cell_footprint,
+        area,
+        async_reset_pins,
+    })
 }
 
 /// Serialize a `Lib` to the cache byte format (magic + version + payload).
@@ -364,8 +403,15 @@ pub fn encode(lib: &Lib) -> Vec<u8> {
     // the default on the SECOND load — working once and then quietly not.
     let t = &lib.thresholds;
     for v in [
-        t.slew_lower_rise, t.slew_upper_rise, t.slew_lower_fall, t.slew_upper_fall,
-        t.input_rise, t.input_fall, t.output_rise, t.output_fall, t.slew_derate,
+        t.slew_lower_rise,
+        t.slew_upper_rise,
+        t.slew_lower_fall,
+        t.slew_upper_fall,
+        t.input_rise,
+        t.input_fall,
+        t.output_rise,
+        t.output_fall,
+        t.slew_derate,
     ] {
         w.f64(v);
     }
@@ -402,7 +448,11 @@ pub fn decode(bytes: &[u8]) -> Option<Lib> {
         let k = r.s()?;
         cells.insert(k, dec_cell(&mut r)?);
     }
-    Some(Lib { cells, voltage, thresholds })
+    Some(Lib {
+        cells,
+        voltage,
+        thresholds,
+    })
 }
 
 // ── on-disk cache ────────────────────────────────────────────────────────────────
@@ -417,7 +467,10 @@ fn cache_dir() -> Option<PathBuf> {
         }
     }
     let home = std::env::var_os("HOME")?;
-    let dir = Path::new(&home).join(".vyges").join("cache").join("liberty");
+    let dir = Path::new(&home)
+        .join(".vyges")
+        .join("cache")
+        .join("liberty");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
@@ -435,7 +488,9 @@ fn cache_cap_bytes() -> u64 {
 /// entries first. Content-addressed entries are cheap to regenerate, so evicting the
 /// oldest on overflow is a safe FIFO/LRU-ish bound. Best-effort; ignores errors.
 fn prune_in(dir: &Path, cap_bytes: u64) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut entries: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
     let mut total: u64 = 0;
     for e in rd.flatten() {
@@ -476,7 +531,8 @@ pub fn disk_get_in(dir: &Path, key: (u64, u64, bool)) -> Option<Lib> {
 pub fn disk_put_in(dir: &Path, key: (u64, u64, bool), lib: &Lib) {
     let bytes = encode(lib);
     let tmp = dir.join(format!(".tmp-{}-{:016x}", std::process::id(), key.0));
-    if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, entry_path(dir, key)).is_err() {
+    if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, entry_path(dir, key)).is_err()
+    {
         let _ = std::fs::remove_file(&tmp);
     }
 }
@@ -533,13 +589,20 @@ library (demo) {
         // Thresholds must survive the cache. A field parsed but not encoded works on the
         // FIRST load and silently reverts to the default on every one after — the worst
         // shape of bug, because it passes any test that parses and uses in one breath.
-        assert_eq!(back.thresholds, lib.thresholds, "thresholds lost across the cache");
+        assert_eq!(
+            back.thresholds, lib.thresholds,
+            "thresholds lost across the cache"
+        );
         // recovery/removal likewise: an async pin whose checks vanish on the second
         // load leaves the design silently unchecked, which is worse than not caching.
         for (cn, c) in &lib.cells {
             for (pn, p) in &c.pins {
                 let b = &back.cells[cn].pins[pn];
-                assert_eq!(b.recovery.len(), p.recovery.len(), "{cn}/{pn} recovery lost");
+                assert_eq!(
+                    b.recovery.len(),
+                    p.recovery.len(),
+                    "{cn}/{pn} recovery lost"
+                );
                 assert_eq!(b.removal.len(), p.removal.len(), "{cn}/{pn} removal lost");
             }
         }
@@ -559,11 +622,14 @@ library (demo) {
     fn big_lib(cells: usize) -> String {
         let idx = "0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64";
         let table = |name: &str, base: f64| {
-            let mut t = format!("        {name} (t) {{ index_1(\"{idx}\"); index_2(\"{idx}\");\n          values(");
+            let mut t = format!(
+                "        {name} (t) {{ index_1(\"{idx}\"); index_2(\"{idx}\");\n          values("
+            );
             let rows: Vec<String> = (0..7)
                 .map(|i| {
-                    let r: Vec<String> =
-                        (0..7).map(|j| format!("{:.5}", base + i as f64 * 0.011 + j as f64 * 0.003)).collect();
+                    let r: Vec<String> = (0..7)
+                        .map(|j| format!("{:.5}", base + i as f64 * 0.011 + j as f64 * 0.003))
+                        .collect();
                     format!("\"{}\"", r.join(", "))
                 })
                 .collect();
@@ -573,9 +639,13 @@ library (demo) {
         };
         let mut s = String::from("library (big) {\n  capacitive_load_unit (1, pf);\n");
         for k in 0..cells {
-            s.push_str(&format!("  cell (CELL{k}) {{\n    cell_leakage_power : 1.0;\n"));
+            s.push_str(&format!(
+                "  cell (CELL{k}) {{\n    cell_leakage_power : 1.0;\n"
+            ));
             s.push_str("    pin (A) { direction : input; capacitance : 0.002; }\n");
-            s.push_str("    pin (Y) { direction : output;\n      timing () { related_pin : \"A\";\n");
+            s.push_str(
+                "    pin (Y) { direction : output;\n      timing () { related_pin : \"A\";\n",
+            );
             s.push_str(&table("cell_rise", 0.10));
             s.push_str(&table("cell_fall", 0.12));
             s.push_str(&table("rise_transition", 0.03));
@@ -592,7 +662,11 @@ library (demo) {
         use std::time::Instant;
         let text = big_lib(2000);
         let bytes = encode(&Lib::parse(&text).unwrap());
-        println!("\nlib text {} KB → cache {} KB", text.len() / 1024, bytes.len() / 1024);
+        println!(
+            "\nlib text {} KB → cache {} KB",
+            text.len() / 1024,
+            bytes.len() / 1024
+        );
         let reps = 5;
         let mut t_parse = std::time::Duration::MAX;
         let mut t_decode = std::time::Duration::MAX;
@@ -608,7 +682,10 @@ library (demo) {
         }
         let sp = t_parse.as_secs_f64() * 1e3;
         let sd = t_decode.as_secs_f64() * 1e3;
-        println!("parse: {sp:.2} ms   decode: {sd:.2} ms   speedup: {:.1}×\n", sp / sd);
+        println!(
+            "parse: {sp:.2} ms   decode: {sd:.2} ms   speedup: {:.1}×\n",
+            sp / sd
+        );
         assert!(sd < sp, "decode should beat re-parse");
     }
 
@@ -626,7 +703,11 @@ library (demo) {
         // key includes skip_ccs → the NLDM variant is a different entry
         let nldm_key = (key.0, key.1, true);
         assert!(disk_get_in(&dir, nldm_key).is_none());
-        disk_put_in(&dir, nldm_key, &Lib::parse_opts(LIB, LibOpts { skip_ccs: true }).unwrap());
+        disk_put_in(
+            &dir,
+            nldm_key,
+            &Lib::parse_opts(LIB, LibOpts { skip_ccs: true }).unwrap(),
+        );
         assert!(disk_get_in(&dir, nldm_key).is_some());
 
         std::fs::remove_dir_all(&dir).ok();
@@ -636,8 +717,7 @@ library (demo) {
     fn prune_bounds_cache_size() {
         let lib = Lib::parse(LIB).unwrap();
         let one = encode(&lib).len() as u64;
-        let dir =
-            std::env::temp_dir().join(format!("vyges_libcache_prune_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vyges_libcache_prune_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for i in 0..6u64 {
             disk_put_in(&dir, (i, LIB.len() as u64, false), &lib);

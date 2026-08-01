@@ -21,8 +21,8 @@ pub enum Dir {
 
 #[derive(Debug, Clone, Default)]
 pub struct Table {
-    pub index_1: Vec<f64>, // input slews
-    pub index_2: Vec<f64>, // output loads
+    pub index_1: Vec<f64>,     // input slews
+    pub index_2: Vec<f64>,     // output loads
     pub values: Vec<Vec<f64>>, // values[i][j] over (slew_i, load_j)
 }
 
@@ -54,7 +54,9 @@ pub struct Constraint {
 impl Constraint {
     /// Worst (max) of rise/fall, interpolated at the clock and data transitions.
     pub fn eval(&self, clock_slew: f64, data_slew: f64) -> f64 {
-        self.rise.lookup(clock_slew, data_slew).max(self.fall.lookup(clock_slew, data_slew))
+        self.rise
+            .lookup(clock_slew, data_slew)
+            .max(self.fall.lookup(clock_slew, data_slew))
     }
 }
 
@@ -86,7 +88,11 @@ impl RecvCap {
                     n += 1;
                 }
             }
-            if n == 0 { None } else { Some(sum / n as f64) }
+            if n == 0 {
+                None
+            } else {
+                Some(sum / n as f64)
+            }
         };
         // average the two segments per edge, then the two edges; skip empty tables.
         let edge = |c1: &Table, c2: &Table| match (mean(c1), mean(c2)) {
@@ -115,16 +121,16 @@ impl RecvCap {
 pub struct Pin {
     pub name: String,
     pub direction: Dir,
-    pub capacitance: f64,        // input capacitance in library units (timing/NLDM load axis)
-    pub cap_f: f64,              // same capacitance in Farads (power: net-load summation)
-    pub recv: Option<RecvCap>,   // CCS receiver model (input pins); None -> use `capacitance`
-    pub clock: bool,             // `clock : true` — the cell's clock pin
+    pub capacitance: f64, // input capacitance in library units (timing/NLDM load axis)
+    pub cap_f: f64,       // same capacitance in Farads (power: net-load summation)
+    pub recv: Option<RecvCap>, // CCS receiver model (input pins); None -> use `capacitance`
+    pub clock: bool,      // `clock : true` — the cell's clock pin
     /// Boolean `function` of an output pin, verbatim from Liberty (e.g. `"!A"`, `"A&B"`).
     /// `None` on inputs, and on outputs in libraries that omit it — a timing-only library is
     /// perfectly valid, so absence is not an error.
     pub function: Option<String>,
-    pub setup: Vec<Constraint>,  // setup constraint group(s) vs the clock
-    pub hold: Vec<Constraint>,   // hold constraint group(s) vs the clock
+    pub setup: Vec<Constraint>, // setup constraint group(s) vs the clock
+    pub hold: Vec<Constraint>,  // hold constraint group(s) vs the clock
     /// `recovery_*` — the async set/reset release must arrive early enough before the
     /// clock edge. The asynchronous counterpart of setup, on the SET/RESET pin.
     pub recovery: Vec<Constraint>,
@@ -134,7 +140,7 @@ pub struct Pin {
     /// These are separate constraints with their own tables; applying a *data* setup/hold
     /// table to an async pin is not an approximation, it is the wrong check.
     pub removal: Vec<Constraint>,
-    pub arcs: Vec<Arc>,          // delay arcs (e.g. CK->Q on a flop output)
+    pub arcs: Vec<Arc>, // delay arcs (e.g. CK->Q on a flop output)
 }
 
 impl Pin {
@@ -173,10 +179,10 @@ impl Pin {
 pub struct Cell {
     pub name: String,
     pub pins: BTreeMap<String, Pin>,
-    pub is_seq: bool,                // has an `ff`/`latch` group
-    pub clock_pin: Option<String>,   // the pin marked `clock : true`
-    pub leakage_w: f64,              // cell_leakage_power → Watts (power)
-    pub int_energy_j: f64,           // representative per-transition internal energy → Joules (power)
+    pub is_seq: bool,              // has an `ff`/`latch` group
+    pub clock_pin: Option<String>, // the pin marked `clock : true`
+    pub leakage_w: f64,            // cell_leakage_power → Watts (power)
+    pub int_energy_j: f64,         // representative per-transition internal energy → Joules (power)
     /// `cell_footprint` — the vendor's own grouping of interchangeable cells. When a library
     /// provides it, it is the most reliable equivalence key there is: the foundry is asserting
     /// these cells are drop-in for one another.
@@ -184,6 +190,14 @@ pub struct Cell {
     /// `area` in library units. Zero when absent. Ranks an equivalence class: for cells of the
     /// same function, area is a good proxy for drive strength.
     pub area: f64,
+    /// Pins that **asynchronously** force the output — the `clear` / `preset` expressions in
+    /// the `ff` / `latch` group, e.g. `clear : "!RESET_B"` yields `["RESET_B"]`.
+    ///
+    /// These are the reset-domain sources, and they are what makes reset-domain-crossing
+    /// analysis possible at all. A synchronous reset is just data on `next_state` and is
+    /// deliberately NOT collected here: it is timed like any other path and cannot cause the
+    /// deassertion race an RDC check exists to find.
+    pub async_reset_pins: Vec<String>,
 }
 
 impl Lib {
@@ -212,10 +226,16 @@ impl Lib {
         let Some(c) = self.cells.get(cell) else {
             return Vec::new();
         };
-        let mut out: Vec<&Cell> =
-            self.cells.values().filter(|o| interchangeable(c, o)).collect();
+        let mut out: Vec<&Cell> = self
+            .cells
+            .values()
+            .filter(|o| interchangeable(c, o))
+            .collect();
         out.sort_by(|a, b| {
-            a.area.partial_cmp(&b.area).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.name.cmp(&b.name))
+            a.area
+                .partial_cmp(&b.area)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.name.cmp(&b.name))
         });
         out
     }
@@ -224,14 +244,20 @@ impl Lib {
     /// setup-repair move: a bigger drive on a critical arc.
     pub fn upsize_candidates(&self, cell: &str) -> Vec<&Cell> {
         let area = self.cells.get(cell).map(|c| c.area).unwrap_or(0.0);
-        self.equivalence_class(cell).into_iter().filter(|c| c.area > area && c.name != cell).collect()
+        self.equivalence_class(cell)
+            .into_iter()
+            .filter(|c| c.area > area && c.name != cell)
+            .collect()
     }
 
     /// Interchangeable cells **smaller** than `cell` — downsize candidates, smallest first. Adds
     /// delay, so it is a hold-repair move as well as an area/leakage one.
     pub fn downsize_candidates(&self, cell: &str) -> Vec<&Cell> {
         let area = self.cells.get(cell).map(|c| c.area).unwrap_or(0.0);
-        self.equivalence_class(cell).into_iter().filter(|c| c.area < area && c.name != cell).collect()
+        self.equivalence_class(cell)
+            .into_iter()
+            .filter(|c| c.area < area && c.name != cell)
+            .collect()
     }
 }
 
@@ -479,6 +505,26 @@ fn next_block(s: &str, from: usize, kw: &str) -> Option<(String, String, usize)>
     }
 }
 
+/// Identifiers in a Liberty boolean expression — `"!RESET_B"` -> `["RESET_B"]`,
+/// `"!CLR & SET"` -> `["CLR", "SET"]`. Operators, constants and whitespace fall away.
+fn idents_in(expr: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for ch in expr.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            cur.push(ch);
+        } else if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    // A bare `1`/`0` is a constant, not a pin.
+    out.retain(|t| !t.chars().all(|c| c.is_ascii_digit()));
+    out
+}
+
 fn simple_attr(body: &str, key: &str) -> Option<String> {
     // matches `key : value ;`
     let b = body.as_bytes();
@@ -499,13 +545,17 @@ fn simple_attr(body: &str, key: &str) -> Option<String> {
 }
 
 fn floats(s: &str) -> Vec<f64> {
-    s.split(',').filter_map(|t| t.trim().parse::<f64>().ok()).collect()
+    s.split(',')
+        .filter_map(|t| t.trim().parse::<f64>().ok())
+        .collect()
 }
 
 fn parse_table(body: &str) -> Table {
     // index_1/index_2 use paren+quote form: `index_1 ("0.01, 0.04");`
     let idx = |kw: &str| {
-        next_paren_after(body, kw).map(|s| floats(&s.replace('"', ""))).unwrap_or_default()
+        next_paren_after(body, kw)
+            .map(|s| floats(&s.replace('"', "")))
+            .unwrap_or_default()
     };
     let index_1 = idx("index_1");
     let index_2 = idx("index_2");
@@ -526,7 +576,11 @@ fn parse_table(body: &str) -> Table {
             rows
         })
         .unwrap_or_default();
-    Table { index_1, index_2, values }
+    Table {
+        index_1,
+        index_2,
+        values,
+    }
 }
 
 /// Content of the `( ... )` following `kw` (paren-matched), e.g. `values ( ... )`.
@@ -565,7 +619,9 @@ fn next_paren_after(s: &str, kw: &str) -> Option<String> {
 
 fn parse_arc(timing_body: &str, skip_ccs: bool) -> Arc {
     let tbl = |name: &str| {
-        next_block(timing_body, 0, name).map(|(_, body, _)| parse_table(&body)).unwrap_or_default()
+        next_block(timing_body, 0, name)
+            .map(|(_, body, _)| parse_table(&body))
+            .unwrap_or_default()
     };
     Arc {
         related_pin: simple_attr(timing_body, "related_pin").unwrap_or_default(),
@@ -575,7 +631,11 @@ fn parse_arc(timing_body: &str, skip_ccs: bool) -> Arc {
         rise_transition: tbl("rise_transition"),
         fall_transition: tbl("fall_transition"),
         // CCS output_current waveforms — skipped (empty) for NLDM-only parses.
-        ccs: if skip_ccs { crate::ccs::CcsArc::default() } else { parse_ccs(timing_body) },
+        ccs: if skip_ccs {
+            crate::ccs::CcsArc::default()
+        } else {
+            parse_ccs(timing_body)
+        },
         sigma_rise: tbl("ocv_sigma_cell_rise"),
         sigma_fall: tbl("ocv_sigma_cell_fall"),
     }
@@ -595,7 +655,9 @@ fn parse_ccs_set(timing_body: &str, group: &str) -> Vec<crate::ccs::CcsWaveform>
         return Vec::new();
     };
     let first = |kw: &str, b: &str| {
-        next_paren_after(b, kw).map(|s| floats(&s.replace('"', ""))).unwrap_or_default()
+        next_paren_after(b, kw)
+            .map(|s| floats(&s.replace('"', "")))
+            .unwrap_or_default()
     };
     let mut out = Vec::new();
     let mut at = 0;
@@ -606,7 +668,9 @@ fn parse_ccs_set(timing_body: &str, group: &str) -> Vec<crate::ccs::CcsWaveform>
             out.push(crate::ccs::CcsWaveform {
                 in_slew: first("index_1", &vbody).first().copied().unwrap_or(0.0),
                 out_cap: first("index_2", &vbody).first().copied().unwrap_or(0.0),
-                ref_time: simple_attr(&vbody, "reference_time").and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                ref_time: simple_attr(&vbody, "reference_time")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0),
                 time,
                 current,
             });
@@ -619,9 +683,14 @@ fn parse_ccs_set(timing_body: &str, group: &str) -> Vec<crate::ccs::CcsWaveform>
 /// Parse a setup/hold constraint group's rise/fall tables.
 fn parse_constraint(timing_body: &str) -> Constraint {
     let tbl = |name: &str| {
-        next_block(timing_body, 0, name).map(|(_, b, _)| parse_table(&b)).unwrap_or_default()
+        next_block(timing_body, 0, name)
+            .map(|(_, b, _)| parse_table(&b))
+            .unwrap_or_default()
     };
-    Constraint { rise: tbl("rise_constraint"), fall: tbl("fall_constraint") }
+    Constraint {
+        rise: tbl("rise_constraint"),
+        fall: tbl("fall_constraint"),
+    }
 }
 
 fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
@@ -631,8 +700,9 @@ fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
         Some("inout") => Dir::Inout,
         _ => Dir::Other,
     };
-    let capacitance =
-        simple_attr(body, "capacitance").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let capacitance = simple_attr(body, "capacitance")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
     let cap_f = capacitance * cap_unit_f;
     // CCS receiver capacitance group (input pins): the Miller-aware two-segment load.
     // Skipped for NLDM-only parses (consumers fall back to lumped Ceff).
@@ -641,7 +711,9 @@ fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
     } else {
         next_block(body, 0, "receiver_capacitance").map(|(_, rbody, _)| {
             let tbl = |name: &str| {
-                next_block(&rbody, 0, name).map(|(_, b, _)| parse_table(&b)).unwrap_or_default()
+                next_block(&rbody, 0, name)
+                    .map(|(_, b, _)| parse_table(&b))
+                    .unwrap_or_default()
             };
             RecvCap {
                 c1_rise: tbl("receiver_capacitance1_rise"),
@@ -681,7 +753,20 @@ fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
         }
         at = after;
     }
-    Pin { name, direction, capacitance, cap_f, recv, clock, function, setup, hold, recovery, removal, arcs }
+    Pin {
+        name,
+        direction,
+        capacitance,
+        cap_f,
+        recv,
+        clock,
+        function,
+        setup,
+        hold,
+        recovery,
+        removal,
+        arcs,
+    }
 }
 
 fn parse_cell(name: String, body: &str, units: &Units, skip_ccs: bool) -> Cell {
@@ -692,8 +777,26 @@ fn parse_cell(name: String, body: &str, units: &Units, skip_ccs: bool) -> Cell {
         pins.insert(pname, pin);
         at = after;
     }
-    let is_seq = next_block(body, 0, "ff").is_some() || next_block(body, 0, "latch").is_some();
+    let ff = next_block(body, 0, "ff").or_else(|| next_block(body, 0, "latch"));
+    let is_seq = ff.is_some();
     let clock_pin = pins.iter().find(|(_, p)| p.clock).map(|(n, _)| n.clone());
+    // The `clear`/`preset` expressions name the asynchronous reset pins. Take only names the
+    // cell actually declares as pins, so an expression referring to an internal node cannot
+    // invent one.
+    let async_reset_pins = ff
+        .as_ref()
+        .map(|(_, fbody, _)| {
+            let mut v: Vec<String> = ["clear", "preset"]
+                .iter()
+                .filter_map(|k| simple_attr(fbody, k))
+                .flat_map(|e| idents_in(&e))
+                .filter(|n| pins.contains_key(n))
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        })
+        .unwrap_or_default();
     // power: leakage + representative internal (switching) energy.
     let leakage_w = simple_attr(body, "cell_leakage_power")
         .and_then(|s| s.parse::<f64>().ok())
@@ -706,8 +809,20 @@ fn parse_cell(name: String, body: &str, units: &Units, skip_ccs: bool) -> Cell {
         (ivals.iter().sum::<f64>() / ivals.len() as f64) * units.energy_j
     };
     let cell_footprint = simple_attr(body, "cell_footprint").filter(|f| !f.is_empty());
-    let area = simple_attr(body, "area").and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    Cell { name, pins, is_seq, clock_pin, leakage_w, int_energy_j, cell_footprint, area }
+    let area = simple_attr(body, "area")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    Cell {
+        name,
+        pins,
+        is_seq,
+        clock_pin,
+        leakage_w,
+        int_energy_j,
+        cell_footprint,
+        area,
+        async_reset_pins,
+    }
 }
 
 /// Options controlling how much of a Liberty file is parsed.
@@ -734,8 +849,8 @@ const LIB_CACHE_CAP: usize = 256;
 
 type LibCacheKey = (u64, u64, bool); // (content hash, byte length, skip_ccs)
 
-fn lib_cache() -> &'static std::sync::Mutex<std::collections::HashMap<LibCacheKey, std::sync::Arc<Lib>>>
-{
+fn lib_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<LibCacheKey, std::sync::Arc<Lib>>> {
     static C: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<LibCacheKey, std::sync::Arc<Lib>>>,
     > = std::sync::OnceLock::new();
@@ -774,13 +889,20 @@ impl Lib {
         let mut cells = BTreeMap::new();
         let mut at = 0;
         while let Some((cname, cbody, after)) = next_block(text, at, "cell") {
-            cells.insert(cname.clone(), parse_cell(cname, &cbody, &units, opts.skip_ccs));
+            cells.insert(
+                cname.clone(),
+                parse_cell(cname, &cbody, &units, opts.skip_ccs),
+            );
             at = after;
         }
         if cells.is_empty() {
             return Err(LibError("no cells found".into()));
         }
-        Ok(Lib { cells, voltage, thresholds })
+        Ok(Lib {
+            cells,
+            voltage,
+            thresholds,
+        })
     }
 
     pub fn load(path: &str) -> Result<Lib, LibError> {
@@ -841,7 +963,10 @@ impl Lib {
             s.push_str(&format!("\"is_seq\":{},", cell.is_seq));
             s.push_str(&format!(
                 "\"clock_pin\":{},",
-                cell.clock_pin.as_deref().map(jstr).unwrap_or_else(|| "null".into())
+                cell.clock_pin
+                    .as_deref()
+                    .map(jstr)
+                    .unwrap_or_else(|| "null".into())
             ));
             s.push_str(&format!("\"leakage_w\":{},", jnum(cell.leakage_w)));
             s.push_str(&format!("\"int_energy_j\":{},", jnum(cell.int_energy_j)));
@@ -939,16 +1064,30 @@ struct Units {
 
 impl Units {
     fn from_lib(text: &str) -> Units {
-        let leak_w =
-            simple_attr(text, "leakage_power_unit").as_deref().map(parse_si_power).unwrap_or(1.0e-9);
-        let time_s =
-            simple_attr(text, "time_unit").as_deref().map(parse_si_time).unwrap_or(1.0e-9);
+        let leak_w = simple_attr(text, "leakage_power_unit")
+            .as_deref()
+            .map(parse_si_power)
+            .unwrap_or(1.0e-9);
+        let time_s = simple_attr(text, "time_unit")
+            .as_deref()
+            .map(parse_si_time)
+            .unwrap_or(1.0e-9);
         let cap_f = cap_load_unit(text).unwrap_or(1.0e-12);
         // Dynamic-energy unit = power_unit × time, where dynamic power_unit =
         // voltage_unit × current_unit (NOT leakage_power_unit). sky130: 1V·1mA·1ns = 1e-12 J.
-        let v = simple_attr(text, "voltage_unit").as_deref().map(parse_si_voltage).unwrap_or(1.0);
-        let a = simple_attr(text, "current_unit").as_deref().map(parse_si_current).unwrap_or(1.0);
-        Units { cap_f, leak_w, energy_j: v * a * time_s }
+        let v = simple_attr(text, "voltage_unit")
+            .as_deref()
+            .map(parse_si_voltage)
+            .unwrap_or(1.0);
+        let a = simple_attr(text, "current_unit")
+            .as_deref()
+            .map(parse_si_current)
+            .unwrap_or(1.0);
+        Units {
+            cap_f,
+            leak_w,
+            energy_j: v * a * time_s,
+        }
     }
 }
 
@@ -962,16 +1101,45 @@ fn parse_si(s: &str, units: &[(&str, f64)]) -> f64 {
     s.parse::<f64>().unwrap_or(1.0)
 }
 fn parse_si_power(s: &str) -> f64 {
-    parse_si(s, &[("fW", 1e-15), ("pW", 1e-12), ("nW", 1e-9), ("uW", 1e-6), ("mW", 1e-3), ("W", 1.0)])
+    parse_si(
+        s,
+        &[
+            ("fW", 1e-15),
+            ("pW", 1e-12),
+            ("nW", 1e-9),
+            ("uW", 1e-6),
+            ("mW", 1e-3),
+            ("W", 1.0),
+        ],
+    )
 }
 fn parse_si_time(s: &str) -> f64 {
-    parse_si(s, &[("fs", 1e-15), ("ps", 1e-12), ("ns", 1e-9), ("us", 1e-6), ("ms", 1e-3), ("s", 1.0)])
+    parse_si(
+        s,
+        &[
+            ("fs", 1e-15),
+            ("ps", 1e-12),
+            ("ns", 1e-9),
+            ("us", 1e-6),
+            ("ms", 1e-3),
+            ("s", 1.0),
+        ],
+    )
 }
 fn parse_si_voltage(s: &str) -> f64 {
     parse_si(s, &[("uV", 1e-6), ("mV", 1e-3), ("kV", 1e3), ("V", 1.0)])
 }
 fn parse_si_current(s: &str) -> f64 {
-    parse_si(s, &[("pA", 1e-12), ("nA", 1e-9), ("uA", 1e-6), ("mA", 1e-3), ("A", 1.0)])
+    parse_si(
+        s,
+        &[
+            ("pA", 1e-12),
+            ("nA", 1e-9),
+            ("uA", 1e-6),
+            ("mA", 1e-3),
+            ("A", 1.0),
+        ],
+    )
 }
 
 /// `capacitive_load_unit (1, pf)` → Farads-per-unit.
@@ -1077,7 +1245,7 @@ library (demo) {
         let inv = lib.cell("INV").unwrap();
         assert!((inv.leakage_w - 2.0e-9).abs() < 1e-18); // 2 nW
         assert!((inv.input_cap("A") - 0.004e-12).abs() < 1e-21); // 0.004 pF -> F
-        // mean(0.010,0.012,0.008,0.010)=0.010 ; energy unit = V·I·t = 1·1·1ns = 1e-9 J
+                                                                 // mean(0.010,0.012,0.008,0.010)=0.010 ; energy unit = V·I·t = 1·1·1ns = 1e-9 J
         assert!((inv.int_energy_j - 0.010e-9).abs() < 1e-13);
         assert_eq!(inv.outputs().count(), 1);
         assert_eq!(inv.pins.get("A").unwrap().direction, Dir::In);
@@ -1129,9 +1297,15 @@ library (demo) {
         let full = Lib::parse(CCS_LIB).unwrap();
         let a = full.cell("INV").unwrap().pins.get("A").unwrap();
         let y = full.cell("INV").unwrap().pins.get("Y").unwrap();
-        assert!(a.recv.is_some(), "receiver_capacitance present on full parse");
+        assert!(
+            a.recv.is_some(),
+            "receiver_capacitance present on full parse"
+        );
         assert_eq!(y.arcs.len(), 1);
-        assert!(!y.arcs[0].ccs.is_empty(), "output_current present on full parse");
+        assert!(
+            !y.arcs[0].ccs.is_empty(),
+            "output_current present on full parse"
+        );
 
         // skip_ccs drops both CCS groups but leaves the NLDM delay arc intact.
         let nldm = Lib::parse_opts(CCS_LIB, LibOpts { skip_ccs: true }).unwrap();
@@ -1155,7 +1329,9 @@ library (demo) {
         assert!(js.contains("\"related_pin\":\"A\""));
 
         // NLDM-only parse flips the CCS presence flags to false.
-        let js2 = Lib::parse_opts(CCS_LIB, LibOpts { skip_ccs: true }).unwrap().to_json();
+        let js2 = Lib::parse_opts(CCS_LIB, LibOpts { skip_ccs: true })
+            .unwrap()
+            .to_json();
         assert!(js2.contains("\"has_recv_ccs\":false"));
         assert!(js2.contains("\"has_ccs\":false"));
     }
@@ -1182,7 +1358,8 @@ library (demo) {
     #[test]
     fn load_opts_is_consistent_and_opts_keyed() {
         std::env::set_var("VYGES_LIB_CACHE", "0"); // keep this test off the real ~/.vyges
-        let path = std::env::temp_dir().join(format!("vyges_loom_cache_{}.lib", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("vyges_loom_cache_{}.lib", std::process::id()));
         std::fs::write(&path, CACHE_LIB).unwrap();
         let p = path.to_str().unwrap();
 
@@ -1194,7 +1371,14 @@ library (demo) {
 
         // skip_ccs is part of the cache key → a distinct entry with CCS pruned.
         let nldm = Lib::load_opts(p, LibOpts { skip_ccs: true }).unwrap();
-        assert!(nldm.cell("INV").unwrap().pins.get("A").unwrap().recv.is_none());
+        assert!(nldm
+            .cell("INV")
+            .unwrap()
+            .pins
+            .get("A")
+            .unwrap()
+            .recv
+            .is_none());
 
         std::fs::remove_file(&path).ok();
     }
@@ -1221,16 +1405,23 @@ mod threshold_tests {
              slew_derate_from_library : 0.5;\n{BODY}"
         );
         let t = Lib::parse(&text).unwrap().thresholds;
-        assert_eq!(t.slew_lower_rise, 0.10, "stored as a FRACTION, not a percentage");
+        assert_eq!(
+            t.slew_lower_rise, 0.10,
+            "stored as a FRACTION, not a percentage"
+        );
         assert_eq!(t.slew_upper_rise, 0.90);
         assert_eq!(t.slew_derate, 0.5);
-        assert!((t.slew_span() - 0.8).abs() < 1e-12, "10/90 spans 80% of a full edge");
+        assert!(
+            (t.slew_span() - 0.8).abs() < 1e-12,
+            "10/90 spans 80% of a full edge"
+        );
     }
 
     #[test]
     fn a_library_that_declares_nothing_gets_the_liberty_defaults() {
-        let text =
-            format!("library(t) {{\n  time_unit : \"1ns\";\n  capacitive_load_unit (1, pf);\n{BODY}");
+        let text = format!(
+            "library(t) {{\n  time_unit : \"1ns\";\n  capacitive_load_unit (1, pf);\n{BODY}"
+        );
         let t = Lib::parse(&text).unwrap().thresholds;
         assert_eq!((t.slew_lower_rise, t.slew_upper_rise), (0.2, 0.8));
         assert!((t.slew_span() - 0.6).abs() < 1e-12);
@@ -1248,7 +1439,10 @@ mod threshold_tests {
             slew_upper_fall: 0.1,
             ..Thresholds::default()
         };
-        assert!((t.slew_span() - 0.6).abs() < 1e-12, "falls back rather than returning <= 0");
+        assert!(
+            (t.slew_span() - 0.6).abs() < 1e-12,
+            "falls back rather than returning <= 0"
+        );
     }
 }
 
@@ -1299,38 +1493,115 @@ mod async_check_tests {
         let rb = &lib.cells["DFRTP"].pins["RESET_B"];
         assert_eq!(rb.recovery.len(), 1, "recovery must be kept");
         assert_eq!(rb.removal.len(), 1, "removal must be kept");
-        assert!(rb.setup.is_empty() && rb.hold.is_empty(), "not data setup/hold");
+        assert!(
+            rb.setup.is_empty() && rb.hold.is_empty(),
+            "not data setup/hold"
+        );
         assert!((rb.recovery[0].eval(0.01, 0.01) - 0.11).abs() < 1e-9);
         assert!((rb.removal[0].eval(0.01, 0.01) - 0.07).abs() < 1e-9);
 
         let d = &lib.cells["DFRTP"].pins["D"];
         assert_eq!((d.setup.len(), d.hold.len()), (1, 1));
-        assert!(d.recovery.is_empty() && d.removal.is_empty(), "D is data, not async");
+        assert!(
+            d.recovery.is_empty() && d.removal.is_empty(),
+            "D is data, not async"
+        );
         // and the numbers really do differ, or checking the wrong one would be harmless
         assert_ne!(d.hold[0].eval(0.01, 0.01), rb.removal[0].eval(0.01, 0.01));
     }
 
     #[test]
+    /// The `ff` group's `clear`/`preset` expressions name the ASYNC reset pins, and nothing
+    /// else does. Without them there is no way to tell a reset-domain crossing from any other
+    /// path, because a synchronous reset is just data and is timed like data.
+    #[test]
+    fn async_reset_pins_come_from_the_ff_group() {
+        let lib = Lib::parse(
+            r#"library(t) {
+  cell (dfrtp) {
+    ff (IQ, IQN) { clocked_on : "CLK"; next_state : "D"; clear : "!RESET_B"; }
+    pin (CLK) { direction : input; clock : true; }
+    pin (D)   { direction : input; }
+    pin (RESET_B) { direction : input; }
+    pin (Q)   { direction : output; }
+  }
+  cell (dfstp) {
+    ff (IQ, IQN) { clocked_on : "CLK"; next_state : "D"; preset : "!SET_B"; clear : "!CLR"; }
+    pin (CLK) { direction : input; clock : true; }
+    pin (D)   { direction : input; }
+    pin (SET_B) { direction : input; }
+    pin (CLR) { direction : input; }
+    pin (Q)   { direction : output; }
+  }
+  cell (dfxtp) {
+    ff (IQ, IQN) { clocked_on : "CLK"; next_state : "D"; }
+    pin (CLK) { direction : input; clock : true; }
+    pin (D)   { direction : input; }
+    pin (Q)   { direction : output; }
+  }
+  cell (nand2) {
+    pin (A) { direction : input; }
+    pin (B) { direction : input; }
+    pin (Y) { direction : output; }
+  }
+}
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            lib.cells["dfrtp"].async_reset_pins,
+            vec!["RESET_B"],
+            "polarity stripped"
+        );
+        assert_eq!(
+            lib.cells["dfstp"].async_reset_pins,
+            vec!["CLR", "SET_B"],
+            "both clear and preset, sorted"
+        );
+        assert!(
+            lib.cells["dfxtp"].async_reset_pins.is_empty(),
+            "a flop with no async reset has none — not an empty-string entry"
+        );
+        assert!(
+            lib.cells["nand2"].async_reset_pins.is_empty(),
+            "combinational cells have no ff group at all"
+        );
+    }
+
     fn a_clear_arc_is_still_not_a_data_launch_path() {
         // RESET_B -> Q is an async *effect*, not a max-delay arc. Propagating data
         // through it would invent a launch path that cannot exist.
         let lib = Lib::parse(DFRTP).unwrap();
         let q = &lib.cells["DFRTP"].pins["Q"];
-        assert_eq!(q.arcs.len(), 1, "only the CLK->Q edge arc: {:?}",
-                   q.arcs.iter().map(|a| &a.related_pin).collect::<Vec<_>>());
+        assert_eq!(
+            q.arcs.len(),
+            1,
+            "only the CLK->Q edge arc: {:?}",
+            q.arcs.iter().map(|a| &a.related_pin).collect::<Vec<_>>()
+        );
         assert_eq!(q.arcs[0].related_pin, "CLK");
     }
 
     #[test]
     fn the_real_sky130_flop_agrees_with_that_shape() {
         // Guards against the fixture being wishful. Skips when the PDK is absent.
-        let path = concat!(env!("HOME"),
-            "/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib");
+        let path = concat!(
+            env!("HOME"),
+            "/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib"
+        );
         let Ok(lib) = Lib::load(path) else { return };
-        let Some(cell) = lib.cells.get("sky130_fd_sc_hd__dfrtp_1") else { return };
+        let Some(cell) = lib.cells.get("sky130_fd_sc_hd__dfrtp_1") else {
+            return;
+        };
         let rb = cell.pins.get("RESET_B").expect("dfrtp has RESET_B");
-        assert!(!rb.removal.is_empty(), "sky130 dfrtp RESET_B must carry removal");
-        assert!(!rb.recovery.is_empty(), "sky130 dfrtp RESET_B must carry recovery");
+        assert!(
+            !rb.removal.is_empty(),
+            "sky130 dfrtp RESET_B must carry removal"
+        );
+        assert!(
+            !rb.recovery.is_empty(),
+            "sky130 dfrtp RESET_B must carry recovery"
+        );
         assert!(rb.hold.is_empty(), "and must NOT be a data hold pin");
     }
 }
@@ -1368,10 +1639,14 @@ mod constant_tests {
 
     #[test]
     fn the_real_sky130_tie_cell_is_recognised() {
-        let path = concat!(env!("HOME"),
-            "/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib");
+        let path = concat!(
+            env!("HOME"),
+            "/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib"
+        );
         let Ok(lib) = Lib::load(path) else { return };
-        let Some(c) = lib.cells.get("sky130_fd_sc_hd__conb_1") else { return };
+        let Some(c) = lib.cells.get("sky130_fd_sc_hd__conb_1") else {
+            return;
+        };
         assert!(c.pins["HI"].is_constant() && c.pins["LO"].is_constant());
         // and a real logic cell in the same library is not swept up by it
         if let Some(inv) = lib.cells.get("sky130_fd_sc_hd__inv_2") {
