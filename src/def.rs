@@ -380,6 +380,26 @@ fn parse_signal(
                     wire_rule = t.get(i + 1).cloned();
                     i += 2;
                 }
+                // `RECT ( dx1 dy1 dx2 dy2 )` is a patch of metal stated as an OFFSET
+                // rectangle from the preceding point, not a route to somewhere. Skipping the
+                // keyword alone leaves its parenthesised body to be read as a coordinate —
+                // and since the offsets are small signed numbers, that draws a wire from the
+                // routing point to somewhere near the origin. Two of those in one net meet
+                // there and tie distant parts of it together, which is a loop in the
+                // extracted RC. Skip the keyword AND its group.
+                //
+                // The patch's own area is not modelled; it is a via-landing enlargement,
+                // typically a few tenths of a micron square. Dropping it understates that
+                // net's capacitance slightly. Drawing a wire across the die does much worse.
+                "RECT" => {
+                    i += 1;
+                    if t.get(i).map(String::as_str) == Some("(") {
+                        while i < t.len() && t[i] != ")" {
+                            i += 1;
+                        }
+                        i += 1; // past ')'
+                    }
+                }
                 "(" => {
                     let mut j = i + 1;
                     let mut inner = Vec::new();
@@ -679,6 +699,37 @@ END NETS
             m1m2.y > met2.y0.min(met2.y1) && m1m2.y < met2.y0.max(met2.y1),
             "strictly inside, so it is an endpoint of nothing"
         );
+    }
+
+    #[test]
+    fn a_rect_patch_is_not_a_route_to_the_origin() {
+        // Real tail of an fft control net. `RECT ( 0 -150 390 150 )` is an offset rectangle
+        // from the preceding point — a via-landing enlargement. Reading its body as a
+        // coordinate draws a wire from (254.610, 899.980) to (0.000, -0.150), right across
+        // the die; two of them in one net meet down there and tie distant parts of it
+        // together, which shows up downstream as a loop in the extracted RC.
+        let def = "\
+UNITS DISTANCE MICRONS 1000 ;
+NETS 1 ;
+- n1 ( a A ) ( b Y )
+  + ROUTED met3 ( 254380 899980 ) ( 254610 * )
+    NEW met3 ( 254610 899980 ) RECT ( 0 -150 390 150 )
+    NEW met3 ( 254380 1000620 ) RECT ( 0 -150 390 150 ) ;
+END NETS
+";
+        let n = &Def::parse(def).unwrap().nets[0];
+        assert_eq!(n.segments.len(), 1, "one real wire, and no phantom ones");
+        assert!(
+            n.segments
+                .iter()
+                .all(|s| s.x0 > 100.0 && s.x1 > 100.0 && s.y0 > 100.0 && s.y1 > 100.0),
+            "nothing runs off toward the origin: {:?}",
+            n.segments
+                .iter()
+                .map(|s| (s.x0, s.y0, s.x1, s.y1))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(n.vias, 0, "a RECT patch is not a via either");
     }
 
     #[test]
