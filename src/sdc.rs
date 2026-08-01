@@ -39,8 +39,45 @@ pub enum ExcKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Exception {
     pub kind: ExcKind,
-    pub from: String,
-    pub to: String,
+    /// Every object named by `-from` / `-rise_from` / `-fall_from`. Empty, or containing
+    /// `*`, means "any".
+    ///
+    /// A **set**, not one name: a sign-off SDC routinely cuts a whole bus with
+    /// `-from [list [get_ports {a[0]}] [get_ports {a[1]}] ...]`, and keeping only the first
+    /// left every other member of that bus timed while the SDC said it was cut. The failure
+    /// was silent in the worst direction — paths the design has declared unreal get reported
+    /// as violations, and an engineer chases them before concluding the tool is wrong.
+    pub from: Vec<String>,
+    /// Every object named by `-to` / `-rise_to` / `-fall_to`. See [`Exception::from`].
+    pub to: Vec<String>,
+}
+
+/// Is `name` in an exception endpoint set? An empty set, or one holding `*`, matches anything.
+fn endpoint_matches(set: &[String], name: &str) -> bool {
+    set.is_empty() || set.iter().any(|o| o == "*" || o == name)
+}
+
+impl Exception {
+    /// Does this exception's `-from` set cover `name`?
+    pub fn from_matches(&self, name: &str) -> bool {
+        endpoint_matches(&self.from, name)
+    }
+    /// Does this exception's `-to` set cover `name`?
+    pub fn to_matches(&self, name: &str) -> bool {
+        endpoint_matches(&self.to, name)
+    }
+    /// Does it cover this launch→capture pair?
+    pub fn covers(&self, launch: &str, capture: &str) -> bool {
+        self.from_matches(launch) && self.to_matches(capture)
+    }
+    /// Endpoint names that are not the `*` wildcard — what a linter can check for existence.
+    pub fn named_endpoints(&self) -> impl Iterator<Item = (&'static str, &String)> {
+        self.from
+            .iter()
+            .map(|o| ("-from", o))
+            .chain(self.to.iter().map(|o| ("-to", o)))
+            .filter(|(_, o)| o.as_str() != "*" && !o.is_empty())
+    }
 }
 
 /// A parsed clock (regular or fully-resolved generated).
@@ -592,19 +629,32 @@ impl Sdc {
 /// Extract `-from`/`-to` object names (first object of each), `*` if absent.
 /// A pin object (`reg/Q`) is reduced to its instance (`reg`) so it matches the
 /// engine's instance-level exception matching; a port keeps its name.
-fn from_to(toks: &[String]) -> (String, String) {
-    let pick = |flags: &[&str]| -> String {
+fn from_to(toks: &[String]) -> (Vec<String>, Vec<String>) {
+    // ALL objects each flag names, not the first. A `-from [list a b c]` that cut only `a`
+    // left `b` and `c` timed against the SDC's stated intent.
+    let pick = |flags: &[&str]| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
         for f in flags {
             if let Some(v) = flag_val(toks, f) {
-                if let Some(name) = resolve_objs(v).into_iter().find(|o| !o.starts_with('*')) {
-                    return match name.rsplit_once('/') {
+                for name in resolve_objs(v) {
+                    if name.starts_with('*') {
+                        continue; // an `all_inputs`-style collection, not a named object
+                    }
+                    // a pin object (`reg/Q`) reduces to its instance, matching the engine's
+                    // instance-level comparison
+                    out.push(match name.rsplit_once('/') {
                         Some((inst, _pin)) => inst.to_string(),
                         None => name,
-                    };
+                    });
                 }
             }
         }
-        "*".to_string()
+        out.sort();
+        out.dedup();
+        if out.is_empty() {
+            out.push("*".to_string()); // the flag was absent or named only a collection
+        }
+        out
     };
     (
         pick(&["-from", "-rise_from", "-fall_from"]),
@@ -652,10 +702,15 @@ mod list_obj_tests {
         .unwrap();
         assert_eq!(sdc.exceptions.len(), 1);
         assert_eq!(
-            sdc.exceptions[0].from, "mask_rev[0]",
-            "must be a design object, not the Tcl command name"
+            sdc.exceptions[0].from,
+            vec!["mask_rev[0]", "mask_rev[1]"],
+            "every member of the list, not the first and not the Tcl command name"
         );
-        assert_eq!(sdc.exceptions[0].to, "out");
+        assert_eq!(sdc.exceptions[0].to, vec!["out"]);
+        assert!(
+            sdc.exceptions[0].covers("mask_rev[1]", "out"),
+            "the second member is cut too"
+        );
     }
 
     #[test]
