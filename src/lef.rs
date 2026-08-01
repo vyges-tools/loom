@@ -196,7 +196,19 @@ impl Lef {
                     if let Some((_, l)) = cur.as_mut() {
                         let num = |s: &str| s.trim_end_matches(';').parse::<f64>().ok();
                         match rest {
-                            ["WIDTH", w, ..] => {
+                            // The layer's default routing width is `WIDTH <n> ;` — one value.
+                            // A `SPACINGTABLE` inside the same block also carries WIDTH rows,
+                            // `WIDTH 0 0.14` / `WIDTH 3 0.28`, which are (width, spacing) pairs.
+                            // Matching those too, last-write-wins, left met1 reporting a routing
+                            // width of **3 µm** instead of 0.14. Nothing downstream noticed,
+                            // because resistance only consults the width when the deck supplies a
+                            // sheet resistance; coupling always does, and a width that large makes
+                            // every edge-to-edge gap negative, so every parallel neighbour clamps
+                            // to the full coefficient and the distance cutoff never fires.
+                            //
+                            // Hence the exact arity: a row with more than one value is a table
+                            // entry, not the default width.
+                            ["WIDTH", w] | ["WIDTH", w, ";"] => {
                                 if let Some(v) = num(w) {
                                     l.width_um = v;
                                 }
@@ -333,6 +345,31 @@ END met1
     #[test]
     fn empty_errors() {
         assert!(Lef::parse("# no layers here\n").is_err());
+    }
+
+    #[test]
+    fn a_spacing_table_does_not_overwrite_the_routing_width() {
+        // Verbatim shape from `sky130_fd_sc_hd__nom.tlef`. The SPACINGTABLE rows are
+        // (width, spacing) pairs, not width declarations; taking the last WIDTH seen made
+        // met1 3 um wide, which silently multiplied every coupling capacitance on the block.
+        let lef = "\
+LAYER met1
+  TYPE ROUTING ;
+  WIDTH 0.14 ;
+  SPACING 0.14 ;
+  SPACINGTABLE
+    PARALLELRUNLENGTH 0
+    WIDTH 0 0.14
+    WIDTH 3 0.28 ;
+  THICKNESS 0.35 ;
+END met1
+";
+        let l = Lef::parse(lef).unwrap();
+        assert_eq!(
+            l.widths["met1"], 0.14,
+            "the declared routing width, not a table row"
+        );
+        assert!((l.thicknesses["met1"] - 0.35).abs() < 1e-9);
     }
 
     #[test]
