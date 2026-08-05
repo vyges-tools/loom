@@ -81,6 +81,31 @@ fn load_all(files: &[String]) -> (Design, Vec<String>) {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    // Tool-level contract. Declares the descriptor format this binary speaks, so a caller can tell
+    // an old build from a current one instead of guessing — `vyges modules` reports it, and a
+    // release gate refuses to ship an engine that stops declaring.
+    //
+    // Deliberately carries no `invocation`: loom is a multi-command tool (inspect / check), and a
+    // descriptor naming one of them would narrow an MCP router to that single command while
+    // hiding the other. Without one, the router keeps full passthrough — which is the wider
+    // surface, not the poorer one.
+    if args.iter().any(|a| a == "--describe") {
+        const DESCRIBE: &str = r#"{
+  "schema": "vyges-tool-descriptor/1.1",
+  "kind": "multi-command",
+  "name": "loom",
+  "summary": "shared design-data foundation — parse netlist / Liberty / SDC / SPEF / LEF / DEF into the design DB",
+  "maturity": "structured",
+  "commands": ["inspect", "check"],
+  "assertion": { "not_applicable": true },
+  "provenance_limitations": [
+      "Reports what the named files contain; it does not verify that they describe the same design, nor that they are the files a flow actually consumed."
+  ]
+}"#;
+        println!("{DESCRIBE}");
+        return ExitCode::SUCCESS;
+    }
+
     // -V/--version short-circuits anywhere.
     if args.iter().any(|a| a == "-V" || a == "--version") {
         println!("{}", version_line());
