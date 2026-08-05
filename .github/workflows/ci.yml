@@ -20,4 +20,7 @@ jobs:
       - name: Build
         run: cargo build --locked --verbose
       - name: Test
-        run: cargo test --locked --verbose
+        # --all-features, not defaults: the fst/lz4 tests sit behind the non-default `fst`
+        # feature, so a default-feature run compiled neither the code nor its tests and reported
+        # green without them. Four tests had never run anywhere.
+        run: cargo test --locked --all-features --verbose
