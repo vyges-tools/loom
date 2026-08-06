@@ -362,3 +362,58 @@ fn singular_and_plural_command_spellings_are_equivalent() {
     let b = parse("set_unit -time 1ns\ncreate_clock -name c -period 4 [get_ports clk]\n");
     assert_eq!(a.clocks[0].period, b.clocks[0].period);
 }
+
+/// **Quartus accepts a FREQUENCY where SDC asks for a period**, and Intel FPGA board files use
+/// it: `create_clock -period "100 MHz" -name {refclk} {pcie_refclk}`. Rejecting it fails the
+/// whole file and takes every other constraint with it.
+///
+/// Found by running this reader over a third-party constraint corpus. None of our own 154 files
+/// use the form, because they are all ASIC flows — which is exactly why a foreign corpus is
+/// worth running.
+#[test]
+fn a_period_may_be_given_as_a_frequency() {
+    let cases = [
+        ("\"100 MHz\"", 10.0),
+        ("\"1 MHz\"", 1000.0),
+        ("100MHz", 10.0),
+        ("\"1 GHz\"", 1.0),
+        ("\"500 kHz\"", 2000.0),
+        ("\"1000000 Hz\"", 1000.0),
+    ];
+    for (text, want) in cases {
+        let s = parse(&format!("create_clock -name c -period {text} [get_ports clk]\n"));
+        assert!(
+            (s.clocks[0].period - want).abs() < 1e-6,
+            "{text}: want {want} ns, got {}",
+            s.clocks[0].period
+        );
+    }
+    // a time is still a time — the frequency reading must not capture `20ns`
+    assert_eq!(parse("create_clock -name c -period 20ns [get_ports clk]\n").clocks[0].period, 20.0);
+    // and something that is neither says so
+    let e = Sdc::parse("create_clock -name c -period \"fast\" [get_ports clk]\n").unwrap_err();
+    assert!(e.to_string().contains("neither a time nor a frequency"), "{e}");
+}
+
+/// **Parsing is not extracting.** A file full of constraints that yields nothing at all has
+/// failed as completely as one that errored, and more quietly. Every construct below is one a
+/// third-party file actually used.
+#[test]
+fn a_file_of_constraints_never_yields_nothing() {
+    let cases: &[(&str, &str)] = &[
+        ("Quartus hierarchical path", "create_clock -name c -period 16ns inst|pcie_ip|coreclkout\n"),
+        ("brace-quoted object", "create_clock -period \"100 MHz\" -name {refclk} {pcie_refclk}\n"),
+        ("exception only", "set_false_path -from [get_clocks a] -to [get_clocks b]\n"),
+        ("groups only", "set_clock_groups -asynchronous -group {a} -group {b}\n"),
+    ];
+    for (label, text) in cases {
+        let s = parse(text);
+        let got = s.clocks.len()
+            + s.input_delays.len()
+            + s.output_delays.len()
+            + s.exceptions.len()
+            + s.async_groups.len()
+            + s.ignored.len();
+        assert!(got > 0, "{label}: parsed cleanly and extracted nothing from:\n{text}");
+    }
+}

@@ -8,6 +8,13 @@
 //! VYGES_CORPUS=$PDK_ROOT/sky130A cargo test --test corpus -- --nocapture
 //! ```
 //!
+//! **Point it at someone else's files too.** Our own corpus is all ASIC/OpenLane, so it cannot
+//! contain the vendor forms we do not use — running against the constraint files in the
+//! Apache-2.0/MIT `sdcx` crate (`git clone https://github.com/dalance/sdcx`, then
+//! `VYGES_CORPUS=sdcx/testcase`) found `create_clock -period "100 MHz"`, a Quartus extension
+//! that failed two files outright and would never have appeared in ours. Nothing is vendored:
+//! the files stay where they are and the corpus is pointed at them.
+//!
 //! Unset, every test passes trivially — the repo ships no PDK and CI has none. That is the
 //! trade: these cannot run everywhere, so they assert **oracle-free invariants** rather than
 //! golden values, and can therefore run over any design from any tool without a stored answer.

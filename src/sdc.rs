@@ -401,6 +401,33 @@ fn resolve_objs(tok: &str) -> Vec<String> {
     tok.split_whitespace().map(|s| s.to_string()).collect()
 }
 
+/// A clock period, accepting the two forms real tools write: a TIME, or a FREQUENCY.
+///
+/// Quartus documents `-period "100 MHz"` as an alternative to a time, and Intel FPGA board
+/// constraint files use it — `create_clock -period "100 MHz" -name {refclk} {pcie_refclk}`.
+/// Rejecting it fails the whole file, taking every other constraint with it. Found by running
+/// this reader over a third-party constraint corpus; none of our own 154 files use the form,
+/// because they are all ASIC flows.
+fn parse_period(v: &str) -> Option<f64> {
+    if let Some(t) = parse_time(v) {
+        return Some(t);
+    }
+    // `<number> <unit>` with the unit naming a frequency; the space is optional.
+    let t = v.trim().trim_matches('"').trim();
+    let split = t
+        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-'))?;
+    let (num, unit) = t.split_at(split);
+    let hz = match unit.trim().to_ascii_lowercase().as_str() {
+        "hz" => 1.0,
+        "khz" => 1.0e3,
+        "mhz" => 1.0e6,
+        "ghz" => 1.0e9,
+        _ => return None,
+    };
+    let f: f64 = num.trim().parse().ok()?;
+    (f > 0.0).then(|| 1.0e9 / (f * hz)) // -> nanoseconds
+}
+
 /// A time value, with or without an SI suffix, normalised to the file's time unit.
 ///
 /// Quartus and several board vendors write `-period 20.000ns`; a bare `parse::<f64>()` rejects
@@ -616,7 +643,7 @@ impl Sdc {
                 "create_clock" => {
                     let raw = flag_val(&toks, "-period");
                     let period: f64 = raw
-                        .and_then(|v| parse_time(v))
+                        .and_then(|v| parse_period(v))
                         .ok_or_else(|| {
                             // Name what was actually there. "create_clock without -period" is
                             // true and useless: the value is nearly always present and simply
@@ -629,7 +656,9 @@ impl Sdc {
                                      variable (set it, or export it for $::env)",
                                     line.trim()
                                 ),
-                                Some(v) => format!("create_clock -period `{v}` is not a time"),
+                                Some(v) => {
+                                    format!("create_clock -period `{v}` is neither a time nor a frequency")
+                                }
                             })
                         })?;
                     let obj = trailing_obj(&toks, &["-name", "-period", "-waveform", "-comment"]);
