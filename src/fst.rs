@@ -34,15 +34,19 @@
 //! VYGES_CORPUS=/tmp/vcdgen cargo test --features fst --test corpus counts_known
 //! ```
 //!
-//! **Residual, not yet explained:** 22 counts across 7 of those 200 generated dumps still differ,
-//! all on multi-bit signals in files containing `$dumpoff` windows. Scalars are exact everywhere,
-//! and on 42 real waveforms the two readers agree on every shared net.
+//! Both readers now agree exactly: on all 200 generated dumps, on 42 real waveforms (Verilog,
+//! SystemVerilog and VHDL), and on 8 Verilator-written triples. Four defects had to be fixed to
+//! get there, each documented at the code that fixes it: the position table's varints were
+//! sign-extended by the VALUE's magnitude instead of the ENCODING's byte count, a zero chain
+//! entry ("repeat the previous alias") was read as a data offset, real-typed variables were
+//! bit-expanded and named after a mantissa byte, and the nine-state levels `H`/`L` were counted
+//! inconsistently between the two readers.
 
 use std::collections::HashMap;
 
 use crate::lz4;
 use crate::names::NetIndex;
-use crate::vcd::{build_sig, Sig};
+use crate::vcd::{build_sig, level, Sig};
 
 #[derive(Debug, Clone, Default)]
 pub struct Fst {
@@ -149,6 +153,9 @@ impl Fst {
 
         // ---- attribute counts to nets ----------------------------------------------
         for h in &handles {
+            if h.ty == "string" {
+                continue;
+            }
             let sig = build_sig(&h.ty, h.width, &h.full_path, h.range.as_deref(), &mut idx);
             let counts = &chain_counts[h.handle];
             match sig {
@@ -185,7 +192,11 @@ struct HierVar {
 
 /// Decompress + walk the hierarchy block into declared vars. `idx` is not populated
 /// here (that happens after chain decode, via `build_sig`), but paths are returned.
-fn parse_hierarchy(htype: u8, payload: &[u8], _idx: &mut NetIndex) -> Result<Vec<HierVar>, FstError> {
+fn parse_hierarchy(
+    htype: u8,
+    payload: &[u8],
+    _idx: &mut NetIndex,
+) -> Result<Vec<HierVar>, FstError> {
     let unclen = be_u64(payload, 0)? as usize;
     let mut o = 8usize;
     let comp = if htype == 7 {
@@ -199,7 +210,11 @@ fn parse_hierarchy(htype: u8, payload: &[u8], _idx: &mut NetIndex) -> Result<Vec
     let data = match htype {
         6 | 7 => lz4::decompress(comp, unclen).map_err(FstError)?,
         4 => zlib(comp).map_err(FstError)?,
-        _ => return Err(FstError(format!("unsupported hierarchy block type {htype}"))),
+        _ => {
+            return Err(FstError(format!(
+                "unsupported hierarchy block type {htype}"
+            )))
+        }
     };
 
     let mut scope: Vec<String> = Vec::new();
@@ -256,8 +271,18 @@ fn parse_hierarchy(htype: u8, payload: &[u8], _idx: &mut NetIndex) -> Result<Vec
                 } else {
                     format!("{}.{}", scope.join("."), vname)
                 };
-                let width = if length == 0 || length == 0xFFFF_FFFF { 1 } else { length as usize };
-                vars.push(HierVar { full_path, ty: fst_var_ty(tag).to_string(), width, range, handle });
+                let width = if length == 0 || length == 0xFFFF_FFFF {
+                    1
+                } else {
+                    length as usize
+                };
+                vars.push(HierVar {
+                    full_path,
+                    ty: fst_var_ty(tag).to_string(),
+                    width,
+                    range,
+                    handle,
+                });
             }
             _ => return Err(FstError(format!("unknown hierarchy tag {tag}"))),
         }
@@ -333,7 +358,12 @@ fn decode_vc_block(
     // optional time table (only needed for windowing): abs time per time-index.
     let times: Option<Vec<u64>> = match window {
         None => None,
-        Some(_) => Some(decode_time_table(&p[time_data_start..time_data_end], time_cmp, time_unc, time_count)?),
+        Some(_) => Some(decode_time_table(
+            &p[time_data_start..time_data_end],
+            time_cmp,
+            time_unc,
+            time_count,
+        )?),
     };
     let (win_from, win_to) = window.unwrap_or((f64::NEG_INFINITY, None));
 
@@ -344,6 +374,7 @@ fn decode_vc_block(
     // decode each physical chain's toggle counts, resolving aliases.
     let mut cache: HashMap<usize, ()> = HashMap::new(); // guard against alias cycles
     let widths = handle_widths(handles, chains.len());
+    let reals = handle_reals(handles, chains.len());
     for (h, chain) in chains.iter().enumerate() {
         let target = resolve_alias(&chains, h, &mut cache)?;
         let off = match chains[target] {
@@ -360,7 +391,8 @@ fn decode_vc_block(
         let seg_end = next_data_offset(&chains, target).unwrap_or(waves.len());
         let counts = decode_chain(
             &waves[off..seg_end],
-            widths[target],
+            widths[target].max(1),
+            reals[target],
             frame_value(&frame, &widths, target),
             times.as_deref(),
             win_from,
@@ -374,13 +406,24 @@ fn decode_vc_block(
 
 /// Per-handle bit width, from the hierarchy (max width seen for that handle).
 fn handle_widths(handles: &[HierVar], n: usize) -> Vec<usize> {
-    let mut w = vec![1usize; n];
+    let mut w = vec![0usize; n];
     for h in handles {
         if h.handle < n {
             w[h.handle] = w[h.handle].max(h.width);
         }
     }
     w
+}
+
+/// Per-handle "this handle carries a double" flag, matching `handle_widths`.
+fn handle_reals(handles: &[HierVar], n: usize) -> Vec<bool> {
+    let mut r = vec![false; n];
+    for h in handles {
+        if h.handle < n && h.ty == "real" {
+            r[h.handle] = true;
+        }
+    }
+    r
 }
 
 enum Chain {
@@ -393,30 +436,53 @@ fn decode_position(data: &[u8], _waves_len: usize) -> Result<Vec<Chain>, FstErro
     let mut chains = Vec::new();
     let mut acc: i64 = 0;
     let mut o = 0usize;
+    // A zero entry means "the SAME alias as the previous entry", so the previous one has to be
+    // carried. Read as a data offset instead — which is what a naive `>= 0` test does — it
+    // points the signal at whatever chain came before, and that signal's own data is then
+    // swallowed by its neighbour's segment. One net reports nothing, the next reports two
+    // nets' worth.
+    let mut prev_alias: i64 = 0;
     while o < data.len() {
+        let start = o;
         let (raw, no) = uvarint(data, o)?;
+        let nbytes = no - start;
         o = no;
         if raw & 1 == 0 {
-            // run of zeros
+            // a run of `raw >> 1` handles with no data of their own
             let run = raw >> 1;
             for _ in 0..run {
                 chains.push(Chain::None);
             }
         } else {
-            let signed = svalue(raw);
-            let enc = signed >> 1; // arithmetic
-            if enc >= 0 {
-                acc += enc;
-                chains.push(Chain::Data((acc - 1) as usize));
-            } else {
-                chains.push(Chain::Alias((-(enc + 1)) as usize));
+            let enc = svalue_n(raw, nbytes) >> 1; // arithmetic shift keeps the sign
+            match enc.cmp(&0) {
+                std::cmp::Ordering::Greater => {
+                    acc += enc;
+                    chains.push(Chain::Data((acc - 1) as usize));
+                }
+                std::cmp::Ordering::Less => {
+                    prev_alias = enc;
+                    chains.push(Chain::Alias((-(enc + 1)) as usize));
+                }
+                std::cmp::Ordering::Equal => {
+                    // repeat the previous alias
+                    if prev_alias < 0 {
+                        chains.push(Chain::Alias((-(prev_alias + 1)) as usize));
+                    } else {
+                        chains.push(Chain::None);
+                    }
+                }
             }
         }
     }
     Ok(chains)
 }
 
-fn resolve_alias(chains: &[Chain], mut h: usize, seen: &mut HashMap<usize, ()>) -> Result<usize, FstError> {
+fn resolve_alias(
+    chains: &[Chain],
+    mut h: usize,
+    seen: &mut HashMap<usize, ()>,
+) -> Result<usize, FstError> {
     seen.clear();
     loop {
         match chains.get(h) {
@@ -456,7 +522,8 @@ fn frame_value<'a>(frame: &'a [u8], widths: &[usize], handle: usize) -> Option<&
     }
     let mut at = 0usize;
     for (h, w) in widths.iter().enumerate() {
-        let w = (*w).max(1);
+        // one byte per bit, and zero-length (variable-length) signals occupy none
+        let w = *w;
         if h == handle {
             return (at + w <= frame.len()).then(|| &frame[at..at + w]);
         }
@@ -465,9 +532,11 @@ fn frame_value<'a>(frame: &'a [u8], widths: &[usize], handle: usize) -> Option<&
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_chain(
     seg: &[u8],
     width: usize,
+    is_real: bool,
     initial: Option<&[u8]>,
     times: Option<&[u64]>,
     win_from: f64,
@@ -475,7 +544,11 @@ fn decode_chain(
     timescale_s: f64,
 ) -> Result<Vec<u64>, FstError> {
     if seg.is_empty() {
-        return Ok(if width <= 1 { vec![0] } else { vec![0; width] });
+        return Ok(if is_real || width <= 1 {
+            vec![0]
+        } else {
+            vec![0; width]
+        });
     }
     let (unclen, o) = uvarint(seg, 0)?;
     let data: Vec<u8> = if unclen == 0 {
@@ -489,25 +562,55 @@ fn decode_chain(
             None => true,
             Some(t) => {
                 let abs = *t.get(ti).unwrap_or(&0) as f64 * timescale_s;
-                abs >= win_from && match win_to {
-                    Some(to) => abs < to,
-                    None => true,
-                }
+                abs >= win_from
+                    && match win_to {
+                        Some(to) => abs < to,
+                        None => true,
+                    }
             }
         }
     };
 
     let mut p = 0usize;
     let mut time_index: usize = 0;
-    if width <= 1 {
+    if is_real {
+        // A double: varint(tdelta<<1 | raw), then either the 8 raw bytes (raw=1) or — rarely —
+        // a single byte standing for eight bits. Either way it is ONE value, so it counts as
+        // one net, not eight. The frame holds the same 8 bytes, which is the baseline.
+        // A NaN frame is "not yet driven" — the real's `x`, and the same rule applies: it is not
+        // a level, so it does not become the baseline. A VCD has no equivalent (its first
+        // `r` record IS the baseline), so seeding from it charges one extra toggle the moment
+        // the signal is first driven. A NaN in a CHANGE record is a real value and does count,
+        // which is what the VCD reader does with one.
+        let mut prev: Option<[u8; 8]> = initial
+            .and_then(|v| <[u8; 8]>::try_from(v).ok())
+            .filter(|b| !f64::from_le_bytes(*b).is_nan());
+        let mut count: u64 = 0;
+        while p < data.len() {
+            let (v, np) = uvarint(&data, p)?;
+            p = np;
+            let mut bytes = [0u8; 8];
+            let take = if v & 1 == 1 { 8 } else { 1 };
+            if p + take > data.len() {
+                break;
+            }
+            bytes[..take].copy_from_slice(&data[p..p + take]);
+            p += take;
+            time_index += (v >> 1) as usize;
+            if prev.map(|q| q != bytes).unwrap_or(false) && in_window(time_index) {
+                count += 1;
+            }
+            prev = Some(bytes);
+        }
+        Ok(vec![count])
+    } else if width <= 1 {
         // 1-bit: one varint per change; value transitions counted vs previous.
         // Seeded from the frame, so the FIRST change is a change and not the baseline.
         // Seeded from the frame, so the FIRST change record is a change and not the baseline.
         // An unknown initial value seeds nothing, exactly as an unknown change counts nothing.
         let mut prev: Option<char> = initial
             .and_then(|v| v.first())
-            .map(|&b| (b as char).to_ascii_lowercase())
-            .filter(|c| *c == '0' || *c == '1');
+            .and_then(|&b| level(b as char));
         let mut count: u64 = 0;
         while p < data.len() {
             let (v, np) = uvarint(&data, p)?;
@@ -522,9 +625,7 @@ fn decode_chain(
             // does not become the baseline — otherwise a signal whose FRAME value is `x`
             // (undriven at time zero, which is most of them) charges one extra toggle the
             // moment it is first driven.
-            if val == 'x' || val == 'z' {
-                continue;
-            }
+            let Some(val) = level(val) else { continue };
             let changed = prev.map(|c| c != val).unwrap_or(false);
             if changed && in_window(time_index) {
                 count += 1;
@@ -535,9 +636,11 @@ fn decode_chain(
     } else {
         // multi-bit: varint(tdelta<<1 | has_xz) then packed BE bytes (has_xz=0) or ASCII.
         let nbytes = width.div_ceil(8);
-        let mut prev: Option<Vec<char>> = initial
-            .filter(|v| v.len() == width)
-            .map(|v| v.iter().map(|&b| (b as char).to_ascii_lowercase()).collect());
+        let mut prev: Option<Vec<char>> = initial.filter(|v| v.len() == width).map(|v| {
+            v.iter()
+                .map(|&b| (b as char).to_ascii_lowercase())
+                .collect()
+        });
         let mut counts = vec![0u64; width];
         while p < data.len() {
             let (hdr, np) = uvarint(&data, p)?;
@@ -573,7 +676,11 @@ fn decode_chain(
                 let mut bitv = Vec::with_capacity(width);
                 for k in 0..width {
                     let byte = raw[k / 8];
-                    bitv.push(if (byte >> (7 - (k % 8))) & 1 == 1 { '1' } else { '0' });
+                    bitv.push(if (byte >> (7 - (k % 8))) & 1 == 1 {
+                        '1'
+                    } else {
+                        '0'
+                    });
                 }
                 bitv
             };
@@ -581,9 +688,9 @@ fn decode_chain(
                 if in_window(time_index) {
                     for (i, (a, b)) in cur.iter().zip(prev).enumerate() {
                         // per bit, an unknown is not a level — see the 1-bit path
-                        if *a == 'x' || *a == 'z' || *b == 'x' || *b == 'z' {
+                        let (Some(a), Some(b)) = (level(*a), level(*b)) else {
                             continue;
-                        }
+                        };
                         if a != b {
                             counts[i] += 1;
                         }
@@ -597,8 +704,8 @@ fn decode_chain(
                 None => cur,
                 Some(mut was) => {
                     for (i, c) in cur.iter().enumerate() {
-                        if i < was.len() && *c != 'x' && *c != 'z' {
-                            was[i] = *c;
+                        if let (true, Some(c)) = (i < was.len(), level(*c)) {
+                            was[i] = c;
                         }
                     }
                     was
@@ -620,8 +727,17 @@ fn merge_counts(dst: &mut Vec<u64>, src: &[u64]) {
 
 // ---- time table (zlib) ---------------------------------------------------------
 
-fn decode_time_table(data: &[u8], cmp: usize, unc: usize, count: usize) -> Result<Vec<u64>, FstError> {
-    let raw = if cmp == unc { data.to_vec() } else { zlib(data).map_err(FstError)? };
+fn decode_time_table(
+    data: &[u8],
+    cmp: usize,
+    unc: usize,
+    count: usize,
+) -> Result<Vec<u64>, FstError> {
+    let raw = if cmp == unc {
+        data.to_vec()
+    } else {
+        zlib(data).map_err(FstError)?
+    };
     let mut times = Vec::with_capacity(count);
     let mut o = 0usize;
     let mut acc: u64 = 0;
@@ -656,14 +772,24 @@ fn uvarint(b: &[u8], mut o: usize) -> Result<(u64, usize), FstError> {
     }
 }
 
-/// Interpret an unsigned-decoded LEB128 as a signed value (sign-extend from the top
-/// bit of the highest 7-bit group actually used).
-fn svalue(raw: u64) -> i64 {
+/// Interpret an unsigned-decoded LEB128 as a signed value, sign-extending from the top bit of
+/// the highest 7-bit group the ENCODING occupied.
+///
+/// `nbytes` is how many bytes the varint actually took, and it has to be passed in: inferring
+/// it from the magnitude of the decoded value is wrong whenever the value is small enough to
+/// fit in fewer groups than were written. `f9 00` encodes 121 in two bytes, so its sign bit is
+/// bit 13 and the value is +121; read as one group, bit 6 is set and it becomes -7.
+///
+/// That mattered: in the chain table a negative value means "alias", so a 2-byte positive
+/// offset was read as an alias to another handle. The signal took its width from the wrong
+/// signal, and its own data was swallowed by the previous chain — one net reporting nothing and
+/// its neighbour counting two nets' worth. Only for values that need a second byte, which is
+/// why it appeared on 7 of 200 generated dumps and not on the small ones.
+fn svalue_n(raw: u64, nbytes: usize) -> i64 {
     if raw == 0 {
         return 0;
     }
-    let bits = 64 - raw.leading_zeros();
-    let group_bits = bits.div_ceil(7) * 7; // round up to a whole 7-bit group
+    let group_bits = (nbytes.max(1) * 7) as u32;
     if group_bits >= 64 {
         return raw as i64;
     }
@@ -700,11 +826,21 @@ fn xz_char(code: u64) -> char {
     }
 }
 
+/// Real-typed variables carry a double, not a bit vector, so they stay one net instead of
+/// expanding per bit.
+///
+/// The tag numbers are `fstVarType`: REAL=3, REAL_PARAMETER=4, REALTIME=20, SV_SHORTREAL=29.
+/// An earlier list here read 2, 6, 7, 18 — PARAMETER, SUPPLY0, SUPPLY1 and PORT — which named
+/// every real `Freq[2]` after one of its mantissa bytes while scalarising three types that
+/// really are bit vectors.
 fn fst_var_ty(tag: u8) -> &'static str {
-    // real types (so build_sig treats them as scalars, not bit-expanded)
     match tag {
-        // FST_VT_VCD_REAL / REAL_PARAMETER / REALTIME and SV real/shortreal
-        2 | 6 | 7 | 18 => "real",
+        3 | 4 | 20 | 29 => "real",
+        // FST_VT_GEN_STRING: a variable-length payload, not a value. It has no bits to toggle,
+        // it occupies NO space in the frame, and the VCD reader already ignores the `s` records
+        // its dumps write — so counting it here made a VHDL string report activity that its own
+        // VCD did not.
+        21 => "string",
         _ => "wire",
     }
 }
@@ -722,9 +858,104 @@ mod tests {
         std::fs::read(path).expect("counter.fst fixture")
     }
 
+    /// A position-table entry that needed two bytes must sign-extend from bit 13, not bit 6.
+    ///
+    /// These are the seven bytes from the block that exposed it. The last entry is `f9 00`, a
+    /// two-byte LEB128 for 121 — positive, so a data offset. Sign-extending from the top of the
+    /// highest group the VALUE needs (bit 6, which is set in 121) makes it -7, and a negative
+    /// entry means "alias": the signal took its width from an unrelated handle and its own
+    /// segment was swallowed by the chain before it.
+    #[test]
+    fn a_two_byte_position_entry_is_an_offset_not_an_alias() {
+        let chains = decode_position(&[0x03, 0x29, 0x27, 0x35, 0x2f, 0xf9, 0x00], 206).unwrap();
+        let offs: Vec<Option<usize>> = chains
+            .iter()
+            .map(|c| match c {
+                Chain::Data(o) => Some(*o),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            offs,
+            vec![Some(0), Some(20), Some(39), Some(65), Some(88), Some(148)]
+        );
+    }
+
+    /// A zero chain entry repeats the PREVIOUS alias; it is not an offset of zero.
+    #[test]
+    fn a_zero_position_entry_repeats_the_previous_alias() {
+        // 0x03 -> data at 0; 0x7d -> signed -3, i.e. alias to handle 1; 0x01 -> repeat it
+        let chains = decode_position(&[0x03, 0x7d, 0x01], 64).unwrap();
+        assert!(matches!(chains[0], Chain::Data(0)));
+        assert!(matches!(chains[1], Chain::Alias(1)));
+        assert!(
+            matches!(chains[2], Chain::Alias(1)),
+            "a repeat, not a second data chain"
+        );
+    }
+
+    /// A scalar written in nine-state codes: `H` and `L` are levels, `W` is not.
+    ///
+    /// Straight at `decode_chain`, because the conversion path drops these — the codes are
+    /// `FST_RCV_*`, `1 | (state << 1) | (tdelta << 4)`, with the state indexing "xzhuwl-?".
+    #[test]
+    fn nine_state_scalar_levels_are_weak_ones_and_zeros() {
+        // u (frame) -> H -> L -> W -> H, one time step apart
+        let seg = [0x00, 0x15, 0x1b, 0x19, 0x15];
+        let counts = decode_chain(
+            &seg,
+            1,
+            false,
+            Some(b"u"),
+            None,
+            f64::NEG_INFINITY,
+            None,
+            1e-9,
+        )
+        .unwrap();
+        // the `u` seeds nothing, H->L is a transition, the W is skipped without becoming the
+        // baseline, so the following H is a transition from the L
+        assert_eq!(counts, vec![2]);
+    }
+
+    /// The same waveform in FST form must produce the same counts as `ninestate.vcd`, whose
+    /// numbers are derived by hand in `tests/vcd_robustness.rs`.
+    ///
+    /// It covers, in one file, everything the two readers used to disagree about: nine-state
+    /// levels, a real that must stay one net (and whose NaN frame is "not yet driven", not a
+    /// baseline), and a string that carries no activity and occupies no space in the frame.
+    #[test]
+    fn nine_state_and_real_agree_with_the_vcd_of_the_same_run() {
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/ninestate.fst"
+        ))
+        .expect("ninestate.fst");
+        let f = Fst::parse(&bytes, None).unwrap();
+        let got = |n: &str| f.idx.toggles.get(n).copied().unwrap_or(0);
+        assert_eq!(got("top.clk"), 4);
+        // `top.weak` is deliberately not asserted here: vcd2fst discards nine-state values on a
+        // SCALAR (GTKWave's own fst2vcd reads the same file back with no changes for it), so the
+        // fixture cannot carry them. The vector below does round-trip them, and the scalar path
+        // is covered directly by `nine_state_scalar_levels_are_weak_ones_and_zeros`.
+        assert_eq!(got("top.bus[3]"), 1);
+        assert_eq!(got("top.bus[2]"), 2);
+        assert_eq!(got("top.bus[1]"), 0);
+        assert_eq!(got("top.bus[0]"), 1);
+        assert_eq!(
+            got("top.freq"),
+            2,
+            "one net, and the NaN frame is not its baseline"
+        );
+        assert!(!f.idx.toggles.keys().any(|k| k.starts_with("top.freq[")));
+        assert_eq!(got("top.label"), 0, "a string has no switching activity");
+    }
+
     #[test]
     fn counter_fst_matches_ground_truth() {
-        let f = Fst::parse(&fixture(), None).unwrap().with_scope(Some("counter_tb.dut".into()));
+        let f = Fst::parse(&fixture(), None)
+            .unwrap()
+            .with_scope(Some("counter_tb.dut".into()));
         // timescale 1ps, end 395000 -> 3.95e-7 s
         assert!((f.sim_time_s - 395_000.0 * 1e-12).abs() < 1e-15);
         let rate = |net: &str| f.toggle_rate(net);
@@ -761,8 +992,20 @@ mod tests {
         let fst = Fst::parse(&fixture(), None).unwrap();
         let vpath = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/counter.vcd");
         let vcd = crate::vcd::Vcd::load(vpath).unwrap();
-        let mut fset: Vec<u64> = fst.idx.toggles.values().copied().filter(|&v| v > 0).collect();
-        let mut vset: Vec<u64> = vcd.idx.toggles.values().copied().filter(|&v| v > 0).collect();
+        let mut fset: Vec<u64> = fst
+            .idx
+            .toggles
+            .values()
+            .copied()
+            .filter(|&v| v > 0)
+            .collect();
+        let mut vset: Vec<u64> = vcd
+            .idx
+            .toggles
+            .values()
+            .copied()
+            .filter(|&v| v > 0)
+            .collect();
         fset.sort_unstable();
         vset.sort_unstable();
         // FST attributes each chain to every aliased name; VCD (last-wins per symbol)

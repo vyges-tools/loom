@@ -1,0 +1,40 @@
+$date Fri Aug  6 00:00:00 2026 $end
+$version vyges nine-state fixture $end
+$timescale 1ns $end
+$scope module top $end
+$var wire 1 ! clk $end
+$var wire 1 " weak $end
+$var wire 4 # bus [3:0] $end
+$var real 64 $ freq $end
+$var string 0 % label $end
+$upscope $end
+$enddefinitions $end
+#0
+$dumpvars
+0!
+U"
+bUUUU #
+r1.0 $
+sidle %
+$end
+#10
+1!
+H"
+bHLZ0 #
+r2.5 $
+#20
+0!
+L"
+bLH1X #
+r2.5 $
+srun %
+#30
+1!
+W"
+b0011 #
+r3.5 $
+#40
+0!
+H"
+bZZZZ #
+r3.5 $

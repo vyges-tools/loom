@@ -15,7 +15,7 @@ fn vcd(decls: &str, body: &str) -> String {
 }
 
 fn toggles(v: &Vcd, net: &str) -> u64 {
-    v.idx.resolve(net).unwrap_or(0) as u64
+    v.idx.resolve(net).unwrap_or(0)
 }
 
 #[test]
@@ -239,4 +239,38 @@ fn the_text_and_binary_readers_agree_on_the_same_simulation() {
         }
     }
     assert!(disagree.is_empty(), "{}", disagree.join("\n"));
+}
+
+/// IEEE 1164 nine-state levels, counted the same by both readers.
+///
+/// `H` and `L` are the weak 1 and weak 0 and a transition to one is a real transition. `U`, `W`,
+/// `X`, `Z` and `-` are the absence of one: they count nothing and leave the last known value in
+/// place. A VHDL dump (nvc, GHDL) is written entirely in these, and the two readers used to
+/// disagree on every one — the VCD reader dropped `H`/`L` scalar changes on the floor, the FST
+/// reader counted `U` and `W` as if they were levels.
+///
+/// The counts below are derived by hand from the fixture, not from either reader.
+#[test]
+fn nine_state_levels_count_as_weak_ones_and_zeros() {
+    let v = vyges_loom::vcd::Vcd::load(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ninestate.vcd"
+    ))
+    .expect("ninestate.vcd");
+    let got = |n: &str| v.idx.toggles.get(n).copied().unwrap_or(0);
+
+    assert_eq!(got("top.clk"), 4, "0,1,0,1,0");
+    // U -> H -> L -> W -> H: the U seeds nothing, the W is skipped without becoming the
+    // baseline, so H->L and the L->H across it are the only two transitions.
+    assert_eq!(got("top.weak"), 2);
+    // UUUU -> HLZ0 -> LH1X -> 0011 -> ZZZZ, per bit, MSB first
+    assert_eq!(got("top.bus[3]"), 1);
+    assert_eq!(got("top.bus[2]"), 2);
+    assert_eq!(got("top.bus[1]"), 0);
+    assert_eq!(got("top.bus[0]"), 1);
+    // a real is one net, not 64: 1.0 -> 2.5 -> 2.5 -> 3.5 -> 3.5
+    assert_eq!(got("top.freq"), 2);
+    assert!(!v.idx.toggles.keys().any(|k| k.starts_with("top.freq[")), "reals are not bit-expanded");
+    // a string carries no switching activity
+    assert_eq!(got("top.label"), 0);
 }

@@ -78,23 +78,23 @@ impl Vcd {
     /// end-of-dump. All value changes still update signal state, so the first
     /// in-window change is measured against the correct pre-window value. Windowing
     /// excludes reset/boot from the measurement (VCD only — SAIF is already cumulative).
-    pub fn parse_windowed(
-        text: &str,
-        window: Option<(f64, Option<f64>)>,
-    ) -> Result<Vcd, VcdError> {
+    pub fn parse_windowed(text: &str, window: Option<(f64, Option<f64>)>) -> Result<Vcd, VcdError> {
         let from_s = window.map(|(f, _)| f).unwrap_or(0.0);
         let to_opt = window.and_then(|(_, t)| t);
         // Does the *current* sim time fall in the counting window? Re-evaluated at each `#t`.
-        let in_window = |t: f64| t >= from_s && match to_opt {
-            Some(to) => t < to,
-            None => true,
+        let in_window = |t: f64| {
+            t >= from_s
+                && match to_opt {
+                    Some(to) => t < to,
+                    None => true,
+                }
         };
 
         let mut tick_s = 1.0e-9; // default 1ns
-        // ONE CODE, MANY NAMES. A VCD identifier code may be declared for several signals — a
-        // net and its port alias share one code, and dumpers emit that routinely. Keyed by a
-        // single `Sig`, the second `$var` overwrote the first and that signal's activity
-        // vanished: it reported a toggle rate of zero while its alias reported the truth.
+                                 // ONE CODE, MANY NAMES. A VCD identifier code may be declared for several signals — a
+                                 // net and its port alias share one code, and dumpers emit that routinely. Keyed by a
+                                 // single `Sig`, the second `$var` overwrote the first and that signal's activity
+                                 // vanished: it reported a toggle rate of zero while its alias reported the truth.
         let mut sym2sig: HashMap<String, Vec<Sig>> = HashMap::new();
         let mut last: HashMap<String, char> = HashMap::new(); // scalar full path -> last value
         let mut vprev: HashMap<String, Vec<char>> = HashMap::new(); // sym -> last KNOWN bits ('?' = never seen)
@@ -183,7 +183,8 @@ impl Vcd {
                         }
                     } else if let Some(first) = tok.chars().next() {
                         match first {
-                            '0' | '1' | 'x' | 'X' | 'z' | 'Z' => {
+                            '0' | '1' | 'x' | 'X' | 'z' | 'Z' | 'u' | 'U' | 'w' | 'W' | 'h'
+                            | 'H' | 'l' | 'L' | '-' => {
                                 // Scalar change: <value><sym>.
                                 //
                                 // `last` holds the last KNOWN value. An `x`/`z` is not a level,
@@ -195,12 +196,11 @@ impl Vcd {
                                 // at all. Counting each of those as a transition inflated
                                 // activity, and therefore dynamic power, without a warning.
                                 let sym = &tok[1..];
-                                let v = first.to_ascii_lowercase();
+                                let Some(v) = level(first) else {
+                                    continue; // unknown: no transition, no new baseline
+                                };
                                 for sig in sym2sig.get(sym).map(Vec::as_slice).unwrap_or(&[]) {
                                     let Sig::Scalar(full) = sig else { continue };
-                                    if v == 'x' || v == 'z' {
-                                        continue; // unknown: no transition, no new baseline
-                                    }
                                     let prev = last.insert(full.clone(), v);
                                     if count_now && prev.map(|p| p != v).unwrap_or(false) {
                                         idx.add_toggles(full, 1);
@@ -217,19 +217,18 @@ impl Vcd {
                                     for sig in sym2sig.get(sym).map(Vec::as_slice).unwrap_or(&[]) {
                                         let Sig::Vector { bits } = sig else { continue };
                                         let cur = pad_bits(value, bits.len());
-                                        let prev = vprev.entry(sym.to_string()).or_insert_with(|| {
-                                            std::iter::repeat_n('?', bits.len()).collect()
-                                        });
+                                        let prev =
+                                            vprev.entry(sym.to_string()).or_insert_with(|| {
+                                                std::iter::repeat_n('?', bits.len()).collect()
+                                            });
                                         for (i, c) in cur.iter().enumerate() {
-                                            if *c == 'x' || *c == 'z' {
-                                                continue;
-                                            }
+                                            let Some(c) = level(*c) else { continue };
                                             if i < prev.len() {
                                                 let was = prev[i];
-                                                if count_now && was != '?' && was != *c {
+                                                if count_now && was != '?' && was != c {
                                                     idx.add_toggles(&bits[i], 1);
                                                 }
-                                                prev[i] = *c;
+                                                prev[i] = c;
                                             }
                                         }
                                     }
@@ -277,7 +276,14 @@ impl Vcd {
 
 fn parse_timescale(s: &str) -> f64 {
     let s = s.trim().to_lowercase();
-    let units = [("fs", 1e-15), ("ps", 1e-12), ("ns", 1e-9), ("us", 1e-6), ("ms", 1e-3), ("s", 1.0)];
+    let units = [
+        ("fs", 1e-15),
+        ("ps", 1e-12),
+        ("ns", 1e-9),
+        ("us", 1e-6),
+        ("ms", 1e-3),
+        ("s", 1.0),
+    ];
     for (suf, scale) in units {
         if let Some(num) = s.strip_suffix(suf) {
             let n: f64 = num.trim().parse().unwrap_or(1.0);
@@ -298,7 +304,13 @@ pub(crate) enum Sig {
 /// Build a [`Sig`] for a `$var` and declare its net(s) in `idx`. Reals and 1-bit
 /// signals are scalars; wider signals expand to per-bit nets so a gate-level netlist's
 /// per-bit nets (`data[0]`) resolve and each bit's toggles are counted independently.
-pub(crate) fn build_sig(ty: &str, width: usize, base: &str, range: Option<&str>, idx: &mut NetIndex) -> Sig {
+pub(crate) fn build_sig(
+    ty: &str,
+    width: usize,
+    base: &str,
+    range: Option<&str>,
+    idx: &mut NetIndex,
+) -> Sig {
     if ty.eq_ignore_ascii_case("real") || width <= 1 {
         idx.declare(base);
         return Sig::Scalar(base.to_string());
@@ -316,6 +328,25 @@ pub(crate) fn build_sig(ty: &str, width: usize, base: &str, range: Option<&str>,
         b += step;
     }
     Sig::Vector { bits }
+}
+
+/// Map an IEEE 1164 nine-state character onto a countable level, or `None` for "no level".
+///
+/// `H` and `L` are the weak 1 and weak 0 — a pull-up holding a bus high is a driven level and a
+/// transition to it is a real transition. `U` (uninitialised), `X`, `W` (weak unknown), `Z` and
+/// `-` (don't care) are the absence of a level: they count nothing and do not become the
+/// baseline, so `0 -> x -> 0` is no toggle and `0 -> x -> 1` is one.
+///
+/// Both readers share this so a VHDL dump counts the same either way. Before, the VCD reader
+/// only recognised `0/1/x/z` as a scalar change at all and silently dropped every `H`/`L`
+/// toggle an nvc or GHDL dump writes, while the FST reader counted `U` and `W` as if they were
+/// levels — the same waveform, two different activity figures, neither of them right.
+pub(crate) fn level(c: char) -> Option<char> {
+    match c.to_ascii_lowercase() {
+        '0' | 'l' => Some('0'),
+        '1' | 'h' => Some('1'),
+        _ => None,
+    }
 }
 
 /// Parse a `[msb:lsb]` (or single `[bit]`) range token into `(msb, lsb)`.
@@ -437,7 +468,10 @@ $enddefinitions $end
         // parse() == parse_windowed(None): unchanged behaviour.
         let full = Vcd::parse(VCD).unwrap();
         let none = Vcd::parse_windowed(VCD, None).unwrap();
-        assert_eq!(full.idx.toggles.get("top.clk"), none.idx.toggles.get("top.clk"));
+        assert_eq!(
+            full.idx.toggles.get("top.clk"),
+            none.idx.toggles.get("top.clk")
+        );
         assert!((full.sim_time_s - none.sim_time_s).abs() < 1e-18);
     }
 
@@ -451,7 +485,9 @@ $enddefinitions $end
         // Bare `clk` collides tb vs dut -> unresolved (0), no silent pick.
         assert_eq!(v.toggle_rate("clk"), 0.0);
         // scope: dut -> resolves to tb.dut.clk.
-        let scoped = Vcd::parse(VCD_HIER).unwrap().with_scope(Some("dut".to_string()));
+        let scoped = Vcd::parse(VCD_HIER)
+            .unwrap()
+            .with_scope(Some("dut".to_string()));
         assert!((scoped.toggle_rate("clk") - 1.0e8).abs() < 1.0); // 2 / 20ns
     }
 
