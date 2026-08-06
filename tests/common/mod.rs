@@ -26,6 +26,20 @@ fn same(a: f64, b: f64) -> bool {
     (a - b).abs() <= 1e-6 * a.abs().max(b.abs()).max(1e-12)
 }
 
+/// The net's own node, spelled the one way.
+///
+/// A bare net reference and `<net>:0` denote the SAME node: the net's own. The bare form is what
+/// some files carry and is not conforming — `*<id>` alone is a PORT reference in SPEF, which is
+/// why the writer emits the node number — so a file written that way comes back spelled the
+/// other way. That is a normalisation, not a loss, and it is the only one accepted here: the
+/// suffix has to be exactly `:0` and the head has to be the net's own name.
+fn canon_node(node: &str, net: &str) -> String {
+    match node.strip_suffix(":0") {
+        Some(head) if head == net => head.to_string(),
+        _ => node.to_string(),
+    }
+}
+
 /// Everything a SPEF reader extracted about one net, in a form two parses can be compared in.
 #[derive(Default)]
 struct NetPrint {
@@ -42,9 +56,17 @@ fn fingerprint(s: &Spef) -> BTreeMap<String, NetPrint> {
     let mut m = BTreeMap::new();
     for (name, n) in &s.nets {
         let mut p = NetPrint { cap: n.cap_ff, res: n.res_ohm, cc: n.coupling_ff, ..Default::default() };
-        p.ground = n.ground.iter().map(|(nd, c)| (nd.clone(), *c)).collect();
-        p.r = n.res.iter().map(|(a, b, o)| (format!("{a}-{b}"), *o)).collect();
-        p.pins = n.pins.iter().map(|(i, pin, nd)| format!("{i}/{pin}@{nd}")).collect();
+        p.ground = n.ground.iter().map(|(nd, c)| (canon_node(nd, name), *c)).collect();
+        p.r = n
+            .res
+            .iter()
+            .map(|(a, b, o)| (format!("{}-{}", canon_node(a, name), canon_node(b, name)), *o))
+            .collect();
+        p.pins = n
+            .pins
+            .iter()
+            .map(|(i, pin, nd)| format!("{i}/{pin}@{}", canon_node(nd, name)))
+            .collect();
         p.coup = n.coupling.iter().map(|(o, c)| (o.clone(), *c)).collect();
         p.ground.sort_by(|a, b| a.0.cmp(&b.0));
         p.r.sort_by(|a, b| a.0.cmp(&b.0));

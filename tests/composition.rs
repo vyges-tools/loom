@@ -45,20 +45,20 @@ fn the_awkward_constructs_survive_the_cycle() {
             "escaped hierarchical and bussed names",
             "*SPEF \"IEEE 1481-1998\"\n*DESIGN \"blk\"\n*T_UNIT 1 PS\n*C_UNIT 1 FF\n*R_UNIT 1 OHM\n\
              *NAME_MAP\n*1 u_a\\.q\\[0\\]\n*2 u_b\n\n\
-             *D_NET *1 10\n*CONN\n*I *2:A I\n*CAP\n1 *1 8\n*RES\n1 *1 *2:A 40\n*END\n",
+             *D_NET *1 10\n*CONN\n*I *2:A I\n*CAP\n1 *1:1 8\n*RES\n1 *1:1 *2:A 40\n*END\n",
         ),
         (
             "coupling between two nets",
             "*SPEF \"IEEE 1481-1998\"\n*DESIGN \"blk\"\n*T_UNIT 1 PS\n*C_UNIT 1 FF\n*R_UNIT 1 OHM\n\
              *NAME_MAP\n*1 aggressor\n*2 victim\n\n\
-             *D_NET *1 12\n*CAP\n1 *1 6\n2 *1 *2 3\n*END\n\
-             *D_NET *2 9\n*CAP\n1 *2 6\n2 *2 *1 3\n*END\n",
+             *D_NET *1 12\n*CAP\n1 *1:1 6\n2 *1:1 *2:1 3\n*END\n\
+             *D_NET *2 9\n*CAP\n1 *2:1 6\n2 *2:1 *1:1 3\n*END\n",
         ),
         (
             "scaled units",
             "*SPEF \"IEEE 1481-1998\"\n*DESIGN \"blk\"\n*T_UNIT 1 PS\n*C_UNIT 1 PF\n*R_UNIT 1 KOHM\n\
              *NAME_MAP\n*1 n\n*2 m\n\n\
-             *D_NET *1 0.01\n*CAP\n1 *1 0.008\n*RES\n1 *1 *2 0.02\n*END\n",
+             *D_NET *1 0.01\n*CAP\n1 *1:1 0.008\n*RES\n1 *1:1 *2:1 0.02\n*END\n",
         ),
         (
             // A writer formatting to six decimal PLACES rounds this to 0.041625, and anything
@@ -67,8 +67,8 @@ fn the_awkward_constructs_survive_the_cycle() {
             "capacitance past the sixth decimal place",
             "*SPEF \"IEEE 1481-1998\"\n*DESIGN \"blk\"\n*T_UNIT 1 PS\n*C_UNIT 1 FF\n*R_UNIT 1 OHM\n\
              *NAME_MAP\n*1 tiny\n*2 other\n\n\
-             *D_NET *1 0.0416254\n*CAP\n1 *1 0.0416254\n2 *1 *2 0.00000017\n*END\n\
-             *D_NET *2 0.00000017\n*CAP\n1 *2 *1 0.00000017\n*END\n",
+             *D_NET *1 0.0416254\n*CAP\n1 *1:1 0.0416254\n2 *1:1 *2:1 0.00000017\n*END\n\
+             *D_NET *2 0.00000017\n*CAP\n1 *2:1 *1:1 0.00000017\n*END\n",
         ),
         (
             "a net with no parasitics at all",

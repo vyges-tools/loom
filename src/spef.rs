@@ -19,6 +19,14 @@ pub struct NetRc {
     pub res_ohm: f64,                 // summed *RES (lumped fallback)
     pub coupling_ff: f64,             // total coupling cap (sum over neighbours)
     pub coupling: Vec<(String, f64)>, // per-aggressor coupling (net, Cc) for window-aware SI
+    /// Per NODE-PAIR coupling as read: `(aggressor net, this net's node, the aggressor's node,
+    /// Cc)`. `coupling` above is the aggregate an SI pass wants; this is what the file said, and
+    /// it is kept so the writer can put a capacitor back on the node it came off. Attached to
+    /// the wrong node it still loads the net, but at the wrong point in the RC network, and the
+    /// timer reports a different number for the same design. Empty when the parasitics were
+    /// built rather than read.
+    #[allow(clippy::type_complexity)]
+    pub coupling_nodes: Vec<(String, String, String, f64)>,
     // RC network (for per-pin tree Elmore):
     pub net_node: String,                 // node where coupling attaches (the net node)
     pub ground: Vec<(String, f64)>,       // (node, grounded cap fF)
@@ -490,6 +498,9 @@ impl Spef {
         let mut nets: BTreeMap<String, NetRc> = BTreeMap::new();
         let mut coupling: BTreeMap<String, f64> = BTreeMap::new();
         let mut coupling_list: BTreeMap<(String, String), f64> = BTreeMap::new();
+        #[allow(clippy::type_complexity)]
+        let mut coupling_nodes: BTreeMap<String, Vec<(String, String, String, f64)>> =
+            BTreeMap::new();
         let mut cur: Option<(String, String, NetRc)> = None; // (name, net_node_token, rc)
         let mut sect = ""; // "", "namemap", "conn", "cap", "res"
         // Node token -> owning net. A coupling entry names one node on this net and one on a
@@ -693,7 +704,17 @@ impl Spef {
                         // whole file has been read, so these are resolved after the loop.
                         triplets |= is_triplet(toks[3]);
                         if let Some(v) = parse_val(toks[3]) {
-                            pending_cc.push((node_tok(toks[1], &names), node_tok(toks[2], &names), v * c_scale));
+                            // NOT claimed for the net whose block this is. The two nodes are
+                            // written in the SAME order in both nets' blocks, so the first one
+                            // is not reliably the local end — claiming it reassigns the other
+                            // net's node to this one and the coupling then resolves to a single
+                            // net and is discarded as intra-net. Ownership comes from the
+                            // grounded caps and resistors, and from the fallback in `net_of`.
+                            pending_cc.push((
+                                node_tok(toks[1], &names),
+                                node_tok(toks[2], &names),
+                                v * c_scale,
+                            ));
                         }
                     } else if toks.len() >= 3 {
                         // grounded cap `<idx> *node <ff>`
@@ -728,6 +749,16 @@ impl Spef {
             if let Some(n) = owner.get(tok) {
                 return Some(n.clone());
             }
+            // FALL BACK TO WHAT THE NODE IS NAMED AFTER. Nodes read as `<owner>:<suffix>`, so a
+            // node the far net never mentions anywhere else — the only place it appears is this
+            // coupling entry — still says which net it belongs to. Requiring an exact match in
+            // the ownership map dropped exactly those, and they are not exotic: a net whose
+            // only parasitic IS the coupling capacitor has no other line to claim a node from.
+            if let Some((head, _)) = tok.split_once(':') {
+                if nets.contains_key(head) || owner.values().any(|n| n == head) {
+                    return Some(head.to_string());
+                }
+            }
             // A bare identifier that named no node is the net itself.
             (!tok.contains(':')).then(|| resolve(tok, &names))
         };
@@ -749,11 +780,14 @@ impl Spef {
             // other for a while couple at several distinct node pairs, and a window-aware SI
             // pass wants one Cc per aggressor to switch against.
             *coupling_list.entry((na.clone(), nb.clone())).or_default() += v;
-            *coupling_list.entry((nb, na)).or_default() += v;
+            *coupling_list.entry((nb.clone(), na.clone())).or_default() += v;
+            coupling_nodes.entry(na.clone()).or_default().push((nb.clone(), a.clone(), b.clone(), v));
+            coupling_nodes.entry(nb).or_default().push((na, b, a, v));
         }
 
         for (name, rc) in nets.iter_mut() {
             rc.coupling_ff = coupling.get(name).copied().unwrap_or(0.0);
+            rc.coupling_nodes = coupling_nodes.remove(name).unwrap_or_default();
             rc.coupling = coupling_list
                 .range((name.clone(), String::new())..)
                 .take_while(|((n, _), _)| n == name)
@@ -819,19 +853,39 @@ impl Spef {
         for inst in &insts {
             intern(inst, &mut id_of, &mut order);
         }
-        let inst_set: std::collections::BTreeSet<&String> = insts.iter().collect();
 
         // Resolve an RC-network node string to a SPEF node token.
         let node_tok = |s: &str,
+                        owner: &str,
                         id_of: &mut BTreeMap<String, usize>,
                         order: &mut Vec<String>|
          -> String {
-            if let Some(id) = id_of.get(s) {
-                return format!("*{id}"); // net node (or already-interned node)
+            // THE OBJECT'S OWN NODE STILL NEEDS A NODE NUMBER. `*<id>` on its own is a PORT
+            // reference in SPEF, not "the node of net <id>", so a bare index for an internal
+            // net names something the design does not have. OpenSTA reads it, cannot find the
+            // port, drops the capacitor with a warning, and reports a much faster path than the
+            // one the file describes — on the three-inverter example, arrival 1.77 ns against
+            // the 7.25 ns the same parasitics give when they are attached.
+            // The net's OWN node, and only that. `*<id>` alone is a PORT reference in SPEF,
+            // so an internal net written that way names something the design does not have —
+            // OpenSTA drops the capacitor and reports a faster path than the file describes.
+            // A node named after anything ELSE (a port, another net) is left bare, because for
+            // a port the bare form is the correct one and adding a node number would invent a
+            // node on it.
+            if s == owner {
+                if let Some(id) = id_of.get(s) {
+                    return format!("*{id}:0");
+                }
+            } else if let Some(id) = id_of.get(s) {
+                return format!("*{id}");
             }
+            // `<name>:<suffix>` is an instance pin OR a net-internal node, and BOTH are written
+            // the same way. Only instances were recognised here, so every `n1:1` fell through
+            // to the fallback below and was interned in the name map as a name with an escaped
+            // colon — a node no reader can join to the net it belongs to. A real extraction is
+            // almost entirely these.
             if let Some((pre, suf)) = s.split_once(':') {
-                if inst_set.contains(&pre.to_string()) {
-                    let id = id_of[pre];
+                if let Some(id) = id_of.get(pre) {
                     return format!("*{id}:{suf}");
                 }
             }
@@ -874,19 +928,41 @@ impl Spef {
             if rc.ground.is_empty() {
                 let grounded = (rc.cap_ff - rc.coupling_ff).max(0.0);
                 if grounded > 0.0 {
-                    cap_lines.push(format!("*{nid} {}", fmtf(grounded)));
+                    // `:0` for the same reason as everywhere else here: `*<id>` alone is a PORT
+                    // reference, so a lumped cap written that way attaches to nothing.
+                    cap_lines.push(format!("*{nid}:0 {}", fmtf(grounded)));
                 }
             } else {
                 for (node, c) in &rc.ground {
-                    let tok = node_tok(node, &mut id_of, &mut order);
+                    let tok = node_tok(node, net, &mut id_of, &mut order);
                     cap_lines.push(format!("{tok} {}", fmtf(*c)));
                 }
             }
-            for (other, cc) in &rc.coupling {
+            for (other, near, far, cc) in &rc.coupling_nodes {
+                if net.as_str() < other.as_str() {
+                    let ta = node_tok(near, net, &mut id_of, &mut order);
+                    let tb = node_tok(far, other, &mut id_of, &mut order);
+                    cap_lines.push(format!("{ta} {tb} {}", fmtf(*cc)));
+                }
+            }
+            for (other, cc) in rc.coupling.iter().filter(|_| rc.coupling_nodes.is_empty()) {
                 if net.as_str() < other.as_str() {
                     // emit under the lexicographically-smaller net only (dedupe)
-                    if let Some(oid) = id_of.get(other).copied() {
-                        cap_lines.push(format!("*{nid} *{oid} {}", fmtf(*cc)));
+                    //
+                    // ATTACHED TO A NODE THE NET ACTUALLY HAS. The reader keeps one coupling
+                    // figure per aggressor NET, not per node pair, so the original node is not
+                    // recoverable — but writing it on a node number nothing else references
+                    // leaves the capacitor hanging off a stub, loading nothing. A timer then
+                    // reads the file, finds the coupling attached to an isolated node, and
+                    // reports a faster path than the parasitics describe: on the three-inverter
+                    // example, -5.04 ns of slack against the -6.45 ns the same file gives when
+                    // the capacitor sits on the wire.
+                    let near = rep_node(rc);
+                    let far = self.nets.get(other).map(rep_node).unwrap_or_else(|| "0".into());
+                    if id_of.contains_key(other) {
+                        let ta = node_tok(&near, net, &mut id_of, &mut order);
+                        let tb = node_tok(&far, other, &mut id_of, &mut order);
+                        cap_lines.push(format!("{ta} {tb} {}", fmtf(*cc)));
                     }
                 }
             }
@@ -900,8 +976,8 @@ impl Spef {
             if !rc.res.is_empty() {
                 body.push_str("*RES\n");
                 for (i, (a, b, r)) in rc.res.iter().enumerate() {
-                    let ta = node_tok(a, &mut id_of, &mut order);
-                    let tb = node_tok(b, &mut id_of, &mut order);
+                    let ta = node_tok(a, net, &mut id_of, &mut order);
+                    let tb = node_tok(b, net, &mut id_of, &mut order);
                     body.push_str(&format!("{} {ta} {tb} {}\n", i + 1, fmtf(*r)));
                 }
             }
@@ -937,6 +1013,21 @@ impl Spef {
         out.push_str(&body);
         out
     }
+}
+
+/// A node string this net demonstrably has: the first node its own network references, or the
+/// net itself when it has no network at all (a lumped net, whose single node is its own).
+fn rep_node(rc: &NetRc) -> String {
+    if let Some((n, _)) = rc.ground.first() {
+        return n.clone();
+    }
+    if let Some((a, _, _)) = rc.res.first() {
+        return a.clone();
+    }
+    if let Some((_, _, n)) = rc.pins.first() {
+        return n.clone();
+    }
+    rc.net_node.clone()
 }
 
 /// Compact float for SPEF numbers: the shortest decimal that reads back as the same value.
@@ -979,6 +1070,7 @@ mod writer_tests {
                 res: vec![("neta".to_string(), "u1:A".to_string(), 100.0)],
                 pins: vec![("u1".to_string(), "A".to_string(), "u1:A".to_string())],
                 conns: vec![],
+                coupling_nodes: vec![],
             },
         );
         nets.insert(
@@ -993,6 +1085,7 @@ mod writer_tests {
                 res: vec![("netb".to_string(), "u2:Y".to_string(), 50.0)],
                 pins: vec![("u2".to_string(), "Y".to_string(), "u2:Y".to_string())],
                 conns: vec![],
+                coupling_nodes: vec![],
             },
         );
         Spef { nets, ..Default::default() }
