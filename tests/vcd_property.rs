@@ -178,11 +178,9 @@ fn generate(seed: u64) -> Case {
                     continue;
                 }
                 let prev = vlast[n][i];
-                if prev == '0' || prev == '1' {
-                    if prev != *b {
-                        // bit i of a [vw-1:0] vector is named [vw-1-i]
-                        *expect.get_mut(&format!("top.{n}[{}]", vw - 1 - i)).unwrap() += 1;
-                    }
+                if (prev == '0' || prev == '1') && prev != *b {
+                    // bit i of a [vw-1:0] vector is named [vw-1-i]
+                    *expect.get_mut(&format!("top.{n}[{}]", vw - 1 - i)).unwrap() += 1;
                 }
                 vlast.get_mut(n).unwrap()[i] = *b;
             }

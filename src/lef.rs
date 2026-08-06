@@ -267,7 +267,7 @@ impl Lef {
                 match toks.as_slice() {
                     ["END", "UNITS", ..] => in_units = false,
                     [q @ ("CAPACITANCE" | "RESISTANCE"), _unit, f, ..] => {
-                        if let Some(v) = f.trim_end_matches(';').parse::<f64>().ok() {
+                        if let Ok(v) = f.trim_end_matches(';').parse::<f64>() {
                             if (v - 1.0).abs() > 1e-12 {
                                 unapplied_units.push((q.to_string(), v));
                             }

@@ -213,9 +213,22 @@ fn a_section_keyword_used_as_a_name_does_not_move_a_section() {
     for name in ["SPECIALNETS", "COMPONENTS", "NETS", "END"] {
         // as a component name, and as a net name
         let body = format!("    - net_{name} ( u2 Y )\n      + ROUTED met1 ( 100 100 ) ( 200 * )\n    ;\n");
-        assert!(
-            !perturbs(&good_def(&body, ""), &base) || true,
-            "placeholder"
+        // A keyword-named net has to read exactly like an ordinary one: it contributes its own
+        // entry and changes nothing else. Comparing against `base` alone cannot say that — the
+        // net is a real addition, so the fingerprint is SUPPOSED to differ — so the control is
+        // the same net under a name that is not a keyword.
+        let ctrl = fingerprint(&parse(&good_def(
+            "    - net_ordinary ( u2 Y )\n      + ROUTED met1 ( 100 100 ) ( 200 * )\n    ;\n",
+            "",
+        )));
+        let want: BTreeMap<String, String> = ctrl
+            .iter()
+            .map(|(k, v)| (k.replace("net_ordinary", &format!("net_{name}")), v.clone()))
+            .collect();
+        assert_eq!(
+            fingerprint(&parse(&good_def(&body, ""))),
+            want,
+            "`{name}` used as a net name moved a section boundary"
         );
         // The real hazard: the bare token appearing before the section it names.
         let top = format!("PROPERTYDEFINITIONS\n  COMPONENTPIN {name} STRING ;\nEND PROPERTYDEFINITIONS\n");

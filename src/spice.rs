@@ -555,7 +555,7 @@ MMIP1 Y A VPWR VPB pfet_01v8_hvt m=1 w=1.0 l=0.15
         assert_eq!(n.devices[0].nodes, ["Y", "A", "VGND", "VNB"]);
         assert!((n.devices[0].params.get("w").copied().unwrap() - 0.65).abs() < 1e-12);
         assert!((n.devices[0].params.get("l").copied().unwrap() - 0.15).abs() < 1e-12);
-        assert!(n.devices[0].params.get("topography").is_none(), "non-numeric param skipped");
+        assert!(!n.devices[0].params.contains_key("topography"), "non-numeric param skipped");
     }
 
     #[test]

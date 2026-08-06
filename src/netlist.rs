@@ -513,7 +513,7 @@ fn read_conn_value(t: &[String], i: &mut usize) -> Vec<String> {
         }
         depth_brace = depth_brace.saturating_sub(closes);
         *i += 1;
-        if depth_brace == 0 && (opens > 0 || closes > 0 || !out.is_empty()) && closes > 0 {
+        if depth_brace == 0 && closes > 0 {
             break;
         }
         if depth_brace == 0 && opens == 0 && closes == 0 && out.len() == 1 {

@@ -851,11 +851,11 @@ fn parse_cell(name: String, body: &str, units: &Units, skip_ccs: bool) -> Cell {
     // leakage per logic state give `leakage_power () { value ; when ; related_pg_pin ; }` groups
     // INSTEAD — asap7 has 222 of them and no per-cell attribute — and reading only the scalar
     // reports those cells as leaking exactly nothing, which is not a number anyone would query.
-    let leakage_w = match simple_attr(body, "cell_leakage_power").and_then(|s| s.parse::<f64>().ok())
-    {
-        Some(v) => v * units.leak_w,
-        None => state_leakage(body) * units.leak_w,
-    };
+    let leakage_w =
+        match simple_attr(body, "cell_leakage_power").and_then(|s| s.parse::<f64>().ok()) {
+            Some(v) => v * units.leak_w,
+            None => state_leakage(body) * units.leak_w,
+        };
     let ivals = internal_values(body);
     let int_energy_j = if ivals.is_empty() {
         0.0
@@ -1580,7 +1580,6 @@ mod async_check_tests {
         assert_ne!(d.hold[0].eval(0.01, 0.01), rb.removal[0].eval(0.01, 0.01));
     }
 
-    #[test]
     /// The `ff` group's `clear`/`preset` expressions name the ASYNC reset pins, and nothing
     /// else does. Without them there is no way to tell a reset-domain crossing from any other
     /// path, because a synchronous reset is just data and is timed like data.
@@ -1638,6 +1637,7 @@ mod async_check_tests {
         );
     }
 
+    #[test]
     fn a_clear_arc_is_still_not_a_data_launch_path() {
         // RESET_B -> Q is an async *effect*, not a max-delay arc. Propagating data
         // through it would invent a launch path that cannot exist.
