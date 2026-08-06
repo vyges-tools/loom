@@ -901,6 +901,53 @@ mod writer_tests {
         assert_eq!(s.nets.get("neta").unwrap().coupling, vec![("netb".to_string(), 2.0)]);
     }
 
+    /// The other convention: each cap listed ONCE, in one net's block. Both are legal and both
+    /// come out of OpenRCX — its `couplingFlow` output lists every cap twice, its pattern-
+    /// extraction output lists each once. A reader that "corrects" by halving is right on one
+    /// and wrong on the other; deduping by node pair is right on both, which is why the two
+    /// cases below must agree.
+    #[test]
+    fn a_coupling_cap_listed_once_is_read_the_same_way() {
+        let head = "\
+*SPEF \"IEEE 1481-1999\"
+*DESIGN \"blk\"
+*DATE \"x\"
+*DIVIDER /
+*DELIMITER :
+*BUS_DELIMITER []
+*T_UNIT 1 NS
+*C_UNIT 1 FF
+*R_UNIT 1 OHM
+*L_UNIT 1 HENRY
+
+*NAME_MAP
+*1 neta
+*2 netb
+*3 u1
+*4 u2
+
+*D_NET *1 10
+*CONN
+*I *3:A I
+*CAP
+1 *3:A 8
+2 *3:A *4:Y 2
+*END
+
+*D_NET *2 7
+*CONN
+*I *4:Y O
+*CAP
+1 *4:Y 5
+";
+        let once = Spef::parse(&format!("{head}*END\n"));
+        let twice = Spef::parse(&format!("{head}2 *3:A *4:Y 2\n*END\n"));
+        for s in [&once, &twice] {
+            assert_eq!(s.nets.get("neta").unwrap().coupling_ff, 2.0);
+            assert_eq!(s.nets.get("netb").unwrap().coupling_ff, 2.0);
+        }
+    }
+
     /// Coupling endpoints are normally NODE tokens — an instance pin or an internal node,
     /// whose owning net is only known from the `*CONN` / `*RES` entries elsewhere in the file.
     /// Reading only the bare-net form discards most of the coupling in a real SPEF.
