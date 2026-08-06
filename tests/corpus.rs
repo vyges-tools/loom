@@ -430,6 +430,130 @@ fn activity_partitions_across_windows() {
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
 
+/// **The FST reader against an external oracle.**
+///
+/// Wherever a `.vcd` and a `.fst` sit side by side, they are the same waveform in two formats
+/// and the two readers must agree exactly — one a line reader, one a clean-room decoder of a
+/// compressed binary layout. Generate the pairs with GTKWave's own converter and the oracle is
+/// external to us entirely:
+///
+/// ```sh
+/// for f in $(find "$VYGES_CORPUS" -name '*.vcd'); do vcd2fst "$f" "${f%.vcd}.fst"; done
+/// ```
+///
+/// Neither reader can be tuned to pass this without being right: there is no stored expected
+/// value, and a drift in either shows up as a disagreement rather than as a changed number.
+#[cfg(feature = "fst")]
+#[test]
+fn the_fst_reader_agrees_with_the_vcd_reader_on_every_pair() {
+    use vyges_loom::fst::Fst;
+    let vcds = corpus(&[".vcd"]);
+    let pairs: Vec<PathBuf> = vcds
+        .into_iter()
+        .filter(|p| p.with_extension("fst").is_file())
+        .collect();
+    announce("VCD/FST pairs", &pairs);
+    let mut bad = Vec::new();
+    for v in &pairs {
+        let f = v.with_extension("fst");
+        let (Ok(a), Ok(b)) = (Vcd::load(v.to_str().unwrap()), Fst::load(f.to_str().unwrap())) else {
+            bad.push(format!("{}: one of the pair would not load", show(v)));
+            continue;
+        };
+        if (a.sim_time_s - b.sim_time_s).abs() > 1e-15 * a.sim_time_s.max(1.0) {
+            bad.push(format!("{}: sim time vcd {:e} fst {:e}", show(v), a.sim_time_s, b.sim_time_s));
+        }
+        let mut shown = 0;
+        for (path, n) in &a.idx.toggles {
+            let m = b.idx.toggles.get(path).copied();
+            if m != Some(*n) {
+                bad.push(format!("{}: {path} vcd={n} fst={m:?}", show(v)));
+                shown += 1;
+                if shown >= 3 {
+                    break;
+                }
+            }
+        }
+        for path in b.idx.toggles.keys() {
+            if !a.idx.toggles.contains_key(path) {
+                bad.push(format!("{}: {path} in fst only", show(v)));
+                break;
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// **Toggle counts known BY CONSTRUCTION.**
+///
+/// A generator writes VCDs and, because it decides every value change itself, records the
+/// expected count as arithmetic rather than by asking any tool. Both readers must reproduce it
+/// exactly. Where a `.fst` sits alongside (produced by GTKWave's `vcd2fst`), the binary reader
+/// is held to the same number — so the chain is: our arithmetic, an external converter, and two
+/// independently written parsers, all agreeing or the test fails.
+///
+/// This is the one check here that can be made arbitrarily exhaustive: generate more files.
+/// The generator deliberately emits x/z excursions and `$dumpoff` windows, which is where four
+/// of the defects in these readers lived.
+///
+/// ```sh
+/// python3 gen_vcd.py /tmp/vcdgen 200
+/// for f in /tmp/vcdgen/*.vcd; do vcd2fst "$f" "${f%.vcd}.fst"; done
+/// VYGES_CORPUS=/tmp/vcdgen cargo test --features fst --test corpus counts_known
+/// ```
+#[test]
+fn counts_known_by_construction_are_reproduced_exactly() {
+    let files: Vec<PathBuf> = corpus(&[".vcd"])
+        .into_iter()
+        .filter(|p| p.with_extension("expected").is_file())
+        .collect();
+    announce("generated VCD", &files);
+    let mut bad = Vec::new();
+    for f in &files {
+        let Ok(exp_txt) = std::fs::read_to_string(f.with_extension("expected")) else { continue };
+        let expected: std::collections::BTreeMap<&str, u64> = exp_txt
+            .lines()
+            .filter_map(|l| l.split_once('\t'))
+            .filter_map(|(k, v)| v.trim().parse().ok().map(|n| (k, n)))
+            .collect();
+        let Ok(v) = Vcd::load(f.to_str().unwrap()) else {
+            bad.push(format!("{}: vcd would not load", show(f)));
+            continue;
+        };
+        for (net, want) in &expected {
+            let got = v.idx.toggles.get(*net).copied().unwrap_or(0);
+            if got != *want {
+                bad.push(format!("{}: VCD {net} want {want} got {got}", show(f)));
+            }
+        }
+        for net in v.idx.toggles.keys() {
+            if !expected.contains_key(net.as_str()) {
+                bad.push(format!("{}: VCD reports {net}, which the generator never wrote", show(f)));
+            }
+        }
+        #[cfg(feature = "fst")]
+        {
+            let fp = f.with_extension("fst");
+            if fp.is_file() {
+                match vyges_loom::fst::Fst::load(fp.to_str().unwrap()) {
+                    Err(e) => bad.push(format!("{}: fst would not load: {e}", show(f))),
+                    Ok(b) => {
+                        for (net, want) in &expected {
+                            let got = b.idx.toggles.get(*net).copied().unwrap_or(0);
+                            if got != *want {
+                                bad.push(format!("{}: FST {net} want {want} got {got}", show(f)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let n = bad.len();
+    bad.truncate(12);
+    assert!(bad.is_empty(), "{n} mismatch(es):\n{}", bad.join("\n"));
+}
+
 fn show(p: &Path) -> String {
     p.file_name()
         .and_then(|s| s.to_str())

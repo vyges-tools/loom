@@ -17,6 +17,24 @@
 //! `varint(tdelta<<1 | has_xz)` + packed BE bytes (or ASCII when `has_xz`). Toggle
 //! counting mirrors the VCD reader: scalar = value transitions; vector = per-bit
 //! Hamming distance between consecutive values.
+//!
+//! ## KNOWN DEFECT: multi-bit signals under-count
+//!
+//! Scalars are exact — verified against 200 generated dumps whose toggle counts are known by
+//! construction, and against the same waveforms read as VCD. **Vectors are not**: they read
+//! low, by a margin that varies per signal, and some read zero. The VCD reader reproduces the
+//! same 200 files exactly, so the fault is here and not in the expectation.
+//!
+//! This reader is behind the non-default `fst` feature, so nothing ships on it today. Do not
+//! use it for multi-bit activity until the vector path is fixed and this note is deleted.
+//!
+//! To reproduce, and to verify a fix:
+//!
+//! ```sh
+//! python3 tools/gen_vcd.py /tmp/vcdgen 200
+//! for f in /tmp/vcdgen/*.vcd; do vcd2fst "$f" "${f%.vcd}.fst"; done   # GTKWave
+//! VYGES_CORPUS=/tmp/vcdgen cargo test --features fst --test corpus counts_known
+//! ```
 
 use std::collections::HashMap;
 
@@ -265,7 +283,12 @@ fn decode_vc_block(
     o = no;
     let (_bits_cnt, no) = uvarint(p, o)?;
     o = no;
-    o += bits_cmp as usize; // skip frame (initial values) — not needed for counting
+    // Skip the frame (initial values). MEASURED, not assumed: `vcd2fst` writes each signal's
+    // value at time zero as its first value-change record too, so that record IS the baseline,
+    // and seeding from the frame as well counts one transition too many. Verified against 200
+    // generated dumps whose counts are known by construction: seeding made every scalar read
+    // one high, removing it made every scalar exact.
+    o += bits_cmp as usize;
     let (_waves_count, no) = uvarint(p, o)?;
     o = no;
     let _packtype = *p.get(o).ok_or_else(|| FstError("short vc block".into()))?;
@@ -443,6 +466,7 @@ fn decode_chain(
     let mut time_index: usize = 0;
     if width <= 1 {
         // 1-bit: one varint per change; value transitions counted vs previous.
+        // Seeded from the frame, so the FIRST change is a change and not the baseline.
         let mut prev: Option<char> = None;
         let mut count: u64 = 0;
         while p < data.len() {
@@ -454,6 +478,13 @@ fn decode_chain(
                 (xz_char((v >> 1) & 7), (v >> 4) as usize)
             };
             time_index += td;
+            // Same rule as the VCD reader: `x`/`z` is not a level. It counts no transition and
+            // does not become the baseline — otherwise a signal whose FRAME value is `x`
+            // (undriven at time zero, which is most of them) charges one extra toggle the
+            // moment it is first driven.
+            if val == 'x' || val == 'z' {
+                continue;
+            }
             let changed = prev.map(|c| c != val).unwrap_or(false);
             if changed && in_window(time_index) {
                 count += 1;
@@ -472,12 +503,21 @@ fn decode_chain(
             let has_xz = hdr & 1 == 1;
             let td = (hdr >> 1) as usize;
             time_index += td;
+            // A RECORD THAT RUNS PAST THE END OF THE BLOCK IS TRUNCATED, and the only safe
+            // reading of it is none. Clamping the slice and then indexing as though it were
+            // full length is what turned a short tail into `index out of bounds` — a library
+            // panic, which a caller cannot catch and which takes the whole tool with it.
+            // Found on a GTKWave-produced file, by the converter's own output.
+            let need = if has_xz { width } else { nbytes };
+            if p + need > data.len() {
+                break;
+            }
             let cur: Vec<char> = if has_xz {
-                let s: Vec<char> = data[p..(p + width).min(data.len())].iter().map(|&b| b as char).collect();
+                let s: Vec<char> = data[p..p + width].iter().map(|&b| b as char).collect();
                 p += width;
                 s
             } else {
-                let raw = &data[p..(p + nbytes).min(data.len())];
+                let raw = &data[p..p + nbytes];
                 p += nbytes;
                 // BE bytes -> width bits, MSB first
                 let mut bitv = Vec::with_capacity(width);
@@ -491,13 +531,30 @@ fn decode_chain(
             if let Some(prev) = &prev {
                 if in_window(time_index) {
                     for (i, (a, b)) in cur.iter().zip(prev).enumerate() {
+                        // per bit, an unknown is not a level — see the 1-bit path
+                        if *a == 'x' || *a == 'z' || *b == 'x' || *b == 'z' {
+                            continue;
+                        }
                         if a != b {
                             counts[i] += 1;
                         }
                     }
                 }
             }
-            prev = Some(cur);
+            // An unknown bit leaves the last KNOWN value in place, so `0 -> x -> 0` counts
+            // nothing and `0 -> x -> 1` counts one. Replacing the whole vector would make the
+            // unknown itself the baseline.
+            prev = Some(match prev.take() {
+                None => cur,
+                Some(mut was) => {
+                    for (i, c) in cur.iter().enumerate() {
+                        if i < was.len() && *c != 'x' && *c != 'z' {
+                            was[i] = *c;
+                        }
+                    }
+                    was
+                }
+            });
         }
         Ok(counts)
     }
