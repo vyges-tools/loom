@@ -352,15 +352,45 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
                 // candidate instance:  CELL  INST  ( .pin(net), ... ) ;
                 // the cell must be a real identifier — a stray numeric token before
                 // `(` is never a cell (defensive net around tokenizer edge cases).
-                if i + 2 < n
-                    && is_ident(&t[i])
-                    && !is_keyword(&t[i])
-                    && !is_keyword(&t[i + 1])
-                    && t[i + 2] == "("
+                // A PARAMETER OVERRIDE sits between the cell and the instance name:
+                // `ALU #(.MODE("AND")) u1 (.A(a), …)`. Yosys emits them, and so does any
+                // parameterised macro. Read without allowing for it, `#` became the instance
+                // NAME, the parameter list became its connections, and the instance's real
+                // connections were never seen — a whole gate, silently replaced by its own
+                // parameters.
+                let mut head = i;
+                if head + 1 < n && t[head + 1] == "#" {
+                    let mut k = head + 2;
+                    if k < n && t[k] == "(" {
+                        let mut d = 0;
+                        while k < n {
+                            if t[k] == "(" {
+                                d += 1;
+                            } else if t[k] == ")" {
+                                d -= 1;
+                                if d == 0 {
+                                    k += 1;
+                                    break;
+                                }
+                            }
+                            k += 1;
+                        }
+                        // `CELL #(…)` then INST `(` — keep the cell, skip the parameters
+                        if k + 1 < n && is_ident(&t[k]) && t[k + 1] == "(" {
+                            head = k - 1; // so `head+1` is the instance name below
+                        }
+                    }
+                }
+                let cell_tok = i;
+                if head + 2 < n
+                    && is_ident(&t[cell_tok])
+                    && !is_keyword(&t[cell_tok])
+                    && !is_keyword(&t[head + 1])
+                    && t[head + 2] == "("
                 {
-                    let cell = t[i].clone();
-                    let name = t[i + 1].clone();
-                    i += 3; // past CELL INST (
+                    let cell = t[cell_tok].clone();
+                    let name = t[head + 1].clone();
+                    i = head + 3; // past CELL [#(...)] INST (
                     let mut conns = Vec::new();
                     let mut depth = 1;
                     // Named (`.PIN(net)`) and positional (`CELL u (a, b)`) forms are both legal

@@ -27,13 +27,22 @@ use std::path::{Path, PathBuf};
 
 use vyges_loom::{def::Def, lef::Lef, netlist, sdc::Sdc, spef::Spef};
 
-/// Files under `VYGES_CORPUS` (recursively) with any of the given extensions.
+/// Files under `VYGES_CORPUS` (recursively) with any of the given extensions, PLUS the
+/// in-repo regression fixtures in `tests/data/`.
+///
+/// The fixtures are unconditional: each pins a construct this reader once got wrong, and they
+/// must run in CI where there is no PDK and no flow output. The real-design corpora stay
+/// opt-in because they are gigabytes and not ours to ship.
 fn corpus(exts: &[&str]) -> Vec<PathBuf> {
-    let Ok(root) = std::env::var("VYGES_CORPUS") else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
-    let mut stack = vec![PathBuf::from(root)];
+    let mut stack: Vec<PathBuf> = Vec::new();
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    if fixtures.is_dir() {
+        stack.push(fixtures);
+    }
+    if let Ok(root) = std::env::var("VYGES_CORPUS") {
+        stack.push(PathBuf::from(root));
+    }
     while let Some(d) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&d) else { continue };
         for e in rd.flatten() {
@@ -60,10 +69,11 @@ fn corpus(exts: &[&str]) -> Vec<PathBuf> {
 }
 
 fn announce(what: &str, files: &[PathBuf]) {
-    if files.is_empty() {
-        println!("{what}: no corpus (set VYGES_CORPUS to a PDK or flow run directory) — skipped");
-    } else {
-        println!("{what}: {} file(s)", files.len());
+    let fixtures = files.iter().filter(|p| p.components().any(|c| c.as_os_str() == "data")).count();
+    match (files.len(), fixtures) {
+        (0, _) => println!("{what}: nothing to check (set VYGES_CORPUS for real designs)"),
+        (n, f) if f == n => println!("{what}: {n} in-repo fixture(s); set VYGES_CORPUS for real designs"),
+        (n, f) => println!("{what}: {n} file(s) ({f} in-repo fixture(s) + {} from VYGES_CORPUS)", n - f),
     }
 }
 
@@ -251,6 +261,11 @@ fn every_sdc_parses_and_names_what_it_drops() {
 fn every_named_connection_in_a_real_netlist_is_conserved() {
     let files = corpus(&[".v"]);
     announce("Verilog", &files);
+    // A path slip must not turn this into a test that checks nothing.
+    assert!(
+        files.iter().any(|p| p.ends_with("param_override_string.v")),
+        "the in-repo netlist fixtures were not found"
+    );
     let mut bad = Vec::new();
     for f in &files {
         let Ok(t) = std::fs::read_to_string(f) else { continue };
@@ -262,9 +277,35 @@ fn every_named_connection_in_a_real_netlist_is_conserved() {
         if n.insts.is_empty() || n.behavioural > 0 {
             continue; // RTL, or an empty wrapper — not this reader's contract
         }
+        // `Netlist` returns the TOP module only, so a multi-module file's other modules
+        // legitimately contribute connections to the text that are absent from the result.
+        if n.modules.len() > 1 {
+            continue;
+        }
         // Ground truth is counted on the text with COMMENTS REMOVED: a `//` line mentioning
         // `.port_name(wire_name)` is prose, and counting it made this check report losses the
         // parser was right to take.
+        // Block comments too: `.out2 (/* unconnected */)` is not a connection, and Yosys' own
+        // tests contain exactly that.
+        let t = {
+            let mut o = String::with_capacity(t.len());
+            let b = t.as_bytes();
+            let mut i = 0;
+            while i < b.len() {
+                if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+                    i += 2;
+                    while i < b.len() && !(b[i] == b'*' && i + 1 < b.len() && b[i + 1] == b'/') {
+                        if b[i] == b'\n' { o.push('\n'); }
+                        i += 1;
+                    }
+                    i = (i + 2).min(b.len());
+                    continue;
+                }
+                o.push(b[i] as char);
+                i += 1;
+            }
+            o
+        };
         let t: String = t
             .lines()
             .map(|l| match l.find("//") {
@@ -273,9 +314,41 @@ fn every_named_connection_in_a_real_netlist_is_conserved() {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        // Byte ranges covered by a `#( … )` PARAMETER list. `\$lcu #(.WIDTH(WIDTH)) impl (…)`
+        // has a `.name(` inside it that is a parameter, not a connection — the distinction is
+        // positional and cannot be made from the value, which may be an identifier like any net.
+        let mut params: Vec<(usize, usize)> = Vec::new();
+        {
+            let bb = t.as_bytes();
+            let mut i = 0;
+            while i + 1 < bb.len() {
+                if bb[i] == b'#' && bb[i + 1..].iter().position(|c| !c.is_ascii_whitespace()).is_some_and(|k| bb[i + 1 + k] == b'(') {
+                    let open = i + 1 + bb[i + 1..].iter().position(|c| !c.is_ascii_whitespace()).unwrap();
+                    let mut d = 0;
+                    let mut j = open;
+                    while j < bb.len() {
+                        if bb[j] == b'(' {
+                            d += 1;
+                        } else if bb[j] == b')' {
+                            d -= 1;
+                            if d == 0 {
+                                break;
+                            }
+                        }
+                        j += 1;
+                    }
+                    params.push((open, j.min(bb.len())));
+                    i = j;
+                }
+                i += 1;
+            }
+        }
         let b = t.as_bytes();
         let mut want = 0usize;
         for (i, _) in t.match_indices('.') {
+            if params.iter().any(|&(a, z)| i > a && i < z) {
+                continue; // a parameter, not a connection
+            }
             let r = &t[i + 1..];
             let name: String = r.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
             if name.is_empty() || !r[name.len()..].trim_start().starts_with('(') {

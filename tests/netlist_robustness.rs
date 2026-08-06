@@ -222,3 +222,37 @@ fn empty_and_constant_connections_are_not_nets() {
     );
     assert_eq!(conns_of(&n, "u1"), [("q", "y")], "only the real net survives");
 }
+
+/// **A parameter override sits between the cell and the instance name.** Yosys emits
+/// `ALU #(.MODE("AND")) u1 (.A(a), .Y(y));` and so does any parameterised macro. Read without
+/// allowing for it, `#` became the instance NAME, the parameters became its connections, and
+/// the gate's real connections were never seen — a whole instance replaced by its own
+/// parameters, silently.
+///
+/// Found by running this reader over Yosys' own test corpus (ISC), which contains forms our
+/// flattened OpenLane netlists never do.
+#[test]
+fn a_parameter_override_does_not_swallow_the_instance() {
+    let n = parse(
+        "module m(a, b, y);\n input [7:0] a, b;\n output [7:0] y;\n \
+         ALU #(.MODE(\"AND\")) u1 (.A(a), .B(b), .Y(y));\nendmodule\n",
+    );
+    assert_eq!(n.insts.len(), 1);
+    assert_eq!(n.insts[0].cell, "ALU");
+    assert_eq!(n.insts[0].name, "u1", "the instance name, not `#`");
+    assert_eq!(conns_of(&n, "u1"), [("A", "a"), ("B", "b"), ("Y", "y")]);
+
+    // multi-line, multiple parameters, and a trailing comma in the port list
+    let n = parse(
+        "module top(i, o);\n input [3:0] i;\n output [3:0] o;\n \
+         python_inv #(\n   .width(4),\n   .depth(2)\n ) inv (\n  .i(i),\n  .o(o),\n );\nendmodule\n",
+    );
+    assert_eq!(n.insts.len(), 1);
+    assert_eq!((n.insts[0].cell.as_str(), n.insts[0].name.as_str()), ("python_inv", "inv"));
+    assert_eq!(conns_of(&n, "inv"), [("i", "i"), ("o", "o")]);
+
+    // a positional parameter override, which is also legal
+    let n = parse("module m(a, y); input a; output y; DLY #(3) u1 (.A(a), .Y(y)); endmodule\n");
+    assert_eq!(n.insts[0].name, "u1");
+    assert_eq!(conns_of(&n, "u1"), [("A", "a"), ("Y", "y")]);
+}
