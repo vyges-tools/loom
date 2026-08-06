@@ -478,6 +478,39 @@ fn is_ident(c: u8) -> bool {
 }
 
 /// Next `kw ( args ) { body }` at/after `from`. Returns (args, body, after_idx).
+/// Representative leakage from per-state `leakage_power ()` groups, in library units.
+///
+/// Each group gives one power rail's leakage in one logic state (`when`). The cell's leakage in
+/// that state is the SUM over its rails — a ground-referenced entry of 0 is half of the same
+/// state, not a state of its own — and the representative figure is the MEAN over states, which
+/// is what `cell_leakage_power` means where a library provides both.
+///
+/// Returns 0.0 when there are no such groups, which is the honest answer for a library that
+/// simply does not characterise leakage.
+fn state_leakage(body: &str) -> f64 {
+    use std::collections::BTreeMap;
+    let mut by_state: BTreeMap<String, f64> = BTreeMap::new();
+    let mut anon = 0usize;
+    let mut at = 0;
+    while let Some((_, gbody, after)) = next_block(body, at, "leakage_power") {
+        at = after;
+        let Some(v) = simple_attr(&gbody, "value").and_then(|s| s.parse::<f64>().ok()) else {
+            continue;
+        };
+        // Groups with no `when` are unconditional; keep each on its own so they are averaged
+        // rather than summed into one another.
+        let state = simple_attr(&gbody, "when").unwrap_or_else(|| {
+            anon += 1;
+            format!("\u{0}anon{anon}")
+        });
+        *by_state.entry(state).or_default() += v;
+    }
+    if by_state.is_empty() {
+        return 0.0;
+    }
+    by_state.values().sum::<f64>() / by_state.len() as f64
+}
+
 fn next_block(s: &str, from: usize, kw: &str) -> Option<(String, String, usize)> {
     let b = s.as_bytes();
     let mut p = from;
@@ -537,7 +570,23 @@ fn simple_attr(body: &str, key: &str) -> Option<String> {
             q += 1;
         }
         if before_ok && q < b.len() && b[q] == b':' {
-            let semi = body[q..].find(';')? + q;
+            // A simple attribute ends at `;` OR at the end of the line, whichever comes first.
+            //
+            // Liberty asks for the semicolon and real libraries do not always write one: asap7
+            // states `area : 0.20412` with no terminator on 37 cells. Scanning to the next `;`
+            // then swallows everything up to some later attribute, the value fails to parse,
+            // and the cell silently reports an area of ZERO — which ranks it first among
+            // interchangeable cells. Nothing errors; the number is simply gone.
+            //
+            // A value genuinely continued onto the next line is rare but legal, so an empty
+            // first line falls back to the semicolon rather than returning nothing.
+            let semi = body[q..].find(';').map(|i| i + q).unwrap_or(body.len());
+            let nl = body[q..].find('\n').map(|i| i + q).unwrap_or(body.len());
+            let end = semi.min(nl);
+            let v = body[q + 1..end].trim().trim_matches('"').trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
             return Some(body[q + 1..semi].trim().trim_matches('"').to_string());
         }
         p = hit + key.len();
@@ -798,10 +847,15 @@ fn parse_cell(name: String, body: &str, units: &Units, skip_ccs: bool) -> Cell {
         })
         .unwrap_or_default();
     // power: leakage + representative internal (switching) energy.
-    let leakage_w = simple_attr(body, "cell_leakage_power")
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0)
-        * units.leak_w;
+    // `cell_leakage_power` is the cell's single representative number. Libraries that model
+    // leakage per logic state give `leakage_power () { value ; when ; related_pg_pin ; }` groups
+    // INSTEAD — asap7 has 222 of them and no per-cell attribute — and reading only the scalar
+    // reports those cells as leaking exactly nothing, which is not a number anyone would query.
+    let leakage_w = match simple_attr(body, "cell_leakage_power").and_then(|s| s.parse::<f64>().ok())
+    {
+        Some(v) => v * units.leak_w,
+        None => state_leakage(body) * units.leak_w,
+    };
     let ivals = internal_values(body);
     let int_energy_j = if ivals.is_empty() {
         0.0
@@ -857,10 +911,26 @@ fn lib_cache(
     C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// The identity of "what parsing a `.lib` means", stamped at build time from the parser's own
+/// source (see `build.rs`).
+///
+/// The cache is keyed on the FILE, so without this a parser fix never reaches anyone whose cache
+/// is warm: the file has not changed, the key has not changed, and the stale answer is served for
+/// ever. Measured twice in one sitting — a fix to attribute termination, then a fix to
+/// state-dependent leakage, both correct and both invisible, because entries written minutes
+/// earlier were still on disk. A hand-bumped constant was tried first and forgotten immediately,
+/// which is why this is derived rather than remembered.
+///
+/// The magic/version tag inside the cache format guards the SERIALISATION; this guards the
+/// SEMANTICS. They are different things and both are needed.
+const LIB_PARSER_STAMP: &str = env!("VYGES_LIB_PARSER_STAMP");
+
 fn lib_cache_key(text: &str, opts: LibOpts) -> LibCacheKey {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut h);
+    LIB_PARSER_STAMP.hash(&mut h);
+    env!("CARGO_PKG_VERSION").hash(&mut h);
     (h.finish(), text.len() as u64, opts.skip_ccs)
 }
 

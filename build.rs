@@ -16,6 +16,30 @@ fn main() {
     println!("cargo:rerun-if-env-changed=VYGES_GIT_SHA");
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
     println!("cargo:rustc-env=VYGES_GIT_SHA={}", build_sha());
+
+    // ---- parser-semantics stamp, for the Liberty cache key ----
+    //
+    // The `.lib` cache is keyed on the FILE, so a parser fix never reaches anyone whose cache is
+    // warm — the file has not changed, the key has not changed, and the stale answer is served
+    // for ever. That was not hypothetical: a fix to Liberty attribute termination was measured
+    // as having no effect, twice in one sitting, because entries written minutes earlier were
+    // still on disk. Relying on a hand-bumped constant failed the second time it was needed.
+    //
+    // So the stamp is derived from the parser SOURCE. Any edit to it changes the key, and the
+    // cache invalidates itself without anyone having to remember.
+    println!("cargo:rerun-if-changed=src/liberty.rs");
+    println!("cargo:rerun-if-changed=src/ccs.rs");
+    println!("cargo:rustc-env=VYGES_LIB_PARSER_STAMP={}", parser_stamp());
+}
+
+/// A cheap, stable hash of the Liberty parser sources — the identity of "what parsing means".
+fn parser_stamp() -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for f in ["src/liberty.rs", "src/ccs.rs"] {
+        std::fs::read_to_string(f).unwrap_or_default().hash(&mut h);
+    }
+    format!("{:016x}", h.finish())
 }
 
 fn build_sha() -> String {
