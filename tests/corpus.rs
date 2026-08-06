@@ -25,7 +25,7 @@
 
 use std::path::{Path, PathBuf};
 
-use vyges_loom::{def::Def, lef::Lef, netlist, sdc::Sdc, spef::Spef, vcd::Vcd};
+use vyges_loom::{def::Def, lef::Lef, netlist, saif::Saif, sdc::Sdc, spef::Spef, vcd::Vcd};
 
 /// Files under `VYGES_CORPUS` (recursively) with any of the given extensions, PLUS the
 /// in-repo regression fixtures in `tests/data/`.
@@ -554,6 +554,57 @@ fn counts_known_by_construction_are_reproduced_exactly() {
     let n = bad.len();
     bad.truncate(12);
     assert!(bad.is_empty(), "{n} mismatch(es):\n{}", bad.join("\n"));
+}
+
+/// **The SAIF reader against an external oracle.**
+///
+/// Verilator 5.040 writes both formats from one simulation — `--trace` for the VCD and
+/// `--trace-saif` for the SAIF — so the same activity arrives twice, described two completely
+/// different ways: a log of every transition, and a cumulative `TC` per net. Our two readers
+/// must land on the same number, and neither can be tuned to pass without being right.
+///
+/// This closes the one gap the activity work had left: SAIF semantics were covered by
+/// construction (escaping, hierarchy, timescale) but never checked against another
+/// implementation.
+///
+/// ```sh
+/// verilator --binary --timing --trace      -o sim_vcd  tb.sv && ./obj_dir/sim_vcd
+/// verilator --binary --timing --trace-saif -o sim_saif tb.sv && ./obj_saif/sim_saif
+/// VYGES_CORPUS=<dir with wave.vcd + wave.saif> cargo test --test corpus the_saif_reader
+/// ```
+#[test]
+fn the_saif_reader_agrees_with_the_vcd_reader_on_every_pair() {
+    let pairs: Vec<PathBuf> = corpus(&[".vcd"])
+        .into_iter()
+        .filter(|p| p.with_extension("saif").is_file())
+        .collect();
+    announce("VCD/SAIF pairs", &pairs);
+    let mut bad = Vec::new();
+    for v in &pairs {
+        let sp = v.with_extension("saif");
+        let (Ok(a), Ok(b)) = (Vcd::load(v.to_str().unwrap()), Saif::load(sp.to_str().unwrap()))
+        else {
+            bad.push(format!("{}: one of the pair would not load", show(v)));
+            continue;
+        };
+        // A SAIF states the run's DURATION; a VCD's span is its last timestamp. They describe
+        // the same window and must agree.
+        if (a.sim_time_s - b.sim_time_s).abs() > 1e-15 * a.sim_time_s.max(1.0) {
+            bad.push(format!("{}: span vcd {:e} saif {:e}", show(v), a.sim_time_s, b.sim_time_s));
+        }
+        let mut shown = 0;
+        for (path, n) in &a.idx.toggles {
+            let m = b.idx.toggles.get(path).copied();
+            if m != Some(*n) {
+                bad.push(format!("{}: {path} vcd={n} saif={m:?}", show(v)));
+                shown += 1;
+                if shown >= 4 {
+                    break;
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
 
 fn show(p: &Path) -> String {
