@@ -77,6 +77,95 @@ pub struct Lef {
     /// guessing from that alone will connect the wrong two layers wherever three meet.
     /// The list includes the cut layer, since a tech LEF is what tells routing from cut.
     pub vias: BTreeMap<String, Vec<String>>,
+    /// `UNITS` conversion factors this reader did NOT apply, as `(quantity, factor)`.
+    ///
+    /// LEF states its electrical units in a `UNITS` block — `CAPACITANCE PICOFARADS 1 ;`,
+    /// `RESISTANCE OHMS 1 ;`. The factor is 1 in every PDK we have seen, and this reader
+    /// assumes it. If a file says otherwise, every resistance and capacitance we report is
+    /// scaled wrong, and nothing about the numbers would look unusual — so the assumption is
+    /// recorded rather than made silently. See [`Lef::health`].
+    pub unapplied_units: Vec<(String, f64)>,
+}
+
+/// Interpret ONE complete `;`-terminated statement from a `LAYER` block.
+///
+/// The statement is the whole construct, so its first token names it unambiguously: a
+/// `SPACINGTABLE ... WIDTH 3 0.28` arrives here as one `SPACINGTABLE` statement and matches
+/// nothing, where a line-based reader would have seen a bare `WIDTH 3 0.28` row.
+fn apply_layer_stmt(stmt: &[String], l: &mut Layer) {
+    let t: Vec<&str> = stmt.iter().map(String::as_str).collect();
+    let num = |s: &str| s.parse::<f64>().ok();
+    match t.as_slice() {
+        ["WIDTH", w] => {
+            if let Some(v) = num(w) {
+                l.width_um = v;
+            }
+        }
+        ["THICKNESS", x] => {
+            if let Some(v) = num(x) {
+                l.thickness_um = v;
+            }
+        }
+        ["TYPE", "ROUTING"] => l.routing = true,
+        ["RESISTANCE", "RPERSQ", v] => {
+            if let Some(x) = num(v) {
+                l.rpersq = x;
+            }
+        }
+        // plain RESISTANCE <ohm> on a CUT layer = per-cut via resistance
+        ["RESISTANCE", v] => {
+            if let Some(x) = num(v) {
+                l.cut_res = x;
+            }
+        }
+        ["CAPACITANCE", "CPERSQDIST", v] => {
+            if let Some(x) = num(v) {
+                l.cpersqdist = x;
+            }
+        }
+        ["EDGECAPACITANCE", v] => {
+            if let Some(x) = num(v) {
+                l.edge_cap = x;
+            }
+        }
+        ["DCCURRENTDENSITY", "AVERAGE", v] => {
+            if let Some(x) = num(v) {
+                l.dc_jmax = x;
+            }
+        }
+        ["ACCURRENTDENSITY", "RMS", v] => {
+            if let Some(x) = num(v) {
+                l.ac_rms = x;
+            }
+        }
+        ["ACCURRENTDENSITY", "PEAK", v] => {
+            if let Some(x) = num(v) {
+                l.ac_peak = x;
+            }
+        }
+        _ => {}
+    }
+}
+
+impl Lef {
+    /// One line on whether the read can be trusted, or `None` when nothing looks wrong.
+    pub fn health(&self) -> Option<String> {
+        let mut notes = Vec::new();
+        for (q, f) in &self.unapplied_units {
+            notes.push(format!(
+                "UNITS {q} conversion factor is {f}, not 1 — this reader does not apply it, so                  every {} value it reports is scaled by {f}",
+                q.to_ascii_lowercase()
+            ));
+        }
+        // A **cell** LEF is macros with no LAYER blocks at all, and that is perfectly normal —
+        // only a file that declares layers without a routing stack is suspect.
+        if !self.layers.is_empty() && self.routing_order.is_empty() {
+            notes.push(
+                "layers are declared but none is TYPE ROUTING — nothing to extract on".to_string(),
+            );
+        }
+        (!notes.is_empty()).then(|| notes.join("; "))
+    }
 }
 
 #[derive(Debug)]
@@ -107,6 +196,12 @@ impl Lef {
         // a MACRO is. VIA blocks additionally record what they join; VIARULE is generated
         // geometry and only needs shielding.
         let mut cur_via: Option<(String, Vec<String>, bool)> = None;
+        let mut in_propdefs = false;
+        // A LEF statement is `;`-terminated and may span lines; these carry the partial one.
+        let mut stmt: Vec<String> = Vec::new();
+        let mut in_quote = false;
+        let mut in_units = false;
+        let mut unapplied_units: Vec<(String, f64)> = Vec::new();
         for raw in text.lines() {
             let line = match raw.find('#') {
                 Some(i) => &raw[..i],
@@ -128,7 +223,27 @@ impl Lef {
                 }
                 continue;
             }
+            // ---- property-definition mode: shield tech parsing ----
+            // `PROPERTYDEFINITIONS` legally contains `LAYER <property-name> STRING ;`, a line
+            // shaped exactly like the start of a tech layer — and sky130's own tech LEF has one.
+            // Without the shield the reader opens a layer named after the property; today it
+            // survives only because the next real `LAYER` overwrites it before it is inserted,
+            // which is luck, not a rule.
+            if in_propdefs {
+                if let ["END", "PROPERTYDEFINITIONS", ..] = toks.as_slice() {
+                    in_propdefs = false;
+                }
+                continue;
+            }
             match toks.as_slice() {
+                ["PROPERTYDEFINITIONS", ..] => {
+                    in_propdefs = true;
+                    continue;
+                }
+                ["UNITS", ..] => {
+                    in_units = true;
+                    continue;
+                }
                 ["VIA", name, ..] => {
                     cur_via = Some((name.to_string(), Vec::new(), true));
                     continue;
@@ -138,6 +253,22 @@ impl Lef {
                     continue;
                 }
                 _ => {}
+            }
+
+            // ---- units mode: record the conversion factors, shield tech parsing ----
+            if in_units {
+                match toks.as_slice() {
+                    ["END", "UNITS", ..] => in_units = false,
+                    [q @ ("CAPACITANCE" | "RESISTANCE"), _unit, f, ..] => {
+                        if let Some(v) = f.trim_end_matches(';').parse::<f64>().ok() {
+                            if (v - 1.0).abs() > 1e-12 {
+                                unapplied_units.push((q.to_string(), v));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
             }
 
             // ---- macro mode: consume MACRO/PIN/DIRECTION, shield tech parsing ----
@@ -183,8 +314,16 @@ impl Lef {
             }
 
             match toks.as_slice() {
-                ["LAYER", name, ..] => cur = Some((name.to_string(), Layer::default())),
+                ["LAYER", name, ..] => {
+                    stmt.clear();
+                    in_quote = false;
+                    cur = Some((name.to_string(), Layer::default()));
+                }
+                // `END <name>` closes a block and carries no `;`. Anything still buffered is
+                // an unterminated statement — dropped, not guessed at.
                 ["END", name, ..] if cur.as_ref().map(|(n, _)| n == name).unwrap_or(false) => {
+                    stmt.clear();
+                    in_quote = false;
                     if let Some((n, l)) = cur.take() {
                         if l.routing {
                             routing_order.push(n.clone());
@@ -193,69 +332,49 @@ impl Lef {
                     }
                 }
                 rest => {
-                    if let Some((_, l)) = cur.as_mut() {
-                        let num = |s: &str| s.trim_end_matches(';').parse::<f64>().ok();
-                        match rest {
-                            // The layer's default routing width is `WIDTH <n> ;` — one value.
-                            // A `SPACINGTABLE` inside the same block also carries WIDTH rows,
-                            // `WIDTH 0 0.14` / `WIDTH 3 0.28`, which are (width, spacing) pairs.
-                            // Matching those too, last-write-wins, left met1 reporting a routing
-                            // width of **3 µm** instead of 0.14. Nothing downstream noticed,
-                            // because resistance only consults the width when the deck supplies a
-                            // sheet resistance; coupling always does, and a width that large makes
-                            // every edge-to-edge gap negative, so every parallel neighbour clamps
-                            // to the full coefficient and the distance cutoff never fires.
-                            //
-                            // Hence the exact arity: a row with more than one value is a table
-                            // entry, not the default width.
-                            ["WIDTH", w] | ["WIDTH", w, ";"] => {
-                                if let Some(v) = num(w) {
-                                    l.width_um = v;
+                    if cur.is_some() {
+                        // ---- STATEMENTS, NOT LINES ----
+                        //
+                        // A LEF statement ends at `;`, and may span many lines. `SPACINGTABLE`
+                        // is one statement whose body carries `WIDTH 0 0.15` / `WIDTH 3 0.28`
+                        // rows; read line by line, those look exactly like the layer's own
+                        // `WIDTH 0.14 ;`, and last-write-wins once made met1 report a routing
+                        // width of 3 um in the middle of a correlation study.
+                        //
+                        // Matching per line makes every such row a candidate and leaves the
+                        // reader guarding each collision by hand — a generated sweep over the
+                        // grammar found 422 of 423 keywords able to smuggle a wrong value in
+                        // this way. Accumulating to the `;` instead dissolves the whole class:
+                        // a nested construct is ONE statement, its first token names it, and
+                        // nothing inside it is ever mistaken for an attribute of the layer.
+                        //
+                        // Quotes are respected, because a `PROPERTY LEF58_x "...;..."` string
+                        // legally contains semicolons that do not end anything.
+                        for t in rest {
+                            if in_quote {
+                                stmt.push((*t).to_string());
+                                if t.ends_with('"') {
+                                    in_quote = false;
                                 }
+                                continue;
                             }
-                            ["THICKNESS", t, ..] => {
-                                if let Some(v) = num(t) {
-                                    l.thickness_um = v;
+                            if t.starts_with('"') && !(t.len() > 1 && t.ends_with('"')) {
+                                in_quote = true;
+                                stmt.push((*t).to_string());
+                                continue;
+                            }
+                            if *t == ";" {
+                                apply_layer_stmt(&stmt, cur.as_mut().map(|(_, l)| l).unwrap());
+                                stmt.clear();
+                            } else if let Some(head) = t.strip_suffix(';') {
+                                if !head.is_empty() {
+                                    stmt.push(head.to_string());
                                 }
+                                apply_layer_stmt(&stmt, cur.as_mut().map(|(_, l)| l).unwrap());
+                                stmt.clear();
+                            } else {
+                                stmt.push((*t).to_string());
                             }
-                            ["TYPE", "ROUTING", ..] => l.routing = true,
-                            ["RESISTANCE", "RPERSQ", v, ..] => {
-                                if let Some(x) = num(v) {
-                                    l.rpersq = x;
-                                }
-                            }
-                            // plain RESISTANCE <ohm> on a CUT layer = per-cut via resistance
-                            ["RESISTANCE", v, ..] => {
-                                if let Some(x) = num(v) {
-                                    l.cut_res = x;
-                                }
-                            }
-                            ["CAPACITANCE", "CPERSQDIST", v, ..] => {
-                                if let Some(x) = num(v) {
-                                    l.cpersqdist = x;
-                                }
-                            }
-                            ["EDGECAPACITANCE", v, ..] => {
-                                if let Some(x) = num(v) {
-                                    l.edge_cap = x;
-                                }
-                            }
-                            ["DCCURRENTDENSITY", "AVERAGE", v, ..] => {
-                                if let Some(x) = num(v) {
-                                    l.dc_jmax = x;
-                                }
-                            }
-                            ["ACCURRENTDENSITY", "RMS", v, ..] => {
-                                if let Some(x) = num(v) {
-                                    l.ac_rms = x;
-                                }
-                            }
-                            ["ACCURRENTDENSITY", "PEAK", v, ..] => {
-                                if let Some(x) = num(v) {
-                                    l.ac_peak = x;
-                                }
-                            }
-                            _ => {}
                         }
                     }
                 }
@@ -283,6 +402,7 @@ impl Lef {
             widths,
             thicknesses,
             vias,
+            unapplied_units,
         })
     }
 

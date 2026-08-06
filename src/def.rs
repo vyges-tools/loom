@@ -163,13 +163,8 @@ impl Def {
         let ndr = parse_ndr(&tv, scale);
         let nets = parse_signal(&tv, scale, &ndr)?;
         let tref: Vec<&str> = tv.iter().map(|s| s.as_str()).collect();
-        let power_nets = match tref.iter().position(|&t| t == "SPECIALNETS") {
-            Some(s) => {
-                let end = (s..tref.len())
-                    .find(|&i| tref[i] == "END" && tref.get(i + 1) == Some(&"SPECIALNETS"))
-                    .unwrap_or(tref.len());
-                parse_specialnets(&tref[s + 1..end])
-            }
+        let power_nets = match section_start(&tref, "SPECIALNETS") {
+            Some(s) => parse_specialnets(&tref[s + 1..section_end(&tref, "SPECIALNETS", s)]),
             None => Vec::new(),
         };
         let comps = parse_components(&tref);
@@ -312,7 +307,8 @@ fn parse_signal(
     ndr: &BTreeMap<String, BTreeMap<String, f64>>,
 ) -> Result<Vec<DefNet>, DefError> {
     let mut nets = Vec::new();
-    let mut i = match t.iter().position(|x| x == "NETS") {
+    let tref: Vec<&str> = t.iter().map(String::as_str).collect();
+    let mut i = match section_start(&tref, "NETS") {
         Some(p) => p,
         None => return Ok(nets), // no signal nets
     };
@@ -338,6 +334,8 @@ fn parse_signal(
             ..DefNet::default()
         };
         let mut in_routing = false;
+        // Has any `+` attribute been seen? Past the first one, no group is a connection.
+        let mut seen_plus = false;
         let mut layer: Option<String> = None;
         let mut prev: Option<(f64, f64)> = None;
         // non-default routing rule: net-level (`+ NONDEFAULTRULE r`) or per-wire
@@ -356,6 +354,7 @@ fn parse_signal(
         while i < t.len() && t[i] != ";" {
             match t[i].as_str() {
                 "+" => {
+                    seen_plus = true;
                     let status = t.get(i + 1).map(String::as_str).unwrap_or("");
                     if matches!(status, "ROUTED" | "FIXED" | "COVER" | "NOSHIELD") {
                         in_routing = true;
@@ -407,11 +406,20 @@ fn parse_signal(
                         inner.push(t[j].clone());
                         j += 1;
                     }
-                    if !in_routing {
+                    // CONNECTIONS COME FIRST. A net statement lists its `( inst pin )`
+                    // connections and only then its `+` attributes, so a parenthesised group
+                    // after the first `+` belongs to that attribute — it is not a connection.
+                    //
+                    // Keying on "not yet routing" instead was silently wrong for any attribute
+                    // that carries coordinates before the wiring does. `+ VPIN vp LAYER met2
+                    // ( -50 -50 ) ( 50 50 ) PLACED ( 3000 3000 ) N` is valid DEF 5.8, and gave
+                    // the net three extra pins named after its own coordinates — connectivity
+                    // invented out of geometry, which extraction then builds an RC network to.
+                    if !seen_plus {
                         if inner.len() >= 2 {
                             net.pins.push((inner[0].clone(), inner[1].clone()));
                         }
-                    } else if inner.len() >= 2 {
+                    } else if in_routing && inner.len() >= 2 {
                         let (px, py) = prev.unwrap_or((0.0, 0.0));
                         let x = coord(&inner[0], px, scale)?;
                         let y = coord(&inner[1], py, scale)?;
@@ -460,13 +468,39 @@ fn parse_signal(
 
 // ─────────────────────────── power / components pass (PDN) ──────────────────────
 
+/// Find a DEF **section header**, not merely the keyword.
+///
+/// A section opens as `KEYWORD <count> ;` and closes as `END KEYWORD`. Scanning the token
+/// stream for the bare keyword instead finds it wherever it occurs — as a property name, a
+/// component or net name, an entry in `PROPERTYDEFINITIONS`. The result is not a parse error:
+/// the reader takes the boundary from the wrong place and returns a different design without
+/// complaint. Measured: a `PROPERTYDEFINITIONS` entry naming `SPECIALNETS` made the COMPONENTS
+/// section parse as the power grid, inventing a power net per instance — and the power grid is
+/// what the extractor uses to decide which wires are shielded from each other.
+///
+/// Requiring the header shape costs two token comparisons and removes the whole class.
+fn section_start(toks: &[&str], name: &str) -> Option<usize> {
+    (0..toks.len()).find(|&i| {
+        toks[i] == name
+            && toks
+                .get(i + 1)
+                .is_some_and(|c| c.parse::<i64>().is_ok())
+            && toks.get(i + 2) == Some(&";")
+    })
+}
+
+/// The matching `END <name>`, searched from the header.
+fn section_end(toks: &[&str], name: &str, from: usize) -> usize {
+    (from..toks.len())
+        .find(|&i| toks[i] == "END" && toks.get(i + 1) == Some(&name))
+        .unwrap_or(toks.len())
+}
+
 fn parse_components(toks: &[&str]) -> Vec<Comp> {
-    let Some(s) = toks.iter().position(|&t| t == "COMPONENTS") else {
+    let Some(s) = section_start(toks, "COMPONENTS") else {
         return Vec::new();
     };
-    let end = (s..toks.len())
-        .find(|&i| toks[i] == "END" && toks.get(i + 1) == Some(&"COMPONENTS"))
-        .unwrap_or(toks.len());
+    let end = section_end(toks, "COMPONENTS", s);
     let body = &toks[s + 1..end];
     let mut comps = Vec::new();
     let mut i = 0;
