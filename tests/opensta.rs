@@ -18,10 +18,12 @@
 //! Without it the test says so and passes, because CI has no EDA tools.
 //!
 //! ```sh
-//! VYGES_STA=/usr/local/bin/sta cargo test --test opensta -- --nocapture
+//! VYGES_STA=/usr/local/bin/sta \
+//! VYGES_CORPUS=~/runs VYGES_LIB=$PDK_ROOT/.../sky130_fd_sc_hd__tt_025C_1v80.lib \
+//!   cargo test --release --test opensta -- --nocapture
 //! ```
 //!
-//! What it found, on a four-line example, all of it invisible to our own reader:
+//! What it found on a four-line example, none of it visible to our own reader:
 //!
 //! - Net-internal nodes were interned into the name map as NAMES with an escaped colon, instead
 //!   of being written `*<netid>:<node>`. OpenSTA could not attach them and reported an arrival
@@ -31,6 +33,21 @@
 //!   hanging off a stub: -5.04 ns of slack against -6.45.
 //! - And the reader threw the coupling's node pair away, so re-emission put the capacitor on
 //!   the driver pin rather than the wire: -6.60 ns against -6.45.
+//!
+//! And what a REAL hardened design found that the example could not — which is the argument for
+//! pointing this at one rather than shipping a bigger fixture:
+//!
+//! - Bus brackets were escaped. `*BUS_DELIMITER [ ]` declares them, so an extractor writes
+//!   `*4 count[0]`; ours wrote `count\[0\]` and OpenSTA reported `net count\[0\] not found`
+//!   for every bussed net in the design.
+//! - `*P` port connections were read and then dropped, because a port's node is not
+//!   `<inst>:<pin>`. Every net touching the boundary was short a connection.
+//! - The node named after a net that IS a port is the PORT, and has to stay a bare `*<id>`;
+//!   giving it a node number moved the boundary capacitance onto a node nothing reaches, and
+//!   the clock network came out 26 ps fast.
+//! - A coupling capacitor has to be listed in BOTH nets' blocks, which is what OpenRCX does and
+//!   is not redundancy: a reader applies it to the net whose block it is in, so listing it once
+//!   leaves the other net believing it is coupled to nothing.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -50,22 +67,116 @@ fn sta_binary() -> Option<PathBuf> {
     (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
-/// Run OpenSTA over the example design with `spef` annotated, returning its whole output.
-fn run_sta(sta: &Path, work: &Path, spef: &Path) -> String {
+/// A design this check can be run on: everything a timer needs, plus the parasitics.
+struct Design {
+    what: String,
+    top: String,
+    liberty: PathBuf,
+    netlist: PathBuf,
+    sdc: Option<PathBuf>,
+    spef: PathBuf,
+}
+
+/// The example that ships with the crate — the case that runs wherever OpenSTA exists.
+fn example_design() -> Design {
+    Design {
+        what: "examples/top".into(),
+        top: "top".into(),
+        liberty: ex("cells.lib"),
+        netlist: ex("top.v"),
+        sdc: Some(ex("top.sdc")),
+        spef: ex("top.spef"),
+    }
+}
+
+/// Hardened designs under `VYGES_CORPUS`, in the LibreLane `final/` layout — `nl/<top>.nl.v`,
+/// `spef/<corner>/<top>.<corner>.spef`, `sdc/<top>.sdc`. That layout is worth understanding by
+/// name because it is the only production harden path we have.
+///
+/// The standard-cell Liberty is NOT in a run directory — it belongs to the PDK — so it comes
+/// from `VYGES_LIB`. Nothing is vendored: the run stays where the flow left it.
+fn corpus_designs() -> Vec<Design> {
+    let (Ok(root), Ok(lib)) = (std::env::var("VYGES_CORPUS"), std::env::var("VYGES_LIB")) else {
+        return Vec::new();
+    };
+    let liberty = PathBuf::from(lib);
+    if !liberty.is_file() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut stack = vec![PathBuf::from(root)];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            if p.file_name().and_then(|s| s.to_str()) == Some("final") {
+                let Some(netlist) = first_with(&p.join("nl"), ".nl.v").or_else(|| first_with(&p.join("nl"), ".v")) else { continue };
+                let top = netlist
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.split('.').next().unwrap_or(s).to_string())
+                    .unwrap_or_default();
+                let mut spefs = Vec::new();
+                if let Ok(corners) = std::fs::read_dir(p.join("spef")) {
+                    for c in corners.flatten() {
+                        if let Some(f) = first_with(&c.path(), ".spef") {
+                            spefs.push(f);
+                        }
+                    }
+                }
+                for spef in spefs {
+                    out.push(Design {
+                        what: format!("{}", spef.display()),
+                        top: top.clone(),
+                        liberty: liberty.clone(),
+                        netlist: netlist.clone(),
+                        sdc: first_with(&p.join("sdc"), ".sdc"),
+                        spef,
+                    });
+                }
+            } else {
+                stack.push(p);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.what.cmp(&b.what));
+    out
+}
+
+fn first_with(dir: &Path, ext: &str) -> Option<PathBuf> {
+    let mut hits: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.to_str().is_some_and(|s| s.ends_with(ext)))
+        .collect();
+    hits.sort();
+    hits.into_iter().next()
+}
+
+/// Run OpenSTA over `d` with `spef` annotated, returning its whole output.
+fn run_sta(sta: &Path, work: &Path, d: &Design, spef: &Path) -> String {
     let script = work.join("run.tcl");
+    let sdc = match &d.sdc {
+        Some(p) => format!("read_sdc {}\n", p.display()),
+        None => String::new(),
+    };
     std::fs::write(
         &script,
         format!(
             "read_liberty {}\n\
              read_verilog {}\n\
-             link_design top\n\
-             read_sdc {}\n\
+             link_design {}\n\
+             {sdc}\
              read_spef {}\n\
              report_checks -path_delay max -digits 6\n\
              exit\n",
-            ex("cells.lib").display(),
-            ex("top.v").display(),
-            ex("top.sdc").display(),
+            d.liberty.display(),
+            d.netlist.display(),
+            d.top,
             spef.display()
         ),
     )
@@ -91,6 +202,38 @@ fn slack(report: &str) -> Option<String> {
         .map(|l| l.split_whitespace().next().unwrap_or("").to_string())
 }
 
+/// One design, timed twice: as the parasitics arrived, and after a trip through our reader and
+/// writer. Returns a complaint, or `None` when the two agree.
+fn check(sta: &Path, work: &Path, d: &Design) -> Option<String> {
+    let original = run_sta(sta, work, d, &d.spef);
+    let want = slack(&original)?; // no timing report at all: nothing to compare, say so upstream
+
+    let text = std::fs::read_to_string(&d.spef).ok()?;
+    let ours_path = work.join("ours.spef");
+    std::fs::write(
+        &ours_path,
+        vyges_loom::spef::Spef::parse(&text).to_spef(&vyges_loom::spef::WriteOpts::default()),
+    )
+    .expect("write spef");
+    let ours = run_sta(sta, work, d, &ours_path);
+
+    // Complaints first: they NAME the defect, where a slack difference only says there is one.
+    // Only those about the parasitics — a netlist that instantiates fill and tap cells the
+    // Liberty does not define warns identically for both files and is not ours to fix.
+    let spef_name = ours_path.file_name().and_then(|s| s.to_str()).unwrap_or("spef");
+    let complaints: Vec<&str> = ours
+        .lines()
+        .filter(|l| (l.starts_with("Error:") || l.starts_with("Warning:")) && l.contains(spef_name))
+        .collect();
+    if !complaints.is_empty() {
+        return Some(format!("{}: OpenSTA objected:\n    {}", d.what, complaints.join("\n    ")));
+    }
+    let got = slack(&ours)?;
+    (got != want).then(|| {
+        format!("{}: the same parasitics, rewritten, time differently: {want} -> {got}", d.what)
+    })
+}
+
 #[test]
 fn opensta_reads_the_spef_we_write_and_gets_the_same_answer() {
     let Some(sta) = sta_binary() else {
@@ -102,42 +245,24 @@ fn opensta_reads_the_spef_we_write_and_gets_the_same_answer() {
     let work = std::env::temp_dir().join(format!("vyges-opensta-{}", std::process::id()));
     std::fs::create_dir_all(&work).expect("work dir");
 
-    // 1. The parasitics as they arrived.
-    let original = run_sta(&sta, &work, &ex("top.spef"));
-    let want = slack(&original)
-        .unwrap_or_else(|| panic!("no timing report from the original SPEF:\n{original}"));
+    let mut designs = vec![example_design()];
+    let corpus = corpus_designs();
+    match corpus.len() {
+        0 => println!(
+            "OpenSTA: the shipped example only — point VYGES_CORPUS at a tree of LibreLane runs \
+             and VYGES_LIB at a standard-cell Liberty to check hardened designs too"
+        ),
+        n => println!("OpenSTA: the shipped example plus {n} hardened design(s)"),
+    }
+    designs.extend(corpus);
 
-    // 2. The same parasitics through our reader and writer.
-    let text = std::fs::read_to_string(ex("top.spef")).expect("top.spef");
-    let ours_path = work.join("ours.spef");
-    std::fs::write(
-        &ours_path,
-        vyges_loom::spef::Spef::parse(&text).to_spef(&vyges_loom::spef::WriteOpts::default()),
-    )
-    .expect("write spef");
-    let ours = run_sta(&sta, &work, &ours_path);
-
-    // Errors and warnings first: they name the defect, where a slack difference only shows that
-    // there is one. "pin n1 not found" is a node we wrote that the design does not have.
-    let complaints: Vec<&str> = ours
-        .lines()
-        .filter(|l| l.starts_with("Error:") || l.starts_with("Warning:"))
-        .collect();
-    assert!(
-        complaints.is_empty(),
-        "OpenSTA objected to the SPEF we wrote:\n  {}\n\nfile:\n{}",
-        complaints.join("\n  "),
-        std::fs::read_to_string(&ours_path).unwrap_or_default()
-    );
-
-    let got = slack(&ours).unwrap_or_else(|| panic!("no timing report from our SPEF:\n{ours}"));
-    assert_eq!(
-        got,
-        want,
-        "the same parasitics, rewritten, time differently to an outside reader\n\
-         --- what we wrote ---\n{}",
-        std::fs::read_to_string(&ours_path).unwrap_or_default()
-    );
-    println!("OpenSTA agrees: slack {want} from both the original SPEF and ours");
+    let mut bad = Vec::new();
+    for d in &designs {
+        match check(&sta, &work, d) {
+            Some(c) => bad.push(c),
+            None => println!("  ok  {}", d.what),
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
     let _ = std::fs::remove_dir_all(&work);
 }

@@ -42,11 +42,16 @@ pub struct NetRc {
 /// A `*CONN` entry with direction and input-pin load capacitance (fF).
 #[derive(Debug, Clone, Default)]
 pub struct PinConn {
+    /// Empty for a top-level port — see [`PinConn::is_port`].
     pub inst: String,
     pub pin: String,
     pub node: String,
     pub dir: crate::lef::PinDir,
     pub cap_ff: f64,
+    /// A `*P` entry: the net reaches a TOP-LEVEL PORT rather than an instance pin. Dropping
+    /// these — which is what happens if you only look for `<inst>:<pin>` — leaves every net that
+    /// touches the boundary short one connection, and a timer loads it accordingly.
+    pub is_port: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -173,12 +178,21 @@ fn is_triplet(t: &str) -> bool {
 }
 
 
-/// Add SPEF name escaping — the inverse of [`unescape`], applied by the writer so a name
-/// containing SPEF punctuation survives a round trip instead of becoming a syntax error.
+/// Add SPEF name escaping — the inverse of [`unescape`].
+///
+/// **The declared delimiters are NOT escaped.** A SPEF header declares `*DIVIDER /`,
+/// `*DELIMITER :` and `*BUS_DELIMITER [ ]` precisely so those characters can appear in a name
+/// meaning what they say, and that is how every extractor writes them: OpenRCX emits
+/// `*4 count[0]`, not `*4 count\[0\]`. Escaping them anyway makes the backslashes part of the
+/// name — OpenSTA reports `net count\[0\] not found` and drops the parasitics for every bussed
+/// net in the design, which on a hardened counter was ten of them and a 20 ps shift in slack.
+///
+/// What still has to be escaped is a character that would break the tokenising: a backslash
+/// itself, and whitespace, which would end the name.
 fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if matches!(c, '\\' | '[' | ']' | '.' | '/' | ':' | '*' | '!' | '{' | '}') {
+        if c == '\\' || c.is_whitespace() {
             out.push('\\');
         }
         out.push(c);
@@ -644,7 +658,17 @@ impl Spef {
                         .is_some_and(|t| t.eq_ignore_ascii_case("*I") || t.eq_ignore_ascii_case("*P")) =>
                 {
                     if let Some(node) = toks.get(1) {
-                        if let Some((inst, pin)) = pin_of(node, &names) {
+                        // `*P <port> <dir>` names a top-level port, whose node is the port
+                        // itself and not `<inst>:<pin>`, so it never matched the instance form.
+                        let is_port = toks
+                            .first()
+                            .is_some_and(|t| t.eq_ignore_ascii_case("*P"));
+                        let hookup = if is_port {
+                            Some((String::new(), resolve(node, &names)))
+                        } else {
+                            pin_of(node, &names)
+                        };
+                        if let Some((inst, pin)) = hookup {
                             let dir = match toks.get(2).copied() {
                                 Some("O") => crate::lef::PinDir::Output,
                                 Some("B") => crate::lef::PinDir::Inout,
@@ -661,13 +685,22 @@ impl Spef {
                                 .unwrap_or(0.0);
                             claim(&cur, &mut owner, &node_tok(node, &names));
                             if let Some((_, _, rc)) = cur.as_mut() {
-                                rc.pins.push((inst.clone(), pin.clone(), node_tok(node, &names)));
+                                // `pins` is instance hookup, which is what a netlist join asks
+                                // for; a port has no instance to name there.
+                                if !is_port {
+                                    rc.pins.push((
+                                        inst.clone(),
+                                        pin.clone(),
+                                        node_tok(node, &names),
+                                    ));
+                                }
                                 rc.conns.push(PinConn {
                                     inst,
                                     pin,
                                     node: node_tok(node, &names),
                                     dir,
                                     cap_ff,
+                                    is_port,
                                 });
                             }
                         }
@@ -788,6 +821,11 @@ impl Spef {
         for (name, rc) in nets.iter_mut() {
             rc.coupling_ff = coupling.get(name).copied().unwrap_or(0.0);
             rc.coupling_nodes = coupling_nodes.remove(name).unwrap_or_default();
+            // A CANONICAL ORDER, so the writer is a fixed point on its own output. These arrive
+            // in file order, and a file we wrote lists them in ours — so without this, writing
+            // what we just read produces the same parasitics in a different order, and every
+            // further pass through a flow shuffles the file again.
+            rc.coupling_nodes.sort_by(|a, b| (&a.0, &a.1, &a.2).cmp(&(&b.0, &b.1, &b.2)));
             rc.coupling = coupling_list
                 .range((name.clone(), String::new())..)
                 .take_while(|((n, _), _)| n == name)
@@ -844,7 +882,10 @@ impl Spef {
                 }
             }
             for c in &rc.conns {
-                if !insts.contains(&c.inst) {
+                // A PORT entry has no instance. Interning its empty name put a nameless entry
+                // in the name map (`*51 ` with nothing after it), which is a syntax error to
+                // the next reader — the whole file, rejected, for one blank line.
+                if !c.is_port && !c.inst.is_empty() && !insts.contains(&c.inst) {
                     insts.push(c.inst.clone());
                 }
             }
@@ -857,6 +898,7 @@ impl Spef {
         // Resolve an RC-network node string to a SPEF node token.
         let node_tok = |s: &str,
                         owner: &str,
+                        owner_is_port: bool,
                         id_of: &mut BTreeMap<String, usize>,
                         order: &mut Vec<String>|
          -> String {
@@ -874,7 +916,18 @@ impl Spef {
             // node on it.
             if s == owner {
                 if let Some(id) = id_of.get(s) {
-                    return format!("*{id}:0");
+                    // ON A NET THAT REACHES A TOP-LEVEL PORT, the node named after the net IS
+                    // the port — and a bare `*<id>` is exactly how SPEF says "this port". Adding
+                    // a node number there invents an internal node instead, which disconnects
+                    // the boundary: the grounded capacitance and the resistor that used to sit
+                    // on the port now sit on a node nothing else reaches. OpenSTA reported
+                    // 6.8 ps at `rst_n (in)` where the same file gives 9.1 ps, and a clock
+                    // network 26 ps faster than it is.
+                    return if owner_is_port {
+                        format!("*{id}")
+                    } else {
+                        format!("*{id}:0")
+                    };
                 }
             } else if let Some(id) = id_of.get(s) {
                 return format!("*{id}");
@@ -900,16 +953,25 @@ impl Spef {
         let mut body = String::new();
         for (net, rc) in &self.nets {
             let nid = id_of[net];
+            // Does this net reach a top-level port of the same name?
+            let net_is_port = rc.conns.iter().any(|c| c.is_port && &c.pin == net);
             body.push_str(&format!("\n*D_NET *{nid} {}\n", fmtf(rc.cap_ff)));
             if !rc.conns.is_empty() {
                 body.push_str("*CONN\n");
                 for c in &rc.conns {
-                    let iid = id_of[&c.inst];
                     let d = match c.dir {
                         crate::lef::PinDir::Output => "O",
                         crate::lef::PinDir::Inout => "B",
                         _ => "I", // input / unknown → load
                     };
+                    // A port entry names the port, not an instance pin.
+                    if c.is_port {
+                        intern(&c.pin, &mut id_of, &mut order);
+                        let pid = id_of[&c.pin];
+                        body.push_str(&format!("*P *{pid} {d}\n"));
+                        continue;
+                    }
+                    let iid = id_of[&c.inst];
                     if c.cap_ff > 0.0 {
                         body.push_str(&format!("*I *{iid}:{} {d} *L {}\n", c.pin, fmtf(c.cap_ff)));
                     } else {
@@ -934,19 +996,29 @@ impl Spef {
                 }
             } else {
                 for (node, c) in &rc.ground {
-                    let tok = node_tok(node, net, &mut id_of, &mut order);
+                    let tok = node_tok(node, net, net_is_port, &mut id_of, &mut order);
                     cap_lines.push(format!("{tok} {}", fmtf(*c)));
                 }
             }
+            // EMITTED IN BOTH NETS' BLOCKS, which is what OpenRCX does and is not redundancy:
+            // a reader applies a coupling capacitor to the net whose block it appears in, so a
+            // cap listed once loads one of the two nets and leaves the other believing it is
+            // not coupled to anything. Writing each one once put the whole design 3 ps fast.
+            // The READER still dedupes by node pair — counting both listings would double every
+            // net's crosstalk — so this round-trips.
             for (other, near, far, cc) in &rc.coupling_nodes {
-                if net.as_str() < other.as_str() {
-                    let ta = node_tok(near, net, &mut id_of, &mut order);
-                    let tb = node_tok(far, other, &mut id_of, &mut order);
+                {
+                    let far_is_port = self
+                        .nets
+                        .get(other)
+                        .is_some_and(|o| o.conns.iter().any(|c| c.is_port && &c.pin == other));
+                    let ta = node_tok(near, net, net_is_port, &mut id_of, &mut order);
+                    let tb = node_tok(far, other, far_is_port, &mut id_of, &mut order);
                     cap_lines.push(format!("{ta} {tb} {}", fmtf(*cc)));
                 }
             }
             for (other, cc) in rc.coupling.iter().filter(|_| rc.coupling_nodes.is_empty()) {
-                if net.as_str() < other.as_str() {
+                {
                     // emit under the lexicographically-smaller net only (dedupe)
                     //
                     // ATTACHED TO A NODE THE NET ACTUALLY HAS. The reader keeps one coupling
@@ -959,9 +1031,13 @@ impl Spef {
                     // the capacitor sits on the wire.
                     let near = rep_node(rc);
                     let far = self.nets.get(other).map(rep_node).unwrap_or_else(|| "0".into());
+                    let far_is_port = self
+                        .nets
+                        .get(other)
+                        .is_some_and(|o| o.conns.iter().any(|c| c.is_port && &c.pin == other));
                     if id_of.contains_key(other) {
-                        let ta = node_tok(&near, net, &mut id_of, &mut order);
-                        let tb = node_tok(&far, other, &mut id_of, &mut order);
+                        let ta = node_tok(&near, net, net_is_port, &mut id_of, &mut order);
+                        let tb = node_tok(&far, other, far_is_port, &mut id_of, &mut order);
                         cap_lines.push(format!("{ta} {tb} {}", fmtf(*cc)));
                     }
                 }
@@ -976,8 +1052,8 @@ impl Spef {
             if !rc.res.is_empty() {
                 body.push_str("*RES\n");
                 for (i, (a, b, r)) in rc.res.iter().enumerate() {
-                    let ta = node_tok(a, net, &mut id_of, &mut order);
-                    let tb = node_tok(b, net, &mut id_of, &mut order);
+                    let ta = node_tok(a, net, net_is_port, &mut id_of, &mut order);
+                    let tb = node_tok(b, net, net_is_port, &mut id_of, &mut order);
                     body.push_str(&format!("{} {ta} {tb} {}\n", i + 1, fmtf(*r)));
                 }
             }
@@ -1290,8 +1366,8 @@ mod writer_tests {
                 ground: vec![("n0".to_string(), 5.0)],
                 res: vec![("n0".to_string(), "u1:Y".to_string(), 20.0)],
                 conns: vec![
-                    PinConn { inst: "u1".into(), pin: "Y".into(), node: "u1:Y".into(), dir: PinDir::Output, cap_ff: 0.0 },
-                    PinConn { inst: "u2".into(), pin: "A".into(), node: "u2:A".into(), dir: PinDir::Input, cap_ff: 1.5 },
+                    PinConn { inst: "u1".into(), pin: "Y".into(), node: "u1:Y".into(), dir: PinDir::Output, cap_ff: 0.0, is_port: false },
+                    PinConn { inst: "u2".into(), pin: "A".into(), node: "u2:A".into(), dir: PinDir::Input, cap_ff: 1.5, is_port: false },
                 ],
                 ..Default::default()
             },

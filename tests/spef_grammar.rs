@@ -70,8 +70,13 @@ fn escaped_names_are_unescaped() {
     assert!(s.nets.contains_key("u_a.q[0]"), "got {:?}", s.nets.keys().collect::<Vec<_>>());
 }
 
-/// And the writer escapes on the way out, so a name survives the round trip rather than
-/// becoming a syntax error for the next reader.
+/// And a name survives the round trip — written the way an extractor writes it.
+///
+/// **The declared delimiters are not escaped.** The header declares `*DIVIDER /`,
+/// `*DELIMITER :` and `*BUS_DELIMITER [ ]` so that those characters can appear in a name meaning
+/// what they say; OpenRCX emits `*4 count[0]`. This test asserted the opposite until OpenSTA was
+/// pointed at a file we wrote and reported `net count\[0\] not found` for every bussed net in a
+/// hardened design — the backslashes had become part of the name.
 #[test]
 fn escaping_round_trips() {
     let src = one_net(
@@ -80,7 +85,10 @@ fn escaping_round_trips() {
         "1 OHM",
     );
     let text = src.to_spef(&Default::default());
-    assert!(text.contains("u_a\\.q\\[0\\]"), "writer must escape: {text}");
+    assert!(
+        text.contains("*1 u_a.q[0]"),
+        "the bus and divider characters are declared, not escaped: {text}"
+    );
     let back = Spef::parse(&text);
     assert!(back.nets.contains_key("u_a.q[0]"));
     assert_eq!(back.nets["u_a.q[0]"].cap_ff, 10.0);
