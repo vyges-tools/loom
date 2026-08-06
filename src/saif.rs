@@ -15,6 +15,7 @@
 
 use crate::names::NetIndex;
 
+
 #[derive(Debug, Clone, Default)]
 pub struct Saif {
     pub idx: NetIndex,   // full-path TC counts + leaf index + optional design scope
@@ -29,6 +30,28 @@ impl std::fmt::Display for SaifError {
     }
 }
 impl std::error::Error for SaifError {}
+
+/// Strip SAIF name escaping: `i\[0\]` -> `i[0]`, `top/u\.a` -> `top/u.a`.
+///
+/// Kept deliberately narrow — a backslash only ever escapes the character that follows it.
+fn unescape_saif(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut esc = false;
+    for c in s.chars() {
+        if esc {
+            out.push(c);
+            esc = false;
+        } else if c == '\\' {
+            esc = true;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
 
 impl Saif {
     /// Transitions / second for a netlist net (0 if unresolved, ambiguous, or
@@ -76,6 +99,12 @@ impl Saif {
         let mut max_span_units = 0.0_f64;
         let mut path: Vec<String> = Vec::new();
         root.walk_scoped(&mut path, &mut |full, tc, span| {
+            // SAIF ESCAPES PUNCTUATION IN NAMES: a bussed net is written `i\[0\]`. Left
+            // escaped it matches nothing in the netlist, so the net resolves to no activity at
+            // all and its power is computed from a default estimate instead of the measurement
+            // — quietly, because "no activity recorded" and "a net that never toggles" look
+            // identical from the outside.
+            let full = unescape_saif(&full);
             idx.declare(&full);
             idx.add_toggles(&full, tc);
             if span > max_span_units {

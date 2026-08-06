@@ -91,9 +91,14 @@ impl Vcd {
         };
 
         let mut tick_s = 1.0e-9; // default 1ns
-        let mut sym2sig: HashMap<String, Sig> = HashMap::new(); // sym -> scalar path or per-bit paths
+        // ONE CODE, MANY NAMES. A VCD identifier code may be declared for several signals — a
+        // net and its port alias share one code, and dumpers emit that routinely. Keyed by a
+        // single `Sig`, the second `$var` overwrote the first and that signal's activity
+        // vanished: it reported a toggle rate of zero while its alias reported the truth.
+        let mut sym2sig: HashMap<String, Vec<Sig>> = HashMap::new();
         let mut last: HashMap<String, char> = HashMap::new(); // scalar full path -> last value
-        let mut vprev: HashMap<String, Vec<char>> = HashMap::new(); // sym -> last vector value (padded)
+        let mut vprev: HashMap<String, Vec<char>> = HashMap::new(); // sym -> last KNOWN bits ('?' = never seen)
+        let mut rprev: HashMap<String, String> = HashMap::new(); // real path -> last value
         let mut idx = NetIndex::default();
         let mut scope_stack: Vec<String> = Vec::new();
         let mut time_ticks: u64 = 0;
@@ -124,6 +129,16 @@ impl Vcd {
                     }
                     if !name.is_empty() {
                         scope_stack.push(name);
+                    }
+                }
+                // `$comment` bodies contain anything at all, including things shaped exactly
+                // like a timestamp and a value change. Read as data, a commented-out `#999 1!`
+                // became a real transition — activity invented out of prose.
+                "$comment" => {
+                    for t in toks.by_ref() {
+                        if t == "$end" {
+                            break;
+                        }
                     }
                 }
                 "$upscope" => {
@@ -157,7 +172,7 @@ impl Vcd {
                             format!("{}.{}", scope_stack.join("."), name)
                         };
                         let sig = build_sig(&ty, width, &base, range.as_deref(), &mut idx);
-                        sym2sig.insert(sym, sig);
+                        sym2sig.entry(sym).or_default().push(sig);
                     }
                 }
                 _ => {
@@ -169,10 +184,23 @@ impl Vcd {
                     } else if let Some(first) = tok.chars().next() {
                         match first {
                             '0' | '1' | 'x' | 'X' | 'z' | 'Z' => {
-                                // scalar change: <value><sym>
+                                // Scalar change: <value><sym>.
+                                //
+                                // `last` holds the last KNOWN value. An `x`/`z` is not a level,
+                                // it is the absence of one: it neither counts as a transition
+                                // nor replaces what we knew. So 0→x→1 counts ONE toggle (the
+                                // net did change), 0→x→0 counts none (it did not), and the
+                                // x-flood a `$dumpoff` writes over every signal — which is a
+                                // statement about the dumper, not the circuit — counts nothing
+                                // at all. Counting each of those as a transition inflated
+                                // activity, and therefore dynamic power, without a warning.
                                 let sym = &tok[1..];
-                                if let Some(Sig::Scalar(full)) = sym2sig.get(sym) {
-                                    let v = first.to_ascii_lowercase();
+                                let v = first.to_ascii_lowercase();
+                                for sig in sym2sig.get(sym).map(Vec::as_slice).unwrap_or(&[]) {
+                                    let Sig::Scalar(full) = sig else { continue };
+                                    if v == 'x' || v == 'z' {
+                                        continue; // unknown: no transition, no new baseline
+                                    }
                                     let prev = last.insert(full.clone(), v);
                                     if count_now && prev.map(|p| p != v).unwrap_or(false) {
                                         idx.add_toggles(full, 1);
@@ -180,29 +208,48 @@ impl Vcd {
                                 }
                             }
                             'b' | 'B' => {
-                                // vector change: b<value> <sym> — count each *bit* that flips.
+                                // Vector change: b<value> <sym> — count each *bit* that flips.
+                                // Per bit, the same rule as a scalar: an `x`/`z` bit is unknown,
+                                // so it counts nothing and leaves that bit's last known value
+                                // in place.
                                 let value = &tok[1..];
                                 if let Some(sym) = toks.next() {
-                                    if let Some(Sig::Vector { bits }) = sym2sig.get(sym) {
+                                    for sig in sym2sig.get(sym).map(Vec::as_slice).unwrap_or(&[]) {
+                                        let Sig::Vector { bits } = sig else { continue };
                                         let cur = pad_bits(value, bits.len());
-                                        if count_now {
-                                            if let Some(prev) = vprev.get(sym) {
-                                                for (i, (a, b)) in cur.iter().zip(prev).enumerate() {
-                                                    if a != b {
-                                                        idx.add_toggles(&bits[i], 1);
-                                                    }
+                                        let prev = vprev.entry(sym.to_string()).or_insert_with(|| {
+                                            std::iter::repeat_n('?', bits.len()).collect()
+                                        });
+                                        for (i, c) in cur.iter().enumerate() {
+                                            if *c == 'x' || *c == 'z' {
+                                                continue;
+                                            }
+                                            if i < prev.len() {
+                                                let was = prev[i];
+                                                if count_now && was != '?' && was != *c {
+                                                    idx.add_toggles(&bits[i], 1);
                                                 }
+                                                prev[i] = *c;
                                             }
                                         }
-                                        vprev.insert(sym.to_string(), cur);
                                     }
                                 }
                             }
                             'r' | 'R' => {
-                                // real change: r<value> <sym> — not bit-decomposable; count 1.
+                                // Real change: r<value> <sym> — not bit-decomposable, so one
+                                // toggle per CHANGE. The initial dump is not a change, and
+                                // counting it made every real signal report one transition it
+                                // never made — the same off-by-one the scalar path avoids by
+                                // comparing against a previous value.
+                                let value = tok[1..].to_string();
                                 if let Some(sym) = toks.next() {
-                                    if count_now {
-                                        if let Some(Sig::Scalar(full)) = sym2sig.get(sym) {
+                                    for sig in sym2sig.get(sym).map(Vec::as_slice).unwrap_or(&[]) {
+                                        let Sig::Scalar(full) = sig else { continue };
+                                        let changed = rprev
+                                            .insert(full.clone(), value.clone())
+                                            .map(|p| p != value)
+                                            .unwrap_or(false);
+                                        if count_now && changed {
                                             idx.add_toggles(full, 1);
                                         }
                                     }

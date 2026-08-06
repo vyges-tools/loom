@@ -25,7 +25,7 @@
 
 use std::path::{Path, PathBuf};
 
-use vyges_loom::{def::Def, lef::Lef, netlist, sdc::Sdc, spef::Spef};
+use vyges_loom::{def::Def, lef::Lef, netlist, sdc::Sdc, spef::Spef, vcd::Vcd};
 
 /// Files under `VYGES_CORPUS` (recursively) with any of the given extensions, PLUS the
 /// in-repo regression fixtures in `tests/data/`.
@@ -377,6 +377,52 @@ fn every_named_connection_in_a_real_netlist_is_conserved() {
                 x.starts_with('{') || x.ends_with('}') || x.is_empty() || *x == ")"
             }) {
                 bad.push(format!("{}: {} pin {p} has a non-net `{x}`", show(f), inst.name));
+                break;
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// **Activity must partition.** Toggles counted over the whole dump must equal the toggles of
+/// its halves — an internal invariant that needs no reference waveform, and that exercises the
+/// window arithmetic the power engine uses when it analyses a slice of a long run.
+///
+/// It also catches the whole class of "counted something that is not a transition": an `x` from
+/// a `$dumpoff`, a `$comment` body, an aliased code credited to one name only. Any of those
+/// lands in one half but not in the whole, or the reverse.
+#[test]
+fn activity_partitions_across_windows() {
+    let files = corpus(&[".vcd"]);
+    announce("VCD", &files);
+    let mut bad = Vec::new();
+    for f in &files {
+        let Ok(text) = std::fs::read_to_string(f) else { continue };
+        // very large dumps are the opt-in corpus's business, not a per-commit check
+        if text.len() > 40_000_000 {
+            continue;
+        }
+        let Ok(whole) = Vcd::parse(&text) else {
+            bad.push(format!("{}: would not parse", show(f)));
+            continue;
+        };
+        if whole.sim_time_s <= 0.0 {
+            continue; // a dump with no time span has nothing to partition
+        }
+        let mid = whole.sim_time_s / 2.0;
+        let (Ok(a), Ok(b)) = (
+            Vcd::parse_windowed(&text, Some((0.0, Some(mid)))),
+            Vcd::parse_windowed(&text, Some((mid, None))),
+        ) else {
+            bad.push(format!("{}: windowed parse failed", show(f)));
+            continue;
+        };
+        // compare on the FULL hierarchical path, so leaf-name ambiguity plays no part
+        for (path, n) in &whole.idx.toggles {
+            let split = a.idx.toggles.get(path).copied().unwrap_or(0)
+                + b.idx.toggles.get(path).copied().unwrap_or(0);
+            if *n != split {
+                bad.push(format!("{}: {path} whole={n} halves={split}", show(f)));
                 break;
             }
         }
