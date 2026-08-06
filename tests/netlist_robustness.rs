@@ -141,6 +141,12 @@ fn a_concatenation_expands_msb_first() {
 
 /// Escaped identifiers run to whitespace and may contain `.`, `[`, `]` — yosys emits them for
 /// hierarchical names. Splitting one leaves a fragment that mis-parses as another instance.
+///
+/// The NAME excludes the leading backslash, which introduces the identifier and is no more part
+/// of it than the terminating whitespace: per the LRM `\foo ` denotes the same identifier as
+/// `foo`. Keeping it made every hierarchical net fail to match the SPEF and DEF that describe
+/// the same design — 767 of 14238 nets on a real block, and the 4527 coupling references a
+/// timer then dropped in silence.
 #[test]
 fn escaped_identifiers_survive_intact() {
     let n = parse(
@@ -148,8 +154,8 @@ fn escaped_identifiers_survive_intact() {
          INV \\u_cpu.buf[0] (.A(a), .Y(\\u_cpu.net[3] ));\nendmodule\n",
     );
     assert_eq!(n.insts.len(), 1);
-    assert_eq!(n.insts[0].name, "\\u_cpu.buf[0]");
-    assert_eq!(conns_of(&n, "\\u_cpu.buf[0]"), [("A", "a"), ("Y", "\\u_cpu.net[3]")]);
+    assert_eq!(n.insts[0].name, "u_cpu.buf[0]");
+    assert_eq!(conns_of(&n, "u_cpu.buf[0]"), [("A", "a"), ("Y", "u_cpu.net[3]")]);
 }
 
 /// Port bus ranges expand to bits so they match the bit-nets gates drive, and a bit-select

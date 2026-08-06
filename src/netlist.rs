@@ -145,6 +145,16 @@ fn tokenize(text: &str) -> Vec<String> {
     // inside it — `\clkbuf_0_gpio_in[0]`, `\ANTENNA_u_cpu.foo[1]` — is part of the
     // name, so it must NOT be split on `[`/`]`/`.`; otherwise the real instance is
     // missed and the leftover `0 ] (` fragment mis-parses as a bogus cell.
+    //
+    // THE BACKSLASH IS NOT PART OF THE NAME EITHER. Per the LRM an escaped identifier denotes
+    // the same identifier as the equivalent simple one — `\foo ` IS `foo` — so it is dropped
+    // here, exactly as the terminating whitespace is. Keeping it is not cosmetic: every other
+    // file in the flow spells the name without it. A SPEF says `u_adapter.req_addr_q[0]` and a
+    // DEF says `u_adapter\.req_addr_q\[0\]`, both of which resolve to the same characters,
+    // and a netlist net called `\u_adapter.req_addr_q[0]` matches neither. On a real block that
+    // was 767 of 14238 nets, and 4527 coupling aggressor references that a timer looked up,
+    // failed to find, and dropped without a word — silently removing crosstalk from the
+    // analysis.
     let mut escaped = false;
     for ch in clean.chars() {
         if escaped {
@@ -159,7 +169,6 @@ fn tokenize(text: &str) -> Vec<String> {
         match ch {
             '\\' => {
                 flush(&mut cur, &mut out);
-                cur.push(ch);
                 escaped = true;
             }
             '(' | ')' | ';' | ',' | '.' | '[' | ']' | '=' => {
@@ -557,9 +566,11 @@ endmodule
         let nl = parse(src).unwrap();
         assert_eq!(nl.insts.len(), 2, "both escaped-id instances parse");
         assert_eq!(nl.insts[0].cell, "sky130_fd_sc_hd__clkbuf_16");
-        assert_eq!(nl.insts[0].name, "\\clkbuf_0_gpio_in[0]");
+        // Named WITHOUT the leading backslash: `\name ` and `name` are the same identifier in
+        // Verilog, and every other file in the flow spells it the second way.
+        assert_eq!(nl.insts[0].name, "clkbuf_0_gpio_in[0]");
         assert_eq!(nl.insts[1].cell, "sky130_fd_sc_hd__inv_2");
-        assert_eq!(nl.insts[1].name, "\\ANTENNA_u_cpu.irq[1]");
+        assert_eq!(nl.insts[1].name, "ANTENNA_u_cpu.irq[1]");
         // no bogus numeric-cell instance leaked in
         assert!(nl.insts.iter().all(|inst| is_ident(&inst.cell)));
     }

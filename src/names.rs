@@ -10,6 +10,33 @@
 //! same leaf in more than one scope, e.g. a testbench net and the DUT net of the same
 //! name) is left **unresolved** so the caller falls back to the vectorless factor —
 //! never a silent last-write-wins pick. Set `scope:` to disambiguate.
+//!
+//! # One spelling for a net, across every reader
+//!
+//! A design is described by five or six files written by different tools, and an engine joins
+//! them **by name**. Every reader here therefore normalises a net name to the SAME form: the
+//! characters of the name, with each format's own escaping removed.
+//!
+//! | file | on disk | what the reader must yield |
+//! | --- | --- | --- |
+//! | gate-level Verilog | `wire \u_a.q[0] ;` | `u_a.q[0]` — the `\` introduces an escaped identifier and is no more part of the name than the terminating space (LRM: `\foo ` IS `foo`) |
+//! | DEF | `- u_a\.q\[0\]` | `u_a.q[0]` — `\` escapes the character that follows |
+//! | SPEF | `*7 u_a.q[0]` or `*7 u_a\.q\[0\]` | `u_a.q[0]` — both spellings occur and mean the same characters |
+//! | VCD (ModelSim) | `$var wire 1 ) r [2]` | `r[2]` — a bit-select is part of the name; a `[3:0]` RANGE is not |
+//!
+//! **This is the defect class that keeps recurring, and it is silent every time.** A name that
+//! does not join is not an error: the net simply has no parasitics, or no activity, or no
+//! timing, and the answer comes out optimistic with nothing to say it was incomplete. Measured
+//! instances, all on real designs: 10-20 % of nets when DEF names were left escaped; 767 of
+//! 14238 nets and 4527 coupling references when the netlist kept its backslash — which removed
+//! that crosstalk from the timing analysis without a word; and every bit of every bus when a
+//! ModelSim dump's bit-selects were dropped.
+//!
+//! The rule follows from that: **normalise on the way in, and write back what the source
+//! spelled.** A reader that leaves a name in its own format's escaping has not finished, and a
+//! writer that re-derives escaping from the characters cannot — the same characters are spelled
+//! two legal ways and only the source knows which. `tests/composition.rs` asserts the join
+//! directly, which is the only place this class of defect is visible.
 
 use std::collections::HashMap;
 

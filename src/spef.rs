@@ -9,6 +9,45 @@
 //! `vyges-extract` emits).
 //!
 //! Pure std — fully unit-tested offline.
+//!
+//! # Format decisions, and why they are not obvious
+//!
+//! Each of these was measured by writing a file and having OpenSTA read it back
+//! (`tests/opensta.rs`), not derived from the standard alone. They are recorded here because
+//! every one of them is a place where the obvious answer is wrong, and where our own tests
+//! cannot tell — a reader and writer that share a mistaken convention round-trip perfectly.
+//!
+//! **A node reference is not a net reference.** `*<id>` alone denotes a top-level PORT.
+//! A net's own node is `*<id>:0`, and a net-internal node is `*<id>:<n>`; an instance pin is
+//! `*<instid>:<pin>`. Writing a bare `*<id>` for an internal net asks the reader for a port the
+//! design does not have — OpenSTA drops the capacitor with `pin <name> not found` and reports a
+//! faster path than the file describes. The exception is a net that IS a port, where the bare
+//! form is exactly right.
+//!
+//! **Names are written as the source spelled them, and never re-escaped.** Both `count[0]` and
+//! `count\[0\]` are legal SPEF and they mean different things: the grammar reads the first as
+//! a BIT_IDENT (bit 0 of bus `count`) and the second as an ID whose characters include the
+//! brackets. Which is correct depends on whether the netlist declares `output [7:0] count;` or
+//! `wire \CFG_REG[0] ;` — the characters alone cannot say. Where there is no source spelling to
+//! preserve, the plain form is the safe one: OpenSTA's lookup tries the name, then
+//! `escapeDividers`, then `escapeBrackets`, then both, so it only ever ADDS escapes.
+//! Under-escaping is recoverable; over-escaping is a hard miss.
+//!
+//! **A coupling capacitor is written in BOTH nets' blocks.** This looks like redundancy and is
+//! not: a reader applies the capacitor to the net whose block it appears in, so listing it once
+//! leaves the other net believing it is uncoupled. It is what OpenRCX does. The READER dedupes
+//! by node pair — counting both listings would double every net's crosstalk — so the two halves
+//! of this are asymmetric on purpose.
+//!
+//! **Numbers carry significant figures, not decimal places.** `{:.6}` is six places: it wrote
+//! every capacitance below 5e-7 as `0.000000`, deleting the capacitor in a file that still
+//! parses, and small coupling capacitors are exactly where that lands.
+//!
+//! **What the reader keeps that it does not itself need.** [`NetRc::coupling_nodes`] holds the
+//! node pair each coupling capacitor came off, alongside the per-aggressor aggregate an SI pass
+//! actually wants. The aggregate is lossy in a way that only matters on the way back OUT: put
+//! the capacitor back on the wrong node and it still loads the net, but at the wrong point in
+//! the RC network, and the timer answers differently for the same design.
 
 use crate::names::unescape;
 use std::collections::{BTreeMap, HashMap};
