@@ -138,6 +138,7 @@ impl Netlist {
         let mut globals: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         globals.insert("0".into()); // SPICE global ground
         let mut cur: Option<Netlist> = None;
+        let mut in_control = false;
 
         for st in &stmts {
             let toks: Vec<&str> = st.split_whitespace().collect();
@@ -145,6 +146,23 @@ impl Netlist {
                 continue;
             }
             let head = toks[0].to_ascii_lowercase();
+            // A `.control` … `.endc` BLOCK IS SIMULATOR COMMANDS, NOT CIRCUIT. It carries
+            // arbitrary text — `run`, `print all`, `let x = ...` — and read as netlist that text
+            // becomes devices: `run` parses as a resistor and fails the terminal count, and a
+            // line that happens to look like `M99 a b c d model` becomes a transistor the design
+            // does not have. An LVS compare then reports a mismatch against a layout that is
+            // perfectly correct.
+            if head == ".control" {
+                in_control = true;
+                continue;
+            }
+            if head == ".endc" {
+                in_control = false;
+                continue;
+            }
+            if in_control {
+                continue;
+            }
             if head == ".subckt" {
                 let name = toks.get(1).map(|s| s.to_string()).unwrap_or_default();
                 // `.subckt` with no name, or a name and no ports, is a real thing to meet in
@@ -185,13 +203,25 @@ impl Netlist {
                 .get(&want.to_ascii_lowercase())
                 .cloned()
                 .ok_or_else(|| SpiceError(format!("subckt {want:?} not found")))?
+        } else if !flat.is_empty() {
+            // A DECK WITH DEVICES IS THE CIRCUIT. Subckts are definitions it may instantiate,
+            // not candidates to be it — so when the top level has devices of its own, that is
+            // the netlist, and the definitions are flattened into it below.
+            //
+            // Choosing "the single subckt" whenever there was exactly one discarded the whole
+            // top-level deck without a word: a netlist defining one cell and instantiating it
+            // alongside a few discretes read as the cell definition alone, and an LVS compare of
+            // it against a layout compared the wrong thing entirely.
+            Netlist { name: "(top)".into(), ports: Vec::new(), devices: flat }
         } else {
+            // An empty deck: the netlist is a library of definitions, and one of them is the
+            // subject. Unambiguous only if there is exactly one.
             match subckts.len() {
                 0 => Netlist { name: "(top)".into(), ports: Vec::new(), devices: flat },
                 1 => subckts.into_iter().next().unwrap(),
                 _ => {
                     return Err(SpiceError(format!(
-                        "{} subckts; pass `top:` to choose ({})",
+                        "{} subckts and no top-level devices; pass `top:` to choose ({})",
                         subckts.len(),
                         subckts.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
                     )))

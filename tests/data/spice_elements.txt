@@ -1,0 +1,84 @@
+# SPICE element letters and dot-commands — the vocabulary a netlist may contain.
+#
+# Provenance: the element letters are the set every SPICE dialect shares (Berkeley SPICE3f5
+# section 6, carried through ngspice's manual chapter 4 "Circuit Elements and Models" and
+# HSPICE/Spectre's netlist syntax); the dot-commands are ngspice's manual chapter 15 "Analyses
+# and Output Control" plus the structural ones from chapter 2. Cross-checked against the
+# element letters that actually occur in ngspice's own `tests/` tree.
+#
+# This reader models M Q R C L D X and ignores the rest. That is a deliberate, narrow scope —
+# it exists for LVS connectivity and device recognition, not simulation — and the point of the
+# sweep is that ignoring is not the same as *tolerating*: a construct we do not model must not
+# change the devices we do.
+#
+# One letter per line for elements, `.name` for dot-commands. Comments and blanks skipped.
+
+# --- element letters -------------------------------------------------------------------------
+A   # XSPICE code model instance
+B   # behavioural (arbitrary) source
+C   # capacitor                          (modelled)
+D   # diode                              (modelled)
+E   # voltage-controlled voltage source
+F   # current-controlled current source
+G   # voltage-controlled current source
+H   # current-controlled voltage source
+I   # independent current source
+J   # JFET
+K   # mutual inductance (couples two L)
+L   # inductor                           (modelled)
+M   # MOSFET                             (modelled)
+N   # numerical device / Verilog-A instance
+O   # lossy transmission line
+P   # port
+Q   # BJT                                (modelled)
+R   # resistor                           (modelled)
+S   # voltage-controlled switch
+T   # lossless transmission line
+U   # uniform distributed RC line
+V   # independent voltage source
+W   # current-controlled switch
+X   # subcircuit instance                (modelled)
+Y   # user-defined / TXL
+Z   # MESFET / HFET
+
+# --- dot-commands ----------------------------------------------------------------------------
+.ac
+.control
+.csparam
+.data
+.dc
+.del
+.disto
+.end
+.endc
+.endl
+.ends
+.four
+.func
+.global
+.ic
+.if
+.include
+.lib
+.measure
+.model
+.noise
+.nodeset
+.op
+.option
+.options
+.param
+.plot
+.print
+.probe
+.pz
+.save
+.sens
+.step
+.subckt
+.table
+.temp
+.tf
+.title
+.tran
+.width
