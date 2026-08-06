@@ -380,3 +380,41 @@ fn a_one_bit_signal_dumped_as_a_vector_still_counts() {
     // the two spellings share one baseline: 0 -> 1 -> 0 -> 1
     assert_eq!(v.idx.toggles.get("tb.en").copied().unwrap_or(0), 3);
 }
+
+/// **A fractional timestamp still advances the clock.** IEEE 1364 says `#` carries a whole
+/// number of timescale units, but migen writes `#3.2` and viewers accept it. Parsed as an
+/// integer it simply fails — and a failed parse used to leave the clock where it was, so a dump
+/// whose every timestamp is fractional measured as zero-length and every toggle RATE taken from
+/// it came out zero. Nothing about a rate of zero says the times were unreadable.
+#[test]
+fn a_fractional_timestamp_still_advances_the_clock() {
+    let v = vyges_loom::vcd::Vcd::parse(
+        "$timescale 1ns $end\n\
+         $scope module tb $end\n$var wire 1 ! clk $end\n$upscope $end\n\
+         $enddefinitions $end\n\
+         #0\n$dumpvars\n0!\n$end\n\
+         #3.2\n1!\n\
+         #6.0\n0!\n\
+         #15.0\n1!\n",
+    )
+    .expect("vcd");
+    assert!((v.sim_time_s - 15.0e-9).abs() < 1e-18, "dump length: {:e}", v.sim_time_s);
+    assert_eq!(v.idx.toggles.get("tb.clk").copied().unwrap_or(0), 3);
+    // and the window boundaries land where the fractional times say they do
+    let w = vyges_loom::vcd::Vcd::parse_windowed(
+        "$timescale 1ns $end\n\
+         $scope module tb $end\n$var wire 1 ! clk $end\n$upscope $end\n\
+         $enddefinitions $end\n\
+         #0\n$dumpvars\n0!\n$end\n\
+         #3.2\n1!\n\
+         #6.0\n0!\n\
+         #15.0\n1!\n",
+        Some((5.0e-9, None)),
+    )
+    .expect("vcd");
+    assert_eq!(
+        w.idx.toggles.get("tb.clk").copied().unwrap_or(0),
+        2,
+        "the change at 3.2 ns is before the window, the two after it are inside"
+    );
+}

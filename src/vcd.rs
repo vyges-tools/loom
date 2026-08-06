@@ -101,7 +101,7 @@ impl Vcd {
         let mut rprev: HashMap<String, String> = HashMap::new(); // real path -> last value
         let mut idx = NetIndex::default();
         let mut scope_stack: Vec<String> = Vec::new();
-        let mut time_ticks: u64 = 0;
+        let mut time_ticks: f64 = 0.0;
         let mut count_now = in_window(0.0);
 
         let mut toks = text.split_whitespace().peekable();
@@ -183,9 +183,18 @@ impl Vcd {
                 }
                 _ => {
                     if let Some(rest) = tok.strip_prefix('#') {
-                        if let Ok(t) = rest.parse::<u64>() {
-                            time_ticks = t;
-                            count_now = in_window(time_ticks as f64 * tick_s);
+                        // PARSED AS A REAL, NOT AN INTEGER. IEEE 1364 says a timestamp is a
+                        // whole number of timescale units, but migen writes `#3.2` and viewers
+                        // accept it. Parsed as an integer it fails, and a failed parse left the
+                        // clock where it was — so in a dump whose every timestamp is fractional
+                        // the time never advanced, the dump measured as zero-length, and every
+                        // toggle RATE computed from it came out zero. Silently: nothing about a
+                        // rate of zero says the times were unreadable.
+                        if let Ok(t) = rest.parse::<f64>() {
+                            if t.is_finite() {
+                                time_ticks = t;
+                                count_now = in_window(time_ticks * tick_s);
+                            }
                         }
                     } else if let Some(first) = tok.chars().next() {
                         match first {
@@ -302,7 +311,7 @@ impl Vcd {
             }
         }
 
-        let last_time_s = time_ticks as f64 * tick_s;
+        let last_time_s = time_ticks * tick_s;
         let sim_time_s = match window {
             None => last_time_s,
             Some((f, t)) => {
