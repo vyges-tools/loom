@@ -117,6 +117,138 @@ pub struct Sdc {
     pub ignored: Vec<String>, // commands we recognised but do not model
 }
 
+/// SDC commands that CHANGE A TIMING ANSWER when they are not modelled.
+///
+/// Every unmodelled command is recorded in [`Sdc::ignored`], but that list mixes two very
+/// different things. `set_dont_touch` and `set_max_area` are instructions to synthesis and cost
+/// a timer nothing. `set_driving_cell` sets the slew every input path starts from — and it is
+/// the most common input constraint there is: 480 uses against 65 of `set_input_transition`
+/// across this organisation's own constraint files. Reporting both in one undifferentiated list
+/// leaves the reader to know which is which.
+///
+/// Membership means: ignoring this can move a reported slack. It does not mean we should
+/// necessarily model it — only that the warning must say so.
+const TIMING_AFFECTING: &[&str] = &[
+    // ── the environment a path starts and ends in ──────────────────────────────────────
+    "set_driving_cell",      // input drive -> the slew every input path starts from
+    "set_drive",             // ditto, as a resistance
+    "set_operating_conditions", // the PVT corner itself — every delay in the design
+    "set_voltage",           // operating voltage, likewise
+    "set_resistance",        // a net's resistance, overriding what extraction said
+    "set_wire_load_model",   // pre-layout delays come from here when there is no SPEF
+    "set_wire_load_mode",
+    "set_wire_load_selection_group",
+    "set_wire_load_min_block_size",
+    "set_fanout_load",       // feeds the fanout-based load estimate
+    "set_port_fanout_number",
+    // ── logic held constant, so paths through it cannot toggle ─────────────────────────
+    "set_case_analysis",
+    "set_logic_zero",
+    "set_logic_one",
+    "set_logic_dc",
+    "set_disable_timing",    // arcs removed from the graph entirely
+    // ── constraints that replace or reshape the clock-derived one ──────────────────────
+    "set_max_delay",
+    "set_min_delay",
+    "set_max_time_borrow",   // how much a latch may borrow, hence whether a path passes
+    "set_data_check",        // a non-clock setup/hold relationship
+    "set_min_pulse_width",
+    "group_path",            // path grouping changes what is reported as critical
+    // ── the clock network ──────────────────────────────────────────────────────────────
+    "set_clock_transition",  // the clock's own slew, hence every launch/capture delay
+    "set_propagated_clock",  // ideal vs propagated -> latency and skew
+    "set_clock_sense",       // which edge propagates through a divider or mux
+    "set_sense",
+    "set_clock_gating_check", // setup/hold on the gating enable
+    "set_ideal_network",     // nets excluded from delay calculation
+    "set_ideal_latency",
+    "set_ideal_transition",
+    "derive_clock_uncertainty", // generates the uncertainty we would otherwise be given
+    "derive_pll_clocks",     // generates clocks that would otherwise not exist
+    // ── design rules, whose violations ARE timing findings ─────────────────────────────
+    "set_max_transition",
+    "set_max_fanout",
+    "set_max_capacitance",
+    "set_min_capacitance",
+    // ── SDC 2.x ────────────────────────────────────────────────────────────────────────
+    "set_disable_clock_gating_check", // removes a check, so its violations vanish
+    "unset_propagated_clock",         // reverts to an ideal network -> latency and skew
+    "set_max_trans",                  // Tcl accepts unambiguous abbreviations
+];
+
+/// Explicitly NOT timing-affecting: instructions to synthesis, placement or power
+/// optimisation. Listed rather than merely omitted, so the distinction is a decision on record
+/// instead of an oversight — `set_max_area` and `set_driving_cell` are both "unmodelled", and
+/// only one of them can move a slack.
+pub const BENIGN_FOR_TIMING: &[&str] = &[
+    "set_max_area",
+    "set_max_dynamic_power",
+    "set_max_leakage_power",
+    "create_voltage_area",
+    "set_level_shifter_strategy",
+    "set_level_shifter_threshold",
+    "set_dont_touch",
+    "set_dont_use",
+    "set_size_only",
+    // synthesis / DFT / physical directives — nothing a timer consults
+    "set_clock_gating_enable",
+    "set_clock_gating_style",
+    "set_clock_gating_verification",
+    "set_timing_enable_verification",
+    "set_dont_touch_network",
+    "set_optimize_design",
+    "set_scan_configuration",
+    "set_min_porosity",
+    "set_critical_range",  // steers optimisation effort; does not change a slack
+];
+
+impl Sdc {
+    /// The subset of [`Sdc::ignored`] that can move a reported slack — see [`TIMING_AFFECTING`].
+    /// Deduplicated and sorted, so a file constraining forty ports with `set_driving_cell`
+    /// yields one name rather than forty.
+    pub fn ignored_affecting_timing(&self) -> Vec<&str> {
+        let mut v: Vec<&str> = self
+            .ignored
+            .iter()
+            .map(String::as_str)
+            .filter(|c| TIMING_AFFECTING.contains(c))
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// One line on what was read and what was passed over, or `None` when nothing was ignored
+    /// that could matter. Cheap enough to print on every load, which is the point.
+    pub fn health(&self) -> Option<String> {
+        let mut notes = Vec::new();
+        // A clock with no period is read faithfully — the file says what it says — but every
+        // setup check against it is meaningless, and a generated constraint file really does
+        // sometimes write `-period 0.0`. Parse it, then say so.
+        let bad: Vec<&str> = self
+            .clocks
+            .iter()
+            .filter(|c| !(c.period.is_finite() && c.period > 0.0))
+            .map(|c| c.name.as_str())
+            .collect();
+        if !bad.is_empty() {
+            notes.push(format!(
+                "clock(s) with no usable period: {} — every check against them is vacuous",
+                bad.join(", ")
+            ));
+        }
+        let affecting = self.ignored_affecting_timing();
+        if !affecting.is_empty() {
+            notes.push(format!(
+                "{} unmodelled constraint(s) that can move a slack: {}",
+                affecting.len(),
+                affecting.join(", ")
+            ));
+        }
+        (!notes.is_empty()).then(|| notes.join("; "))
+    }
+}
+
 #[derive(Debug)]
 pub struct SdcError(pub String);
 impl std::fmt::Display for SdcError {
@@ -269,7 +401,43 @@ fn resolve_objs(tok: &str) -> Vec<String> {
     tok.split_whitespace().map(|s| s.to_string()).collect()
 }
 
-/// Apply `set var value` substitution to a logical line (`$var`, `${var}`).
+/// A time value, with or without an SI suffix, normalised to the file's time unit.
+///
+/// Quartus and several board vendors write `-period 20.000ns`; a bare `parse::<f64>()` rejects
+/// that, and the whole constraint file went with it. Six of the 154 files in this organisation
+/// are of exactly that form. A bare number keeps its existing meaning — the file's own time
+/// unit — so this only ever adds cases that used to fail.
+fn parse_time(v: &str) -> Option<f64> {
+    let t = v.trim();
+    if let Ok(x) = t.parse::<f64>() {
+        return Some(x);
+    }
+    // Longest suffix first, so `ps` is not read as `s`.
+    for (suf, scale) in [
+        ("fs", 1e-6),
+        ("ps", 1e-3),
+        ("ns", 1.0),
+        ("us", 1e3),
+        ("ms", 1e6),
+        ("s", 1e9),
+    ] {
+        if let Some(num) = t.strip_suffix(suf) {
+            if let Ok(x) = num.trim().parse::<f64>() {
+                return Some(x * scale);
+            }
+        }
+    }
+    None
+}
+
+/// Apply `set var value` substitution to a logical line (`$var`, `${var}`, `$::env(NAME)`).
+///
+/// **`$::env(...)` is how a real flow parameterises constraints.** OpenLane writes
+/// `create_clock -name clk -period $::env(CLOCK_PERIOD) [get_ports clk]`, and 8 of the 154
+/// constraint files in this organisation do exactly that. Resolving only `$var` left the period
+/// empty, which failed the whole file — every other constraint in it lost along with the clock.
+/// Tcl reads `::env` from the process environment and so do we, falling back to `set` for a
+/// variable of that name.
 fn subst_vars(line: &str, vars: &HashMap<String, String>) -> String {
     if !line.contains('$') {
         return line.to_string();
@@ -279,6 +447,29 @@ fn subst_vars(line: &str, vars: &HashMap<String, String>) -> String {
     let mut i = 0;
     while i < cs.len() {
         if cs[i] == '$' {
+            // `$::env(NAME)` / `$env(NAME)` — a parenthesised array read, not a bare name.
+            let rest: String = cs[i..].iter().collect();
+            let env_pfx = ["$::env(", "$env("]
+                .iter()
+                .find(|p| rest.starts_with(**p))
+                .copied();
+            if let Some(pfx) = env_pfx {
+                if let Some(close) = rest.find(')') {
+                    let name = &rest[pfx.len()..close];
+                    match vars.get(name).cloned().or_else(|| std::env::var(name).ok()) {
+                        Some(v) => out.push_str(&v),
+                        // UNRESOLVED KEEPS ITS TEXT. Substituting nothing deletes the token,
+                        // and the argument after it slides into its place: `-period $undefined
+                        // [get_ports clk]` then reads the port expression as the period, and
+                        // `-period $undefined 5` would silently yield a period of 5. Leaving
+                        // `$::env(NAME)` in place makes it fail to parse as a time, and the
+                        // error names the variable.
+                        None => out.push_str(&rest[..close + 1]),
+                    }
+                    i += close + 1;
+                    continue;
+                }
+            }
             let braced = i + 1 < cs.len() && cs[i + 1] == '{';
             let mut j = if braced { i + 2 } else { i + 1 };
             let start = j;
@@ -294,8 +485,14 @@ fn subst_vars(line: &str, vars: &HashMap<String, String>) -> String {
                 j += 1;
             }
             let name: String = cs[start..j].iter().collect();
-            if let Some(val) = vars.get(&name) {
-                out.push_str(val);
+            match vars.get(&name) {
+                Some(val) => out.push_str(val),
+                // See the note above: an unresolved variable keeps its text rather than
+                // vanishing and letting the next argument take its place.
+                None => {
+                    let end = if braced { j + 1 } else { j };
+                    out.extend(cs[i..end.min(cs.len())].iter());
+                }
             }
             i = if braced { j + 1 } else { j };
         } else {
@@ -399,7 +596,12 @@ impl Sdc {
                         vars.insert(toks[1].clone(), toks[2].clone());
                     }
                 }
-                "set_units" => {
+                // SDC accepts the singular and plural spellings interchangeably, and tools
+                // emit both. Matching one silently ignores the other — and for
+                // `set_clock_group` that means losing an asynchronous-clock declaration, so
+                // paths between clocks that never relate get checked and report false
+                // violations. Found by diffing our command inventory against SDC 2.1.
+                "set_units" | "set_unit" => {
                     if let Some(v) = flag_val(&toks, "-time") {
                         if let Some(s) = unit_scale(v, true) {
                             t_scale = s;
@@ -412,9 +614,24 @@ impl Sdc {
                     }
                 }
                 "create_clock" => {
-                    let period: f64 = flag_val(&toks, "-period")
-                        .and_then(|v| v.parse().ok())
-                        .ok_or_else(|| SdcError("create_clock without -period".into()))?;
+                    let raw = flag_val(&toks, "-period");
+                    let period: f64 = raw
+                        .and_then(|v| parse_time(v))
+                        .ok_or_else(|| {
+                            // Name what was actually there. "create_clock without -period" is
+                            // true and useless: the value is nearly always present and simply
+                            // unresolvable — an `${VAR}` the flow supplies, or a period written
+                            // with a unit suffix. Saying which turns a dead end into a fix.
+                            SdcError(match raw {
+                                None => "create_clock without -period".to_string(),
+                                Some(v) if v.is_empty() => format!(
+                                    "create_clock -period is empty on `{}` — an unresolved \
+                                     variable (set it, or export it for $::env)",
+                                    line.trim()
+                                ),
+                                Some(v) => format!("create_clock -period `{v}` is not a time"),
+                            })
+                        })?;
                     let obj = trailing_obj(&toks, &["-name", "-period", "-waveform", "-comment"]);
                     let source = obj
                         .as_deref()
@@ -557,7 +774,7 @@ impl Sdc {
                         sdc.early_derate = Some(v);
                     }
                 }
-                "set_clock_groups" => {
+                "set_clock_groups" | "set_clock_group" => {
                     // -asynchronous / -exclusive: clocks in different -group blocks are
                     // unrelated. Collect each -group's resolved clock names.
                     let mut groups: Vec<Vec<String>> = Vec::new();

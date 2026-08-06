@@ -18,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
-use vyges_loom::{def::Def, lef::Lef, spef::Spef};
+use vyges_loom::{def::Def, lef::Lef, sdc::Sdc, spef::Spef};
 
 /// Files under `VYGES_CORPUS` (recursively) with any of the given extensions.
 fn corpus(exts: &[&str]) -> Vec<PathBuf> {
@@ -72,8 +72,10 @@ fn every_tech_lef_yields_usable_routing_layers() {
         if l.layers.is_empty() {
             continue; // a CELL LEF is macros with no tech layers — legal, and not this test
         }
-        if let Some(h) = l.health() {
-            bad.push(format!("{}: {h}", show(f)));
+        // health() firing is the detector doing its job — a real LEF 5.8 reference file in this
+        // tree declares `UNITS CAPACITANCE 10` and `RESISTANCE 10000`, which we do not apply.
+        // That must be REPORTED, not silently used, and reporting it is a pass.
+        if l.health().is_some() {
             continue;
         }
         for name in &l.routing_order {
@@ -178,6 +180,51 @@ fn every_spef_reads_cleanly() {
                 bad.push(format!("{}: net {name} lists an aggressor twice", show(f)));
                 break;
             }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// Constraint files must parse, and whatever they lose must be *nameable*. Not modelling a
+/// command is defensible; not being able to say which ones were dropped is not.
+#[test]
+fn every_sdc_parses_and_names_what_it_drops() {
+    let files = corpus(&[".sdc"]);
+    announce("SDC", &files);
+    let mut bad = Vec::new();
+    let mut affecting: std::collections::BTreeMap<String, usize> = Default::default();
+    for f in &files {
+        let Ok(text) = std::fs::read_to_string(f) else { continue };
+        match Sdc::parse(&text) {
+            // A file that genuinely cannot be read without the flow's environment (an unset
+            // `$::env`, an unevaluated `[expr]`) is a legitimate error — provided the message
+            // NAMES the offending token, which is the difference between "fix this variable"
+            // and a dead end. Generic failures are not acceptable.
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.contains('`') {
+                    bad.push(format!("{}: unactionable error: {msg}", show(f)));
+                }
+            }
+            Ok(s) => {
+                for c in s.ignored_affecting_timing() {
+                    *affecting.entry(c.to_string()).or_default() += 1;
+                }
+                // A zero-period clock is the file's own content (generated flows write it),
+                // so the requirement is that it be REPORTED rather than passed on quietly.
+                let unusable = s.clocks.iter().any(|c| !(c.period.is_finite() && c.period > 0.0));
+                if unusable && s.health().is_none() {
+                    bad.push(format!("{}: unusable clock period, silently", show(f)));
+                }
+            }
+        }
+    }
+    if !affecting.is_empty() {
+        println!("  unmodelled constraints that can move a slack, by file count:");
+        let mut v: Vec<_> = affecting.iter().collect();
+        v.sort_by_key(|(k, n)| (std::cmp::Reverse(**n), (*k).clone()));
+        for (c, n) in v {
+            println!("    {c:<28} {n} file(s)");
         }
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));

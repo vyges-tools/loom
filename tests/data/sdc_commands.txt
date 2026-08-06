@@ -1,0 +1,108 @@
+# 93 SDC commands.
+#
+# PROVENANCE: the command vocabulary of SDC 1.8, taken from Appendix A of Synopsys' own
+# "Using the Synopsys Design Constraints Format" application note (tables A-2 object access,
+# A-3 timing constraints, A-4 environment, A-5 multivoltage), extended with the SDC 2.0/2.1 additions confirmed against
+# the Apache-2.0/MIT `sdcx` crate's own command set, and UNIONED with every command
+# actually appearing in 154 real `.sdc` files across this organisation's IP repos, SoC projects
+# and OpenLane/LibreLane flows. Command names are interface facts about a published format;
+# the reference implementations are GPLv3 and no code is taken from them.
+#
+# The trailing count is how many of our own files use it -- the spec says what may appear, the
+# corpus says what does. `set_driving_cell` at 480 uses against 65 for `set_input_transition`
+# is why the two are classified differently in src/sdc.rs.
+#
+# USED BY: tests/sdc_robustness.rs.
+all_clocks  # 0
+all_inputs  # 0
+all_outputs  # 0
+all_registers  # 0
+append_to_collection  # 6
+axi_araddr_i  # 1
+create_clock  # 168
+create_generated_clock  # 22
+create_voltage_area  # 0
+current_design  # 5
+current_instance  # 0
+derive_clock_uncertainty  # 8
+derive_pll_clocks  # 8
+get_cells  # 0
+get_clocks  # 0
+get_lib_cells  # 0
+get_lib_pins  # 0
+get_libs  # 0
+get_nets  # 0
+get_pins  # 0
+get_ports  # 0
+group_path  # 4
+link_design  # 18
+read_liberty  # 18
+read_verilog  # 18
+report_checks  # 24
+report_tns  # 18
+set_case_analysis  # 93
+set_clock_gating_check  # 1
+set_clock_gating_enable  # 1
+set_clock_gating_style  # 1
+set_clock_gating_verification  # 1
+set_clock_group  # 0
+set_clock_groups  # 22
+set_clock_latency  # 23
+set_clock_sense  # 14
+set_clock_transition  # 35
+set_clock_uncertainty  # 171
+set_critical_range  # 15
+set_data_check  # 0
+set_disable_clock_gating_check  # 1
+set_disable_timing  # 0
+set_dont_touch  # 12
+set_dont_touch_network  # 3
+set_drive  # 19
+set_driving_cell  # 480
+set_false_path  # 313
+set_fanout_load  # 0
+set_hierarchy_separator  # 1
+set_ideal_latency  # 0
+set_ideal_network  # 51
+set_ideal_transition  # 0
+set_input_delay  # 731
+set_input_transition  # 65
+set_level_shifter_strategy  # 0
+set_level_shifter_threshold  # 0
+set_load  # 757
+set_logic_dc  # 0
+set_logic_one  # 0
+set_logic_zero  # 0
+set_max_area  # 9
+set_max_capacitance  # 2
+set_max_delay  # 41
+set_max_dynamic_power  # 3
+set_max_fanout  # 17
+set_max_leakage_power  # 3
+set_max_time_borrow  # 0
+set_max_trans  # 1
+set_max_transition  # 12
+set_min_capacitance  # 0
+set_min_delay  # 0
+set_min_porosity  # 0
+set_min_pulse_width  # 0
+set_multicycle_path  # 73
+set_operating_conditions  # 5
+set_optimize_design  # 2
+set_output_delay  # 956
+set_port_fanout_number  # 0
+set_propagated_clock  # 23
+set_resistance  # 0
+set_scan_configuration  # 1
+set_sense  # 6
+set_size_only  # 16
+set_timing_derate  # 34
+set_timing_enable_verification  # 1
+set_unit  # 0
+set_units  # 1
+set_voltage  # 0
+set_wire_load_min_block_size  # 0
+set_wire_load_mode  # 0
+set_wire_load_model  # 4
+set_wire_load_selection_group  # 0
+unset_propagated_clock  # 2

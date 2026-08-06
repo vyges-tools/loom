@@ -157,11 +157,18 @@ impl Lef {
                 q.to_ascii_lowercase()
             ));
         }
-        // A **cell** LEF is macros with no LAYER blocks at all, and that is perfectly normal —
-        // only a file that declares layers without a routing stack is suspect.
-        if !self.layers.is_empty() && self.routing_order.is_empty() {
+        // A **cell** LEF is macros with no LAYER blocks, and a **PDN** LEF names layers with no
+        // attributes at all — both perfectly normal. Only a file that carries per-layer
+        // ELECTRICAL data, and therefore means to be a tech LEF, is suspect without a routing
+        // stack: that is the one whose numbers we would go on to use.
+        let has_electrical = self
+            .layers
+            .values()
+            .any(|l| l.width_um > 0.0 || l.rpersq > 0.0 || l.thickness_um > 0.0);
+        if has_electrical && self.routing_order.is_empty() {
             notes.push(
-                "layers are declared but none is TYPE ROUTING — nothing to extract on".to_string(),
+                "layers carry electrical data but none is TYPE ROUTING — nothing to extract on"
+                    .to_string(),
             );
         }
         (!notes.is_empty()).then(|| notes.join("; "))
