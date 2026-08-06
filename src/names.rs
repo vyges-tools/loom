@@ -82,6 +82,29 @@ pub fn leaf_of(path: &str) -> &str {
     path.rsplit('.').next().unwrap_or(path)
 }
 
+/// Strip SPEF name escaping: `u_a\.q\[0\]` -> `u_a.q[0]`.
+///
+/// Names are matched against the design's own net names, and a backslash that survives the read
+/// makes every hierarchical or bussed name miss — silently, as a net with no parasitics.
+pub(crate) fn unescape(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut esc = false;
+    for c in s.chars() {
+        if esc {
+            out.push(c);
+            esc = false;
+        } else if c == '\\' {
+            esc = true;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

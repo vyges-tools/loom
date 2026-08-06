@@ -10,6 +10,7 @@
 //! (DBU, `i64`) run over the same token stream. `( * y )` / `( x * )` shorthand is
 //! resolved in both. Pure std — unit-tested offline.
 
+use crate::names::unescape;
 use std::collections::BTreeMap;
 
 // ─────────────────────────── signal view (extraction, µm) ──────────────────────
@@ -326,7 +327,12 @@ fn parse_signal(
             continue;
         }
         i += 1; // consume '-'
-        let name = t.get(i).cloned().unwrap_or_default();
+        // ESCAPED, LIKE EVERY OTHER NAME IN THE FLOW. DEF writes a bussed net as
+        // `CFG_REG\[0\]` because `[` is its BUSBITCHARS delimiter. Left escaped, the name
+        // matches nothing anywhere else: the SPEF extracted from this very DEF calls the same
+        // net `CFG_REG[0]`, and so does the netlist. On real designs that was 10-20% of nets —
+        // every bussed one — joining to nothing, with both readers reporting success.
+        let name = unescape(&t.get(i).cloned().unwrap_or_default());
         i += 1;
 
         let mut net = DefNet {
@@ -417,7 +423,7 @@ fn parse_signal(
                     // invented out of geometry, which extraction then builds an RC network to.
                     if !seen_plus {
                         if inner.len() >= 2 {
-                            net.pins.push((inner[0].clone(), inner[1].clone()));
+                            net.pins.push((unescape(&inner[0]), unescape(&inner[1])));
                         }
                     } else if in_routing && inner.len() >= 2 {
                         let (px, py) = prev.unwrap_or((0.0, 0.0));
@@ -506,8 +512,8 @@ fn parse_components(toks: &[&str]) -> Vec<Comp> {
     let mut i = 0;
     while i < body.len() {
         if body[i] == "-" {
-            let name = body.get(i + 1).copied().unwrap_or("").to_string();
-            let cell = body.get(i + 2).copied().unwrap_or("").to_string();
+            let name = unescape(body.get(i + 1).copied().unwrap_or(""));
+            let cell = unescape(body.get(i + 2).copied().unwrap_or(""));
             let mut j = i + 3;
             let mut xy = None;
             while j < body.len() && body[j] != ";" {
@@ -548,7 +554,7 @@ fn parse_specialnets(body: &[&str]) -> Vec<NetGeom> {
                 if let Some(n) = cur.take() {
                     nets.push(n);
                 }
-                let name = body.get(i + 1).copied().unwrap_or("").to_string();
+                let name = unescape(body.get(i + 1).copied().unwrap_or(""));
                 cur = Some(NetGeom {
                     name,
                     ..Default::default()

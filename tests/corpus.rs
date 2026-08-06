@@ -46,6 +46,8 @@
 
 use std::path::{Path, PathBuf};
 
+mod common;
+
 use vyges_loom::{def::Def, lef::Lef, netlist, saif::Saif, sdc::Sdc, spef::Spef, vcd::Vcd};
 
 /// Files under `VYGES_CORPUS` (recursively) with any of the given extensions, PLUS the
@@ -645,6 +647,81 @@ fn show(p: &Path) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("?")
         .to_string()
+}
+
+/// **Every real SPEF must survive being written back out and read again.**
+///
+/// The reader is checked against files other tools wrote; the WRITER is checked against nothing
+/// but itself, and its output is what a downstream timer consumes. The cycle closes that: parse,
+/// write, parse, write, then require that the two parses agree about every net, cap, resistor,
+/// pin and coupling pair, and that the two texts are identical.
+///
+/// It found a real one on a four-line example — the RC network we emitted referenced nodes that
+/// no longer joined the pins in `*CONN`, so a driver was attached to nothing in a file that
+/// still parsed cleanly. A real extraction has orders of magnitude more node shapes than any
+/// fixture, which is why this runs over the corpus and not only over `examples/`, and the
+/// second thing it found — six decimal PLACES where six significant figures were meant, which
+/// rounds a small capacitor and deletes a very small one — was only visible on real values.
+///
+/// Add `--release` for a large corpus: the cycle reads and writes each file twice, and a 20 MB
+/// SPEF takes a few seconds that way against a few minutes in the default test profile.
+#[test]
+fn every_spef_survives_a_write_and_reread() {
+    let files = corpus(&[".spef"]);
+    announce("SPEF (write/re-read cycle)", &files);
+    for f in &files {
+        let Ok(text) = std::fs::read_to_string(f) else { continue };
+        common::survives_the_cycle(&text, &show(f));
+    }
+}
+
+/// **A SPEF and the DEF it was extracted from must agree about the design's net names.**
+///
+/// Extraction reads a DEF and writes a SPEF, so the two name the same wires — and the timer
+/// then joins them back by name. A name that does not join is not an error at either end: the
+/// DEF reader is content, the SPEF reader is content, and the net simply carries no parasitics.
+///
+/// Only files sitting beside each other with the same stem are paired, so this costs nothing
+/// when the corpus has no DEFs. Nets appearing only in the DEF are expected and not reported —
+/// an extractor legitimately omits nets it treats as ideal — but a SPEF net that names nothing
+/// in the DEF has no wire to belong to.
+#[test]
+fn a_spef_and_its_def_agree_about_net_names() {
+    let mut pairs = 0usize;
+    let mut bad = Vec::new();
+    for f in corpus(&[".spef"]) {
+        // `x.nom.spef` pairs with `x.def` as readily as `x.spef` does
+        let stem = f.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let base = stem.split('.').next().unwrap_or(stem);
+        let def_path = f.with_file_name(format!("{base}.def"));
+        if !def_path.is_file() {
+            continue;
+        }
+        let (Ok(text), Ok(d)) =
+            (std::fs::read_to_string(&f), Def::load(def_path.to_str().unwrap()))
+        else {
+            continue;
+        };
+        pairs += 1;
+        let spef = Spef::parse(&text);
+        let mut known: std::collections::BTreeSet<&str> =
+            d.nets.iter().map(|n| n.name.as_str()).collect();
+        known.extend(d.power_nets.iter().map(|p| p.name.as_str()));
+        let orphans: Vec<&String> =
+            spef.nets.keys().filter(|n| !known.contains(n.as_str())).collect();
+        if !orphans.is_empty() {
+            bad.push(format!(
+                "{} vs {}: {} of {} SPEF net(s) name nothing in the DEF, e.g. {:?}",
+                show(&f),
+                base,
+                orphans.len(),
+                spef.nets.len(),
+                orphans.iter().take(5).collect::<Vec<_>>()
+            ));
+        }
+    }
+    println!("SPEF/DEF pairs: {pairs}");
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
 
 /// Does this FST hold only a header — a dump whose writer was killed before it wrote a

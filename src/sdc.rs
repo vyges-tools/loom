@@ -84,8 +84,17 @@ impl Exception {
 #[derive(Debug, Clone)]
 pub struct SdcClock {
     pub name: String,
-    pub source: String, // port name or inst/pin
-    pub period: f64,    // ns
+    /// Port name or `inst/pin`. **Empty for a virtual clock** — see [`SdcClock::is_virtual`].
+    pub source: String,
+    pub period: f64, // ns
+}
+
+impl SdcClock {
+    /// A clock with no source object: it constrains I/O timing but launches nothing in this
+    /// design, so nothing should look for a port to attach it to.
+    pub fn is_virtual(&self) -> bool {
+        self.source.is_empty()
+    }
 }
 
 /// One `set_input_delay`/`set_output_delay`: a value plus its target. `default`
@@ -673,11 +682,14 @@ impl Sdc {
                             source.clone()
                         }
                     });
-                    let src = if source.is_empty() {
-                        name.clone()
-                    } else {
-                        source
-                    };
+                    // A VIRTUAL CLOCK HAS NO SOURCE, and must not be given one. `create_clock
+                    // -name clk -period 1.0` with no object list is a reference clock for I/O
+                    // budgeting that exists nowhere in the design. Defaulting its source to its
+                    // own name makes it indistinguishable from a clock defined ON a port called
+                    // `clk` — so if such a port exists, the virtual clock silently becomes a
+                    // real one and launches and captures through it. An empty source is what
+                    // "virtual" means; `is_virtual()` says so at the call site.
+                    let src = source;
                     sdc.clocks.push(SdcClock {
                         name,
                         source: src,

@@ -284,3 +284,47 @@ fn real_net_attributes_are_read_correctly() {
         assert_eq!(d.power_nets.len(), 1, "{label} changed the power grid");
     }
 }
+
+/// **An escaped name is unescaped on the way in**, exactly as the SPEF reader does it.
+///
+/// DEF writes a bussed net as `CFG_REG\[0\]`, because `[` is its own BUSBITCHARS delimiter, and
+/// a hierarchical instance as `u_a\/b`. Left escaped, the name matches nothing anywhere else in
+/// the flow: the SPEF extracted from this very DEF calls the net `CFG_REG[0]`, and so does the
+/// netlist. Nothing fails — both readers report success and the two sets of names simply never
+/// join. On real designs that was 10-20% of the nets, every one of them bussed.
+#[test]
+fn escaped_bus_and_hierarchy_names_are_unescaped() {
+    let text = "VERSION 5.8 ;\n\
+                DIVIDERCHAR \"/\" ;\n\
+                BUSBITCHARS \"[]\" ;\n\
+                DESIGN blk ;\n\
+                UNITS DISTANCE MICRONS 1000 ;\n\
+                DIEAREA ( 0 0 ) ( 100000 100000 ) ;\n\
+                COMPONENTS 2 ;\n\
+                \x20   - u1 INV_X1 + PLACED ( 1000 2000 ) N ;\n\
+                \x20   - u_a\\/b INV_X1 + PLACED ( 5000 2000 ) N ;\n\
+                END COMPONENTS\n\
+                NETS 1 ;\n\
+                \x20   - CFG_REG\\[0\\] ( u1 Y ) ( u_a\\/b A )\n\
+                \x20     + ROUTED met1 ( 1000 4000 ) ( 20000 * )\n\
+                \x20   ;\n\
+                END NETS\n\
+                END DESIGN\n";
+    let d = parse(text);
+    let n = d.nets.iter().find(|n| n.name == "CFG_REG[0]").unwrap_or_else(|| {
+        panic!(
+            "bussed net stayed escaped: {:?}",
+            d.nets.iter().map(|n| &n.name).collect::<Vec<_>>()
+        )
+    });
+    assert!(
+        n.pins.iter().any(|(i, p)| i == "u_a/b" && p == "A"),
+        "an escaped instance name must unescape too: {:?}",
+        n.pins
+    );
+    assert!(
+        d.comps.iter().any(|c| c.name == "u_a/b"),
+        "and in COMPONENTS: {:?}",
+        d.comps.iter().map(|c| &c.name).collect::<Vec<_>>()
+    );
+}

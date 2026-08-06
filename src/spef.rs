@@ -10,6 +10,7 @@
 //!
 //! Pure std — fully unit-tested offline.
 
+use crate::names::unescape;
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Default)]
@@ -120,8 +121,33 @@ impl std::fmt::Display for SpefError {
 }
 impl std::error::Error for SpefError {}
 
-fn node_tok(t: &str) -> String {
-    t.trim_start_matches('*').to_string()
+/// Resolve a node reference to REAL NAMES: `*3:Y` -> `g1:Y`, `*1` -> `n1`, `*1:2` -> `n1:2`.
+///
+/// A node reference is a name-map index (or a literal name) followed by an optional `:<suffix>`
+/// naming a pin or an internal node number; only the head is mapped. Keeping the raw index made
+/// every node meaningless to every consumer — `3:Y` says nothing about which instance that is —
+/// and it broke our own writer, which cannot tell the node `3:Y` from a net someone NAMED
+/// `3:Y`. It interned it as a name, so the RC network we wrote no longer joined the pins in
+/// `*CONN`: a driver attached to nothing, in a file that still parsed. That is what a
+/// read-write-read cycle over the whole structure catches and a field-by-field round trip does
+/// not, because nobody thinks to assert on node identity.
+///
+/// The suffix delimiter is `:`, the format's default and the only one this writer emits.
+fn node_tok(t: &str, names: &BTreeMap<usize, String>) -> String {
+    let head = |h: &str| -> String {
+        match h.strip_prefix('*') {
+            Some(body) => body
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| names.get(&i).cloned())
+                .unwrap_or_else(|| body.to_string()),
+            None => h.to_string(),
+        }
+    };
+    match t.split_once(':') {
+        Some((h, suf)) => format!("{}:{suf}", head(h)),
+        None => head(t),
+    }
 }
 
 /// A SPEF value may be a single number or a **corner triplet** `min:typ:max`, written whenever
@@ -138,28 +164,6 @@ fn is_triplet(t: &str) -> bool {
     t.contains(':') && t.split(':').count() > 1 && t.split(':').all(|f| f.parse::<f64>().is_ok())
 }
 
-/// Strip SPEF name escaping: `u_a\.q\[0\]` -> `u_a.q[0]`.
-///
-/// Names are matched against the design's own net names, and a backslash that survives the read
-/// makes every hierarchical or bussed name miss — silently, as a net with no parasitics.
-fn unescape(s: &str) -> String {
-    if !s.contains('\\') {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut esc = false;
-    for c in s.chars() {
-        if esc {
-            out.push(c);
-            esc = false;
-        } else if c == '\\' {
-            esc = true;
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
 
 /// Add SPEF name escaping — the inverse of [`unescape`], applied by the writer so a name
 /// containing SPEF punctuation survives a round trip instead of becoming a syntax error.
@@ -585,7 +589,7 @@ impl Spef {
                 triplets |= toks.get(2).is_some_and(|s| is_triplet(s));
                 let cap = toks.get(2).and_then(|s| parse_val(s)).unwrap_or(0.0) * c_scale;
                 let name = resolve(idtok, &names);
-                let net_node = node_tok(idtok);
+                let net_node = node_tok(idtok, &names);
                 owner.insert(net_node.clone(), name.clone());
                 cur = Some((
                     name,
@@ -644,13 +648,13 @@ impl Spef {
                                 .and_then(|s| parse_val(s))
                                 .map(|c| c * c_scale)
                                 .unwrap_or(0.0);
-                            claim(&cur, &mut owner, &node_tok(node));
+                            claim(&cur, &mut owner, &node_tok(node, &names));
                             if let Some((_, _, rc)) = cur.as_mut() {
-                                rc.pins.push((inst.clone(), pin.clone(), node_tok(node)));
+                                rc.pins.push((inst.clone(), pin.clone(), node_tok(node, &names)));
                                 rc.conns.push(PinConn {
                                     inst,
                                     pin,
-                                    node: node_tok(node),
+                                    node: node_tok(node, &names),
                                     dir,
                                     cap_ff,
                                 });
@@ -667,7 +671,7 @@ impl Spef {
                         triplets |= is_triplet(toks[3]);
                         if let Some(r) = parse_val(toks[3]) {
                             let r = r * r_scale;
-                            let (na, nb) = (node_tok(toks[1]), node_tok(toks[2]));
+                            let (na, nb) = (node_tok(toks[1], &names), node_tok(toks[2], &names));
                             claim(&cur, &mut owner, &na);
                             claim(&cur, &mut owner, &nb);
                             if let Some((_, _, rc)) = cur.as_mut() {
@@ -689,13 +693,13 @@ impl Spef {
                         // whole file has been read, so these are resolved after the loop.
                         triplets |= is_triplet(toks[3]);
                         if let Some(v) = parse_val(toks[3]) {
-                            pending_cc.push((node_tok(toks[1]), node_tok(toks[2]), v * c_scale));
+                            pending_cc.push((node_tok(toks[1], &names), node_tok(toks[2], &names), v * c_scale));
                         }
                     } else if toks.len() >= 3 {
                         // grounded cap `<idx> *node <ff>`
                         triplets |= is_triplet(toks[2]);
                         if let Some(v) = parse_val(toks[2]) {
-                            let node = node_tok(toks[1]);
+                            let node = node_tok(toks[1], &names);
                             claim(&cur, &mut owner, &node);
                             if let Some((_, _, rc)) = cur.as_mut() {
                                 rc.ground.push((node, v * c_scale));
@@ -935,18 +939,26 @@ impl Spef {
     }
 }
 
-/// Compact fixed-ish float for SPEF numbers: integers stay integer, otherwise up
-/// to 6 significant decimals with trailing zeros trimmed (stable, no exponent).
+/// Compact float for SPEF numbers: the shortest decimal that reads back as the same value.
+///
+/// **Not a fixed number of decimal PLACES.** `{:.6}` is six places, not six significant
+/// figures, so it rounded a 0.0416254 fF capacitor to 0.041625 — and any value below 5e-7
+/// straight to `0.000000`, which trims to `0` and deletes the capacitor outright. Small
+/// coupling capacitors are exactly where that lands, and the file still parses afterwards.
+///
+/// Rust's `Display` for `f64` gives the shortest representation that round-trips and never uses
+/// an exponent, so the output stays plain decimal for any real parasitic. The exponent fallback
+/// is for a value no extractor produces (below ~1e-16), where the decimal form would run to
+/// hundreds of digits; SPEF readers take it, and nothing physical reaches it.
 fn fmtf(v: f64) -> String {
     if v == 0.0 {
         return "0".into();
     }
-    if v.fract() == 0.0 && v.abs() < 1e15 {
-        return format!("{}", v as i64);
+    let s = format!("{v}");
+    if s.len() > 24 {
+        return format!("{v:e}");
     }
-    let s = format!("{v:.6}");
-    let s = s.trim_end_matches('0').trim_end_matches('.');
-    s.to_string()
+    s
 }
 
 #[cfg(test)]
