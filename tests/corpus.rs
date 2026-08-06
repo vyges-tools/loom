@@ -15,6 +15,27 @@
 //! that failed two files outright and would never have appeared in ours. Nothing is vendored:
 //! the files stay where they are and the corpus is pointed at them.
 //!
+//! **The waveform corpora are the same trade.** `wellen` (BSD-3-Clause), the reader Surfer loads
+//! waveforms through, tests against ~150 dumps from tools we do not run — ModelSim, Quartus,
+//! migen, libsigrok, nvc, SystemC — and half of them are matched `x.vcd` / `x.vcd.fst` pairs,
+//! which makes each one a differential oracle for free:
+//!
+//! ```sh
+//! git clone --depth 1 https://github.com/ekiwi/wellen
+//! for f in $(find wellen -name '*.vcd.fst'); do v=${f%.fst}; b=$(basename $v .vcd);
+//!   cp $v pairs/$b.vcd; cp $f pairs/$b.fst; done
+//! VYGES_CORPUS=pairs cargo test --all-features --test corpus -- --nocapture
+//! ```
+//!
+//! Twenty of those 38 pairs disagreed the first time, on six defects — every one in a construct
+//! no dump of ours contains. Nothing is vendored and nothing of theirs is copied; the files stay
+//! where they are.
+//!
+//! A **second SAIF oracle** can be generated the same way, with `wave2saif` (EUPL-1.2, so run
+//! the binary — do not read it): `wave2saif x.vcd -o x.saif` beside each `x.vcd`. Useful but
+//! partial — v0.1.0 writes only scalars, drops some instances, and does not escape `(` in a
+//! net name, so treat a `saif=None` on a vector bit as the writer's gap and not ours.
+//!
 //! Unset, every test passes trivially — the repo ships no PDK and CI has none. That is the
 //! trade: these cannot run everywhere, so they assert **oracle-free invariants** rather than
 //! golden values, and can therefore run over any design from any tool without a stored answer.
