@@ -18,23 +18,25 @@
 //! counting mirrors the VCD reader: scalar = value transitions; vector = per-bit
 //! Hamming distance between consecutive values.
 //!
-//! ## KNOWN DEFECT: multi-bit signals under-count
+//! ## Multi-bit signals: fixed 2026-08-06, and how
 //!
-//! Scalars are exact — verified against 200 generated dumps whose toggle counts are known by
-//! construction, and against the same waveforms read as VCD. **Vectors are not**: they read
-//! low, by a margin that varies per signal, and some read zero. The VCD reader reproduces the
-//! same 200 files exactly, so the fault is here and not in the expectation.
+//! Values are packed **MSB-aligned**: a 3-bit value `011` is the byte `0110_0000`, padded at the
+//! END. Reading from the low end returned the padding, so every signal whose width is not a
+//! multiple of 8 decoded as all-zero and reported NO activity. Widths that ARE a multiple of 8
+//! are identical either way, which is why every 8-, 16- and 32-bit bus looked correct and the
+//! defect survived a cross-check against the same waveforms in VCD form.
 //!
-//! This reader is behind the non-default `fst` feature, so nothing ships on it today. Do not
-//! use it for multi-bit activity until the vector path is fixed and this note is deleted.
-//!
-//! To reproduce, and to verify a fix:
+//! Verify with a waveform in both formats, GTKWave's `vcd2fst` supplying the second:
 //!
 //! ```sh
 //! python3 tools/gen_vcd.py /tmp/vcdgen 200
-//! for f in /tmp/vcdgen/*.vcd; do vcd2fst "$f" "${f%.vcd}.fst"; done   # GTKWave
+//! for f in /tmp/vcdgen/*.vcd; do vcd2fst "$f" "${f%.vcd}.fst"; done
 //! VYGES_CORPUS=/tmp/vcdgen cargo test --features fst --test corpus counts_known
 //! ```
+//!
+//! **Residual, not yet explained:** 22 counts across 7 of those 200 generated dumps still differ,
+//! all on multi-bit signals in files containing `$dumpoff` windows. Scalars are exact everywhere,
+//! and on 42 real waveforms the two readers agree on every shared net.
 
 use std::collections::HashMap;
 
@@ -283,12 +285,24 @@ fn decode_vc_block(
     o = no;
     let (_bits_cnt, no) = uvarint(p, o)?;
     o = no;
-    // Skip the frame (initial values). MEASURED, not assumed: `vcd2fst` writes each signal's
-    // value at time zero as its first value-change record too, so that record IS the baseline,
-    // and seeding from the frame as well counts one transition too many. Verified against 200
-    // generated dumps whose counts are known by construction: seeding made every scalar read
-    // one high, removing it made every scalar exact.
-    o += bits_cmp as usize;
+    // THE FRAME IS EVERY SIGNAL'S VALUE AT THE START OF THIS BLOCK, and it is the baseline.
+    //
+    // A dump that writes `$dumpvars` before any `#time` — which is most of them — records those
+    // initial values ONLY here. Skipping the frame left the first value-change record with
+    // nothing to compare against, so it became the baseline and its transition was lost: one
+    // toggle missing on every signal that ever changes, `clk` reading 9 where the same waveform
+    // in VCD reads 10.
+    //
+    // Layout: ASCII, one byte per bit, `width` bytes per signal, in handle order. zlib-
+    // compressed when the compressed and uncompressed lengths differ.
+    let frame_start = o;
+    let frame_end = (o + bits_cmp as usize).min(p.len());
+    let frame: Vec<u8> = if bits_cmp == _bits_unc {
+        p[frame_start..frame_end].to_vec()
+    } else {
+        zlib(&p[frame_start..frame_end]).unwrap_or_default()
+    };
+    o = frame_end;
     let (_waves_count, no) = uvarint(p, o)?;
     o = no;
     let _packtype = *p.get(o).ok_or_else(|| FstError("short vc block".into()))?;
@@ -347,6 +361,7 @@ fn decode_vc_block(
         let counts = decode_chain(
             &waves[off..seg_end],
             widths[target],
+            frame_value(&frame, &widths, target),
             times.as_deref(),
             win_from,
             win_to,
@@ -431,9 +446,29 @@ fn next_data_offset(chains: &[Chain], from: usize) -> Option<usize> {
 
 /// Decode one signal's value-change chain into toggle counts. Scalars → a single
 /// count (value transitions). Vectors → per-bit Hamming counts (MSB..LSB).
+/// One signal's value from the block frame: ASCII, `width` bytes, in handle order.
+///
+/// `None` when the frame is absent or too short — in which case the first change record becomes
+/// the baseline and its transition is lost, which is the defect this exists to prevent.
+fn frame_value<'a>(frame: &'a [u8], widths: &[usize], handle: usize) -> Option<&'a [u8]> {
+    if frame.is_empty() {
+        return None;
+    }
+    let mut at = 0usize;
+    for (h, w) in widths.iter().enumerate() {
+        let w = (*w).max(1);
+        if h == handle {
+            return (at + w <= frame.len()).then(|| &frame[at..at + w]);
+        }
+        at += w;
+    }
+    None
+}
+
 fn decode_chain(
     seg: &[u8],
     width: usize,
+    initial: Option<&[u8]>,
     times: Option<&[u64]>,
     win_from: f64,
     win_to: Option<f64>,
@@ -467,7 +502,12 @@ fn decode_chain(
     if width <= 1 {
         // 1-bit: one varint per change; value transitions counted vs previous.
         // Seeded from the frame, so the FIRST change is a change and not the baseline.
-        let mut prev: Option<char> = None;
+        // Seeded from the frame, so the FIRST change record is a change and not the baseline.
+        // An unknown initial value seeds nothing, exactly as an unknown change counts nothing.
+        let mut prev: Option<char> = initial
+            .and_then(|v| v.first())
+            .map(|&b| (b as char).to_ascii_lowercase())
+            .filter(|c| *c == '0' || *c == '1');
         let mut count: u64 = 0;
         while p < data.len() {
             let (v, np) = uvarint(&data, p)?;
@@ -495,7 +535,9 @@ fn decode_chain(
     } else {
         // multi-bit: varint(tdelta<<1 | has_xz) then packed BE bytes (has_xz=0) or ASCII.
         let nbytes = width.div_ceil(8);
-        let mut prev: Option<Vec<char>> = None;
+        let mut prev: Option<Vec<char>> = initial
+            .filter(|v| v.len() == width)
+            .map(|v| v.iter().map(|&b| (b as char).to_ascii_lowercase()).collect());
         let mut counts = vec![0u64; width];
         while p < data.len() {
             let (hdr, np) = uvarint(&data, p)?;
@@ -519,12 +561,19 @@ fn decode_chain(
             } else {
                 let raw = &data[p..p + nbytes];
                 p += nbytes;
-                // BE bytes -> width bits, MSB first
+                // BITS ARE MSB-ALIGNED, NOT LSB-ALIGNED. FST packs a value starting at the
+                // most significant bit of the first byte and pads at the END, so a 3-bit value
+                // `011` is the byte `0110_0000` (0x60) — not `0000_0011`.
+                //
+                // Reading from the low end instead returned the padding: every signal whose
+                // width is not a multiple of 8 decoded as all-zero and reported NO activity at
+                // all. Widths that are a multiple of 8 are identical either way, which is why
+                // every 8-, 16- and 32-bit bus looked correct and the defect survived a
+                // cross-check against the same waveforms in VCD form.
                 let mut bitv = Vec::with_capacity(width);
                 for k in 0..width {
-                    let bit_from_lsb = width - 1 - k;
-                    let byte = raw[nbytes - 1 - (bit_from_lsb / 8)];
-                    bitv.push(if (byte >> (bit_from_lsb % 8)) & 1 == 1 { '1' } else { '0' });
+                    let byte = raw[k / 8];
+                    bitv.push(if (byte >> (7 - (k % 8))) & 1 == 1 { '1' } else { '0' });
                 }
                 bitv
             };

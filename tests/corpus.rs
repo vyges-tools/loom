@@ -474,9 +474,11 @@ fn the_fst_reader_agrees_with_the_vcd_reader_on_every_pair() {
                 }
             }
         }
-        for path in b.idx.toggles.keys() {
-            if !a.idx.toggles.contains_key(path) {
-                bad.push(format!("{}: {path} in fst only", show(v)));
+        // A net that never toggles gets no entry from either reader, but they can disagree
+        // about WHICH those are — so compare on the union, treating a missing key as zero.
+        for (path, m) in &b.idx.toggles {
+            if !a.idx.toggles.contains_key(path) && *m > 0 {
+                bad.push(format!("{}: {path} vcd=absent fst={m}", show(v)));
                 break;
             }
         }
