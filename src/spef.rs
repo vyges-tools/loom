@@ -239,6 +239,42 @@ fn escape(s: &str) -> String {
     out
 }
 
+/// Spread a crosstalk capacitance over the wire it actually sits on.
+///
+/// **Not at `net_node`.** That field is the net's own node, and it is a node of the RC network
+/// only when the extractor wrote the bare `*<netid>` form. A real OpenRCX file names its nodes
+/// `*<netid>:<n>` and `*<instid>:<pin>`, so `net_node` matches nothing in the network: measured
+/// on a routed sky130 block, it was a network node for **221 of 14238 nets**. For the other 98 %
+/// every femtofarad of coupling was deposited on a node the tree never visits, and left the
+/// delay without trace — `miller` could be set to any value at all and the answer did not move.
+///
+/// Coupling follows the wire, so it is distributed like the wire's own capacitance: in
+/// proportion to each node's grounded cap, falling back to the driver when a net carries none.
+/// A lumped net with one node degenerates to "all of it there", which is the old behaviour for
+/// the files that behaved.
+///
+/// (The reader does keep the node each capacitor came off — see `NetRc::coupling_nodes` — but
+/// the caller has already summed the window-overlapping aggressors by the time it gets here.
+/// Passing that through per node would be better still, and needs the caller to change too.)
+fn spread_xtalk<'a>(
+    cap: &mut HashMap<&'a str, f64>,
+    ground: &'a [(String, f64)],
+    driver: &'a str,
+    xtalk_cap_ff: f64,
+) {
+    if xtalk_cap_ff == 0.0 {
+        return;
+    }
+    let total: f64 = ground.iter().map(|(_, c)| *c).sum();
+    if total > 0.0 {
+        for (n, c) in ground {
+            *cap.entry(n.as_str()).or_default() += xtalk_cap_ff * (c / total);
+        }
+    } else {
+        *cap.entry(driver).or_default() += xtalk_cap_ff;
+    }
+}
+
 /// Drop a `//` line comment, which is legal anywhere in a SPEF line. Left in place it becomes
 /// extra tokens, and an entry's field count is how this format distinguishes a grounded cap from
 /// a coupling one — so a trailing comment turns a ground cap into an unparseable coupling cap.
@@ -251,7 +287,7 @@ fn strip_comment(line: &str) -> &str {
 
 impl NetRc {
     /// Per-node Elmore delays (ns) for the net's RC tree rooted at `driver`,
-    /// with `xtalk_cap_ff` added at the net node (the Miller crosstalk load).
+    /// with `xtalk_cap_ff` spread over the wire (the Miller crosstalk load) — see [`spread_xtalk`].
     /// Returns `None` if the network is not a tree reachable from the driver
     /// (caller falls back to the lumped delay).
     pub fn elmore(&self, driver: &str, xtalk_cap_ff: f64) -> Option<BTreeMap<String, f64>> {
@@ -263,7 +299,7 @@ impl NetRc {
         for (node, c) in &self.ground {
             *cap.entry(node.as_str()).or_default() += c;
         }
-        *cap.entry(self.net_node.as_str()).or_default() += xtalk_cap_ff;
+        spread_xtalk(&mut cap, &self.ground, driver, xtalk_cap_ff);
         // adjacency
         let mut adj: HashMap<&str, Vec<(&str, f64)>> = HashMap::new();
         for (a, b, r) in &self.res {
@@ -347,7 +383,7 @@ impl NetRc {
         for (n, c) in &self.ground {
             *cap.entry(n.as_str()).or_default() += c;
         }
-        *cap.entry(self.net_node.as_str()).or_default() += xtalk_cap_ff;
+        spread_xtalk(&mut cap, &self.ground, driver, xtalk_cap_ff);
         let mut adj: HashMap<&str, Vec<(&str, f64)>> = HashMap::new();
         for (a, b, r) in &self.res {
             adj.entry(a).or_default().push((b, *r));
@@ -1318,6 +1354,56 @@ mod writer_tests {
     /// Coupling endpoints are normally NODE tokens — an instance pin or an internal node,
     /// whose owning net is only known from the `*CONN` / `*RES` entries elsewhere in the file.
     /// Reading only the bare-net form discards most of the coupling in a real SPEF.
+    /// **Crosstalk must actually reach the delay** on a net named the way a real extractor
+    /// names one.
+    ///
+    /// The capacitance used to be deposited at `net_node` — the net's own name — which is a node
+    /// of the RC network only when the file uses the bare `*<netid>` form. OpenRCX writes
+    /// `*<netid>:<n>` and `*<instid>:<pin>`, so on a routed sky130 block `net_node` matched a
+    /// network node for 221 of 14238 nets: for the other 98 % every femtofarad of coupling
+    /// landed on a node the tree never visits. Nothing failed. The Miller factor could be set to
+    /// any value at all and the answer did not move — an SI term that was structurally incapable
+    /// of doing anything.
+    ///
+    /// This fixture is deliberately spelled the OpenRCX way, because the bare-node spelling is
+    /// exactly the one that hid the defect.
+    #[test]
+    fn crosstalk_changes_the_delay_of_a_net_named_the_way_extractors_name_them() {
+        let text = "*SPEF \"IEEE 1481-1998\"\n*DESIGN \"blk\"\n\
+                    *T_UNIT 1 PS\n*C_UNIT 1 FF\n*R_UNIT 1 OHM\n\
+                    *NAME_MAP\n*1 victim\n*2 drv\n*3 snk\n\n\
+                    *D_NET *1 10\n*CONN\n*I *2:Y O\n*I *3:A I\n\
+                    *CAP\n1 *1:1 5\n2 *3:A 5\n\
+                    *RES\n1 *2:Y *1:1 100\n2 *1:1 *3:A 100\n*END\n";
+        let s = Spef::parse(text);
+        let rc = s.nets.get("victim").expect("victim");
+        // the precondition that makes this test meaningful
+        let nodes: Vec<&str> = rc.res.iter().flat_map(|(a, b, _)| [a.as_str(), b.as_str()]).collect();
+        assert!(
+            !nodes.contains(&rc.net_node.as_str()),
+            "the fixture must name its nodes the way an extractor does, not as the bare net"
+        );
+
+        let th = crate::liberty::Thresholds::default();
+        let worst = |xc: f64| {
+            rc.transient("drv:Y", 0.15, xc, th)
+                .expect("a tree rooted at the driver")
+                .values()
+                .map(|(d, _)| *d)
+                .fold(0.0f64, f64::max)
+        };
+        let (quiet, coupled) = (worst(0.0), worst(50.0));
+        assert!(
+            coupled > quiet * 1.05,
+            "50 fF of crosstalk must slow the net: {quiet:.6} ns -> {coupled:.6} ns"
+        );
+        // and the same through the Elmore path, which shares the defect and the fix
+        let e = |xc: f64| {
+            rc.elmore("drv:Y", xc).expect("elmore").values().copied().fold(0.0f64, f64::max)
+        };
+        assert!(e(50.0) > e(0.0) * 1.05, "and through Elmore: {} -> {}", e(0.0), e(50.0));
+    }
+
     #[test]
     fn coupling_between_node_tokens_resolves_to_their_nets() {
         let text = "\

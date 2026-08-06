@@ -141,6 +141,17 @@ pub struct SpefCoverage {
     pub design_nets: usize,
     pub file_nets: usize,
     pub matched: usize,
+    /// Nets the FILE carries that name nothing in the design. The mirror of `matched`, and the
+    /// more sensitive of the two: a percentage of design nets covered is a ratio that stays
+    /// reassuring while a whole naming convention fails. On a routed block whose netlist reader
+    /// kept the backslash of an escaped identifier, coverage read 94.6 % — comfortably above any
+    /// threshold anyone would set — while 767 nets carried no parasitics at all.
+    pub file_nets_unmatched: usize,
+    /// Coupling references whose aggressor names nothing in the design, out of `coupling_refs`.
+    /// A timer looks each one up and drops the ones it cannot find, which removes crosstalk from
+    /// the analysis with no other symptom. Same block: 4527 of 177680.
+    pub coupling_unresolved: usize,
+    pub coupling_refs: usize,
 }
 
 impl SpefCoverage {
@@ -156,6 +167,18 @@ impl SpefCoverage {
     pub fn read_but_unmatched(&self) -> bool {
         self.file_nets > 0 && self.matched == 0
     }
+
+    /// Does every name in the file correspond to something in the design?
+    ///
+    /// **This is the check worth gating on**, not a coverage percentage. A design legitimately
+    /// has nets a SPEF omits (an extractor skips what it treats as ideal), so `matched` is
+    /// always a fraction and any threshold on it is a guess. The converse is not: a parasitic
+    /// the file went to the trouble of describing, for a net nothing in the design is called,
+    /// means the two files disagree about names — and everything downstream of that disagreement
+    /// is silently missing.
+    pub fn names_all_correspond(&self) -> bool {
+        self.file_nets_unmatched == 0 && self.coupling_unresolved == 0
+    }
 }
 
 pub fn spef(nl: &Netlist, sp: &Spef) -> SpefCoverage {
@@ -168,10 +191,22 @@ pub fn spef(nl: &Netlist, sp: &Spef) -> SpefCoverage {
     for p in nl.inputs.iter().chain(nl.outputs.iter()) {
         design.insert(p.as_str());
     }
+    let (mut coupling_refs, mut coupling_unresolved) = (0usize, 0usize);
+    for rc in sp.nets.values() {
+        for (agg, _) in &rc.coupling {
+            coupling_refs += 1;
+            if !design.contains(agg.as_str()) {
+                coupling_unresolved += 1;
+            }
+        }
+    }
     SpefCoverage {
         matched: design.iter().filter(|n| sp.nets.contains_key(**n)).count(),
         design_nets: design.len(),
         file_nets: sp.nets.len(),
+        file_nets_unmatched: sp.nets.keys().filter(|n| !design.contains(n.as_str())).count(),
+        coupling_refs,
+        coupling_unresolved,
     }
 }
 
@@ -207,6 +242,7 @@ mod tests {
             design_nets: 10,
             file_nets: 0,
             matched: 0,
+            ..Default::default()
         };
         assert!(
             !none_read.read_but_unmatched(),
@@ -216,15 +252,12 @@ mod tests {
             design_nets: 10,
             file_nets: 99,
             matched: 0,
+            ..Default::default()
         };
         assert!(read_unmatched.read_but_unmatched());
         assert_eq!(read_unmatched.percent(), 0.0);
         assert_eq!(
-            SpefCoverage {
-                design_nets: 0,
-                file_nets: 0,
-                matched: 0
-            }
+            SpefCoverage::default()
             .percent(),
             0.0
         );
