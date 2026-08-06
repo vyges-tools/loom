@@ -44,6 +44,7 @@
 //! rather than regressions, so a golden-file comparison could never have caught either. An
 //! invariant can.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 mod common;
@@ -722,6 +723,85 @@ fn a_spef_and_its_def_agree_about_net_names() {
     }
     println!("SPEF/DEF pairs: {pairs}");
     assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// **The two netlist front ends must describe the same design.**
+///
+/// Yosys `write_json` and structural Verilog are two spellings of one netlist, and this crate
+/// reads both onto one model. That makes each a free oracle for the other — with the property
+/// that matters: they were written independently, so a mistake in one is unlikely to be made the
+/// same way in the other. Anything they disagree about is a defect in exactly one of them.
+///
+/// Pair a `<name>.json` with a `<name>.v` beside it. Generate them from any gate-level netlist:
+///
+/// ```sh
+/// yosys -q -p "read_verilog x.nl.v; write_json x.json"
+/// ```
+///
+/// Connections are compared as a SET per instance, because the two front ends have no reason to
+/// order pins the same way; what must not differ is which pin is on which net.
+#[test]
+fn the_two_netlist_front_ends_agree_on_every_design() {
+    let jsons: Vec<PathBuf> = corpus(&[".json"])
+        .into_iter()
+        .filter(|p| p.with_extension("v").is_file())
+        .collect();
+    announce("netlist (json/verilog pairs)", &jsons);
+    let mut bad = Vec::new();
+    for j in &jsons {
+        let v = j.with_extension("v");
+        let (Ok(nv), Ok(nj)) = (
+            netlist::load(v.to_str().unwrap()),
+            vyges_loom::yosys_json::load(j.to_str().unwrap()),
+        ) else {
+            bad.push(format!("{}: one of the pair would not load", show(j)));
+            continue;
+        };
+        if nv.module != nj.module {
+            bad.push(format!("{}: top module {} vs {}", show(j), nv.module, nj.module));
+            continue;
+        }
+        let key = |n: &netlist::Netlist| -> BTreeMap<String, BTreeSet<String>> {
+            n.insts
+                .iter()
+                .map(|i| {
+                    (
+                        format!("{}:{}", i.cell, i.name),
+                        i.conns.iter().map(|(p, net)| format!("{p}={net}")).collect(),
+                    )
+                })
+                .collect()
+        };
+        let (kv, kj) = (key(&nv), key(&nj));
+        let only_v: Vec<&String> = kv.keys().filter(|k| !kj.contains_key(*k)).collect();
+        let only_j: Vec<&String> = kj.keys().filter(|k| !kv.contains_key(*k)).collect();
+        if !only_v.is_empty() || !only_j.is_empty() {
+            bad.push(format!(
+                "{}: {} instance(s) only in the verilog (e.g. {:?}), {} only in the json (e.g. {:?})",
+                show(j),
+                only_v.len(),
+                only_v.first(),
+                only_j.len(),
+                only_j.first()
+            ));
+            continue;
+        }
+        if let Some((k, a, b)) = kv.iter().find_map(|(k, a)| {
+            let b = kj.get(k)?;
+            (a != b).then(|| (k.clone(), a.clone(), b.clone()))
+        }) {
+            let d: Vec<&String> = a.symmetric_difference(&b).collect();
+            bad.push(format!("{}: `{k}` connected differently: {:?}", show(j), d));
+        }
+    }
+    let shown: Vec<&String> = bad.iter().take(8).collect();
+    assert!(
+        bad.is_empty(),
+        "{} design(s) where the two front ends disagree, first {}:\n  {}",
+        bad.len(),
+        shown.len(),
+        shown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n  ")
+    );
 }
 
 /// **Every SPICE netlist reads into devices whose terminals are named.**

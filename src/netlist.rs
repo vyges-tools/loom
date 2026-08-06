@@ -247,6 +247,9 @@ pub fn parse(text: &str) -> Result<Netlist, NetlistError> {
 fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
     let n = t.len();
     let mut nl = Netlist::default();
+    // names declared as a one-bit VECTOR (`wire [0:0] x`), and the single index they carry
+    let mut one_bit_vec: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     let mut i = from;
 
     // module NAME ( ... ) ;  — keep name, skip the header port list
@@ -351,8 +354,35 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
                 nl.behavioural += 1;
                 i += 1;
             }
+            // A DECLARATION CARRIES THE WIDTH, and a one-bit VECTOR is named without an index.
+            // `wire [0:0] clk;` and `wire clk;` are the same net to every consumer — Yosys's own
+            // JSON represents them identically, `bits: [n]`, with nothing to tell them apart —
+            // but Verilog source may write the connection either way. Left as written, one front
+            // end says `clk[0]` and the other says `clk`, and the two describe the same design
+            // differently. The declaration is the only place the answer exists, so it is read
+            // rather than skipped.
             "wire" | "reg" | "inout" | "parameter" | "localparam" | "supply0" | "supply1" => {
+                i += 1;
+                // an optional `[ msb:lsb ]` range, then the names it applies to
+                let mut single: Option<String> = None;
+                if i < n && t[i] == "[" {
+                    let range = t.get(i + 1).cloned().unwrap_or_default();
+                    if let Some((a, b)) = range.split_once(':') {
+                        if a.trim() == b.trim() {
+                            single = Some(a.trim().to_string());
+                        }
+                    }
+                    while i < n && t[i] != "]" {
+                        i += 1;
+                    }
+                    i += 1;
+                }
                 while i < n && t[i] != ";" {
+                    if let Some(idx) = &single {
+                        if is_ident(&t[i]) && !is_keyword(&t[i]) {
+                            one_bit_vec.insert(t[i].clone(), idx.clone());
+                        }
+                    }
                     i += 1;
                 }
             }
@@ -474,6 +504,58 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
             }
         }
     }
+    // ---- canonicalise the net names, so both front ends describe one design ------------------
+    //
+    // Two normalisations, each because the same net is legitimately written more than one way
+    // and every consumer joins by NAME:
+    //
+    //   * `x[0]` where `x` is a one-bit vector is just `x`. Yosys's JSON cannot say otherwise —
+    //     it represents `wire [0:0] x` and `wire x` identically — so the bare form is the only
+    //     one both front ends can agree on.
+    //
+    //   * a net tied to a PORT by `assign port = net;` is that port. Both names are the net's,
+    //     and the port's is the one the DEF, the SPEF and the SDC all use, so it is the one that
+    //     joins. Yosys resolves this for us by merging both names onto one bit id and reporting
+    //     the port; reading the Verilog literally reported the local wire, and the two front
+    //     ends then disagreed about a net on five of fifteen real designs.
+    let ports: std::collections::BTreeSet<&str> =
+        nl.inputs.iter().chain(nl.outputs.iter()).map(String::as_str).collect();
+    let mut to_port: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    for (lhs, rhs) in &nl.aliases {
+        match (ports.contains(lhs.as_str()), ports.contains(rhs.as_str())) {
+            (true, false) => to_port.insert(rhs.as_str(), lhs.as_str()),
+            (false, true) => to_port.insert(lhs.as_str(), rhs.as_str()),
+            _ => None,
+        };
+    }
+    let canon = |net: &str| -> String {
+        if let Some(p) = to_port.get(net) {
+            return p.to_string();
+        }
+        if let Some((base, rest)) = net.split_once('[') {
+            if let Some(idx) = rest.strip_suffix(']') {
+                if one_bit_vec.get(base).map(String::as_str) == Some(idx) {
+                    return base.to_string();
+                }
+            }
+        }
+        net.to_string()
+    };
+    let renames: Vec<(usize, usize, String)> = nl
+        .insts
+        .iter()
+        .enumerate()
+        .flat_map(|(ii, inst)| {
+            inst.conns.iter().enumerate().filter_map(move |(ci, (_, net))| {
+                let c = canon(net);
+                (c != *net).then_some((ii, ci, c))
+            })
+        })
+        .collect();
+    for (ii, ci, c) in renames {
+        nl.insts[ii].conns[ci].1 = c;
+    }
+
     (nl, i)
 }
 

@@ -262,3 +262,50 @@ fn a_parameter_override_does_not_swallow_the_instance() {
     assert_eq!(n.insts[0].name, "u1");
     assert_eq!(conns_of(&n, "u1"), [("A", "a"), ("Y", "y")]);
 }
+
+/// **The two front ends must name a net the same way**, because every consumer joins by name.
+///
+/// Two cases where one Verilog net legitimately has two spellings, and the readers used to
+/// choose independently — so the same design read two ways described different circuits, on ten
+/// of fifteen real gate-level netlists:
+///
+/// * `assign port = net;` ties a local wire to a port. Both names are the net's; the port's is
+///   the one the DEF, the SPEF and the SDC use, so it is the one that joins. Yosys merges them
+///   onto one bit id and reports whichever its JSON object lists first, which is arbitrary.
+/// * `wire [0:0] x;` connected as `x[0]` is just `x`. Yosys's JSON cannot say otherwise — it
+///   represents a one-bit vector and a scalar identically — so the bare form is the only one
+///   both front ends can agree on.
+#[test]
+fn both_front_ends_name_a_net_the_same_way() {
+    let v = parse(
+        "module m(a, y);\n input a;\n output y;\n\
+         wire [0:0] w;\n wire n1;\n\
+         INV g1 (.A(a), .Y(w[0]));\n\
+         INV g2 (.A(w[0]), .Y(n1));\n\
+         assign y = n1;\nendmodule\n",
+    );
+    let conns = |n: &vyges_loom::netlist::Netlist, inst: &str| -> Vec<(String, String)> {
+        n.insts
+            .iter()
+            .find(|i| i.name == inst)
+            .map(|i| i.conns.clone())
+            .unwrap_or_default()
+    };
+    // the one-bit vector loses its index
+    assert_eq!(conns(&v, "g1"), [("A".into(), "a".into()), ("Y".into(), "w".into())]);
+    // and the wire tied to the output port takes the port's name
+    assert_eq!(conns(&v, "g2"), [("A".into(), "w".into()), ("Y".into(), "y".into())]);
+
+    // The same design as Yosys writes it: `y` and `n1` share a bit, and `w` is one bit wide.
+    let j = vyges_loom::yosys_json::parse(
+        r#"{"modules":{"m":{"attributes":{"top":"00000000000000000000000000000001"},
+             "ports":{"a":{"direction":"input","bits":[2]},"y":{"direction":"output","bits":[4]}},
+             "cells":{
+               "g1":{"type":"INV","connections":{"A":[2],"Y":[3]}},
+               "g2":{"type":"INV","connections":{"A":[3],"Y":[4]}}},
+             "netnames":{"a":{"bits":[2]},"w":{"bits":[3]},"n1":{"bits":[4]},"y":{"bits":[4]}}}}}"#,
+    )
+    .expect("yosys json");
+    assert_eq!(conns(&j, "g1"), conns(&v, "g1"), "g1 differs between the front ends");
+    assert_eq!(conns(&j, "g2"), conns(&v, "g2"), "g2 differs between the front ends");
+}

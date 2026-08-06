@@ -66,7 +66,29 @@ pub fn parse(text: &str) -> Result<Netlist, NetlistError> {
             }
         }
     }
-    let name_of = |id: i64| bit_name.iter().find(|(b, _)| *b == id).map(|(_, n)| n.clone());
+    // A BIT WITH TWO NAMES TAKES THE PORT'S. Yosys merges `assign port = net;` onto one bit and
+    // reports both names, so the first one encountered is whichever the JSON object happened to
+    // list first — arbitrary, and it made this reader disagree with the structural-Verilog
+    // reader about a net on ten of fifteen real designs, in both directions. The port's name is
+    // the one the DEF, the SPEF and the SDC all use, so it is the one that joins.
+    let mut port_bit: Vec<(i64, String)> = Vec::new();
+    if let Some(ports) = module.get("ports").and_then(|p| p.as_object()) {
+        for (pname, obj) in ports {
+            let bits = obj.get("bits").and_then(|b| b.as_array()).map(|a| a.as_slice()).unwrap_or(&[]);
+            for (idx, bit) in bits.iter().enumerate() {
+                if let Some(id) = bit.as_int() {
+                    port_bit.push((id, expand(pname, idx, bits.len())));
+                }
+            }
+        }
+    }
+    let name_of = |id: i64| {
+        port_bit
+            .iter()
+            .find(|(b, _)| *b == id)
+            .or_else(|| bit_name.iter().find(|(b, _)| *b == id))
+            .map(|(_, n)| n.clone())
+    };
 
     // Ports → inputs / outputs (expanded per bit).
     if let Some(ports) = module.get("ports").and_then(|p| p.as_object()) {
