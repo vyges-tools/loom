@@ -25,7 +25,7 @@
 
 use std::path::{Path, PathBuf};
 
-use vyges_loom::{def::Def, lef::Lef, sdc::Sdc, spef::Spef};
+use vyges_loom::{def::Def, lef::Lef, netlist, sdc::Sdc, spef::Spef};
 
 /// Files under `VYGES_CORPUS` (recursively) with any of the given extensions.
 fn corpus(exts: &[&str]) -> Vec<PathBuf> {
@@ -232,6 +232,80 @@ fn every_sdc_parses_and_names_what_it_drops() {
         v.sort_by_key(|(k, n)| (std::cmp::Reverse(**n), (*k).clone()));
         for (c, n) in v {
             println!("    {c:<28} {n} file(s)");
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// **Connection conservation on real gate-level Verilog.**
+///
+/// A netlist reader cannot be checked by "did it parse" — it produces connectivity, and a
+/// mangled net name or a dropped connection is a different circuit that still parses. But every
+/// `.pin(net)` in the text must become exactly one connection, and that is checkable against any
+/// netlist from any tool with no golden answer.
+///
+/// The ground truth deliberately excludes a `.name(` that follows an identifier character or a
+/// `]`, because those occur INSIDE escaped identifiers (`\u_cpu.eoi_unused[31]`) and are not
+/// connections. Getting that wrong made this check report 15 phantom losses on a real file.
+#[test]
+fn every_named_connection_in_a_real_netlist_is_conserved() {
+    let files = corpus(&[".v"]);
+    announce("Verilog", &files);
+    let mut bad = Vec::new();
+    for f in &files {
+        let Ok(t) = std::fs::read_to_string(f) else { continue };
+        // gate-level only: an RTL file is a different language and not this reader's business
+        if !t.contains("module ") || !t.contains('(') {
+            continue;
+        }
+        let Ok(n) = netlist::parse(&t) else { continue };
+        if n.insts.is_empty() || n.behavioural > 0 {
+            continue; // RTL, or an empty wrapper — not this reader's contract
+        }
+        // Ground truth is counted on the text with COMMENTS REMOVED: a `//` line mentioning
+        // `.port_name(wire_name)` is prose, and counting it made this check report losses the
+        // parser was right to take.
+        let t: String = t
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let b = t.as_bytes();
+        let mut want = 0usize;
+        for (i, _) in t.match_indices('.') {
+            let r = &t[i + 1..];
+            let name: String = r.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            if name.is_empty() || !r[name.len()..].trim_start().starts_with('(') {
+                continue;
+            }
+            if i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b']') {
+                continue; // inside an escaped identifier or a bit-select
+            }
+            // `.pin()` connects nothing, and `.pin(32'h0)` is a constant tie, not a net —
+            // neither becomes a connection, by design.
+            let val = r[name.len()..].trim_start().trim_start_matches('(').trim_start();
+            if val.starts_with(')') || val.starts_with(|c: char| c.is_ascii_digit()) {
+                continue;
+            }
+            want += 1;
+        }
+        let got: usize = n.insts.iter().map(|i| i.conns.len()).sum();
+        // A concatenation is one `.pin(` and several connections, so `got` may legitimately
+        // exceed `want`; it must never fall short.
+        if got < want {
+            bad.push(format!("{}: {want} named connections in the text, {got} parsed", show(f)));
+        }
+        // and nothing may be recorded under a name that is plainly not a net
+        for inst in &n.insts {
+            if let Some((p, x)) = inst.conns.iter().find(|(_, x)| {
+                x.starts_with('{') || x.ends_with('}') || x.is_empty() || *x == ")"
+            }) {
+                bad.push(format!("{}: {} pin {p} has a non-net `{x}`", show(f), inst.name));
+                break;
+            }
         }
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
