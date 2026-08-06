@@ -109,7 +109,7 @@ pub fn parse(text: &str) -> (Spef, EmGeom) {
         }
     }
 
-    (Spef { nets }, geom)
+    (Spef { nets, ..Default::default() }, geom)
 }
 
 /// Parse from a file path.

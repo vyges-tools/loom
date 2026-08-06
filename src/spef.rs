@@ -43,6 +43,36 @@ pub struct PinConn {
 #[derive(Debug, Clone, Default)]
 pub struct Spef {
     pub nets: BTreeMap<String, NetRc>,
+    /// Lines inside a recognised section that this reader could not interpret.
+    ///
+    /// **A parser that cannot fail cannot warn.** `parse` returns a `Spef` whatever it is given,
+    /// so every gap it has ever had produced a quietly smaller answer rather than an error: a
+    /// file of corner triplets read as zero parasitics, a lower-case file read as no nets at all.
+    /// This is the tell. Non-zero on a file you expect to be understood means the reader is
+    /// behind the writer — check it before trusting the numbers, and see [`Spef::health`].
+    pub skipped: usize,
+    /// The file carried **corner triplets** (`min:typ:max`) and this reader took the first
+    /// field of each. Single-corner by construction; a caller that needs a specific corner
+    /// must not read it from here.
+    pub triplets: bool,
+}
+
+impl Spef {
+    /// One line on whether the read can be trusted, or `None` when nothing looks wrong.
+    /// Cheap enough to log on every load, which is the point.
+    pub fn health(&self) -> Option<String> {
+        let mut notes = Vec::new();
+        if self.nets.is_empty() {
+            notes.push("no nets were parsed".to_string());
+        }
+        if self.skipped > 0 {
+            notes.push(format!("{} line(s) in known sections not understood", self.skipped));
+        }
+        if self.triplets {
+            notes.push("corner triplets present — the first (min) field was taken".to_string());
+        }
+        (!notes.is_empty()).then(|| notes.join("; "))
+    }
 }
 
 /// Options for the SPEF writer ([`Spef::to_spef`]). Kept minimal and
@@ -80,6 +110,66 @@ impl std::error::Error for SpefError {}
 
 fn node_tok(t: &str) -> String {
     t.trim_start_matches('*').to_string()
+}
+
+/// A SPEF value may be a single number or a **corner triplet** `min:typ:max`, written whenever
+/// more than one process corner was extracted. `f64::from_str` rejects the triplet outright, so
+/// a reader that parses naively silently returns *no* capacitance and *no* resistance for every
+/// net in such a file — the net still appears, it just has no parasitics, which a timer reads as
+/// ideal interconnect. This reader is single-corner, so it takes the first field and says so.
+fn parse_val(t: &str) -> Option<f64> {
+    t.split(':').next()?.parse::<f64>().ok()
+}
+
+/// Did this value token carry a corner triplet?
+fn is_triplet(t: &str) -> bool {
+    t.contains(':') && t.split(':').count() > 1 && t.split(':').all(|f| f.parse::<f64>().is_ok())
+}
+
+/// Strip SPEF name escaping: `u_a\.q\[0\]` -> `u_a.q[0]`.
+///
+/// Names are matched against the design's own net names, and a backslash that survives the read
+/// makes every hierarchical or bussed name miss — silently, as a net with no parasitics.
+fn unescape(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut esc = false;
+    for c in s.chars() {
+        if esc {
+            out.push(c);
+            esc = false;
+        } else if c == '\\' {
+            esc = true;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Add SPEF name escaping — the inverse of [`unescape`], applied by the writer so a name
+/// containing SPEF punctuation survives a round trip instead of becoming a syntax error.
+fn escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '[' | ']' | '.' | '/' | ':' | '*' | '!' | '{' | '}') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Drop a `//` line comment, which is legal anywhere in a SPEF line. Left in place it becomes
+/// extra tokens, and an entry's field count is how this format distinguishes a grounded cap from
+/// a coupling one — so a trailing comment turns a ground cap into an unparseable coupling cap.
+fn strip_comment(line: &str) -> &str {
+    match line.find("//") {
+        Some(i) => &line[..i],
+        None => line,
+    }
 }
 
 impl NetRc {
@@ -391,6 +481,8 @@ impl Spef {
         let mut owner: BTreeMap<String, String> = BTreeMap::new();
         // (node a, node b, fF), in file order — resolved to nets and deduped after the loop.
         let mut pending_cc: Vec<(String, String, f64)> = Vec::new();
+        let mut skipped = 0usize;
+        let mut triplets = false;
 
         // Record that `node` sits on the net whose block we are inside.
         let claim = |cur: &Option<(String, String, NetRc)>,
@@ -424,7 +516,7 @@ impl Spef {
                     .ok()
                     .and_then(|i| names.get(&i).cloned())
                     .unwrap_or_else(|| body.to_string()),
-                None => tok.to_string(),
+                None => unescape(tok),
             }
         };
         // resolve a pin token "iid:pin" -> (instance name, pin)
@@ -434,27 +526,35 @@ impl Spef {
         };
 
         for raw in text.lines() {
-            let t = raw.trim();
-            if t.starts_with("*C_UNIT") {
+            // Keywords are case-insensitive in the SPEF grammar, and a `//` comment is legal
+            // anywhere. A reader that assumes upper case and ignores comments does not fail on a
+            // file that uses either — it returns an EMPTY design, or an entry short of a field.
+            let t = strip_comment(raw).trim();
+            let kw = {
+                let head = t.split_whitespace().next().unwrap_or("");
+                head.to_ascii_uppercase()
+            };
+            if kw == "*C_UNIT" {
                 let p: Vec<&str> = t.split_whitespace().collect();
                 c_scale = p.get(1).and_then(|s| s.parse::<f64>().ok()).unwrap_or(1.0) * cap_unit(p.get(2));
                 continue;
             }
-            if t.starts_with("*R_UNIT") {
+            if kw == "*R_UNIT" {
                 let p: Vec<&str> = t.split_whitespace().collect();
                 r_scale = p.get(1).and_then(|s| s.parse::<f64>().ok()).unwrap_or(1.0) * res_unit(p.get(2));
                 continue;
             }
-            if t == "*NAME_MAP" {
+            if kw == "*NAME_MAP" {
                 sect = "namemap";
                 continue;
             }
-            if t.starts_with("*D_NET") {
+            if kw == "*D_NET" {
                 sect = "";
                 finish(&mut cur, &mut nets);
                 let toks: Vec<&str> = t.split_whitespace().collect();
                 let idtok = toks.get(1).copied().unwrap_or("");
-                let cap = toks.get(2).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0) * c_scale;
+                triplets |= toks.get(2).is_some_and(|s| is_triplet(s));
+                let cap = toks.get(2).and_then(|s| parse_val(s)).unwrap_or(0.0) * c_scale;
                 let name = resolve(idtok, &names);
                 let net_node = node_tok(idtok);
                 owner.insert(net_node.clone(), name.clone());
@@ -465,7 +565,7 @@ impl Spef {
                 ));
                 continue;
             }
-            match t {
+            match kw.as_str() {
                 "*CONN" => {
                     sect = "conn";
                     continue;
@@ -490,11 +590,15 @@ impl Spef {
                 "namemap" if t.starts_with('*') => {
                     if let (Some(idtok), Some(name)) = (toks.first(), toks.get(1)) {
                         if let Ok(id) = idtok.trim_start_matches('*').parse::<usize>() {
-                            names.insert(id, name.to_string());
+                            names.insert(id, unescape(name));
                         }
                     }
                 }
-                "conn" if toks.first() == Some(&"*I") || toks.first() == Some(&"*P") => {
+                "conn"
+                    if toks
+                        .first()
+                        .is_some_and(|t| t.eq_ignore_ascii_case("*I") || t.eq_ignore_ascii_case("*P")) =>
+                {
                     if let Some(node) = toks.get(1) {
                         if let Some((inst, pin)) = pin_of(node, &names) {
                             let dir = match toks.get(2).copied() {
@@ -506,9 +610,9 @@ impl Spef {
                             // optional `*L <cap>` load capacitance
                             let cap_ff = toks
                                 .iter()
-                                .position(|&t| t == "*L")
+                                .position(|t| t.eq_ignore_ascii_case("*L"))
                                 .and_then(|i| toks.get(i + 1))
-                                .and_then(|s| s.parse::<f64>().ok())
+                                .and_then(|s| parse_val(s))
                                 .map(|c| c * c_scale)
                                 .unwrap_or(0.0);
                             claim(&cur, &mut owner, &node_tok(node));
@@ -527,8 +631,12 @@ impl Spef {
                 }
                 "res" => {
                     // `<idx> *a *b <ohm>`
+                    if toks.len() < 4 || parse_val(toks[3]).is_none() {
+                        skipped += 1;
+                    }
                     if toks.len() >= 4 {
-                        if let Ok(r) = toks[3].parse::<f64>() {
+                        triplets |= is_triplet(toks[3]);
+                        if let Some(r) = parse_val(toks[3]) {
                             let r = r * r_scale;
                             let (na, nb) = (node_tok(toks[1]), node_tok(toks[2]));
                             claim(&cur, &mut owner, &na);
@@ -541,16 +649,23 @@ impl Spef {
                     }
                 }
                 "cap" => {
+                    let understood = (toks.len() >= 4 && parse_val(toks[3]).is_some())
+                        || (toks.len() == 3 && parse_val(toks[2]).is_some());
+                    if !understood {
+                        skipped += 1;
+                    }
                     if toks.len() >= 4 {
                         // Two-node coupling cap `<idx> <A> <B> <ff>`. Both ends are usually
                         // NODE tokens (`*262:A`), whose owning net is only known once the
                         // whole file has been read, so these are resolved after the loop.
-                        if let Ok(v) = toks[3].parse::<f64>() {
+                        triplets |= is_triplet(toks[3]);
+                        if let Some(v) = parse_val(toks[3]) {
                             pending_cc.push((node_tok(toks[1]), node_tok(toks[2]), v * c_scale));
                         }
                     } else if toks.len() >= 3 {
                         // grounded cap `<idx> *node <ff>`
-                        if let Ok(v) = toks[2].parse::<f64>() {
+                        triplets |= is_triplet(toks[2]);
+                        if let Some(v) = parse_val(toks[2]) {
                             let node = node_tok(toks[1]);
                             claim(&cur, &mut owner, &node);
                             if let Some((_, _, rc)) = cur.as_mut() {
@@ -612,7 +727,7 @@ impl Spef {
                 .map(|((_, other), v)| (other.clone(), *v))
                 .collect();
         }
-        Spef { nets }
+        Spef { nets, skipped, triplets }
     }
 
     pub fn load(path: &str) -> Result<Spef, SpefError> {
@@ -781,7 +896,10 @@ impl Spef {
         out.push_str("*T_UNIT 1 PS\n*C_UNIT 1 FF\n*R_UNIT 1 OHM\n*L_UNIT 1 HENRY\n");
         out.push_str("\n*NAME_MAP\n");
         for (i, name) in order.iter().enumerate() {
-            out.push_str(&format!("*{} {}\n", i + 1, name));
+            // Escaped on the way out, unescaped on the way in — a hierarchical or bussed name
+            // written raw is a syntax error to a conforming reader, and one that survives with
+            // its backslashes silently matches no net in the design.
+            out.push_str(&format!("*{} {}\n", i + 1, escape(name)));
         }
         out.push_str(&body);
         out
@@ -836,7 +954,7 @@ mod writer_tests {
                 conns: vec![],
             },
         );
-        Spef { nets }
+        Spef { nets, ..Default::default() }
     }
 
     #[test]
@@ -1044,7 +1162,7 @@ mod writer_tests {
                 ..Default::default()
             },
         );
-        let text = Spef { nets }.to_spef(&WriteOpts::default());
+        let text = Spef { nets, ..Default::default() }.to_spef(&WriteOpts::default());
         assert!(text.contains(" O\n") || text.contains(" O *L")); // driver marked O
         assert!(text.contains("*L 1.5")); // load cap emitted
         let back = Spef::parse(&text);
