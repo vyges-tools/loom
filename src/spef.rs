@@ -383,10 +383,23 @@ impl Spef {
         let mut names: BTreeMap<usize, String> = BTreeMap::new();
         let mut nets: BTreeMap<String, NetRc> = BTreeMap::new();
         let mut coupling: BTreeMap<String, f64> = BTreeMap::new();
-        let mut coupling_list: BTreeMap<String, Vec<(String, f64)>> = BTreeMap::new();
+        let mut coupling_list: BTreeMap<(String, String), f64> = BTreeMap::new();
         let mut cur: Option<(String, String, NetRc)> = None; // (name, net_node_token, rc)
         let mut sect = ""; // "", "namemap", "conn", "cap", "res"
+        // Node token -> owning net. A coupling entry names one node on this net and one on a
+        // net defined elsewhere in the file, so the far end can only be resolved at the end.
+        let mut owner: BTreeMap<String, String> = BTreeMap::new();
+        // (node a, node b, fF), in file order — resolved to nets and deduped after the loop.
+        let mut pending_cc: Vec<(String, String, f64)> = Vec::new();
 
+        // Record that `node` sits on the net whose block we are inside.
+        let claim = |cur: &Option<(String, String, NetRc)>,
+                     owner: &mut BTreeMap<String, String>,
+                     node: &str| {
+            if let Some((name, _, _)) = cur.as_ref() {
+                owner.insert(node.to_string(), name.clone());
+            }
+        };
         let finish = |cur: &mut Option<(String, String, NetRc)>,
                       nets: &mut BTreeMap<String, NetRc>| {
             if let Some((name, _, rc)) = cur.take() {
@@ -413,13 +426,6 @@ impl Spef {
                     .unwrap_or_else(|| body.to_string()),
                 None => tok.to_string(),
             }
-        };
-        let netname = |tok: &str, names: &BTreeMap<usize, String>| -> Option<String> {
-            // a node token (`name:3`) names a point on a net, not the net
-            if tok.trim_start_matches('*').contains(':') {
-                return None;
-            }
-            Some(resolve(tok, names))
         };
         // resolve a pin token "iid:pin" -> (instance name, pin)
         let pin_of = |tok: &str, names: &BTreeMap<usize, String>| -> Option<(String, String)> {
@@ -451,6 +457,7 @@ impl Spef {
                 let cap = toks.get(2).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0) * c_scale;
                 let name = resolve(idtok, &names);
                 let net_node = node_tok(idtok);
+                owner.insert(net_node.clone(), name.clone());
                 cur = Some((
                     name,
                     net_node.clone(),
@@ -504,6 +511,7 @@ impl Spef {
                                 .and_then(|s| s.parse::<f64>().ok())
                                 .map(|c| c * c_scale)
                                 .unwrap_or(0.0);
+                            claim(&cur, &mut owner, &node_tok(node));
                             if let Some((_, _, rc)) = cur.as_mut() {
                                 rc.pins.push((inst.clone(), pin.clone(), node_tok(node)));
                                 rc.conns.push(PinConn {
@@ -522,30 +530,31 @@ impl Spef {
                     if toks.len() >= 4 {
                         if let Ok(r) = toks[3].parse::<f64>() {
                             let r = r * r_scale;
+                            let (na, nb) = (node_tok(toks[1]), node_tok(toks[2]));
+                            claim(&cur, &mut owner, &na);
+                            claim(&cur, &mut owner, &nb);
                             if let Some((_, _, rc)) = cur.as_mut() {
                                 rc.res_ohm += r;
-                                rc.res.push((node_tok(toks[1]), node_tok(toks[2]), r));
+                                rc.res.push((na, nb, r));
                             }
                         }
                     }
                 }
                 "cap" => {
                     if toks.len() >= 4 {
-                        // two-node coupling cap `<idx> *A *B <ff>`
-                        if let (Some(a), Some(b), Ok(v)) =
-                            (netname(toks[1], &names), netname(toks[2], &names), toks[3].parse::<f64>())
-                        {
-                            let v = v * c_scale;
-                            *coupling.entry(a.clone()).or_default() += v;
-                            *coupling.entry(b.clone()).or_default() += v;
-                            coupling_list.entry(a.clone()).or_default().push((b.clone(), v));
-                            coupling_list.entry(b).or_default().push((a, v));
+                        // Two-node coupling cap `<idx> <A> <B> <ff>`. Both ends are usually
+                        // NODE tokens (`*262:A`), whose owning net is only known once the
+                        // whole file has been read, so these are resolved after the loop.
+                        if let Ok(v) = toks[3].parse::<f64>() {
+                            pending_cc.push((node_tok(toks[1]), node_tok(toks[2]), v * c_scale));
                         }
                     } else if toks.len() >= 3 {
                         // grounded cap `<idx> *node <ff>`
                         if let Ok(v) = toks[2].parse::<f64>() {
+                            let node = node_tok(toks[1]);
+                            claim(&cur, &mut owner, &node);
                             if let Some((_, _, rc)) = cur.as_mut() {
-                                rc.ground.push((node_tok(toks[1]), v * c_scale));
+                                rc.ground.push((node, v * c_scale));
                             }
                         }
                     }
@@ -554,9 +563,54 @@ impl Spef {
             }
         }
         finish(&mut cur, &mut nets);
+
+        // ── resolve the coupling caps ────────────────────────────────────────────────────
+        //
+        // ONE physical cap, up to TWO listings. A coupling cap belongs to two nets and SPEF
+        // lets it appear in either block; OpenRCX writes it in BOTH, at full value, so each
+        // net's block stands alone (`extSpef::writeSrcCouplingCaps` + `writeTgtCouplingCaps`).
+        // Crediting every listing therefore doubles every net's crosstalk load. Deduping by
+        // the NODE pair is correct for either convention: written once, it is counted once;
+        // written twice, the second listing is the same cap and is dropped.
+        //
+        // Both ends are resolved through the node->net map built above, because an endpoint is
+        // normally an instance-pin or internal node (`*262:A`), not a net name. Reading only
+        // the bare-net form silently discarded most of the coupling in a real SPEF.
+        let net_of = |tok: &str| -> Option<String> {
+            if let Some(n) = owner.get(tok) {
+                return Some(n.clone());
+            }
+            // A bare identifier that named no node is the net itself.
+            (!tok.contains(':')).then(|| resolve(tok, &names))
+        };
+        let mut seen: std::collections::BTreeSet<(String, String)> = Default::default();
+        for (a, b, v) in pending_cc {
+            let key = if a <= b { (a.clone(), b.clone()) } else { (b.clone(), a.clone()) };
+            if !seen.insert(key) {
+                continue; // the same cap, listed again in the other net's block
+            }
+            let (Some(na), Some(nb)) = (net_of(&a), net_of(&b)) else {
+                continue;
+            };
+            if na == nb {
+                continue; // intra-net cap, not crosstalk
+            }
+            *coupling.entry(na.clone()).or_default() += v;
+            *coupling.entry(nb.clone()).or_default() += v;
+            // One entry per AGGRESSOR NET, not per node pair: two nets routed alongside each
+            // other for a while couple at several distinct node pairs, and a window-aware SI
+            // pass wants one Cc per aggressor to switch against.
+            *coupling_list.entry((na.clone(), nb.clone())).or_default() += v;
+            *coupling_list.entry((nb, na)).or_default() += v;
+        }
+
         for (name, rc) in nets.iter_mut() {
             rc.coupling_ff = coupling.get(name).copied().unwrap_or(0.0);
-            rc.coupling = coupling_list.get(name).cloned().unwrap_or_default();
+            rc.coupling = coupling_list
+                .range((name.clone(), String::new())..)
+                .take_while(|((n, _), _)| n == name)
+                .map(|((_, other), v)| (other.clone(), *v))
+                .collect();
         }
         Spef { nets }
     }
@@ -805,6 +859,124 @@ mod writer_tests {
         assert_eq!(a.coupling_ff, 2.0);
         assert_eq!(back.nets.get("netb").unwrap().coupling_ff, 2.0);
         assert_eq!(back.nets.get("netb").unwrap().res_ohm, 50.0);
+    }
+
+    /// A coupling cap belongs to two nets, and SPEF lets it appear in either block. OpenRCX
+    /// writes it in BOTH, at full value, so each net's block stands alone. Crediting every
+    /// listing doubles the crosstalk load on every net in a foreign SPEF — count each cap once.
+    #[test]
+    fn a_coupling_cap_listed_in_both_blocks_is_counted_once() {
+        let text = "\
+*SPEF \"IEEE 1481-1999\"
+*DESIGN \"blk\"
+*DATE \"x\"
+*DIVIDER /
+*DELIMITER :
+*BUS_DELIMITER []
+*T_UNIT 1 NS
+*C_UNIT 1 FF
+*R_UNIT 1 OHM
+*L_UNIT 1 HENRY
+
+*NAME_MAP
+*1 neta
+*2 netb
+
+*D_NET *1 10
+*CAP
+1 *1 8
+2 *1 *2 2
+*END
+
+*D_NET *2 7
+*CAP
+1 *2 5
+2 *1 *2 2
+*END
+";
+        let s = Spef::parse(text);
+        assert_eq!(s.nets.get("neta").unwrap().coupling_ff, 2.0, "not 4.0");
+        assert_eq!(s.nets.get("netb").unwrap().coupling_ff, 2.0, "not 4.0");
+        // and the aggressor list names netb once, not twice
+        assert_eq!(s.nets.get("neta").unwrap().coupling, vec![("netb".to_string(), 2.0)]);
+    }
+
+    /// Coupling endpoints are normally NODE tokens — an instance pin or an internal node,
+    /// whose owning net is only known from the `*CONN` / `*RES` entries elsewhere in the file.
+    /// Reading only the bare-net form discards most of the coupling in a real SPEF.
+    #[test]
+    fn coupling_between_node_tokens_resolves_to_their_nets() {
+        let text = "\
+*SPEF \"IEEE 1481-1999\"
+*DESIGN \"blk\"
+*DATE \"x\"
+*DIVIDER /
+*DELIMITER :
+*BUS_DELIMITER []
+*T_UNIT 1 NS
+*C_UNIT 1 FF
+*R_UNIT 1 OHM
+*L_UNIT 1 HENRY
+
+*NAME_MAP
+*1 neta
+*2 netb
+*3 u1
+*4 u2
+
+*D_NET *1 10
+*CONN
+*I *3:A I
+*CAP
+1 *3:A 8
+2 *3:A *4:Y 3
+*END
+
+*D_NET *2 7
+*CONN
+*I *4:Y O
+*CAP
+1 *4:Y 5
+2 *3:A *4:Y 3
+*END
+";
+        let s = Spef::parse(text);
+        assert_eq!(s.nets.get("neta").unwrap().coupling_ff, 3.0);
+        assert_eq!(s.nets.get("netb").unwrap().coupling_ff, 3.0);
+        assert_eq!(s.nets.get("netb").unwrap().coupling, vec![("neta".to_string(), 3.0)]);
+    }
+
+    /// Two nodes on the SAME net are an intra-net cap, not crosstalk.
+    #[test]
+    fn a_cap_between_two_nodes_of_one_net_is_not_coupling() {
+        let text = "\
+*SPEF \"IEEE 1481-1999\"
+*DESIGN \"blk\"
+*DATE \"x\"
+*DIVIDER /
+*DELIMITER :
+*BUS_DELIMITER []
+*T_UNIT 1 NS
+*C_UNIT 1 FF
+*R_UNIT 1 OHM
+*L_UNIT 1 HENRY
+
+*NAME_MAP
+*1 neta
+*3 u1
+
+*D_NET *1 10
+*CONN
+*I *3:A I
+*RES
+1 *1 *3:A 100
+*CAP
+1 *1 8
+2 *1 *3:A 2
+*END
+";
+        let s = Spef::parse(text);
+        assert_eq!(s.nets.get("neta").unwrap().coupling_ff, 0.0);
     }
 
     #[test]
