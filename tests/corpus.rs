@@ -454,10 +454,19 @@ fn the_fst_reader_agrees_with_the_vcd_reader_on_every_pair() {
         .collect();
     announce("VCD/FST pairs", &pairs);
     let mut bad = Vec::new();
+    let mut aborted = Vec::new();
     for v in &pairs {
         let f = v.with_extension("fst");
         let (Ok(a), Ok(b)) = (Vcd::load(v.to_str().unwrap()), Fst::load(f.to_str().unwrap())) else {
-            bad.push(format!("{}: one of the pair would not load", show(v)));
+            // A dump killed mid-run has a header and nothing else — there is no hierarchy to
+            // compare against, so it says nothing about whether the readers agree. It is
+            // NAMED rather than dropped quietly: if a change to the reader started producing
+            // these, the count below is where it would show.
+            if fst_is_aborted(&f) {
+                aborted.push(show(v));
+            } else {
+                bad.push(format!("{}: one of the pair would not load", show(v)));
+            }
             continue;
         };
         if (a.sim_time_s - b.sim_time_s).abs() > 1e-15 * a.sim_time_s.max(1.0) {
@@ -482,6 +491,9 @@ fn the_fst_reader_agrees_with_the_vcd_reader_on_every_pair() {
                 break;
             }
         }
+    }
+    if !aborted.is_empty() {
+        println!("  {} aborted dump(s) skipped: {}", aborted.len(), aborted.join(", "));
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
@@ -612,4 +624,29 @@ fn show(p: &Path) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("?")
         .to_string()
+}
+
+/// Does this FST hold only a header — a dump whose writer was killed before it wrote a
+/// hierarchy? Such a file has nothing to compare and is not evidence about the reader.
+///
+/// The block chain is `type u8` then `length u64` big-endian, the length counting itself;
+/// `FST_BL_SKIP` (255) or a zero length is the end of what was written.
+fn fst_is_aborted(path: &std::path::Path) -> bool {
+    let Ok(d) = std::fs::read(path) else { return false };
+    let mut o = 0usize;
+    while o + 9 <= d.len() {
+        let t = d[o];
+        let len = u64::from_be_bytes(d[o + 1..o + 9].try_into().unwrap()) as usize;
+        if t == 255 || len == 0 {
+            return true; // reached the end marker without ever seeing a hierarchy
+        }
+        if matches!(t, 4 | 6 | 7) {
+            return false; // a hierarchy block: the file is real, so a failure to read is ours
+        }
+        match o.checked_add(1 + len) {
+            Some(n) if n > o && n <= d.len() => o = n,
+            _ => return false,
+        }
+    }
+    true
 }

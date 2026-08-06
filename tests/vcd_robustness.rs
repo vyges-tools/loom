@@ -274,3 +274,109 @@ fn nine_state_levels_count_as_weak_ones_and_zeros() {
     // a string carries no switching activity
     assert_eq!(got("top.label"), 0);
 }
+
+/// **A vector dumped one bit at a time keeps its indices.** ModelSim, Quartus and others do not
+/// emit a vector as one wide `$var`; they emit one 1-bit `$var` per bit, each with its own
+/// identifier and a bit-select. Dropping the select merges every bit onto one net — and because
+/// each reader keeps one last-known value per NAME, the bits then overwrite each other's history
+/// and the total is neither the vector's activity nor any bit's.
+///
+/// A one-bit RANGE (`[0:0]`) is a different declaration: the signal's whole width is one bit and
+/// it is called `w`, not `w[0]`. The colon is what tells them apart.
+#[test]
+fn a_vector_dumped_one_bit_per_var_keeps_its_indices() {
+    let v = vyges_loom::vcd::Vcd::parse(
+        "$timescale 1ns $end\n\
+         $scope module tb $end\n\
+         $var wire 1 ) r [2] $end\n\
+         $var wire 1 * r [1] $end\n\
+         $var wire 1 + r [0] $end\n\
+         $var wire 1 , w [0:0] $end\n\
+         $upscope $end\n\
+         $enddefinitions $end\n\
+         #0\n$dumpvars\n0)\n0*\n0+\n0,\n$end\n\
+         #10\n1)\n1+\n1,\n\
+         #20\n0)\n1*\n",
+    )
+    .expect("vcd");
+    let got = |n: &str| v.idx.toggles.get(n).copied().unwrap_or(0);
+    assert_eq!(got("tb.r[2]"), 2, "0 -> 1 -> 0");
+    assert_eq!(got("tb.r[1]"), 1);
+    assert_eq!(got("tb.r[0]"), 1);
+    assert!(!v.idx.toggles.contains_key("tb.r"), "the bits must not merge onto one net");
+    // [0:0] is a range, not a bit-select: the signal is `w`
+    assert_eq!(got("tb.w"), 1);
+    assert!(!v.idx.toggles.contains_key("tb.w[0]"));
+}
+
+/// **One identifier naming a vector in several scopes credits every name.** A port carried down
+/// a hierarchy shares one code, and dumpers emit that constantly. Keeping one last-value slot
+/// per identifier let the first name consume the change and update it, so every other name
+/// compared against the value just written and reported no activity at all.
+#[test]
+fn an_aliased_vector_identifier_credits_every_name() {
+    let v = vyges_loom::vcd::Vcd::parse(
+        "$timescale 1ns $end\n\
+         $scope module a $end\n$var wire 4 ! bus [3:0] $end\n$upscope $end\n\
+         $scope module b $end\n$var wire 4 ! bus [3:0] $end\n$upscope $end\n\
+         $enddefinitions $end\n\
+         #0\n$dumpvars\nb0000 !\n$end\n\
+         #10\nb0011 !\n",
+    )
+    .expect("vcd");
+    let got = |n: &str| v.idx.toggles.get(n).copied().unwrap_or(0);
+    for scope in ["a", "b"] {
+        assert_eq!(got(&format!("{scope}.bus[0]")), 1, "{scope}");
+        assert_eq!(got(&format!("{scope}.bus[1]")), 1, "{scope}");
+        assert_eq!(got(&format!("{scope}.bus[3]")), 0, "{scope}");
+    }
+}
+
+/// **An unnamed scope contributes no path component.** Verilator writes one as the root of a
+/// dump (`$scope module  $end`), and tokenising on whitespace makes the terminator look like the
+/// name — so every path in the file came out under a scope called `$end` and matched nothing.
+///
+/// The scope is still PUSHED, empty: `$upscope` pops unconditionally, so skipping the push would
+/// pop the parent instead and reparent everything after it. `other.rst` is what proves it.
+#[test]
+fn an_unnamed_scope_contributes_no_path_component() {
+    let v = vyges_loom::vcd::Vcd::parse(
+        "$timescale 1ns $end\n\
+         $scope module  $end\n\
+         $scope module top $end\n$var wire 1 ! clk $end\n$upscope $end\n\
+         $upscope $end\n\
+         $scope module other $end\n$var wire 1 \" rst $end\n$upscope $end\n\
+         $enddefinitions $end\n\
+         #0\n$dumpvars\n0!\n0\"\n$end\n\
+         #10\n1!\n1\"\n",
+    )
+    .expect("vcd");
+    let got = |n: &str| v.idx.toggles.get(n).copied().unwrap_or(0);
+    assert_eq!(got("top.clk"), 1);
+    assert_eq!(got("other.rst"), 1, "the empty scope must not swallow its sibling");
+    assert!(
+        !v.idx.toggles.keys().any(|k| k.starts_with("$end") || k.starts_with('.')),
+        "no stray root component: {:?}",
+        v.idx.toggles.keys().collect::<Vec<_>>()
+    );
+}
+
+/// **A one-bit signal is often dumped in vector form.** `b0 <sym>` for a plain `reg` is the
+/// writer's choice, not the signal's, and the same signal may appear in scalar form elsewhere in
+/// the same file. Handling only the vector case dropped every such signal — declared, never
+/// counted, and indistinguishable from a net that simply never moved.
+#[test]
+fn a_one_bit_signal_dumped_as_a_vector_still_counts() {
+    let v = vyges_loom::vcd::Vcd::parse(
+        "$timescale 1ns $end\n\
+         $scope module tb $end\n$var reg 1 ! en $end\n$upscope $end\n\
+         $enddefinitions $end\n\
+         #0\n$dumpvars\nb0 !\n$end\n\
+         #10\nb1 !\n\
+         #20\n0!\n\
+         #30\nb1 !\n",
+    )
+    .expect("vcd");
+    // the two spellings share one baseline: 0 -> 1 -> 0 -> 1
+    assert_eq!(v.idx.toggles.get("tb.en").copied().unwrap_or(0), 3);
+}

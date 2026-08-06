@@ -121,15 +121,25 @@ impl Vcd {
                 "$scope" => {
                     // $scope <type> <name> $end
                     let _ty = toks.next();
-                    let name = toks.next().unwrap_or("").to_string();
-                    for t in toks.by_ref() {
-                        if t == "$end" {
-                            break;
+                    let mut name = toks.next().unwrap_or("").to_string();
+                    // `$scope module  $end` — an UNNAMED scope, which Verilator writes as the
+                    // root of a dump. Tokenising on whitespace makes the terminator look like
+                    // the name, so every path in the file came out under a scope called
+                    // `$end` and matched nothing — not the netlist, not the same dump in FST
+                    // form. An unnamed scope contributes no path component.
+                    if name == "$end" {
+                        name.clear();
+                    } else {
+                        for t in toks.by_ref() {
+                            if t == "$end" {
+                                break;
+                            }
                         }
                     }
-                    if !name.is_empty() {
-                        scope_stack.push(name);
-                    }
+                    // Pushed even when empty: `$upscope` pops unconditionally, so skipping the
+                    // push here would pop the PARENT instead and reparent the rest of the file.
+                    // The empty component is dropped when the path is joined.
+                    scope_stack.push(name);
                 }
                 // `$comment` bodies contain anything at all, including things shaped exactly
                 // like a timestamp and a value change. Read as data, a commented-out `#999 1!`
@@ -166,11 +176,7 @@ impl Vcd {
                         }
                     }
                     if !sym.is_empty() && !name.is_empty() {
-                        let base = if scope_stack.is_empty() {
-                            name
-                        } else {
-                            format!("{}.{}", scope_stack.join("."), name)
-                        };
+                        let base = join_scope(&scope_stack, &name);
                         let sig = build_sig(&ty, width, &base, range.as_deref(), &mut idx);
                         sym2sig.entry(sym).or_default().push(sig);
                     }
@@ -215,10 +221,45 @@ impl Vcd {
                                 let value = &tok[1..];
                                 if let Some(sym) = toks.next() {
                                     for sig in sym2sig.get(sym).map(Vec::as_slice).unwrap_or(&[]) {
-                                        let Sig::Vector { bits } = sig else { continue };
+                                        // A ONE-BIT SIGNAL IS OFTEN DUMPED IN VECTOR FORM. The
+                                        // form is the writer's choice, not the signal's: this
+                                        // dumper writes `b0 2` for a plain `reg`, and the same
+                                        // signal may appear as `02` elsewhere in the same file.
+                                        // Handling only the vector case dropped every such
+                                        // signal on the floor — declared, never counted, and
+                                        // reported as a net with no activity rather than as
+                                        // anything unread. It shares `last` with the scalar
+                                        // form so the two spellings agree on one baseline.
+                                        let bits = match sig {
+                                            Sig::Scalar(full) => {
+                                                let Some(v) =
+                                                    value.chars().next_back().and_then(level)
+                                                else {
+                                                    continue;
+                                                };
+                                                let prev = last.insert(full.clone(), v);
+                                                if count_now
+                                                    && prev.map(|p| p != v).unwrap_or(false)
+                                                {
+                                                    idx.add_toggles(full, 1);
+                                                }
+                                                continue;
+                                            }
+                                            Sig::Vector { bits } => bits,
+                                        };
                                         let cur = pad_bits(value, bits.len());
+                                        // KEYED BY THE NET, NOT THE IDENTIFIER. One identifier
+                                        // can name the same vector in several scopes — a port
+                                        // carried down a hierarchy shares one symbol — and a
+                                        // single last-value slot per symbol means the first
+                                        // name consumes the change and updates it, so every
+                                        // other name it aliases compares against the value that
+                                        // was just written and counts nothing. The scalar path
+                                        // keys by net and was right; this one credited the
+                                        // vector's activity to whichever scope was declared
+                                        // first and reported the rest as dead.
                                         let prev =
-                                            vprev.entry(sym.to_string()).or_insert_with(|| {
+                                            vprev.entry(bits[0].clone()).or_insert_with(|| {
                                                 std::iter::repeat_n('?', bits.len()).collect()
                                             });
                                         for (i, c) in cur.iter().enumerate() {
@@ -312,8 +353,35 @@ pub(crate) fn build_sig(
     idx: &mut NetIndex,
 ) -> Sig {
     if ty.eq_ignore_ascii_case("real") || width <= 1 {
-        idx.declare(base);
-        return Sig::Scalar(base.to_string());
+        // A ONE-BIT DECLARATION THAT CARRIES A BIT-SELECT IS ONE BIT OF A VECTOR, and has to
+        // keep its index. ModelSim, Quartus and others do not dump a vector as a single wide
+        // `$var`; they dump one 1-bit `$var` per bit, each with its own identifier:
+        //
+        //     $var wire 1 ) r_nxt [2] $end
+        //     $var wire 1 * r_nxt [1] $end
+        //     $var wire 1 + r_nxt [0] $end
+        //
+        // Dropping the index named all three `r_nxt`, so every bit of every vector in such a
+        // dump collapsed onto ONE net. The counts were not merely summed — the readers keep one
+        // last-known value per NAME, so each bit was compared against whichever bit changed
+        // last, and the total was neither the vector's activity nor any bit's. It also hid the
+        // per-bit nets a gate-level netlist asks for by name. Found against the wellen corpus,
+        // where the same dumps in FST form disagreed on a third of the files.
+        // A BIT-SELECT AND A ONE-BIT RANGE ARE NOT THE SAME DECLARATION. `[2]` says this $var
+        // is one bit OF a wider signal and the index belongs in the name; `[0:0]` says the
+        // signal's whole range is one bit, and the signal is called `bus`, not `bus[0]` — which
+        // is what a SAIF writer emits for it. The colon is the difference.
+        let bit_select = range
+            .map(str::trim)
+            .filter(|r| !r.contains(':') && !ty.eq_ignore_ascii_case("real"))
+            .and_then(|_| parse_range(range))
+            .map(|(m, _)| m);
+        let name = match bit_select {
+            Some(b) => format!("{base}[{b}]"),
+            None => base.to_string(),
+        };
+        idx.declare(&name);
+        return Sig::Scalar(name);
     }
     let (msb, lsb) = parse_range(range)
         .filter(|(m, l)| (m - l).unsigned_abs() as usize + 1 == width)
@@ -328,6 +396,26 @@ pub(crate) fn build_sig(
         b += step;
     }
     Sig::Vector { bits }
+}
+
+/// Join a scope stack and a leaf into a full path, dropping unnamed scopes.
+///
+/// An unnamed scope is a real thing — Verilator writes one as the root of a dump — and it
+/// contributes no path component. Keeping it puts a leading separator on every name in the
+/// file, which then matches nothing: not the netlist, not the same dump in another format.
+pub(crate) fn join_scope(scopes: &[String], leaf: &str) -> String {
+    let mut out = String::new();
+    // `$end` is dropped along with the empty string: it is a VCD keyword, so no design can
+    // declare a scope by that name, and a scope carrying it is an unnamed one that some writer
+    // mistook its own terminator for a name. GTKWave's vcd2fst does exactly that, and bakes the
+    // literal name `$end` into the converted file — so a Verilator dump and its own conversion
+    // described the same hierarchy under two different roots, neither of them the real one.
+    for s in scopes.iter().map(|s| s.trim()).filter(|s| !s.is_empty() && *s != "$end") {
+        out.push_str(s);
+        out.push('.');
+    }
+    out.push_str(leaf);
+    out
 }
 
 /// Map an IEEE 1164 nine-state character onto a countable level, or `None` for "no level".

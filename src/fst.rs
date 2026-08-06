@@ -46,7 +46,7 @@ use std::collections::HashMap;
 
 use crate::lz4;
 use crate::names::NetIndex;
-use crate::vcd::{build_sig, level, Sig};
+use crate::vcd::{build_sig, join_scope, level, Sig};
 
 #[derive(Debug, Clone, Default)]
 pub struct Fst {
@@ -104,6 +104,14 @@ impl Fst {
         while i + 9 <= bytes.len() {
             let t = bytes[i];
             let len = be_u64(bytes, i + 1)? as usize;
+            // END OF VALID DATA, NOT A CORRUPT FILE. `FST_BL_SKIP` marks a block still being
+            // written, and a zero length is one whose real length was never backpatched — both
+            // are what a dump killed mid-run looks like, and both mean the same thing: nothing
+            // after this point is readable. Treating it as an overrun rejected the whole file
+            // and lost the blocks that HAD completed.
+            if t == 255 || len == 0 {
+                break;
+            }
             let payload_start = i + 9;
             let payload_end = i + 1 + len;
             if payload_end > bytes.len() || payload_end < payload_start {
@@ -119,7 +127,9 @@ impl Fst {
             i = payload_end;
         }
         let hdr = hdr.ok_or_else(|| FstError("missing header block".into()))?;
-        let (htype, hpayload) = hier.ok_or_else(|| FstError("missing hierarchy block".into()))?;
+        let (htype, hpayload) = hier.ok_or_else(|| {
+            FstError("no hierarchy block: the dump was aborted before any signal was written".into())
+        })?;
 
         // ---- header: timescale exponent + end time ---------------------------------
         // payload offsets (block offset - 9): end_time @8, timescale i8 @64.
@@ -231,6 +241,10 @@ fn parse_hierarchy(
                 p += 1;
                 let name = cstr(&data, &mut p);
                 let _component = cstr(&data, &mut p);
+                // AN UNNAMED SCOPE CONTRIBUTES NO PATH COMPONENT. Verilator writes one as the
+                // root of a dump; keeping it prefixes every path in the file with a stray
+                // separator, so nothing in it matches the same design read from anywhere else.
+                // `scope.pop()` is unconditional to stay in step with the upscope records.
                 scope.push(name);
             }
             255 => {
@@ -266,11 +280,7 @@ fn parse_hierarchy(
                     Some(pos) => (name[..pos].to_string(), Some(name[pos + 1..].to_string())),
                     None => (name, None),
                 };
-                let full_path = if scope.is_empty() {
-                    vname
-                } else {
-                    format!("{}.{}", scope.join("."), vname)
-                };
+                let full_path = join_scope(&scope, &vname);
                 let width = if length == 0 || length == 0xFFFF_FFFF {
                     1
                 } else {
@@ -856,6 +866,24 @@ mod tests {
     fn fixture() -> Vec<u8> {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/counter.fst");
         std::fs::read(path).expect("counter.fst fixture")
+    }
+
+    /// A dump killed mid-run: a header, then `FST_BL_SKIP` with no length. That is the
+    /// documented end of what was written, not a corrupt file — and it must be reported as
+    /// what it is rather than as a block that overruns the file, which is how a zero length
+    /// looks if you subtract from it.
+    #[test]
+    fn an_aborted_dump_is_reported_as_one_and_does_not_panic() {
+        let mut f = vec![0u8]; // FST_BL_HDR
+        f.extend_from_slice(&329u64.to_be_bytes()); // the length counts itself
+        f.extend(std::iter::repeat_n(0u8, 329 - 8));
+        f.push(255); // FST_BL_SKIP
+        f.extend_from_slice(&0u64.to_be_bytes()); // never backpatched
+        let err = Fst::parse(&f, None).expect_err("a header alone is not a waveform");
+        assert!(
+            err.to_string().contains("aborted"),
+            "the reason has to name the aborted dump, got: {err}"
+        );
     }
 
     /// A position-table entry that needed two bytes must sign-extend from bit 13, not bit 6.
