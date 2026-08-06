@@ -217,6 +217,24 @@ fn check(sta: &Path, work: &Path, d: &Design) -> Option<String> {
     .expect("write spef");
     let ours = run_sta(sta, work, d, &ours_path);
 
+    // A design whose netlist instantiates a hardened MACRO cannot be checked with only the
+    // standard-cell Liberty: OpenSTA black-boxes the macro, infers its pins from the
+    // instantiation, and then cannot confirm which net each one is on — so it objects to every
+    // macro pin in the file whatever the file says. The ORIGINAL parasitics draw the same
+    // 8816 complaints on `openframe_project_wrapper`, which is how we know they are not ours.
+    // Named rather than dropped quietly. (Fill and tap cells are black-boxed in every design
+    // and are not macros.)
+    let macro_boxed = original
+        .lines()
+        .filter(|l| l.contains("not found. Creating black box") && !l.contains("sky130_"))
+        .count();
+    if macro_boxed > 0 {
+        return Some(format!(
+            "SKIP {}: {macro_boxed} macro(s) black-boxed for want of their Liberty",
+            d.what
+        ));
+    }
+
     // Complaints first: they NAME the defect, where a slack difference only says there is one.
     // Only those about the parasitics — a netlist that instantiates fill and tap cells the
     // Liberty does not define warns identically for both files and is not ours to fix.
@@ -229,9 +247,28 @@ fn check(sta: &Path, work: &Path, d: &Design) -> Option<String> {
         return Some(format!("{}: OpenSTA objected:\n    {}", d.what, complaints.join("\n    ")));
     }
     let got = slack(&ours)?;
-    (got != want).then(|| {
-        format!("{}: the same parasitics, rewritten, time differently: {want} -> {got}", d.what)
-    })
+    if got == want {
+        return None;
+    }
+    // A FEMTOSECOND IS NOT A DIFFERENCE. Our writer emits each value in a canonical order, so a
+    // timer sums the same numbers in a different order from the original file's and the last bit
+    // moves: `27.784164` against `27.784161`, three femtoseconds, on one corner of one design.
+    // That is floating-point summation order and nothing else — it cannot be removed by writing
+    // more digits, because the digits are already exact.
+    //
+    // The bound is 1e-5 ns, which is ten femtoseconds: four orders of magnitude below the
+    // SMALLEST defect this check has found (26 ps, the boundary capacitance on a port node) and
+    // more than five below the largest (5.5 ns). A real defect does not hide under it, and the
+    // difference is printed whenever it is non-zero so drift stays visible.
+    let (a, b) = (want.parse::<f64>().ok()?, got.parse::<f64>().ok()?);
+    if (a - b).abs() <= 1e-5 {
+        println!("      ({}: {want} -> {got}, {:.1} fs — summation order)", d.what, (a - b).abs() * 1e6);
+        return None;
+    }
+    Some(format!(
+        "{}: the same parasitics, rewritten, time differently: {want} -> {got}",
+        d.what
+    ))
 }
 
 #[test]
@@ -256,12 +293,16 @@ fn opensta_reads_the_spef_we_write_and_gets_the_same_answer() {
     }
     designs.extend(corpus);
 
-    let mut bad = Vec::new();
+    let (mut bad, mut skipped) = (Vec::new(), Vec::new());
     for d in &designs {
         match check(&sta, &work, d) {
+            Some(c) if c.starts_with("SKIP ") => skipped.push(c),
             Some(c) => bad.push(c),
             None => println!("  ok  {}", d.what),
         }
+    }
+    for s in &skipped {
+        println!("  --  {}", s.trim_start_matches("SKIP "));
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
     let _ = std::fs::remove_dir_all(&work);

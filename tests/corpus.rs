@@ -48,7 +48,7 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use vyges_loom::{def::Def, lef::Lef, netlist, saif::Saif, sdc::Sdc, spef::Spef, vcd::Vcd};
+use vyges_loom::{def::Def, lef::Lef, netlist, saif::Saif, sdc::Sdc, spef::Spef, spice, vcd::Vcd};
 
 /// Files under `VYGES_CORPUS` (recursively) with any of the given extensions, PLUS the
 /// in-repo regression fixtures in `tests/data/`.
@@ -722,6 +722,62 @@ fn a_spef_and_its_def_agree_about_net_names() {
     }
     println!("SPEF/DEF pairs: {pairs}");
     assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// **Every SPICE netlist reads into devices whose terminals are named.**
+///
+/// A transistor-level reader degrades in a particular way: the file parses, the device count
+/// looks plausible, and a device has fewer terminals than its kind requires or a terminal with
+/// no name — so an LVS compare walks a graph with a hole in it and reports a match or a mismatch
+/// for the wrong reason. None of that raises an error, which is why the invariants are here
+/// rather than in the reader.
+///
+/// Oracle-free: the arity of a MOSFET and the fact that a net has a name are properties of the
+/// format, not of any particular file, so this runs over anyone's netlists.
+#[test]
+fn every_spice_netlist_yields_devices_with_named_terminals() {
+    let files = corpus(&[".spice", ".cir", ".sp"]);
+    announce("SPICE", &files);
+    let mut bad = Vec::new();
+    let mut devices = 0usize;
+    for f in &files {
+        let Ok(nl) = spice::Netlist::load(f.to_str().unwrap()) else { continue };
+        devices += nl.devices.len();
+        for d in &nl.devices {
+            if d.name.is_empty() {
+                bad.push(format!("{}: a device with no instance name", show(f)));
+                break;
+            }
+            if d.nodes.iter().any(|n| n.is_empty()) {
+                bad.push(format!("{}: `{}` has an unnamed terminal: {:?}", show(f), d.name, d.nodes));
+                break;
+            }
+            // Arity is fixed by the device letter. A short one means the line was mis-split —
+            // most often a parameter read as a node, or a continuation not joined.
+            let want = match d.kind {
+                'M' => 4, // d g s b
+                'Q' => 3, // c b e (a 4th, the substrate, is optional)
+                'R' | 'C' | 'L' | 'D' => 2,
+                _ => 0, // X is whatever its subckt takes
+            };
+            if want > 0 && d.nodes.len() < want {
+                bad.push(format!(
+                    "{}: `{}` ({}) has {} terminal(s), needs {}: {:?}",
+                    show(f), d.name, d.kind, d.nodes.len(), want, d.nodes
+                ));
+                break;
+            }
+        }
+    }
+    println!("  {devices} device(s) across {} file(s)", files.len());
+    let shown: Vec<&String> = bad.iter().take(10).collect();
+    assert!(
+        bad.is_empty(),
+        "{} file(s) with a malformed device, first {}:\n  {}",
+        bad.len(),
+        shown.len(),
+        shown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n  ")
+    );
 }
 
 /// Does this FST hold only a header — a dump whose writer was killed before it wrote a

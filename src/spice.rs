@@ -147,7 +147,11 @@ impl Netlist {
             let head = toks[0].to_ascii_lowercase();
             if head == ".subckt" {
                 let name = toks.get(1).map(|s| s.to_string()).unwrap_or_default();
-                let ports = toks[2..].iter().map(|s| s.to_string()).collect();
+                // `.subckt` with no name, or a name and no ports, is a real thing to meet in
+                // 4000 foreign netlists — and `toks[2..]` PANICS on it, which takes down the
+                // caller rather than skipping one malformed line. A reader is entitled to reject
+                // a file; it is not entitled to abort the process that asked.
+                let ports = toks.get(2..).unwrap_or(&[]).iter().map(|s| s.to_string()).collect();
                 cur = Some(Netlist { name, ports, devices: Vec::new() });
                 continue;
             }
@@ -419,6 +423,28 @@ Mp Y A VDD VDD pfet w=1 l=0.15
 Mn Y A VSS VSS nfet w=0.5 l=0.15
 .ends
 ";
+
+    /// **A malformed line must not abort the caller.** `.subckt` with no name and no ports is
+    /// a line that occurs in real netlists, and `toks[2..]` panicked on it — a library panic,
+    /// which the caller cannot catch and which takes down whatever asked for the parse. Found by
+    /// pointing this reader at 4000 netlists nobody here wrote.
+    #[test]
+    fn a_truncated_dot_command_does_not_panic() {
+        for src in [
+            ".subckt\n.ends\n",                     // no name, no ports
+            ".subckt cell\nM1 d g s b nfet\n.ends\n", // a name, no ports
+            ".global\n",                            // no nets
+            ".subckt cell a b\n",                   // never closed
+        ] {
+            let nl = Netlist::parse(src, None);
+            assert!(nl.is_ok() || nl.is_err(), "parsing must return, not abort: {src:?}");
+        }
+        // and the one with a body still yields its device
+        let nl = Netlist::parse(".subckt cell\nM1 d g s b nfet\n.ends\nX1 cell\n", Some("cell"))
+            .expect("a subckt with no ports is still a subckt");
+        assert_eq!(nl.devices.len(), 1);
+        assert_eq!(nl.devices[0].kind, 'M');
+    }
 
     #[test]
     fn parses_subckt_devices() {
