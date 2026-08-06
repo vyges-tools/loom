@@ -149,3 +149,38 @@ fn unreadable_entries_are_counted_not_ignored() {
     let empty = Spef::parse("*SPEF \"IEEE 1481-1999\"\n");
     assert!(empty.health().unwrap().contains("no nets"));
 }
+
+/// **Reduced parasitics.** `*R_NET` carries a pi-model instead of an RC network. We do not
+/// model it — but a file of them must not read as "an empty design" with no clue why, which is
+/// indistinguishable from a design with no parasitics at all.
+#[test]
+fn reduced_nets_are_reported_not_silently_empty() {
+    let s = one_net(
+        "*NAME_MAP\n*1 neta\n\n*R_NET *1 10\n*DRIVER *2:Y\n*RC 3 5\n*END\n",
+        "1 FF",
+        "1 OHM",
+    );
+    assert!(s.nets.is_empty(), "no detailed net to read");
+    assert_eq!(s.reduced, 1);
+    let h = s.health().expect("must not look like a clean empty read");
+    assert!(h.contains("*R_NET"), "{h}");
+    assert!(h.contains("pi-model"), "{h}");
+}
+
+/// Power-net parasitics are skipped by design and must not be mistaken for signal nets, nor
+/// leave the reader mid-block so the next `*D_NET` inherits their entries.
+#[test]
+fn power_net_blocks_are_skipped_cleanly() {
+    let s = one_net(
+        "*NAME_MAP\n*1 VDD\n*2 neta\n\n*D_PNET *1 99\n*CAP\n1 *1 77\n*END\n\
+         \n*D_NET *2 10\n*CAP\n1 *2 8\n*END\n",
+        "1 FF",
+        "1 OHM",
+    );
+    assert_eq!(s.pnets, 1);
+    assert_eq!(s.nets.len(), 1, "only the signal net");
+    let n = s.nets.get("neta").expect("the signal net after a power block");
+    assert_eq!(n.cap_ff, 10.0);
+    assert_eq!(n.ground.len(), 1, "must not inherit the power block's entries");
+    assert_eq!(n.ground[0].1, 8.0);
+}

@@ -55,6 +55,12 @@ pub struct Spef {
     /// field of each. Single-corner by construction; a caller that needs a specific corner
     /// must not read it from here.
     pub triplets: bool,
+    /// `*R_NET` blocks seen — **reduced** (pi-model) parasitics, which this reader does not
+    /// model. A file of these has no detailed RC to read, and without this the result is an
+    /// empty design with no indication that the format, not the design, was the reason.
+    pub reduced: usize,
+    /// `*D_PNET` / `*R_PNET` blocks seen — power-net parasitics, skipped by design.
+    pub pnets: usize,
 }
 
 impl Spef {
@@ -70,6 +76,12 @@ impl Spef {
         }
         if self.triplets {
             notes.push("corner triplets present — the first (min) field was taken".to_string());
+        }
+        if self.reduced > 0 {
+            notes.push(format!(
+                "{} *R_NET block(s) skipped — reduced (pi-model) parasitics are not read",
+                self.reduced
+            ));
         }
         (!notes.is_empty()).then(|| notes.join("; "))
     }
@@ -483,6 +495,8 @@ impl Spef {
         let mut pending_cc: Vec<(String, String, f64)> = Vec::new();
         let mut skipped = 0usize;
         let mut triplets = false;
+        let mut reduced = 0usize;
+        let mut pnets = 0usize;
 
         // Record that `node` sits on the net whose block we are inside.
         let claim = |cur: &Option<(String, String, NetRc)>,
@@ -546,6 +560,21 @@ impl Spef {
             }
             if kw == "*NAME_MAP" {
                 sect = "namemap";
+                continue;
+            }
+            // Net-section variants we do not model. Recognised explicitly so the reader can
+            // say WHICH thing it skipped: a file of reduced (pi-model) nets otherwise reads as
+            // an empty design, and "no nets" does not tell you the format was the reason.
+            if kw == "*R_NET" {
+                finish(&mut cur, &mut nets);
+                sect = "";
+                reduced += 1;
+                continue;
+            }
+            if kw == "*D_PNET" || kw == "*R_PNET" {
+                finish(&mut cur, &mut nets);
+                sect = "";
+                pnets += 1;
                 continue;
             }
             if kw == "*D_NET" {
@@ -727,7 +756,7 @@ impl Spef {
                 .map(|((_, other), v)| (other.clone(), *v))
                 .collect();
         }
-        Spef { nets, skipped, triplets }
+        Spef { nets, skipped, triplets, reduced, pnets }
     }
 
     pub fn load(path: &str) -> Result<Spef, SpefError> {
