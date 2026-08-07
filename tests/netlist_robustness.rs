@@ -246,7 +246,20 @@ fn a_parameter_override_does_not_swallow_the_instance() {
     assert_eq!(n.insts.len(), 1);
     assert_eq!(n.insts[0].cell, "ALU");
     assert_eq!(n.insts[0].name, "u1", "the instance name, not `#`");
-    assert_eq!(conns_of(&n, "u1"), [("A", "a"), ("B", "b"), ("Y", "y")]);
+    // `.A(a)` with `input [7:0] a` connects EIGHT bits, and is recorded that way — the port's
+    // width is unknowable (ALU is a black box) but the connection's is not. What this test is
+    // about is that the `#(...)` did not swallow the instance, so it checks the shape.
+    let c = conns_of(&n, "u1");
+    assert_eq!(c.len(), 24, "three 8-bit ports: {c:?}");
+    // by PAIRING, not position: bits are listed most significant first (Verilog concatenation
+    // order), and nothing downstream depends on the order — the front-end differential compares
+    // an instance's connections as a set.
+    let has = |p: &str, net: &str| c.iter().any(|(a, b)| *a == p && *b == net);
+    for i in 0..8 {
+        assert!(has(&format!("A[{i}]"), &format!("a[{i}]")), "A[{i}] -> a[{i}] in {c:?}");
+        assert!(has(&format!("B[{i}]"), &format!("b[{i}]")), "B[{i}] -> b[{i}]");
+        assert!(has(&format!("Y[{i}]"), &format!("y[{i}]")), "Y[{i}] -> y[{i}]");
+    }
 
     // multi-line, multiple parameters, and a trailing comma in the port list
     let n = parse(
@@ -255,7 +268,9 @@ fn a_parameter_override_does_not_swallow_the_instance() {
     );
     assert_eq!(n.insts.len(), 1);
     assert_eq!((n.insts[0].cell.as_str(), n.insts[0].name.as_str()), ("python_inv", "inv"));
-    assert_eq!(conns_of(&n, "inv"), [("i", "i"), ("o", "o")]);
+    // 4-bit ports, so four bits each
+    assert_eq!(conns_of(&n, "inv").len(), 8);
+    assert!(conns_of(&n, "inv").iter().any(|(a, b)| *a == "i[0]" && *b == "i[0]"));
 
     // a positional parameter override, which is also legal
     let n = parse("module m(a, y); input a; output y; DLY #(3) u1 (.A(a), .Y(y)); endmodule\n");

@@ -183,6 +183,53 @@ fn tokenize(text: &str) -> Vec<String> {
     out
 }
 
+/// Recover declared ranges from names already expanded to bits (`a[7]`…`a[0]` -> `a` is 7:0).
+fn note_ranges(
+    names: &[String],
+    decl_range: &mut std::collections::BTreeMap<String, (i64, i64)>,
+) {
+    for nm in names {
+        let Some((base, rest)) = nm.split_once('[') else { continue };
+        let Some(b) = rest.strip_suffix(']').and_then(|x| x.parse::<i64>().ok()) else { continue };
+        let e = decl_range.entry(base.to_string()).or_insert((b, b));
+        e.0 = e.0.max(b);
+        e.1 = e.1.min(b);
+    }
+}
+
+/// The bits a connection expression covers, most significant first.
+///
+/// A bare name expands only when it is declared here as a vector — a black-box port's width is
+/// unknowable, but the width of what is connected to it is not. A part-select `x[7:4]` expands
+/// to its range; a bit-select `x[3]` and a constant are already one bit and pass through.
+fn expand_bits(
+    net: &str,
+    decl_range: &std::collections::BTreeMap<String, (i64, i64)>,
+) -> Vec<String> {
+    if let Some((base, rest)) = net.split_once('[') {
+        if let Some(inner) = rest.strip_suffix(']') {
+            if let Some((a, b)) = inner.split_once(':') {
+                if let (Ok(a), Ok(b)) = (a.trim().parse::<i64>(), b.trim().parse::<i64>()) {
+                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                    return (lo..=hi).rev().map(|x| format!("{base}[{x}]")).collect();
+                }
+            }
+        }
+        return vec![net.to_string()];
+    }
+    match decl_range.get(net).copied() {
+        Some((m, l)) => {
+            let (lo, hi) = if m <= l { (m, l) } else { (l, m) };
+            if hi > lo {
+                (lo..=hi).rev().map(|x| format!("{net}[{x}]")).collect()
+            } else {
+                vec![net.to_string()]
+            }
+        }
+        None => vec![net.to_string()],
+    }
+}
+
 fn is_keyword(t: &str) -> bool {
     matches!(
         t,
@@ -250,6 +297,10 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
     // names declared as a one-bit VECTOR (`wire [0:0] x`), and the single index they carry
     let mut one_bit_vec: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
+    // every declared signal's range, so a connection naming a whole bus can be expanded the way
+    // a synthesiser expands it
+    let mut decl_range: std::collections::BTreeMap<String, (i64, i64)> =
+        std::collections::BTreeMap::new();
     let mut i = from;
 
     // module NAME ( ... ) ;  — keep name, skip the header port list
@@ -259,17 +310,65 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
             nl.module = t[i].clone();
             i += 1;
         }
+        // THE HEADER MAY BE WHERE THE PORTS ARE DECLARED. Verilog-2001 ANSI style puts the
+        // direction, type and range inline — `module m (input wire [7:0] ui_in, output ...)` —
+        // and a module written that way has no separate `input`/`output` statements at all.
+        // Skipping the header then yields a design with ZERO ports: every join that asks whether
+        // a net is a port fails, and the port-alias canonicalisation below is inert. It is not a
+        // corner case — it is how modern Verilog is written, and how every TinyTapeout project
+        // is written.
+        //
+        // Both styles are read: an ANSI header declares its ports here, and a non-ANSI header
+        // just lists names that the `input`/`output` statements below will declare properly.
         if i < n && t[i] == "(" {
-            let mut depth = 0;
-            while i < n {
-                if t[i] == "(" {
-                    depth += 1;
-                } else if t[i] == ")" {
-                    depth -= 1;
-                    if depth == 0 {
-                        i += 1;
-                        break;
+            i += 1;
+            let mut depth = 1;
+            let (mut dir, mut range): (Option<&str>, Option<(i64, i64)>) = (None, None);
+            while i < n && depth > 0 {
+                match t[i].as_str() {
+                    "(" => depth += 1,
+                    ")" => {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
                     }
+                    // a direction keyword starts a new ANSI declaration; the range and direction
+                    // then apply to every name until the next one
+                    d @ ("input" | "output" | "inout") => {
+                        dir = Some(d);
+                        range = None;
+                    }
+                    "wire" | "reg" | "logic" | "signed" => {}
+                    "," => {}
+                    "[" => {
+                        let spec = t.get(i + 1).cloned().unwrap_or_default();
+                        range = spec.split_once(':').and_then(|(h, l)| {
+                            Some((h.trim().parse::<i64>().ok()?, l.trim().parse::<i64>().ok()?))
+                        });
+                        while i < n && t[i] != "]" {
+                            i += 1;
+                        }
+                    }
+                    tok if is_ident(tok) && !is_keyword(tok) => {
+                        if let Some(d) = dir {
+                            let names: Vec<String> = match range {
+                                Some((h, l)) => {
+                                    let (hi, lo) = if h >= l { (h, l) } else { (l, h) };
+                                    decl_range.insert(tok.to_string(), (hi, lo));
+                                    (lo..=hi).rev().map(|b| format!("{tok}[{b}]")).collect()
+                                }
+                                None => vec![tok.to_string()],
+                            };
+                            match d {
+                                "input" => nl.inputs.extend(names),
+                                "output" => nl.outputs.extend(names),
+                                _ => {} // inout: not a timing endpoint in v0, as elsewhere
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 i += 1;
             }
@@ -322,13 +421,19 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
                 i += 1;
                 break;
             }
+            // The names come back already expanded to bits, so the declared range is recovered
+            // from them — `expand_bits` needs it when an instance below connects the whole bus.
             "input" => {
                 i += 1;
-                nl.inputs.extend(read_names(&mut i));
+                let names = read_names(&mut i);
+                note_ranges(&names, &mut decl_range);
+                nl.inputs.extend(names);
             }
             "output" => {
                 i += 1;
-                nl.outputs.extend(read_names(&mut i));
+                let names = read_names(&mut i);
+                note_ranges(&names, &mut decl_range);
+                nl.outputs.extend(names);
             }
             // `assign lhs = rhs ;` is not decoration: it is two names for the same net, and
             // tools emit it for port aliases and constant ties. Skipping it leaves the lhs
@@ -365,12 +470,17 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
                 i += 1;
                 // an optional `[ msb:lsb ]` range, then the names it applies to
                 let mut single: Option<String> = None;
+                let mut range: Option<(i64, i64)> = None;
                 if i < n && t[i] == "[" {
-                    let range = t.get(i + 1).cloned().unwrap_or_default();
-                    if let Some((a, b)) = range.split_once(':') {
+                    let spec = t.get(i + 1).cloned().unwrap_or_default();
+                    if let Some((a, b)) = spec.split_once(':') {
                         if a.trim() == b.trim() {
                             single = Some(a.trim().to_string());
                         }
+                        range = match (a.trim().parse::<i64>(), b.trim().parse::<i64>()) {
+                            (Ok(x), Ok(y)) => Some((x, y)),
+                            _ => None,
+                        };
                     }
                     while i < n && t[i] != "]" {
                         i += 1;
@@ -378,9 +488,12 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
                     i += 1;
                 }
                 while i < n && t[i] != ";" {
-                    if let Some(idx) = &single {
-                        if is_ident(&t[i]) && !is_keyword(&t[i]) {
+                    if is_ident(&t[i]) && !is_keyword(&t[i]) {
+                        if let Some(idx) = &single {
                             one_bit_vec.insert(t[i].clone(), idx.clone());
+                        }
+                        if let Some(r) = range {
+                            decl_range.insert(t[i].clone(), r);
                         }
                     }
                     i += 1;
@@ -453,19 +566,35 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
                                 // bit-select, or a CONCATENATION on a bussed pin.
                                 let mut j = i + 3;
                                 let nets = read_conn_value(t, &mut j);
-                                match nets.len() {
+                                // ONE RULE FOR EVERY CONNECTION SHAPE: flatten what is
+                                // connected to a list of BITS, most significant first, then name
+                                // the pin's bits from it. Verilog concatenation is MSB-first and
+                                // that is how a bussed pin is named in Liberty, so the same
+                                // numbering serves a concatenation, a whole bus, a part-select
+                                // and any mixture.
+                                //
+                                // Doing it per MEMBER instead — `{uio_out[4:0], uo_out[4:0]}`
+                                // becoming P[1] and P[0] — is wrong the moment a member is wider
+                                // than one bit, which is most of the time. And a whole bus
+                                // (`.data(ui_in)`) has to expand at all: the port's width is
+                                // unknowable when the module is a black box, but the
+                                // CONNECTION's is not, because the signal is declared here. A
+                                // synthesiser infers the port from the expression the same way,
+                                // which is why Yosys's JSON lists `data[0]`…`data[7]` where this
+                                // reader listed one.
+                                let bits: Vec<String> = nets
+                                    .iter()
+                                    .flat_map(|net| expand_bits(net, &decl_range))
+                                    .collect();
+                                match bits.len() {
                                     0 => {}
                                     1 => {
-                                        if !is_const(&nets[0]) {
-                                            conns.push((pin, nets[0].clone()));
+                                        if !is_const(&bits[0]) {
+                                            conns.push((pin, bits[0].clone()));
                                         }
                                     }
-                                    // `{a, b, c}` on pin P is P[2], P[1], P[0] — Verilog
-                                    // concatenation is MSB-first, and that is how a bussed pin
-                                    // is named in Liberty. Keeping only the first member left a
-                                    // net literally called `{a` and lost the rest.
                                     k => {
-                                        for (idx, net) in nets.iter().enumerate() {
+                                        for (idx, net) in bits.iter().enumerate() {
                                             if is_const(net) {
                                                 continue;
                                             }
@@ -525,6 +654,11 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
         match (ports.contains(lhs.as_str()), ports.contains(rhs.as_str())) {
             (true, false) => to_port.insert(rhs.as_str(), lhs.as_str()),
             (false, true) => to_port.insert(lhs.as_str(), rhs.as_str()),
+            // NEITHER IS A PORT — `assign rom0_data[2] = addr[3];` between two internal nets.
+            // Still one net with two names, so the two front ends must still agree on which, and
+            // there is no port to prefer. The driver is: `assign a = b` makes `b` the source and
+            // `a` a name for it, which is also the one a synthesiser keeps when it merges them.
+            (false, false) => to_port.insert(lhs.as_str(), rhs.as_str()),
             _ => None,
         };
     }
