@@ -144,8 +144,31 @@ pub struct NetGeom {
     pub use_power: bool,
     pub segs: Vec<Seg>,
     pub vias: Vec<(i64, i64)>,
+    /// The same vias, each with the name of the via definition that placed it.
+    ///
+    /// A via's resistance is the cut layer's per-cut resistance divided by the number of
+    /// cuts, and **neither is knowable from the point alone** — both live in the `VIAS`
+    /// definition this names (see [`ViaDef`]). Parallel to `vias`, same order.
+    pub via_names: Vec<(String, i64, i64)>,
     /// Every listed coordinate with its wire layer (incl. via-only landings).
     pub points: Vec<(String, i64, i64)>,
+}
+
+/// A DEF `VIAS` definition — what a via placement actually refers to.
+///
+/// The name carries no reliable information: a via called `via2_3_…` may bridge met1→met2.
+/// `LAYERS <below> <cut> <above>` is authoritative for the cut layer, and `ROWCOL <rows>
+/// <cols>` for the cut count (absent means a single cut).
+#[derive(Debug, Clone, Default)]
+pub struct ViaDef {
+    pub name: String,
+    /// The cut layer — the middle entry of `LAYERS`, whose LEF `RESISTANCE` is per cut.
+    pub cut_layer: String,
+    /// The routing layers it bridges (`LAYERS` first and last).
+    pub below: String,
+    pub above: String,
+    /// Cuts in the array: `ROWCOL rows cols` multiplied out, else 1.
+    pub cuts: u32,
 }
 
 /// A placed instance from the DEF `COMPONENTS` section.
@@ -171,6 +194,8 @@ pub struct Def {
     pub power_nets: Vec<NetGeom>,
     /// Placed instances — per-instance current loads.
     pub comps: Vec<Comp>,
+    /// `VIAS` definitions, by name — the cut layer and cut count behind each via placement.
+    pub via_defs: BTreeMap<String, ViaDef>,
 }
 
 const POWER_NAMES: &[&str] = &["VPWR", "VDD", "VCCD", "VCC", "VDDP"];
@@ -200,12 +225,14 @@ impl Def {
             None => Vec::new(),
         };
         let comps = parse_components(&tref);
+        let via_defs = parse_vias(&tref);
         Ok(Def {
             units_per_um: scale,
             dbu: scale,
             nets,
             power_nets,
             comps,
+            via_defs,
         })
     }
 
@@ -575,6 +602,66 @@ fn parse_components(toks: &[&str]) -> Vec<Comp> {
     comps
 }
 
+/// Read the `VIAS` section: name -> cut layer + cut count.
+///
+/// Each entry runs `- <name> + VIARULE … + LAYERS <below> <cut> <above> + ROWCOL <r> <c> … ;`.
+/// Only `LAYERS` and `ROWCOL` are read; the rest (cut size, spacing, enclosure) describes
+/// geometry we do not model. A `ROWCOL`-less entry is a single cut, which is the DEF default
+/// and not an omission.
+fn parse_vias(toks: &[&str]) -> BTreeMap<String, ViaDef> {
+    let mut out = BTreeMap::new();
+    let Some(s) = section_start(toks, "VIAS") else {
+        return out;
+    };
+    let end = section_end(toks, "VIAS", s);
+    let mut i = s + 1;
+    // skip the count that follows `VIAS`, and its `;`
+    while i < end && (toks[i] == ";" || toks[i].parse::<i64>().is_ok()) {
+        i += 1;
+    }
+    let mut cur: Option<ViaDef> = None;
+    while i < end {
+        match toks[i] {
+            "-" => {
+                if let Some(v) = cur.take() {
+                    out.insert(v.name.clone(), v);
+                }
+                i += 1;
+                if i < end {
+                    cur = Some(ViaDef {
+                        name: toks[i].to_string(),
+                        cuts: 1,
+                        ..Default::default()
+                    });
+                    i += 1;
+                }
+            }
+            "LAYERS" if cur.is_some() => {
+                if i + 3 < end {
+                    let v = cur.as_mut().unwrap();
+                    v.below = toks[i + 1].to_string();
+                    v.cut_layer = toks[i + 2].to_string();
+                    v.above = toks[i + 3].to_string();
+                }
+                i += 4;
+            }
+            "ROWCOL" if cur.is_some() => {
+                if i + 2 < end {
+                    let r: u32 = toks[i + 1].parse().unwrap_or(1);
+                    let c: u32 = toks[i + 2].parse().unwrap_or(1);
+                    cur.as_mut().unwrap().cuts = (r * c).max(1);
+                }
+                i += 3;
+            }
+            _ => i += 1,
+        }
+    }
+    if let Some(v) = cur.take() {
+        out.insert(v.name.clone(), v);
+    }
+    out
+}
+
 fn parse_specialnets(body: &[&str]) -> Vec<NetGeom> {
     let mut nets: Vec<NetGeom> = Vec::new();
     let mut cur: Option<NetGeom> = None;
@@ -671,6 +758,7 @@ fn parse_specialnets(body: &[&str]) -> Vec<NetGeom> {
                     if let (Some(n), Some(p)) = (cur.as_mut(), last) {
                         if !is_qualifier(other) {
                             n.vias.push(p);
+                            n.via_names.push((other.to_string(), p.0, p.1));
                         }
                     }
                 }
@@ -784,6 +872,94 @@ END NETS
             synth.write_name(),
             "traced_net",
             "an empty raw_name must fall back, never write an empty name"
+        );
+    }
+
+    #[test]
+    fn a_via_definition_yields_its_cut_layer_and_cut_count() {
+        // The four PDN via definitions of a real sky130 block, verbatim. Two things here are
+        // not guessable from a via placement alone, and both are why this section is read:
+        //
+        //  - the NAME LIES. `via2_3_…` bridges met1->met2, not met2->met3. Only `LAYERS` is
+        //    authoritative, and its MIDDLE entry is the cut layer whose LEF RESISTANCE is
+        //    stated per cut.
+        //  - the CUT COUNT comes from `ROWCOL rows cols`. A via array of 5 cuts has a fifth
+        //    of one cut's resistance, so treating every via alike is wrong by that factor.
+        //    The last entry has no ROWCOL, which is a single cut by DEF default.
+        let d = Def::parse(
+            r#"
+UNITS DISTANCE MICRONS 1000 ;
+VIAS 4 ;
+    - via2_3_1600_480_1_5_320_320 + VIARULE M1M2_PR + CUTSIZE 150 150  + LAYERS met1 via met2  + CUTSPACING 170 170  + ENCLOSURE 85 165 55 85  + ROWCOL 1 5  ;
+    - via3_4_1600_480_1_4_400_400 + VIARULE M2M3_PR + CUTSIZE 200 200  + LAYERS met2 via2 met3  + CUTSPACING 200 200  + ENCLOSURE 40 85 65 65  + ROWCOL 1 4  ;
+    - via4_5_1600_480_1_4_400_400 + VIARULE M3M4_PR + CUTSIZE 200 200  + LAYERS met3 via3 met4  + CUTSPACING 200 200  + ENCLOSURE 90 60 100 65  + ROWCOL 1 4  ;
+    - via5_6_1600_1600_1_1_1600_1600 + VIARULE M4M5_PR + CUTSIZE 800 800  + LAYERS met4 via4 met5  + CUTSPACING 800 800  + ENCLOSURE 400 190 310 400  ;
+END VIAS
+END DESIGN
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(d.via_defs.len(), 4, "every VIAS entry is read");
+
+        let v = &d.via_defs["via2_3_1600_480_1_5_320_320"];
+        assert_eq!(v.cut_layer, "via", "the cut layer is the MIDDLE of LAYERS");
+        assert_eq!(
+            (v.below.as_str(), v.above.as_str()),
+            ("met1", "met2"),
+            "the name says via2_3 but it bridges met1->met2 — the name is not usable"
+        );
+        assert_eq!(v.cuts, 5, "ROWCOL 1 5");
+
+        assert_eq!(d.via_defs["via3_4_1600_480_1_4_400_400"].cuts, 4);
+        assert_eq!(d.via_defs["via3_4_1600_480_1_4_400_400"].cut_layer, "via2");
+        assert_eq!(d.via_defs["via4_5_1600_480_1_4_400_400"].cuts, 4);
+        assert_eq!(d.via_defs["via4_5_1600_480_1_4_400_400"].cut_layer, "via3");
+
+        let single = &d.via_defs["via5_6_1600_1600_1_1_1600_1600"];
+        assert_eq!(single.cut_layer, "via4");
+        assert_eq!(
+            single.cuts, 1,
+            "no ROWCOL is one cut by DEF default, not an unknown"
+        );
+    }
+
+    #[test]
+    fn a_special_net_via_carries_the_name_that_defines_it() {
+        // A point alone cannot price a via. Without the name there is no cut layer to look up
+        // and no cut count to divide by, which is exactly the gap that made a PDN extractor
+        // fall back to one flat resistance for every via on the die.
+        let d = Def::parse(
+            r#"
+UNITS DISTANCE MICRONS 1000 ;
+SPECIALNETS 1 ;
+    - VPWR ( * VPWR ) + USE POWER
+      + ROUTED met4 1600 ( 5000 10000 ) ( 60000 10000 )
+      NEW met4 1600 ( 20000 10000 ) 0 via5_6_1600_1600_1_1_1600_1600
+      NEW met4 1600 ( 40000 10000 ) 0 via5_6_1600_1600_1_1_1600_1600 ;
+END SPECIALNETS
+END DESIGN
+"#,
+        )
+        .unwrap();
+
+        let n = d.power_net().unwrap();
+        assert_eq!(n.vias.len(), 2);
+        assert_eq!(
+            n.via_names.len(),
+            n.vias.len(),
+            "every via keeps the name of its definition"
+        );
+        assert!(
+            n.via_names
+                .iter()
+                .all(|(nm, _, _)| nm == "via5_6_1600_1600_1_1_1600_1600"),
+            "the via name is recorded, not the layer or a qualifier"
+        );
+        assert_eq!(
+            (n.via_names[0].1, n.via_names[0].2),
+            (20000, 10000),
+            "and it stays attached to its own location"
         );
     }
 
