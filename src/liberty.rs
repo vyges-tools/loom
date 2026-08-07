@@ -35,6 +35,11 @@ pub struct Arc {
     pub rise_transition: Table,
     pub fall_transition: Table,
     pub ccs: crate::ccs::CcsArc, // CCS current waveforms (empty if NLDM-only)
+    /// Did the arc DECLARE an `output_current_*` group, whatever we read from it? Kept separate
+    /// from `ccs.is_empty()` so a library characterised for CCS whose tables we failed to read is
+    /// distinguishable from one that never had any — the first is this reader falling back to
+    /// NLDM without saying so, the second is an NLDM library being used as intended.
+    pub ccs_declared: bool,
     // LVF (Liberty Variation Format): per-(slew,load) delay sigma. Empty -> no LVF;
     // POCV then falls back to the global pocv_sigma fraction.
     pub sigma_rise: Table,
@@ -680,6 +685,7 @@ fn parse_arc(timing_body: &str, skip_ccs: bool) -> Arc {
         rise_transition: tbl("rise_transition"),
         fall_transition: tbl("fall_transition"),
         // CCS output_current waveforms — skipped (empty) for NLDM-only parses.
+        ccs_declared: declares_ccs(timing_body),
         ccs: if skip_ccs {
             crate::ccs::CcsArc::default()
         } else {
@@ -696,6 +702,18 @@ fn parse_ccs(timing_body: &str) -> crate::ccs::CcsArc {
         rise: parse_ccs_set(timing_body, "output_current_rise"),
         fall: parse_ccs_set(timing_body, "output_current_fall"),
     }
+}
+
+/// Did this timing group DECLARE a CCS current table, whatever we managed to read from it?
+///
+/// The distinction the counter below needs: a library with no CCS at all is an ordinary NLDM
+/// library and the engine is right to use NLDM. A library that carries `output_current_rise` and
+/// yields no usable waveform is a different situation entirely — we are falling back to NLDM on
+/// a library characterised for something better, and the run reports a number without saying so.
+/// One is a fact about the library; the other is a fact about this reader.
+fn declares_ccs(timing_body: &str) -> bool {
+    next_block(timing_body, 0, "output_current_rise").is_some()
+        || next_block(timing_body, 0, "output_current_fall").is_some()
 }
 
 /// Collect every `vector (...) { ... }` under an output_current group.

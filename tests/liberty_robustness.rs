@@ -183,6 +183,14 @@ fn no_unhandled_attribute_can_perturb_what_we_read() {
             format!("  {a} : \"x\";\n"),
             format!("  {a} () {{ value : 99.0; }}\n"),
             format!("  {a} (g) {{ index_1 (\"9\"); values (\"99\"); }}\n"),
+            // NESTED, which is the shape that finds a brace-counting defect. A one-level group
+            // can be skipped by scanning to the next `}`; a CCS current table cannot — an
+            // `output_current_rise` holds a `vector` per grid point, each with its own tables,
+            // and a reader that stops at the first closing brace resumes in the middle of a
+            // group and reads its contents as the cell's.
+            format!(
+                "  {a} (t) {{\n  vector (v) {{\n  index_1 (\"9\"); index_2 (\"9\");\n  index_3 (\"9\"); values (\"99, 98\");\n  }}\n  vector (v2) {{ index_1 (\"8\"); values (\"88\"); }}\n  }}\n"
+            ),
         ];
         let mut hit = false;
         for s in &shapes {
@@ -282,4 +290,67 @@ fn table_values_stay_in_library_time_units() {
     let ps = parse(&good_lib("", "", "", "").replace("time_unit : \"1ns\";", "time_unit : \"1ps\";"));
     let d = |l: &Lib| l.cells["INV"].pins["Y"].arcs[0].cell_rise.lookup(0.01, 0.001);
     assert_eq!(d(&ns), d(&ps), "the number is the file's; the unit is the caller's to track");
+}
+
+/// **A CCS table we cannot read is not the same as a library without CCS.**
+///
+/// `output_current_rise` present and no usable waveform read from it means the engine falls back
+/// to NLDM on a library characterised for something better — and reports a number, with nothing
+/// to say the accuracy it was asked for was unavailable. That is invisible from the delay values
+/// themselves, so it is counted: `ccs_declared` against `ccs_usable`.
+///
+/// The malformed case here is the one that actually occurs — a `vector` whose `index_3` (the
+/// time axis) and `values` (the currents) are different lengths, which is what a truncated or
+/// mis-scaled characterisation produces.
+#[test]
+fn a_declared_ccs_table_we_cannot_read_is_counted_separately() {
+    let arc_with = |vectors: &str| {
+        format!(
+            "library (d) {{\n  capacitive_load_unit (1, pf);\n  cell (INV) {{\n\
+             \x20   pin (A) {{ direction : input; capacitance : 0.004; }}\n\
+             \x20   pin (Y) {{ direction : output;\n\
+             \x20     timing () {{ related_pin : \"A\";\n\
+             \x20       cell_rise (t) {{ index_1 (\"0.1\"); index_2 (\"0.1\"); values (\"0.5\"); }}\n\
+             \x20       output_current_rise (ct) {{\n{vectors}      }}\n\
+             \x20     }}\n   }}\n  }}\n}}\n"
+        )
+    };
+    let good = arc_with(
+        "        vector (v) { index_1(\"0.1\"); index_2(\"0.01\"); \
+         index_3(\"0.0, 0.1, 0.2\"); values(\"0.0, 1.0, 0.0\"); }\n",
+    );
+    let broken = arc_with(
+        "        vector (v) { index_1(\"0.1\"); index_2(\"0.01\"); \
+         index_3(\"0.0, 0.1, 0.2\"); values(\"0.0, 1.0\"); }\n",
+    );
+
+    let nl = vyges_loom::netlist::parse(
+        "module m(a, y); input a; output y; INV g1 (.A(a), .Y(y)); endmodule\n",
+    )
+    .expect("netlist");
+
+    let ok = vyges_loom::coverage::liberty(&nl, &Lib::parse(&good).expect("good lib"));
+    assert_eq!((ok.ccs_declared, ok.ccs_usable), (1, 1), "a readable CCS table counts as usable");
+
+    let bad = vyges_loom::coverage::liberty(&nl, &Lib::parse(&broken).expect("broken lib"));
+    assert_eq!(
+        (bad.ccs_declared, bad.ccs_usable),
+        (1, 0),
+        "a declared table we cannot read must be visible, not silently NLDM"
+    );
+
+    // and a library with no CCS at all is neither — it is an NLDM library used as intended
+    let none = vyges_loom::coverage::liberty(
+        &nl,
+        &Lib::parse(
+            "library (d) {\n  capacitive_load_unit (1, pf);\n  cell (INV) {\n\
+             \x20   pin (A) { direction : input; capacitance : 0.004; }\n\
+             \x20   pin (Y) { direction : output;\n\
+             \x20     timing () { related_pin : \"A\";\n\
+             \x20       cell_rise (t) { index_1 (\"0.1\"); index_2 (\"0.1\"); values (\"0.5\"); }\n\
+             \x20     }\n   }\n  }\n}\n",
+        )
+        .expect("nldm lib"),
+    );
+    assert_eq!((none.ccs_declared, none.ccs_usable), (0, 0));
 }

@@ -192,6 +192,8 @@ fn enc_arc(w: &mut W, a: &Arc) {
     enc_table(w, &a.rise_transition);
     enc_table(w, &a.fall_transition);
     enc_ccs(w, &a.ccs);
+    // Whether the arc DECLARED a CCS group, which `ccs` alone cannot say once it is empty.
+    w.u8(a.ccs_declared as u8);
     enc_table(w, &a.sigma_rise);
     enc_table(w, &a.sigma_fall);
 }
@@ -204,6 +206,7 @@ fn dec_arc(r: &mut R) -> Option<Arc> {
         rise_transition: dec_table(r)?,
         fall_transition: dec_table(r)?,
         ccs: dec_ccs(r)?,
+        ccs_declared: r.u8()? != 0,
         sigma_rise: dec_table(r)?,
         sigma_fall: dec_table(r)?,
     })

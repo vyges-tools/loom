@@ -103,6 +103,13 @@ pub struct LibertyCoverage {
     /// Sequential masters with no `setup`, `hold`, `recovery` or `removal` anywhere — flops
     /// whose pins can never become endpoints, so their paths are never checked at all.
     pub sequential_without_constraints: usize,
+    /// Arcs that DECLARED a CCS current table, and how many of those we read a usable waveform
+    /// from. A library characterised for CCS whose tables we cannot read is not an NLDM library:
+    /// the engine falls back to NLDM and reports a number, with nothing to say the accuracy it
+    /// was asked for was unavailable. `ccs_declared > 0 && ccs_usable == 0` is that situation,
+    /// and it is invisible from the delay values themselves.
+    pub ccs_declared: usize,
+    pub ccs_usable: usize,
 }
 
 pub fn liberty(nl: &Netlist, lib: &Lib) -> LibertyCoverage {
@@ -118,6 +125,16 @@ pub fn liberty(nl: &Netlist, lib: &Lib) -> LibertyCoverage {
             .pins
             .values()
             .any(|p| p.direction == Dir::Out && !p.is_constant());
+        for p in cell.pins.values() {
+            for a in &p.arcs {
+                if a.ccs_declared {
+                    c.ccs_declared += 1;
+                    if !a.ccs.is_empty() {
+                        c.ccs_usable += 1;
+                    }
+                }
+            }
+        }
         if drives && !cell.pins.values().any(|p| !p.arcs.is_empty()) {
             c.driving_without_arcs += 1;
         }

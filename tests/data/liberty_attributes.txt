@@ -175,3 +175,37 @@ vomax
 vomin
 when
 zstate_leak_threshold_pct
+
+# --- CCS / ECSM / noise groups ---------------------------------------------------------------
+#
+# ADDED FROM THE FORMAT, NOT FROM DATA, and that difference is worth stating: both libraries the
+# rest of this list was mined from (sky130, ASAP7 as vendored here) are NLDM-only, so none of
+# these names occurs in either. They are the current-source and noise group set every vendor
+# library carries once it is characterised for CCS — the ones a real 7nm or 5nm library would
+# put in front of this reader, and precisely the ones we have never seen.
+#
+# That is a coverage gap in the corpus, recorded rather than papered over: the sweep below can
+# prove these groups do not perturb the NLDM values we read, which is what this reader needs from
+# them today, but nothing here has been checked against a library that actually contains one.
+ccsn_first_stage
+ccsn_last_stage
+ecsm_waveform
+ecsm_waveform_set
+input_ccb
+normalized_driver_waveform
+output_ccb
+output_current_fall
+output_current_rise
+output_current_template
+output_voltage_fall
+output_voltage_rise
+propagated_noise_high
+propagated_noise_low
+receiver_capacitance
+receiver_capacitance1_fall
+receiver_capacitance1_rise
+receiver_capacitance2_fall
+receiver_capacitance2_rise
+receiver_capacitance_fall
+receiver_capacitance_rise
+vector
