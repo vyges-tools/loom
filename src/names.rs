@@ -42,11 +42,35 @@ use std::collections::HashMap;
 
 /// Full-path → toggle count, a leaf → full-paths index, and an optional design scope.
 /// Shared storage/resolution for both the VCD and SAIF readers.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct NetIndex {
     pub toggles: HashMap<String, u64>,         // full hierarchical path -> transition count
     pub by_leaf: HashMap<String, Vec<String>>, // leaf name -> declared full paths
     pub scope: Option<String>,                 // design instance path (job `scope:`)
+}
+
+/// Rendered in **sorted key order**, not the maps' own.
+///
+/// `HashMap` is the right storage here and `BTreeMap` is not: `add_toggles` runs once per value
+/// change in a VCD, so this is the hottest map in the crate and the lookup wants to stay O(1).
+/// But a derived `Debug` walks the map, and Rust seeds its hasher per process — so the derive
+/// printed these in a different order on every run. `Debug` output is output: it lands in
+/// diagnostics, in test failure messages, and in anything comparing two runs. An unstable
+/// rendering makes a byte-comparison between processes meaningless, which is exactly what
+/// `tests/determinism.rs` needs to be able to do.
+///
+/// So: fast storage, ordered rendering. Sorting costs nothing at runtime because nothing formats
+/// a `NetIndex` on a hot path.
+impl std::fmt::Debug for NetIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let toggles: std::collections::BTreeMap<_, _> = self.toggles.iter().collect();
+        let by_leaf: std::collections::BTreeMap<_, _> = self.by_leaf.iter().collect();
+        f.debug_struct("NetIndex")
+            .field("toggles", &toggles)
+            .field("by_leaf", &by_leaf)
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 impl NetIndex {
