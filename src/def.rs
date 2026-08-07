@@ -88,11 +88,42 @@ pub struct ViaPoint {
 #[derive(Debug, Clone, Default)]
 pub struct DefNet {
     pub name: String,
+    /// The name **exactly as the DEF spelled it**, escaping intact — `CFG_REG\[0\]`, not
+    /// `CFG_REG[0]`.
+    ///
+    /// [`name`](Self::name) is unescaped so it joins against the netlist and the SPEF, and that
+    /// is the right canonical form for matching. But unescaping DESTROYS information a writer
+    /// needs: `count[0]` and `CFG_REG\[0\]` unescape to names that look alike, while meaning
+    /// different things — bit 0 of a bus, versus a scalar net whose own name contains brackets
+    /// (what synthesis produces when it flattens a bus into `wire \CFG_REG[0] ;`).
+    ///
+    /// Nothing downstream can recover the distinction from the canonical name alone, so a writer
+    /// that re-derives escaping gets it wrong in one direction or the other. vyges-extract emits
+    /// this field verbatim into its SPEF name map; DEF and SPEF escape the same way, so
+    /// round-tripping the source spelling is both correct and lossless.
+    pub raw_name: String,
     pub pins: Vec<(String, String)>, // (instance, pin)
     pub segments: Vec<Segment>,
     pub vias: usize,
     /// Where each of those vias sits. See [`ViaPoint`].
     pub via_points: Vec<ViaPoint>,
+}
+
+impl DefNet {
+    /// The name to WRITE into a downstream format: the source spelling when we have one,
+    /// otherwise the canonical name.
+    ///
+    /// The fallback is what makes this safe for nets that never came from a DEF at all — the
+    /// `gds → DefNet` front-end synthesises nets from traced geometry, so there is no original
+    /// spelling to preserve and `raw_name` is empty. Reading the field directly would write an
+    /// empty name into a SPEF name map there; a reader would take the whole file as junk.
+    pub fn write_name(&self) -> &str {
+        if self.raw_name.is_empty() {
+            &self.name
+        } else {
+            &self.raw_name
+        }
+    }
 }
 
 // ─────────────────────────── power view (PDN, DBU) ─────────────────────────────
@@ -332,11 +363,15 @@ fn parse_signal(
         // matches nothing anywhere else: the SPEF extracted from this very DEF calls the same
         // net `CFG_REG[0]`, and so does the netlist. On real designs that was 10-20% of nets —
         // every bussed one — joining to nothing, with both readers reporting success.
-        let name = unescape(&t.get(i).cloned().unwrap_or_default());
+        // Both forms are kept: `name` canonical (so it joins), `raw_name` as written (so a writer
+        // can reproduce the escaping it cannot re-derive). See [`DefNet::raw_name`].
+        let raw_name = t.get(i).cloned().unwrap_or_default();
+        let name = unescape(&raw_name);
         i += 1;
 
         let mut net = DefNet {
             name,
+            raw_name,
             ..DefNet::default()
         };
         let mut in_routing = false;
@@ -694,6 +729,61 @@ END NETS
         assert!(
             n.segments.iter().all(|s| s.width_um == 0.0),
             "default width without an NDR"
+        );
+    }
+
+    /// Escaping is not noise on the way to a canonical name: it is the only thing separating two
+    /// different objects. `count[0]` is bit 0 of bus `count`; `CFG_REG\[0\]` is a scalar net whose
+    /// own name contains brackets, which is what synthesis emits when it flattens a bus into
+    /// `wire \CFG_REG[0] ;`. Both unescape to something bracket-shaped, so a writer holding only
+    /// the canonical name has to guess, and guessing is wrong half the time.
+    ///
+    /// So: `name` canonical for joining, `raw_name` verbatim for writing. Losing either one is a
+    /// defect that shows up as a silently under-annotated SPEF, not as an error.
+    #[test]
+    fn a_nets_source_spelling_survives_the_canonical_name() {
+        let def = "\
+UNITS DISTANCE MICRONS 1000 ;
+NETS 3 ;
+- count[0] ( u1 A )
+  + ROUTED met1 ( 0 0 ) ( 1000 0 ) ;
+- CFG_REG\\[0\\] ( u2 A )
+  + ROUTED met1 ( 0 0 ) ( 1000 0 ) ;
+- plain_net ( u3 A )
+  + ROUTED met1 ( 0 0 ) ( 1000 0 ) ;
+END NETS
+";
+        let d = Def::parse(def).unwrap();
+        let by = |n: &str| d.nets.iter().find(|x| x.name == n).expect(n).clone();
+
+        // a real bus bit: DEF did not escape it, so neither do we
+        let bus = by("count[0]");
+        assert_eq!(bus.raw_name, "count[0]");
+        assert_eq!(bus.write_name(), "count[0]");
+
+        // an escaped identifier: canonical name matches the netlist, source spelling preserved
+        let esc = by("CFG_REG[0]");
+        assert_eq!(esc.raw_name, "CFG_REG\\[0\\]", "the DEF's own spelling, intact");
+        assert_eq!(esc.write_name(), "CFG_REG\\[0\\]");
+        assert_ne!(
+            esc.raw_name, esc.name,
+            "if these were equal the distinction would already be lost"
+        );
+
+        // nothing to escape: both forms agree, and no backslash is invented
+        let plain = by("plain_net");
+        assert_eq!(plain.raw_name, "plain_net");
+        assert_eq!(plain.write_name(), "plain_net");
+
+        // the fallback: a net that never came from a DEF (the gds front-end builds these)
+        let synth = DefNet {
+            name: "traced_net".into(),
+            ..DefNet::default()
+        };
+        assert_eq!(
+            synth.write_name(),
+            "traced_net",
+            "an empty raw_name must fall back, never write an empty name"
         );
     }
 
