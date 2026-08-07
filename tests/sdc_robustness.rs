@@ -343,24 +343,28 @@ fn every_spec_command_is_either_modelled_or_classified() {
 /// report violations that do not exist. Found by diffing our inventory against SDC 2.1.
 #[test]
 fn singular_and_plural_command_spellings_are_equivalent() {
-    for (plural, singular) in [("set_clock_groups", "set_clock_group")] {
-        let p = parse(&good_sdc(&format!(
-            "{plural} -asynchronous -group {{clk}} -group {{clk2}}\n"
-        )));
-        let s = parse(&good_sdc(&format!(
-            "{singular} -asynchronous -group {{clk}} -group {{clk2}}\n"
-        )));
-        assert_eq!(p.async_groups, s.async_groups, "{plural} vs {singular}");
-        assert_eq!(p.async_groups.len(), 2, "both groups read: {:?}", p.async_groups);
-        assert!(
-            !s.ignored.iter().any(|i| i == singular),
-            "{singular} must be handled, not ignored"
-        );
-    }
-    // and the same for units
+    // The reader accepts exactly two such pairs — `set_clock_groups`/`set_clock_group` and
+    // `set_units`/`set_unit` — and both are asserted here. They are written out rather than
+    // looped because what each pair proves is different: one that the groups survive, the other
+    // that the unit reaches the period. A loop over two dissimilar cases hides that.
+    let (plural, singular) = ("set_clock_groups", "set_clock_group");
+    let p = parse(&good_sdc(&format!(
+        "{plural} -asynchronous -group {{clk}} -group {{clk2}}\n"
+    )));
+    let s = parse(&good_sdc(&format!(
+        "{singular} -asynchronous -group {{clk}} -group {{clk2}}\n"
+    )));
+    assert_eq!(p.async_groups, s.async_groups, "{plural} vs {singular}");
+    assert_eq!(p.async_groups.len(), 2, "both groups read: {:?}", p.async_groups);
+    assert!(
+        !s.ignored.iter().any(|i| i == singular),
+        "{singular} must be handled, not ignored"
+    );
+
     let a = parse("set_units -time 1ns\ncreate_clock -name c -period 4 [get_ports clk]\n");
     let b = parse("set_unit -time 1ns\ncreate_clock -name c -period 4 [get_ports clk]\n");
     assert_eq!(a.clocks[0].period, b.clocks[0].period);
+    assert!(!b.ignored.iter().any(|i| i == "set_unit"), "set_unit must be handled, not ignored");
 }
 
 /// **Quartus accepts a FREQUENCY where SDC asks for a period**, and Intel FPGA board files use
