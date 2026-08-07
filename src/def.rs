@@ -154,6 +154,26 @@ pub struct NetGeom {
     pub points: Vec<(String, i64, i64)>,
 }
 
+/// A block terminal from the DEF `PINS` section, with its port shapes in absolute DBU.
+///
+/// This is where the design says **the supply actually enters the die**. A PDN analysis that
+/// treats the whole top metal as an ideal source instead of these shapes understates IR drop,
+/// because it removes resistance the real supply has to cross.
+///
+/// The rectangles as written are relative to the pin's `PLACED`/`FIXED` origin; `shapes` holds
+/// them already oriented and translated, so a consumer never repeats that transform.
+#[derive(Debug, Clone, Default)]
+pub struct DefPin {
+    pub name: String,
+    /// The net it belongs to (`+ NET <name>`), which is what ties it to a power net.
+    pub net: String,
+    /// `+ USE POWER` or `+ USE GROUND`.
+    pub use_power: bool,
+    pub use_ground: bool,
+    /// `(layer, x1, y1, x2, y2)` per port rectangle, absolute and normalised so x1<=x2.
+    pub shapes: Vec<(String, i64, i64, i64, i64)>,
+}
+
 /// A DEF `VIAS` definition — what a via placement actually refers to.
 ///
 /// The name carries no reliable information: a via called `via2_3_…` may bridge met1→met2.
@@ -196,6 +216,8 @@ pub struct Def {
     pub comps: Vec<Comp>,
     /// `VIAS` definitions, by name — the cut layer and cut count behind each via placement.
     pub via_defs: BTreeMap<String, ViaDef>,
+    /// `PINS` — block terminals with their port shapes, absolute. Where supply enters the die.
+    pub pins: Vec<DefPin>,
 }
 
 const POWER_NAMES: &[&str] = &["VPWR", "VDD", "VCCD", "VCC", "VDDP"];
@@ -226,6 +248,7 @@ impl Def {
         };
         let comps = parse_components(&tref);
         let via_defs = parse_vias(&tref);
+        let pins = parse_pins(&tref);
         Ok(Def {
             units_per_um: scale,
             dbu: scale,
@@ -233,6 +256,7 @@ impl Def {
             power_nets,
             comps,
             via_defs,
+            pins,
         })
     }
 
@@ -602,6 +626,131 @@ fn parse_components(toks: &[&str]) -> Vec<Comp> {
     comps
 }
 
+/// Apply a DEF orientation to a point, about the origin. The eight LEF/DEF orientations.
+///
+/// A rectangle's corners must both be transformed and then re-normalised: `S` maps a
+/// lower-left corner to an upper-right one, so carrying the corners through unchanged
+/// produces an inverted box that contains nothing.
+fn orient_pt(x: i64, y: i64, orient: &str) -> (i64, i64) {
+    match orient {
+        "N" | "R0" => (x, y),
+        "W" | "R90" => (-y, x),
+        "S" | "R180" => (-x, -y),
+        "E" | "R270" => (y, -x),
+        "FN" | "MY" => (-x, y),
+        "FS" | "MX" => (x, -y),
+        "FW" | "MX90" | "MYR90" => (y, x),
+        "FE" | "MY90" | "MXR90" => (-y, -x),
+        _ => (x, y),
+    }
+}
+
+/// Read the `PINS` section: block terminals and their port shapes, placed and oriented.
+///
+/// Shape: `- <name> + NET <net> + SPECIAL + DIRECTION … + USE POWER + PORT + LAYER <l> ( x1 y1 )
+/// ( x2 y2 ) … + FIXED ( ox oy ) <orient> ;`. Several `LAYER` rectangles may share one `PORT`
+/// and one placement, which is exactly how a power pin is written — so rectangles are collected
+/// and the placement applied to all of them when the entry ends.
+fn parse_pins(toks: &[&str]) -> Vec<DefPin> {
+    let mut out = Vec::new();
+    let Some(s) = section_start(toks, "PINS") else {
+        return out;
+    };
+    let end = section_end(toks, "PINS", s);
+    let mut i = s + 3; // past `PINS <n> ;`
+
+    // rectangles as written (relative to the placement), flushed when the entry closes
+    let mut cur: Option<DefPin> = None;
+    let mut rel: Vec<(String, i64, i64, i64, i64)> = Vec::new();
+    let mut origin = (0i64, 0i64);
+    let mut orient = "N".to_string();
+
+    let flush = |cur: &mut Option<DefPin>,
+                 rel: &mut Vec<(String, i64, i64, i64, i64)>,
+                 origin: &mut (i64, i64),
+                 orient: &mut String,
+                 out: &mut Vec<DefPin>| {
+        if let Some(mut p) = cur.take() {
+            for (layer, x1, y1, x2, y2) in rel.drain(..) {
+                let (ax1, ay1) = orient_pt(x1, y1, orient);
+                let (ax2, ay2) = orient_pt(x2, y2, orient);
+                p.shapes.push((
+                    layer,
+                    ax1.min(ax2) + origin.0,
+                    ay1.min(ay2) + origin.1,
+                    ax1.max(ax2) + origin.0,
+                    ay1.max(ay2) + origin.1,
+                ));
+            }
+            out.push(p);
+        }
+        rel.clear();
+        *origin = (0, 0);
+        *orient = "N".to_string();
+    };
+
+    let num = |t: &str| t.parse::<i64>().ok();
+
+    while i < end {
+        match toks[i] {
+            "-" => {
+                flush(&mut cur, &mut rel, &mut origin, &mut orient, &mut out);
+                i += 1;
+                if i < end {
+                    cur = Some(DefPin {
+                        name: unescape(toks[i]),
+                        ..Default::default()
+                    });
+                    i += 1;
+                }
+            }
+            "NET" if cur.is_some() && i + 1 < end => {
+                cur.as_mut().unwrap().net = unescape(toks[i + 1]);
+                i += 2;
+            }
+            "USE" if cur.is_some() && i + 1 < end => {
+                match toks[i + 1] {
+                    "POWER" => cur.as_mut().unwrap().use_power = true,
+                    "GROUND" => cur.as_mut().unwrap().use_ground = true,
+                    _ => {}
+                }
+                i += 2;
+            }
+            // + LAYER <l> ( x1 y1 ) ( x2 y2 )
+            //   tokens:   i+1  i+2 i+3 i+4 i+5 i+6 i+7 i+8 i+9
+            //             <l>   (   x1  y1   )   (   x2  y2   )
+            "LAYER" if cur.is_some() && i + 9 < end => {
+                let layer = toks[i + 1].to_string();
+                let c = [
+                    num(toks[i + 3]),
+                    num(toks[i + 4]),
+                    num(toks[i + 7]),
+                    num(toks[i + 8]),
+                ];
+                if toks[i + 2] == "(" && toks[i + 6] == "(" {
+                    if let [Some(x1), Some(y1), Some(x2), Some(y2)] = c {
+                        rel.push((layer, x1, y1, x2, y2));
+                    }
+                }
+                i += 10;
+            }
+            // + PLACED|FIXED|COVER ( x y ) <orient>
+            "PLACED" | "FIXED" | "COVER" if cur.is_some() && i + 5 < end => {
+                if toks[i + 1] == "(" {
+                    if let (Some(x), Some(y)) = (num(toks[i + 2]), num(toks[i + 3])) {
+                        origin = (x, y);
+                    }
+                    orient = toks[i + 5].to_string();
+                }
+                i += 6;
+            }
+            _ => i += 1,
+        }
+    }
+    flush(&mut cur, &mut rel, &mut origin, &mut orient, &mut out);
+    out
+}
+
 /// Read the `VIAS` section: name -> cut layer + cut count.
 ///
 /// Each entry runs `- <name> + VIARULE … + LAYERS <below> <cut> <above> + ROWCOL <r> <c> … ;`.
@@ -873,6 +1022,73 @@ END NETS
             "traced_net",
             "an empty raw_name must fall back, never write an empty name"
         );
+    }
+
+    #[test]
+    fn a_power_pin_yields_its_port_shapes_placed_and_oriented() {
+        // The VPWR pin of a real sky130 block, verbatim: ONE pin, ONE port, NINE rectangles
+        // across two layers, and a single FIXED placement they all share. This is where the
+        // supply actually enters the die, and a PDN analysis that instead treats the whole top
+        // metal as an ideal source removes resistance the real supply has to cross.
+        let d = Def::parse(
+            r#"
+UNITS DISTANCE MICRONS 1000 ;
+PINS 1 ;
+    - VPWR + NET VPWR + SPECIAL + DIRECTION INOUT + USE POWER
+      + PORT
+        + LAYER met5 ( -344550 -800 ) ( 344550 800 )
+        + LAYER met4 ( 285610 -616890 ) ( 287210 60870 )
+      + FIXED ( 349830 627530 ) N ;
+END PINS
+END DESIGN
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(d.pins.len(), 1);
+        let p = &d.pins[0];
+        assert_eq!(p.name, "VPWR");
+        assert_eq!(p.net, "VPWR");
+        assert!(p.use_power && !p.use_ground);
+        assert_eq!(p.shapes.len(), 2, "every LAYER rect of the port is a shape");
+
+        // Rectangles are written RELATIVE to the placement; the reader returns them absolute,
+        // so a consumer never repeats the transform (or forgets to).
+        assert_eq!(
+            p.shapes[0],
+            ("met5".to_string(), 5280, 626730, 694380, 628330),
+            "met5 strap translated by the FIXED origin"
+        );
+        assert_eq!(
+            p.shapes[1],
+            ("met4".to_string(), 635440, 10640, 637040, 688400)
+        );
+    }
+
+    #[test]
+    fn a_rotated_pin_keeps_a_rectangle_that_contains_something() {
+        // S maps a lower-left corner to an upper-right one. Carrying the corners through a
+        // rotation unchanged yields x1 > x2 — a box that contains no point, so every source
+        // node inside it silently disappears and the supply is left connected by nothing.
+        let d = Def::parse(
+            r#"
+UNITS DISTANCE MICRONS 1000 ;
+PINS 1 ;
+    - VPWR + NET VPWR + USE POWER
+      + PORT
+        + LAYER met5 ( 100 200 ) ( 500 600 )
+      + FIXED ( 1000 1000 ) S ;
+END PINS
+END DESIGN
+"#,
+        )
+        .unwrap();
+
+        let (layer, x1, y1, x2, y2) = d.pins[0].shapes[0].clone();
+        assert_eq!(layer, "met5");
+        assert!(x1 < x2 && y1 < y2, "the rectangle is normalised, not inverted");
+        // R180 about the origin then translate: (-500,-600)..(-100,-200) + (1000,1000)
+        assert_eq!((x1, y1, x2, y2), (500, 400, 900, 800));
     }
 
     #[test]
