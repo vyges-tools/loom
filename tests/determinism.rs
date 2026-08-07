@@ -185,14 +185,20 @@ fn every_reader_gives_the_same_answer_in_a_fresh_process() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(400);
-    let capped = files.len().min(cap);
+    // Sample with an even STRIDE rather than truncating. The list is sorted, so `take(cap)` over a
+    // corpus of 28k SPICE netlists would compare whatever sorts first and call it coverage — the
+    // silent-cap failure this file's own announcement exists to avoid. A stride is unbiased and
+    // still deterministic, so two runs of the test choose the same files.
+    let stride = files.len().div_ceil(cap.max(1));
+    let files: Vec<PathBuf> = files.iter().step_by(stride.max(1)).cloned().collect();
+    let capped = files.len();
     println!(
         "determinism: {} file(s){}",
         capped,
-        if files.len() > cap {
+        if stride > 1 {
             format!(
-                " (capped from {}; raise with LOOM_DETERMINISM_CAP)",
-                files.len()
+                " (every {stride}th of {}; raise with LOOM_DETERMINISM_CAP)",
+                files.len() * stride
             )
         } else {
             String::new()
@@ -201,7 +207,7 @@ fn every_reader_gives_the_same_answer_in_a_fresh_process() {
 
     let mut differed = Vec::new();
     let mut compared = 0usize;
-    for (i, f) in files.iter().take(capped).enumerate() {
+    for (i, f) in files.iter().enumerate() {
         let (Some(a), Some(b)) = (dump_in_fresh_process(f, i * 2), dump_in_fresh_process(f, i * 2 + 1))
         else {
             continue;
@@ -229,7 +235,7 @@ fn every_reader_gives_the_same_answer_in_a_fresh_process() {
     // readers were exercised — a corpus of only Liberty would look like broad coverage. The
     // methodology's confidence table cites these counts, so they have to mean something.
     let mut by_reader: std::collections::BTreeMap<&str, usize> = Default::default();
-    for f in files.iter().take(capped) {
+    for f in files.iter() {
         let s = f.to_string_lossy();
         let reader = if s.ends_with(".lef") || s.ends_with(".tlef") {
             "LEF"
