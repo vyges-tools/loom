@@ -48,12 +48,20 @@ pub struct MacroPin {
     pub direction: PinDir,
 }
 
-/// A std-cell abstract from the cell LEF `MACRO` section — the pin list + each
-/// pin's direction (PORT geometry is skipped; RC comes from the tech LEF/liberty).
+/// A std-cell abstract from the cell LEF `MACRO` section — the pin list, each pin's
+/// direction, and the cell's footprint (per-pin PORT geometry is still skipped; RC
+/// comes from the tech LEF/liberty).
 #[derive(Debug, Clone, Default)]
 pub struct Macro {
     pub name: String,
     pub pins: BTreeMap<String, MacroPin>,
+    /// `SIZE <w> BY <h> ;` in microns — the placed footprint.
+    ///
+    /// Load-bearing for power integrity: DEF places an instance by its **origin**, but a
+    /// cell draws its supply through a pin that spans the cell, so current enters the rail
+    /// around the cell's centre. Using the origin instead displaces every load by half a
+    /// cell width, which is invisible on small cells and is not on wide ones.
+    pub size_um: (f64, f64),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -307,7 +315,15 @@ impl Lef {
                             macros.insert(done.name.clone(), done);
                         }
                     }
-                    _ => {} // SIZE/ORIGIN/FOREIGN/PORT/LAYER/RECT... ignored
+                    // SIZE <w> BY <h> ;
+                    ["SIZE", w, "BY", h, ..] => {
+                        if let (Ok(w), Ok(h)) =
+                            (w.parse::<f64>(), h.trim_end_matches(';').parse::<f64>())
+                        {
+                            m.size_um = (w, h);
+                        }
+                    }
+                    _ => {} // ORIGIN/FOREIGN/PORT/LAYER/RECT... ignored
                 }
                 continue;
             }
@@ -315,6 +331,7 @@ impl Lef {
                 cur_macro = Some(Macro {
                     name: name.to_string(),
                     pins: BTreeMap::new(),
+                    size_um: (0.0, 0.0),
                 });
                 cur_pin = None;
                 continue;
@@ -440,6 +457,53 @@ impl Lef {
 
 #[cfg(test)]
 mod tests {
+
+    /// A cell's footprint is read, because power integrity needs where a cell *sits*, not
+    /// where DEF happens to anchor it.
+    ///
+    /// DEF places an instance by its origin — the lower-left corner. The cell draws supply
+    /// through a rail-spanning pin, so current enters around the middle. On `dfstp_2`, a
+    /// 9.66 um cell, that is a 4.83 um displacement; measured against PDNSim it moved the
+    /// along-rail IR drop by ~10% on a block of wide cells.
+    #[test]
+    fn a_macro_keeps_its_size() {
+        let l = Lef::parse(
+            "\
+MACRO sky130_fd_sc_hd__dfstp_2
+  CLASS CORE ;
+  ORIGIN 0.000000 0.000000 ;
+  SIZE 9.660000 BY 2.720000 ;
+  SITE unithd ;
+  PIN VPWR
+    DIRECTION INOUT ;
+    USE POWER ;
+  END VPWR
+END sky130_fd_sc_hd__dfstp_2
+",
+        )
+        .unwrap();
+        let m = &l.macros["sky130_fd_sc_hd__dfstp_2"];
+        assert_eq!(m.size_um, (9.66, 2.72));
+        assert!(m.pins.contains_key("VPWR"), "pins still read alongside SIZE");
+    }
+
+    /// A macro with no SIZE reads as zero rather than failing — a consumer must be able to
+    /// tell "not stated" from a real footprint and fall back, not silently place a cell at
+    /// the origin of nothing.
+    #[test]
+    fn a_macro_without_size_reads_as_zero() {
+        let l = Lef::parse(
+            "\
+MACRO nosize
+  PIN A
+    DIRECTION INPUT ;
+  END A
+END nosize
+",
+        )
+        .unwrap();
+        assert_eq!(l.macros["nosize"].size_um, (0.0, 0.0));
+    }
     use super::*;
 
     #[test]

@@ -196,8 +196,12 @@ pub struct ViaDef {
 pub struct Comp {
     pub name: String,
     pub cell: String,
+    /// The placement ORIGIN in DBU — the anchor DEF states, not the cell's centre.
     pub x: i64,
     pub y: i64,
+    /// Placement orientation (`N`, `FS`, `E`, …). A 90-degree rotation swaps the cell's
+    /// width and height, so anything deriving geometry from a LEF `SIZE` needs it.
+    pub orient: String,
 }
 
 // ─────────────────────────── the unified design ────────────────────────────────
@@ -602,12 +606,21 @@ fn parse_components(toks: &[&str]) -> Vec<Comp> {
             let cell = unescape(body.get(i + 2).copied().unwrap_or(""));
             let mut j = i + 3;
             let mut xy = None;
+            let mut orient = String::from("N");
             while j < body.len() && body[j] != ";" {
-                if (body[j] == "PLACED" || body[j] == "FIXED") && body.get(j + 1) == Some(&"(") {
+                if (body[j] == "PLACED" || body[j] == "FIXED" || body[j] == "COVER")
+                    && body.get(j + 1) == Some(&"(")
+                {
                     let x = body.get(j + 2).and_then(|t| t.parse().ok());
                     let y = body.get(j + 3).and_then(|t| t.parse().ok());
                     if let (Some(x), Some(y)) = (x, y) {
                         xy = Some((x, y));
+                    }
+                    // `( x y ) <orient>` — the token after the closing paren
+                    if let Some(o) = body.get(j + 5) {
+                        if o.chars().all(|c| c.is_ascii_alphanumeric()) {
+                            orient = o.to_string();
+                        }
                     }
                     break;
                 }
@@ -615,7 +628,13 @@ fn parse_components(toks: &[&str]) -> Vec<Comp> {
             }
             if let Some((x, y)) = xy {
                 if !name.is_empty() && !cell.is_empty() {
-                    comps.push(Comp { name, cell, x, y });
+                    comps.push(Comp {
+                        name,
+                        cell,
+                        x,
+                        y,
+                        orient,
+                    });
                 }
             }
             i += 3;
