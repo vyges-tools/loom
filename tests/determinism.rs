@@ -91,9 +91,17 @@ fn corpus(exts: &[&str]) -> Vec<PathBuf> {
 fn dump(path: &Path) -> String {
     use vyges_loom::{def::Def, lef::Lef, liberty::Lib, sdc::Sdc, spef::Spef};
     let p = path.to_string_lossy();
+    // FST is binary, so it is read as bytes and handled before the text readers.
+    #[cfg(feature = "fst")]
+    if p.ends_with(".fst") {
+        return match std::fs::read(path) {
+            Ok(b) => format!("{:?}", vyges_loom::fst::Fst::parse(&b, None)),
+            Err(e) => format!("unreadable: {e}"),
+        };
+    }
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        // Binary (FST) or unreadable: nothing to compare, and saying so is itself stable.
+        // Binary or unreadable: nothing to compare, and saying so is itself stable.
         Err(e) => return format!("unreadable: {e}"),
     };
     if p.ends_with(".lef") || p.ends_with(".tlef") {
@@ -110,6 +118,10 @@ fn dump(path: &Path) -> String {
         format!("{:?}", vyges_loom::netlist::parse(&text))
     } else if p.ends_with(".vcd") {
         format!("{:?}", vyges_loom::vcd::Vcd::parse(&text))
+    } else if p.ends_with(".saif") {
+        format!("{:?}", vyges_loom::saif::Saif::parse(&text))
+    } else if p.ends_with(".sp") || p.ends_with(".cir") || p.ends_with(".spice") {
+        format!("{:?}", vyges_loom::spice::Netlist::parse(&text, None))
     } else {
         String::new()
     }
@@ -156,9 +168,16 @@ fn dump_in_fresh_process(file: &Path, tag: usize) -> Option<String> {
 /// The test. One file at a time, two fresh processes, byte-compare.
 #[test]
 fn every_reader_gives_the_same_answer_in_a_fresh_process() {
-    let files = corpus(&[
-        ".lef", ".tlef", ".def", ".spef", ".lib", ".sdc", ".v", ".sv", ".vcd",
-    ]);
+    // Every reader loom has. `.json` is Yosys `write_json`; `.fst` only when the feature is on,
+    // since without it there is no reader to be non-deterministic.
+    let mut exts = vec![
+        ".lef", ".tlef", ".def", ".spef", ".lib", ".sdc", ".v", ".sv", ".json", ".vcd", ".saif",
+        ".sp", ".cir", ".spice",
+    ];
+    if cfg!(feature = "fst") {
+        exts.push(".fst");
+    }
+    let files = corpus(&exts);
     // Bound the run: the corpora are gigabytes and this pays two process spawns per file. The cap
     // is ANNOUNCED rather than silent — an unreported cap reads as full coverage — and it is
     // RAISABLE, because a limit you cannot lift is one nobody ever tests past.
@@ -206,7 +225,46 @@ fn every_reader_gives_the_same_answer_in_a_fresh_process() {
             ));
         }
     }
+    // Report coverage PER READER, not just a total. "89 files identical" says nothing about which
+    // readers were exercised — a corpus of only Liberty would look like broad coverage. The
+    // methodology's confidence table cites these counts, so they have to mean something.
+    let mut by_reader: std::collections::BTreeMap<&str, usize> = Default::default();
+    for f in files.iter().take(capped) {
+        let s = f.to_string_lossy();
+        let reader = if s.ends_with(".lef") || s.ends_with(".tlef") {
+            "LEF"
+        } else if s.ends_with(".def") {
+            "DEF"
+        } else if s.ends_with(".spef") {
+            "SPEF"
+        } else if s.ends_with(".lib") {
+            "Liberty"
+        } else if s.ends_with(".sdc") {
+            "SDC"
+        } else if s.ends_with(".json") {
+            "yosys_json"
+        } else if s.ends_with(".v") || s.ends_with(".sv") {
+            "netlist"
+        } else if s.ends_with(".vcd") {
+            "VCD"
+        } else if s.ends_with(".saif") {
+            "SAIF"
+        } else if s.ends_with(".fst") {
+            "FST"
+        } else {
+            "SPICE"
+        };
+        *by_reader.entry(reader).or_default() += 1;
+    }
     println!("determinism: compared {compared} file(s) across two processes each");
+    println!(
+        "determinism: by reader — {}",
+        by_reader
+            .iter()
+            .map(|(k, v)| format!("{k} {v}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     assert!(
         differed.is_empty(),
         "{} file(s) parsed differently in a second process — the reader is not a function of its \
