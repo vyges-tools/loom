@@ -865,6 +865,7 @@ fn every_spice_netlist_yields_devices_with_named_terminals() {
 ///
 /// The block chain is `type u8` then `length u64` big-endian, the length counting itself;
 /// `FST_BL_SKIP` (255) or a zero length is the end of what was written.
+#[cfg(feature = "fst")] // its only caller is the FST pair check
 fn fst_is_aborted(path: &std::path::Path) -> bool {
     let Ok(d) = std::fs::read(path) else { return false };
     let mut o = 0usize;
