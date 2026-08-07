@@ -160,14 +160,21 @@ fn every_reader_gives_the_same_answer_in_a_fresh_process() {
         ".lef", ".tlef", ".def", ".spef", ".lib", ".sdc", ".v", ".sv", ".vcd",
     ]);
     // Bound the run: the corpora are gigabytes and this pays two process spawns per file. The cap
-    // is ANNOUNCED rather than silent — an unreported cap reads as full coverage.
-    const CAP: usize = 400;
-    let capped = files.len().min(CAP);
+    // is ANNOUNCED rather than silent — an unreported cap reads as full coverage — and it is
+    // RAISABLE, because a limit you cannot lift is one nobody ever tests past.
+    let cap: usize = std::env::var("LOOM_DETERMINISM_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(400);
+    let capped = files.len().min(cap);
     println!(
         "determinism: {} file(s){}",
         capped,
-        if files.len() > CAP {
-            format!(" (capped from {}; raise CAP or narrow VYGES_CORPUS)", files.len())
+        if files.len() > cap {
+            format!(
+                " (capped from {}; raise with LOOM_DETERMINISM_CAP)",
+                files.len()
+            )
         } else {
             String::new()
         }
