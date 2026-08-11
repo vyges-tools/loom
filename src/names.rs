@@ -183,6 +183,30 @@ pub fn instance_of(obj: &str) -> &str {
     split_inst_pin(obj).map(|(i, _)| i).unwrap_or(obj)
 }
 
+/// Split a name into its base and bit index: `data_reg[3]` → `("data_reg", Some(3))`.
+///
+/// A bus does not survive synthesis as a bus — it survives as one net or one flop per bit,
+/// named `base[i]`. That suffix is the only structural evidence left that those bits belong
+/// together, which is what any check reasoning about a *group* of signals (a multi-bit domain
+/// crossing, a bussed exception, a per-bit report rolled up) has to key on.
+///
+/// `(name, None)` when the name does not end in a single-bit select — including a **range**
+/// (`data[3:0]`), which names a whole bus rather than one bit of it, per the rule this module
+/// already follows for VCD `$var` declarations. Also `None` for a name that is *only* a
+/// bit-select (`[3]`), whose base would be empty and would group unrelated signals together.
+pub fn split_bit_select(name: &str) -> (&str, Option<i64>) {
+    let Some(open) = name.rfind('[') else {
+        return (name, None);
+    };
+    if !name.ends_with(']') || open == 0 {
+        return (name, None);
+    }
+    match name[open + 1..name.len() - 1].parse::<i64>() {
+        Ok(bit) => (&name[..open], Some(bit)),
+        Err(_) => (name, None), // a range, or not an index at all
+    }
+}
+
 /// Strip SPEF name escaping: `u_a\.q\[0\]` -> `u_a.q[0]`.
 ///
 /// Names are matched against the design's own net names, and a backslash that survives the read
@@ -259,6 +283,27 @@ mod tests {
         // Yosys-style hierarchy (`.` inside the instance name) has one `/`, and both readings
         // of it agree — the rule is convention-independent.
         assert_eq!(split_inst_pin("core.u_div/Q"), Some(("core.u_div", "Q")));
+    }
+
+    #[test]
+    fn a_bit_select_separates_from_its_base_but_a_range_does_not() {
+        assert_eq!(split_bit_select("data_reg[3]"), ("data_reg", Some(3)));
+        assert_eq!(
+            split_bit_select("core/data_reg[12]"),
+            ("core/data_reg", Some(12))
+        );
+        // A RANGE names the whole bus, not one bit of it — the same distinction this module
+        // already draws for a VCD `$var`.
+        assert_eq!(split_bit_select("data[3:0]"), ("data[3:0]", None));
+        // Nothing to split.
+        assert_eq!(split_bit_select("clk"), ("clk", None));
+        assert_eq!(split_bit_select("data[]"), ("data[]", None));
+        assert_eq!(split_bit_select("data[x]"), ("data[x]", None));
+        // A name that is ONLY a bit-select has no base; grouping on an empty one would put
+        // every such signal in the same bus.
+        assert_eq!(split_bit_select("[3]"), ("[3]", None));
+        // The last dimension wins, which is the one a per-bit flop carries.
+        assert_eq!(split_bit_select("mem[0][1]"), ("mem[0]", Some(1)));
     }
 
     #[test]
