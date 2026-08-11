@@ -108,6 +108,216 @@ impl WindowActivity<'_> {
     }
 }
 
+/// A step-held real-valued series to lay alongside a dump: `(time_s, value)` points, each
+/// holding until the next one.
+#[derive(Debug, Clone, Default)]
+pub struct RealSeries {
+    pub name: String,
+    pub points: Vec<(f64, f64)>,
+}
+
+/// What [`annotate_reals`] wrote.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AnnotateStats {
+    pub declared: usize, // signals added
+    pub records: usize,  // value-change records written
+    pub injected: usize, // timestamps invented for points between existing ones
+    pub tick_s: f64,     // the source dump's timescale
+}
+
+/// Write a **copy** of `src` to `dst` carrying `series` as extra real-valued signals under
+/// their own `$scope`, so an analysis result can be read in a waveform viewer against the
+/// stimulus that produced it.
+///
+/// The source is never modified, and nothing about the original dump changes: declarations are
+/// added before `$enddefinitions`, initial values inside the existing `$dumpvars` block, and
+/// each later point at its own timestamp. Identifier codes are chosen from those the file does
+/// not already use — reusing one would silently rewrite a design signal, which is the one
+/// failure a viewer would render as if it were data.
+///
+/// A point that falls between two of the dump's timestamps gets its own `#t` line rather than
+/// being rounded onto the next one: a power curve whose steps drift off their window
+/// boundaries is a different curve.
+pub fn annotate_reals(
+    src: &str,
+    dst: &str,
+    scope: &str,
+    series: &[RealSeries],
+) -> Result<AnnotateStats, VcdError> {
+    use std::io::{BufRead, BufWriter, Write};
+
+    if series.is_empty() {
+        return Err(VcdError("no series to annotate".into()));
+    }
+    let f = std::fs::File::open(src).map_err(|e| VcdError(format!("{src}: {e}")))?;
+    let mut lines = std::io::BufReader::new(f).lines();
+    let out = std::fs::File::create(dst).map_err(|e| VcdError(format!("{dst}: {e}")))?;
+    let mut w = BufWriter::new(out);
+
+    // --- header. Buffered rather than streamed: the identifier codes already in use are not
+    // all known until the last `$var`, and the new declarations have to be written before
+    // `$enddefinitions`. A header is small; a body may not be, and is streamed below.
+    let mut header: Vec<String> = Vec::new();
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut ts_tokens: Vec<String> = Vec::new();
+    let mut in_timescale = false;
+    let mut end_line: Option<String> = None;
+    for line in lines.by_ref() {
+        let line = line.map_err(|e| VcdError(format!("{src}: {e}")))?;
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        if toks.first() == Some(&"$var") {
+            if let Some(sym) = toks.get(3) {
+                used.insert((*sym).to_string());
+            }
+        }
+        // `$timescale` may carry its value on its own line or the next.
+        for t in &toks {
+            if in_timescale {
+                if *t == "$end" {
+                    in_timescale = false;
+                } else {
+                    ts_tokens.push((*t).to_string());
+                }
+            } else if *t == "$timescale" {
+                in_timescale = true;
+            }
+        }
+        if toks.contains(&"$enddefinitions") {
+            end_line = Some(line);
+            break;
+        }
+        header.push(line);
+    }
+    let Some(end_line) = end_line else {
+        return Err(VcdError(format!("{src}: no $enddefinitions")));
+    };
+    let tick_s = parse_timescale(&ts_tokens.join(""));
+    let syms = free_symbols(&used, series.len());
+    if syms.len() < series.len() {
+        return Err(VcdError("no free identifier codes left in the dump".into()));
+    }
+    for h in &header {
+        writeln!(w, "{h}").map_err(wr)?;
+    }
+    writeln!(w, "$scope module {scope} $end").map_err(wr)?;
+    for (s, sym) in series.iter().zip(&syms) {
+        writeln!(w, "$var real 64 {sym} {} $end", s.name).map_err(wr)?;
+    }
+    writeln!(w, "$upscope $end").map_err(wr)?;
+    writeln!(w, "{end_line}").map_err(wr)?;
+
+    // --- body. Each series is walked in time order alongside the dump's own timestamps.
+    let mut pending: Vec<std::iter::Peekable<std::slice::Iter<'_, (f64, f64)>>> =
+        series.iter().map(|s| s.points.iter().peekable()).collect();
+    let mut stats = AnnotateStats {
+        declared: series.len(),
+        tick_s,
+        ..Default::default()
+    };
+    // Emit every point due at or before `now` (in ticks). Points landing strictly before the
+    // dump's next timestamp get one of their own so a step keeps its boundary.
+    let flush = |w: &mut BufWriter<std::fs::File>,
+                 pending: &mut Vec<std::iter::Peekable<std::slice::Iter<'_, (f64, f64)>>>,
+                 stats: &mut AnnotateStats,
+                 now_ticks: f64,
+                 at_now: bool|
+     -> Result<(), VcdError> {
+        loop {
+            // The earliest tick any series still owes at or before `now`.
+            let mut next: Option<f64> = None;
+            for p in pending.iter_mut() {
+                if let Some((t, _)) = p.peek() {
+                    let tk = (t / tick_s).round();
+                    if tk <= now_ticks && next.map(|n| tk < n).unwrap_or(true) {
+                        next = Some(tk);
+                    }
+                }
+            }
+            let Some(tk) = next else { return Ok(()) };
+            if tk < now_ticks || !at_now {
+                writeln!(w, "#{}", fmt_tick(tk)).map_err(wr)?;
+                stats.injected += 1;
+            }
+            for (i, p) in pending.iter_mut().enumerate() {
+                while let Some((t, v)) = p.peek() {
+                    if (t / tick_s).round() != tk {
+                        break;
+                    }
+                    writeln!(w, "r{:.6e} {}", v, syms[i]).map_err(wr)?;
+                    stats.records += 1;
+                    p.next();
+                }
+            }
+            if tk >= now_ticks {
+                return Ok(());
+            }
+        }
+    };
+
+    // Initial values belong inside the dump's own `$dumpvars` block — that is what it is for,
+    // and a viewer then shows the series from t=0 rather than from the first later timestamp.
+    let mut in_dumpvars = false;
+    for line in lines {
+        let line = line.map_err(|e| VcdError(format!("{src}: {e}")))?;
+        let first = line.split_whitespace().next().unwrap_or("");
+        if first == "$dumpvars" {
+            in_dumpvars = true;
+            writeln!(w, "{line}").map_err(wr)?;
+            continue;
+        }
+        if in_dumpvars && first == "$end" {
+            flush(&mut w, &mut pending, &mut stats, 0.0, true)?;
+            in_dumpvars = false;
+            writeln!(w, "{line}").map_err(wr)?;
+            continue;
+        }
+        if let Some(rest) = first.strip_prefix('#') {
+            if let Ok(t) = rest.parse::<f64>() {
+                if t.is_finite() {
+                    // Anything due strictly before this timestamp (each at its own), then the
+                    // timestamp, then anything due exactly at it. Doing the "before" pass
+                    // first is what keeps the file's times monotonically increasing.
+                    flush(&mut w, &mut pending, &mut stats, t - 1.0, false)?;
+                    writeln!(w, "{line}").map_err(wr)?;
+                    flush(&mut w, &mut pending, &mut stats, t, true)?;
+                    continue;
+                }
+            }
+        }
+        writeln!(w, "{line}").map_err(wr)?;
+    }
+    w.flush().map_err(wr)?;
+    Ok(stats)
+}
+
+/// A VCD timestamp is a whole number of timescale units — render it as one.
+fn fmt_tick(t: f64) -> String {
+    format!("{}", t as i64)
+}
+
+fn wr(e: std::io::Error) -> VcdError {
+    VcdError(e.to_string())
+}
+
+/// Identifier codes the dump does not already use. VCD codes are printable ASCII 33..126;
+/// two-character codes are used so a file already spending the whole single-character range
+/// (a few thousand signals is enough) still has room.
+fn free_symbols(used: &std::collections::HashSet<String>, n: usize) -> Vec<String> {
+    let mut out = Vec::with_capacity(n);
+    for a in 33u8..=126 {
+        for b in 33u8..=126 {
+            if out.len() == n {
+                return out;
+            }
+            let cand = format!("{}{}", a as char, b as char);
+            if !used.contains(&cand) {
+                out.push(cand);
+            }
+        }
+    }
+    out
+}
+
 /// A uniform grid of measurement windows: window `i` spans
 /// `[from + i*step, from + i*step + window)`, clipped to `to` when one is given.
 ///
@@ -1175,6 +1385,145 @@ b0001 !
         let bare = Vcd::parse_sweep(VCD_HIER, 0.0, Some(25.0e-9), 25.0e-9, None).unwrap();
         assert_eq!(bare.window(0).toggle_rate("clk"), 0.0);
         assert_eq!(bare.colliding_leaves(), vec!["clk".to_string()]);
+    }
+
+    // A dump with a `$dumpvars` block and no `#0` — the shape most simulators write, and the
+    // one that decides where initial values go.
+    const VCD_DUMPVARS: &str = r#"$timescale 1ns $end
+$scope module top $end
+$var wire 1 ! clk $end
+$var wire 1 " a $end
+$upscope $end
+$enddefinitions $end
+$dumpvars
+0!
+0"
+$end
+#5
+1!
+#10
+0!
+#15
+1!
+#20
+0!
+"#;
+
+    fn annotate_to_string(tag: &str, src: &str, series: &[RealSeries]) -> String {
+        // Tagged per test: these run in parallel, and a shared path makes one test read the
+        // file another is writing — which reads as a bug in the writer rather than in the test.
+        let dir = std::env::temp_dir().join(format!("loom-annot-{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (i, o) = (dir.join("in.vcd"), dir.join("out.vcd"));
+        std::fs::write(&i, src).unwrap();
+        annotate_reals(
+            i.to_str().unwrap(),
+            o.to_str().unwrap(),
+            "power_sweep",
+            series,
+        )
+        .unwrap();
+        std::fs::read_to_string(&o).unwrap()
+    }
+
+    #[test]
+    fn annotated_copy_carries_the_series_and_still_reads_as_the_same_dump() {
+        // The point of writing one: the analysis result sits beside the stimulus that produced
+        // it. So the copy has to remain the original dump — every signal, every transition —
+        // with signals added, never altered.
+        let series = [RealSeries {
+            name: "power_total_w".into(),
+            points: vec![(0.0, 1.0e-6), (10.0e-9, 3.0e-6), (20.0e-9, 2.0e-6)],
+        }];
+        let out = annotate_to_string("roundtrip", VCD_DUMPVARS, &series);
+        let before = Vcd::parse(VCD_DUMPVARS).unwrap();
+        let after = Vcd::parse(&out).unwrap();
+        for net in ["top.clk", "top.a"] {
+            assert_eq!(
+                before.idx.toggles.get(net),
+                after.idx.toggles.get(net),
+                "{net} changed in the annotated copy"
+            );
+        }
+        assert!((before.sim_time_s - after.sim_time_s).abs() < 1e-18);
+        // The series is declared under its own scope and its changes are counted as a signal.
+        assert!(out.contains("$scope module power_sweep $end"));
+        assert!(out.contains("$var real 64"));
+        assert_eq!(
+            *after
+                .idx
+                .toggles
+                .get("power_sweep.power_total_w")
+                .expect("series declared"),
+            2,
+            "three points, two of them changes after the initial value"
+        );
+    }
+
+    #[test]
+    fn initial_values_go_inside_dumpvars_not_after_it() {
+        // A viewer reads `$dumpvars` as the state at t=0. Writing the first point after the
+        // block instead leaves the curve undefined until the dump's first timestamp — which on
+        // this file is 5 ns in, and on a real one can be most of the reset sequence.
+        let series = [RealSeries {
+            name: "p".into(),
+            points: vec![(0.0, 1.5e-6), (10.0e-9, 2.5e-6)],
+        }];
+        let out = annotate_to_string("dumpvars", VCD_DUMPVARS, &series);
+        let dump_start = out.find("$dumpvars").expect("dumpvars");
+        let dump_end = out[dump_start..].find("$end").expect("block end") + dump_start;
+        assert!(
+            out[dump_start..dump_end].contains("r1.500000e-6"),
+            "initial value belongs in the $dumpvars block, got:\n{}",
+            &out[dump_start..dump_end]
+        );
+    }
+
+    #[test]
+    fn a_point_between_timestamps_gets_its_own_and_time_never_goes_backwards() {
+        // A step that lands between two of the dump's timestamps must keep its boundary: a
+        // power curve rounded onto the next timestamp is a different curve. The invariant that
+        // makes that safe is monotonic time — a viewer rejects a dump that steps backwards.
+        let series = [RealSeries {
+            name: "p".into(),
+            points: vec![(0.0, 1.0), (7.0e-9, 2.0), (12.0e-9, 3.0)],
+        }];
+        let out = annotate_to_string("between", VCD_DUMPVARS, &series);
+        assert!(out.contains("#7"), "the 7 ns point needs its own timestamp");
+        let times: Vec<i64> = out
+            .lines()
+            .filter_map(|l| l.strip_prefix('#'))
+            .filter_map(|t| t.trim().parse().ok())
+            .collect();
+        assert!(
+            times.windows(2).all(|w| w[1] >= w[0]),
+            "timestamps must not go backwards: {times:?}"
+        );
+        assert!(times.contains(&12), "the 12 ns point too");
+    }
+
+    #[test]
+    fn identifier_codes_never_collide_with_the_dumps_own() {
+        // THE ONE FAILURE A VIEWER WOULD RENDER AS DATA. Reusing an existing code does not
+        // corrupt the file — it silently rewrites a design signal, so the waveform shows the
+        // analysis result drawn on top of a net that never had those values.
+        let series: Vec<RealSeries> = (0..3)
+            .map(|i| RealSeries {
+                name: format!("s{i}"),
+                points: vec![(0.0, i as f64)],
+            })
+            .collect();
+        let out = annotate_to_string("codes", VCD_DUMPVARS, &series);
+        let code_of = |line: &str| line.split_whitespace().nth(3).unwrap_or("").to_string();
+        let mut codes: Vec<String> = out
+            .lines()
+            .filter(|l| l.starts_with("$var"))
+            .map(code_of)
+            .collect();
+        let n = codes.len();
+        codes.sort();
+        codes.dedup();
+        assert_eq!(codes.len(), n, "two signals share an identifier code");
     }
 
     #[test]
