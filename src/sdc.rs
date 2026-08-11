@@ -836,9 +836,14 @@ impl Sdc {
                         }
                         i += 1;
                     }
-                    if groups.len() >= 2 {
-                        sdc.async_groups.extend(groups);
-                    }
+                    // Kept even when there is only ONE group. A single group cuts no timing
+                    // path — that needs two clocks in *different* groups — which is why this
+                    // was once dropped as uninteresting. But it still states something the SDC
+                    // has no other way to say: the clocks inside it are related to each other.
+                    // A CDC check reads exactly that, and dropping it made a design whose SDC
+                    // declared its clocks related report every one of those pairs as a
+                    // crossing. Store what the file said; leave the reading to each consumer.
+                    sdc.async_groups.extend(groups);
                 }
                 "set_false_path" => {
                     let (from, to) = from_to(&toks);
@@ -932,6 +937,19 @@ mod async_group_tests {
         assert_eq!(sdc.async_groups.len(), 2, "two groups");
         assert!(sdc.async_groups.iter().any(|g| g == &vec!["a".to_string()]));
         assert!(sdc.async_groups.iter().any(|g| g == &vec!["b".to_string()]));
+    }
+
+    #[test]
+    fn a_single_clock_group_is_kept_because_it_states_relatedness() {
+        // One group cuts no timing path — a cut needs two clocks in *different* groups — so
+        // this was once discarded as having no effect. It does have one: it says the clocks
+        // inside it are related to each other, which is the only way an SDC can say so, and a
+        // CDC check reads it to avoid reporting those pairs as crossings.
+        let s = "create_clock -name a -period 10 [get_ports ca]\n\
+                 create_clock -name b -period 10 [get_ports cb]\n\
+                 set_clock_groups -asynchronous -group {a b}\n";
+        let sdc = Sdc::parse(s).unwrap();
+        assert_eq!(sdc.async_groups, vec![vec!["a".to_string(), "b".to_string()]]);
     }
 }
 
