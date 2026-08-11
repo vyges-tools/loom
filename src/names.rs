@@ -151,6 +151,38 @@ pub fn leaf_of(path: &str) -> &str {
     path.rsplit('.').next().unwrap_or(path)
 }
 
+/// Split an `inst/pin` object reference into `(instance, pin)` — at the **last** `/`.
+///
+/// This is how an SDC names a pin (`create_generated_clock … [get_pins u_div/Q]`,
+/// `set_false_path -to core/r2/D`) and how a timing graph labels one. The split is at the last
+/// separator because **a flattened netlist keeps the hierarchy in the instance name**:
+/// synthesis writes `core/u_div` as a single escaped identifier, so `core/u_div/Q` is pin `Q`
+/// of instance `core/u_div`, not pin `u_div/Q` of instance `core`.
+///
+/// Correct under either hierarchy convention: with `/` as the divider (OpenSTA/OpenROAD) the
+/// last one is the pin boundary, and with `.` (Yosys `flatten`) there is only one `/` and both
+/// readings agree.
+///
+/// `None` when there is no separator — a primary port, which is its own object.
+///
+/// # Why this lives here
+///
+/// Splitting at the *first* separator is the same defect this module exists to name, in a
+/// different format: the instance resolves to a name no node carries, so the clock never
+/// attaches, the clock group never applies, the false path never matches — and **nothing
+/// errors**. The report reads exactly like one from an SDC that never mentioned the object.
+/// Measured instance: it was wrong at four sites in the timer while the constraint linter beside
+/// it was right, so the two halves of one tool disagreed about what `core/u_div/Q` meant.
+pub fn split_inst_pin(obj: &str) -> Option<(&str, &str)> {
+    obj.rsplit_once('/')
+}
+
+/// The instance part of an `inst/pin` object reference; the whole string when it names no pin
+/// (a primary port is its own instance). See [`split_inst_pin`].
+pub fn instance_of(obj: &str) -> &str {
+    split_inst_pin(obj).map(|(i, _)| i).unwrap_or(obj)
+}
+
 /// Strip SPEF name escaping: `u_a\.q\[0\]` -> `u_a.q[0]`.
 ///
 /// Names are matched against the design's own net names, and a backslash that survives the read
@@ -211,6 +243,22 @@ mod tests {
         let mut i = idx();
         i.scope = Some("counter_tb.dut".to_string());
         assert_eq!(i.resolve("clk_in"), Some(40));
+    }
+
+    #[test]
+    fn an_inst_pin_reference_splits_at_the_pin_not_the_hierarchy() {
+        // THE ONE THAT KEEPS BEING GOT WRONG. Everything after the LAST separator is the pin;
+        // everything before it is the instance, hierarchy included.
+        assert_eq!(split_inst_pin("u_div/Q"), Some(("u_div", "Q")));
+        assert_eq!(split_inst_pin("core/u_div/Q"), Some(("core/u_div", "Q")));
+        assert_eq!(instance_of("core/u_div/Q"), "core/u_div");
+        // A port names no pin, and is its own instance — not an empty string, which would
+        // match every exception whose endpoint set is empty.
+        assert_eq!(split_inst_pin("clk"), None);
+        assert_eq!(instance_of("clk"), "clk");
+        // Yosys-style hierarchy (`.` inside the instance name) has one `/`, and both readings
+        // of it agree — the rule is convention-independent.
+        assert_eq!(split_inst_pin("core.u_div/Q"), Some(("core.u_div", "Q")));
     }
 
     #[test]
