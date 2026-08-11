@@ -26,6 +26,203 @@ impl std::fmt::Display for VcdError {
 }
 impl std::error::Error for VcdError {}
 
+/// Most windows a single sweep may measure. A backstop against a job that asks for a
+/// window far smaller than the dump it is measuring — the failure is memory, and it is
+/// better named than hit.
+pub const MAX_SWEEP_WINDOWS: usize = 100_000;
+
+/// The shortest span that counts as a duration: 1 fs, the finest unit a VCD `$timescale`
+/// can name. Anything thinner is floating-point residue, not simulated time.
+const MIN_WINDOW_S: f64 = 1.0e-15;
+
+/// One measured window of a [`VcdSweep`].
+///
+/// Holds only what differs per window — the bounds, the value-change events seen, and the
+/// per-path counts. The name→path index is shared, in [`VcdSweep::decls`].
+#[derive(Debug, Clone, Default)]
+pub struct SweepWindow {
+    pub from_s: f64,     // window start (seconds, absolute dump time)
+    pub to_s: f64,       // window end, clamped to the dump's end
+    pub sim_time_s: f64, // measured duration = to_s - from_s, clamped to the dump
+    pub events: u64,     // value-change records inside the window (an activity indicator)
+    pub toggles: std::collections::HashMap<String, u64>, // full path -> transitions
+}
+
+/// A **single-pass** sweep: many measurement windows over one parse of one dump.
+///
+/// Everything except the per-window counts is invariant across windows, so the alternative
+/// — re-reading the dump once per window — pays for the same parse N times. This walks the
+/// value changes once and routes each transition into the window(s) covering its timestamp.
+///
+/// [`decls`](VcdSweep::decls) carries the declarations (and the job `scope:`); each window
+/// carries only its counts. Use [`window`](VcdSweep::window) to get a toggle-rate view.
+#[derive(Debug, Clone, Default)]
+pub struct VcdSweep {
+    pub decls: NetIndex, // declarations + scope; `toggles` is empty (counts live per window)
+    pub windows: Vec<SweepWindow>,
+    pub dump_end_s: f64, // last timestamp in the dump
+}
+
+impl VcdSweep {
+    /// Set the design scope (job `scope:`) used to disambiguate leaf names.
+    pub fn with_scope(mut self, scope: Option<String>) -> Self {
+        self.decls.scope = scope;
+        self
+    }
+
+    /// Leaf names declared under more than one scope (ambiguous without a `scope:`).
+    pub fn colliding_leaves(&self) -> Vec<String> {
+        self.decls.colliding_leaves()
+    }
+
+    /// A borrowed toggle-rate view of window `i` — the per-window equivalent of a [`Vcd`].
+    pub fn window(&self, i: usize) -> WindowActivity<'_> {
+        WindowActivity {
+            decls: &self.decls,
+            win: &self.windows[i],
+        }
+    }
+}
+
+/// Toggle rates for one window of a [`VcdSweep`], borrowing the shared declaration index.
+///
+/// Deliberately a borrow, not an owned [`Vcd`]: an owned one would clone every declared path
+/// per window, which is the same duplication the single-pass parse exists to avoid.
+#[derive(Debug, Clone, Copy)]
+pub struct WindowActivity<'a> {
+    pub decls: &'a NetIndex,
+    pub win: &'a SweepWindow,
+}
+
+impl WindowActivity<'_> {
+    /// Transitions / second for a netlist net over this window (0 if unresolved,
+    /// ambiguous, or the window has no duration). Same resolution rule as [`Vcd::toggle_rate`].
+    pub fn toggle_rate(&self, net: &str) -> f64 {
+        if self.win.sim_time_s <= 0.0 {
+            return 0.0;
+        }
+        match self.decls.resolve_path(net) {
+            Some(p) => self.win.toggles.get(p).copied().unwrap_or(0) as f64 / self.win.sim_time_s,
+            None => 0.0,
+        }
+    }
+}
+
+/// A uniform grid of measurement windows: window `i` spans
+/// `[from + i*step, from + i*step + window)`, clipped to `to` when one is given.
+///
+/// A single window (the `activity_window:` case) is the one-element grid, so both paths
+/// share one counting loop and cannot drift apart.
+#[derive(Debug, Clone, Copy)]
+struct Grid {
+    from_s: f64,
+    window_s: f64,     // may be infinite (run to end of dump)
+    step_s: f64,       // may be infinite (a single window)
+    to_s: Option<f64>, // hard end; None grows the grid to the end of the dump
+}
+
+impl Grid {
+    /// The `activity_window:` case as a one-element grid.
+    fn single(window: Option<(f64, Option<f64>)>) -> Grid {
+        let (from_s, to) = match window {
+            Some((f, t)) => (f, t),
+            None => (0.0, None),
+        };
+        let window_s = to.map(|t| t - from_s).unwrap_or(f64::INFINITY);
+        Grid {
+            from_s,
+            window_s,
+            step_s: f64::INFINITY,
+            to_s: to,
+        }
+    }
+
+    /// Window count when the grid is bounded; `None` when it grows with the dump.
+    fn bounded_len(&self) -> Option<usize> {
+        let to = self.to_s?;
+        if !self.step_s.is_finite() {
+            return Some(1);
+        }
+        let span = to - self.from_s;
+        if span <= 0.0 {
+            return Some(0);
+        }
+        Some(Self::snap(span / self.step_s).ceil().max(1.0) as usize)
+    }
+
+    /// Inclusive index range of the windows covering `t`, or `None` when no window does
+    /// (before the sweep, after it, or in a gap when `step > window`).
+    fn active(&self, t: f64) -> Option<(usize, usize)> {
+        let rel = t - self.from_s;
+        if rel < 0.0 {
+            return None;
+        }
+        if let Some(to) = self.to_s {
+            if t >= to {
+                return None;
+            }
+        }
+        // An infinite step is a one-window grid: window 0 covers everything the bounds allow.
+        let (lo, hi) = if !self.step_s.is_finite() {
+            (0usize, 0usize)
+        } else {
+            let hi_f = Self::snap(rel / self.step_s).floor();
+            let hi = if hi_f > 0.0 { hi_f as usize } else { 0 };
+            // Smallest window still open at `t`: i*step + window > rel.
+            let lo_f = Self::snap((rel - self.window_s) / self.step_s).floor() + 1.0;
+            let lo = if lo_f.is_finite() && lo_f > 0.0 {
+                lo_f as usize
+            } else {
+                0
+            };
+            (lo, hi)
+        };
+        if lo > hi {
+            return None; // in a gap between windows
+        }
+        if let Some(n) = self.bounded_len() {
+            if lo >= n {
+                return None;
+            }
+            return Some((lo, hi.min(n - 1)));
+        }
+        Some((lo, hi))
+    }
+
+    /// Snap a window index that is a hair off a whole number back onto it.
+    ///
+    /// Window boundaries are derived by dividing durations that were themselves parsed from
+    /// decimal text, so `1020ns - 1000ns` is not exactly `20ns` and `20ns / 5ns` is not
+    /// exactly `4`. Left alone, that produces a spurious fifth window, or drops a transition
+    /// sitting exactly on a boundary into the window before it — and the same dump measured
+    /// from a different time origin then reports different activity, which is the one thing a
+    /// toggle *rate* must never do.
+    fn snap(x: f64) -> f64 {
+        let r = x.round();
+        if (x - r).abs() <= 1e-9 * r.abs().max(1.0) {
+            r
+        } else {
+            x
+        }
+    }
+
+    /// Bounds of window `i`, clipped to the grid's own end (not yet to the dump's).
+    fn bounds(&self, i: usize) -> (f64, f64) {
+        // `0 * INFINITY` is NaN, and an infinite step is how a single open-ended window is
+        // spelled — so window 0 always starts at `from`, arithmetic-free.
+        let start = if i == 0 {
+            self.from_s
+        } else {
+            self.from_s + i as f64 * self.step_s
+        };
+        let end = start + self.window_s;
+        match self.to_s {
+            Some(to) => (start.min(to), end.min(to)),
+            None => (start, end),
+        }
+    }
+}
+
 impl Vcd {
     /// Transitions / second for a netlist net (0 if unresolved, ambiguous, or
     /// zero-duration sim). Resolution is scope-aware — see [`crate::names::NetIndex`].
@@ -79,249 +276,381 @@ impl Vcd {
     /// in-window change is measured against the correct pre-window value. Windowing
     /// excludes reset/boot from the measurement (VCD only — SAIF is already cumulative).
     pub fn parse_windowed(text: &str, window: Option<(f64, Option<f64>)>) -> Result<Vcd, VcdError> {
-        let from_s = window.map(|(f, _)| f).unwrap_or(0.0);
-        let to_opt = window.and_then(|(_, t)| t);
-        // Does the *current* sim time fall in the counting window? Re-evaluated at each `#t`.
-        let in_window = |t: f64| {
-            t >= from_s
-                && match to_opt {
-                    Some(to) => t < to,
-                    None => true,
+        let mut sweep = parse_grid(text, Grid::single(window))?;
+        let w = sweep.windows.pop().unwrap_or_default();
+        let mut idx = sweep.decls;
+        idx.toggles = w.toggles;
+        Ok(Vcd {
+            idx,
+            sim_time_s: w.sim_time_s,
+        })
+    }
+
+    /// Parse a dump **once** into a uniform sweep of measurement windows: window `i` spans
+    /// `[from + i*step, from + i*step + window)`, up to `to` (or the end of the dump when
+    /// `to` is `None`). `step` defaults to `window` — consecutive, non-overlapping windows;
+    /// a smaller `step` overlaps them, a larger one leaves gaps.
+    ///
+    /// This is the power-over-time input: the numbers are the same as calling
+    /// [`parse_windowed`](Vcd::parse_windowed) once per window, at one parse instead of N.
+    pub fn parse_sweep(
+        text: &str,
+        from_s: f64,
+        to_s: Option<f64>,
+        window_s: f64,
+        step_s: Option<f64>,
+    ) -> Result<VcdSweep, VcdError> {
+        let step_s = step_s.unwrap_or(window_s);
+        if window_s <= 0.0 || !window_s.is_finite() {
+            return Err(VcdError(
+                "sweep window must be a positive, finite duration".into(),
+            ));
+        }
+        if step_s <= 0.0 || !step_s.is_finite() {
+            return Err(VcdError(
+                "sweep step must be a positive, finite duration".into(),
+            ));
+        }
+        if let Some(to) = to_s {
+            if to <= from_s {
+                return Err(VcdError("sweep 'to' must be greater than 'from'".into()));
+            }
+        }
+        parse_grid(
+            text,
+            Grid {
+                from_s,
+                window_s,
+                step_s,
+                to_s,
+            },
+        )
+    }
+
+    /// [`parse_sweep`](Vcd::parse_sweep) from a file, with the design scope applied.
+    pub fn load_sweep(
+        path: &str,
+        from_s: f64,
+        to_s: Option<f64>,
+        window_s: f64,
+        step_s: Option<f64>,
+        scope: Option<String>,
+    ) -> Result<VcdSweep, VcdError> {
+        let text = std::fs::read_to_string(path).map_err(|e| VcdError(format!("{path}: {e}")))?;
+        Ok(Vcd::parse_sweep(&text, from_s, to_s, window_s, step_s)?.with_scope(scope))
+    }
+}
+
+/// The one counting loop, over a [`Grid`] of windows.
+///
+/// Value changes are read once; each transition is credited to every window covering its
+/// timestamp (one window in the usual non-overlapping case). All changes update signal
+/// state whether or not a window is open, so the first counted change in a window is
+/// measured against the correct pre-window value.
+fn parse_grid(text: &str, grid: Grid) -> Result<VcdSweep, VcdError> {
+    #[derive(Default, Clone)]
+    struct Bucket {
+        toggles: HashMap<String, u64>,
+        events: u64,
+    }
+    // Credit one transition on `path` to every currently-open window.
+    fn bump(buckets: &mut [Bucket], active: Option<(usize, usize)>, path: &str) {
+        if let Some((lo, hi)) = active {
+            for b in &mut buckets[lo..=hi] {
+                *b.toggles.entry(path.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+    // A bounded grid is allocated up front; an open-ended one grows as the dump advances.
+    fn grow(buckets: &mut Vec<Bucket>, hi: usize) -> Result<(), VcdError> {
+        if hi >= MAX_SWEEP_WINDOWS {
+            return Err(VcdError(format!(
+                "sweep needs more than {MAX_SWEEP_WINDOWS} windows — use a larger window or step"
+            )));
+        }
+        if hi >= buckets.len() {
+            buckets.resize(hi + 1, Bucket::default());
+        }
+        Ok(())
+    }
+    // One value-change record seen while these windows were open.
+    fn count_event(buckets: &mut [Bucket], active: Option<(usize, usize)>) {
+        if let Some((lo, hi)) = active {
+            for b in &mut buckets[lo..=hi] {
+                b.events += 1;
+            }
+        }
+    }
+    let mut buckets: Vec<Bucket> = vec![Bucket::default(); grid.bounded_len().unwrap_or(1)];
+
+    let mut tick_s = 1.0e-9; // default 1ns
+                             // ONE CODE, MANY NAMES. A VCD identifier code may be declared for several signals — a
+                             // net and its port alias share one code, and dumpers emit that routinely. Keyed by a
+                             // single `Sig`, the second `$var` overwrote the first and that signal's activity
+                             // vanished: it reported a toggle rate of zero while its alias reported the truth.
+    let mut sym2sig: HashMap<String, Vec<Sig>> = HashMap::new();
+    let mut last: HashMap<String, char> = HashMap::new(); // scalar full path -> last value
+    let mut vprev: HashMap<String, Vec<char>> = HashMap::new(); // sym -> last KNOWN bits ('?' = never seen)
+    let mut rprev: HashMap<String, String> = HashMap::new(); // real path -> last value
+    let mut idx = NetIndex::default();
+    let mut scope_stack: Vec<String> = Vec::new();
+    let mut time_ticks: f64 = 0.0;
+    let mut active = grid.active(0.0);
+    if let Some((_, hi)) = active {
+        grow(&mut buckets, hi)?;
+    }
+
+    let mut toks = text.split_whitespace().peekable();
+    while let Some(tok) = toks.next() {
+        match tok {
+            "$timescale" => {
+                // e.g. "1ns" or "1" then "ns"
+                let mut unit = String::new();
+                for t in toks.by_ref() {
+                    if t == "$end" {
+                        break;
+                    }
+                    unit.push_str(t);
                 }
-        };
-
-        let mut tick_s = 1.0e-9; // default 1ns
-                                 // ONE CODE, MANY NAMES. A VCD identifier code may be declared for several signals — a
-                                 // net and its port alias share one code, and dumpers emit that routinely. Keyed by a
-                                 // single `Sig`, the second `$var` overwrote the first and that signal's activity
-                                 // vanished: it reported a toggle rate of zero while its alias reported the truth.
-        let mut sym2sig: HashMap<String, Vec<Sig>> = HashMap::new();
-        let mut last: HashMap<String, char> = HashMap::new(); // scalar full path -> last value
-        let mut vprev: HashMap<String, Vec<char>> = HashMap::new(); // sym -> last KNOWN bits ('?' = never seen)
-        let mut rprev: HashMap<String, String> = HashMap::new(); // real path -> last value
-        let mut idx = NetIndex::default();
-        let mut scope_stack: Vec<String> = Vec::new();
-        let mut time_ticks: f64 = 0.0;
-        let mut count_now = in_window(0.0);
-
-        let mut toks = text.split_whitespace().peekable();
-        while let Some(tok) = toks.next() {
-            match tok {
-                "$timescale" => {
-                    // e.g. "1ns" or "1" then "ns"
-                    let mut unit = String::new();
+                tick_s = parse_timescale(&unit);
+            }
+            "$scope" => {
+                // $scope <type> <name> $end
+                let _ty = toks.next();
+                let mut name = toks.next().unwrap_or("").to_string();
+                // `$scope module  $end` — an UNNAMED scope, which Verilator writes as the
+                // root of a dump. Tokenising on whitespace makes the terminator look like
+                // the name, so every path in the file came out under a scope called
+                // `$end` and matched nothing — not the netlist, not the same dump in FST
+                // form. An unnamed scope contributes no path component.
+                if name == "$end" {
+                    name.clear();
+                } else {
                     for t in toks.by_ref() {
                         if t == "$end" {
                             break;
                         }
-                        unit.push_str(t);
                     }
-                    tick_s = parse_timescale(&unit);
                 }
-                "$scope" => {
-                    // $scope <type> <name> $end
-                    let _ty = toks.next();
-                    let mut name = toks.next().unwrap_or("").to_string();
-                    // `$scope module  $end` — an UNNAMED scope, which Verilator writes as the
-                    // root of a dump. Tokenising on whitespace makes the terminator look like
-                    // the name, so every path in the file came out under a scope called
-                    // `$end` and matched nothing — not the netlist, not the same dump in FST
-                    // form. An unnamed scope contributes no path component.
-                    if name == "$end" {
-                        name.clear();
-                    } else {
-                        for t in toks.by_ref() {
-                            if t == "$end" {
-                                break;
+                // Pushed even when empty: `$upscope` pops unconditionally, so skipping the
+                // push here would pop the PARENT instead and reparent the rest of the file.
+                // The empty component is dropped when the path is joined.
+                scope_stack.push(name);
+            }
+            // `$comment` bodies contain anything at all, including things shaped exactly
+            // like a timestamp and a value change. Read as data, a commented-out `#999 1!`
+            // became a real transition — activity invented out of prose.
+            "$comment" => {
+                for t in toks.by_ref() {
+                    if t == "$end" {
+                        break;
+                    }
+                }
+            }
+            "$upscope" => {
+                for t in toks.by_ref() {
+                    if t == "$end" {
+                        break;
+                    }
+                }
+                scope_stack.pop();
+            }
+            "$var" => {
+                // $var <type> <width> <sym> <name> [range] $end
+                let ty = toks.next().unwrap_or("").to_string();
+                let width: usize = toks.next().and_then(|w| w.parse().ok()).unwrap_or(1);
+                let sym = toks.next().unwrap_or("").to_string();
+                let name = toks.next().unwrap_or("").to_string();
+                // remaining tokens before $end: a `[msb:lsb]` range may appear here
+                let mut range: Option<String> = None;
+                for t in toks.by_ref() {
+                    if t == "$end" {
+                        break;
+                    }
+                    if t.starts_with('[') {
+                        range = Some(t.to_string());
+                    }
+                }
+                if !sym.is_empty() && !name.is_empty() {
+                    let base = join_scope(&scope_stack, &name);
+                    let sig = build_sig(&ty, width, &base, range.as_deref(), &mut idx);
+                    sym2sig.entry(sym).or_default().push(sig);
+                }
+            }
+            _ => {
+                if let Some(rest) = tok.strip_prefix('#') {
+                    // PARSED AS A REAL, NOT AN INTEGER. IEEE 1364 says a timestamp is a
+                    // whole number of timescale units, but migen writes `#3.2` and viewers
+                    // accept it. Parsed as an integer it fails, and a failed parse left the
+                    // clock where it was — so in a dump whose every timestamp is fractional
+                    // the time never advanced, the dump measured as zero-length, and every
+                    // toggle RATE computed from it came out zero. Silently: nothing about a
+                    // rate of zero says the times were unreadable.
+                    if let Ok(t) = rest.parse::<f64>() {
+                        if t.is_finite() {
+                            time_ticks = t;
+                            active = grid.active(time_ticks * tick_s);
+                            if let Some((_, hi)) = active {
+                                grow(&mut buckets, hi)?;
                             }
                         }
                     }
-                    // Pushed even when empty: `$upscope` pops unconditionally, so skipping the
-                    // push here would pop the PARENT instead and reparent the rest of the file.
-                    // The empty component is dropped when the path is joined.
-                    scope_stack.push(name);
-                }
-                // `$comment` bodies contain anything at all, including things shaped exactly
-                // like a timestamp and a value change. Read as data, a commented-out `#999 1!`
-                // became a real transition — activity invented out of prose.
-                "$comment" => {
-                    for t in toks.by_ref() {
-                        if t == "$end" {
-                            break;
-                        }
-                    }
-                }
-                "$upscope" => {
-                    for t in toks.by_ref() {
-                        if t == "$end" {
-                            break;
-                        }
-                    }
-                    scope_stack.pop();
-                }
-                "$var" => {
-                    // $var <type> <width> <sym> <name> [range] $end
-                    let ty = toks.next().unwrap_or("").to_string();
-                    let width: usize = toks.next().and_then(|w| w.parse().ok()).unwrap_or(1);
-                    let sym = toks.next().unwrap_or("").to_string();
-                    let name = toks.next().unwrap_or("").to_string();
-                    // remaining tokens before $end: a `[msb:lsb]` range may appear here
-                    let mut range: Option<String> = None;
-                    for t in toks.by_ref() {
-                        if t == "$end" {
-                            break;
-                        }
-                        if t.starts_with('[') {
-                            range = Some(t.to_string());
-                        }
-                    }
-                    if !sym.is_empty() && !name.is_empty() {
-                        let base = join_scope(&scope_stack, &name);
-                        let sig = build_sig(&ty, width, &base, range.as_deref(), &mut idx);
-                        sym2sig.entry(sym).or_default().push(sig);
-                    }
-                }
-                _ => {
-                    if let Some(rest) = tok.strip_prefix('#') {
-                        // PARSED AS A REAL, NOT AN INTEGER. IEEE 1364 says a timestamp is a
-                        // whole number of timescale units, but migen writes `#3.2` and viewers
-                        // accept it. Parsed as an integer it fails, and a failed parse left the
-                        // clock where it was — so in a dump whose every timestamp is fractional
-                        // the time never advanced, the dump measured as zero-length, and every
-                        // toggle RATE computed from it came out zero. Silently: nothing about a
-                        // rate of zero says the times were unreadable.
-                        if let Ok(t) = rest.parse::<f64>() {
-                            if t.is_finite() {
-                                time_ticks = t;
-                                count_now = in_window(time_ticks * tick_s);
+                } else if let Some(first) = tok.chars().next() {
+                    match first {
+                        '0' | '1' | 'x' | 'X' | 'z' | 'Z' | 'u' | 'U' | 'w' | 'W' | 'h' | 'H'
+                        | 'l' | 'L' | '-' => {
+                            // Scalar change: <value><sym>.
+                            //
+                            // `last` holds the last KNOWN value. An `x`/`z` is not a level,
+                            // it is the absence of one: it neither counts as a transition
+                            // nor replaces what we knew. So 0→x→1 counts ONE toggle (the
+                            // net did change), 0→x→0 counts none (it did not), and the
+                            // x-flood a `$dumpoff` writes over every signal — which is a
+                            // statement about the dumper, not the circuit — counts nothing
+                            // at all. Counting each of those as a transition inflated
+                            // activity, and therefore dynamic power, without a warning.
+                            let sym = &tok[1..];
+                            count_event(&mut buckets, active);
+                            let Some(v) = level(first) else {
+                                continue; // unknown: no transition, no new baseline
+                            };
+                            for sig in sym2sig.get(sym).map(Vec::as_slice).unwrap_or(&[]) {
+                                let Sig::Scalar(full) = sig else { continue };
+                                let prev = last.insert(full.clone(), v);
+                                if prev.map(|p| p != v).unwrap_or(false) {
+                                    bump(&mut buckets, active, full);
+                                }
                             }
                         }
-                    } else if let Some(first) = tok.chars().next() {
-                        match first {
-                            '0' | '1' | 'x' | 'X' | 'z' | 'Z' | 'u' | 'U' | 'w' | 'W' | 'h'
-                            | 'H' | 'l' | 'L' | '-' => {
-                                // Scalar change: <value><sym>.
-                                //
-                                // `last` holds the last KNOWN value. An `x`/`z` is not a level,
-                                // it is the absence of one: it neither counts as a transition
-                                // nor replaces what we knew. So 0→x→1 counts ONE toggle (the
-                                // net did change), 0→x→0 counts none (it did not), and the
-                                // x-flood a `$dumpoff` writes over every signal — which is a
-                                // statement about the dumper, not the circuit — counts nothing
-                                // at all. Counting each of those as a transition inflated
-                                // activity, and therefore dynamic power, without a warning.
-                                let sym = &tok[1..];
-                                let Some(v) = level(first) else {
-                                    continue; // unknown: no transition, no new baseline
-                                };
+                        'b' | 'B' => {
+                            // Vector change: b<value> <sym> — count each *bit* that flips.
+                            // Per bit, the same rule as a scalar: an `x`/`z` bit is unknown,
+                            // so it counts nothing and leaves that bit's last known value
+                            // in place.
+                            let value = &tok[1..];
+                            if let Some(sym) = toks.next() {
+                                count_event(&mut buckets, active);
+                                for sig in sym2sig.get(sym).map(Vec::as_slice).unwrap_or(&[]) {
+                                    // A ONE-BIT SIGNAL IS OFTEN DUMPED IN VECTOR FORM. The
+                                    // form is the writer's choice, not the signal's: this
+                                    // dumper writes `b0 2` for a plain `reg`, and the same
+                                    // signal may appear as `02` elsewhere in the same file.
+                                    // Handling only the vector case dropped every such
+                                    // signal on the floor — declared, never counted, and
+                                    // reported as a net with no activity rather than as
+                                    // anything unread. It shares `last` with the scalar
+                                    // form so the two spellings agree on one baseline.
+                                    let bits = match sig {
+                                        Sig::Scalar(full) => {
+                                            let Some(v) = value.chars().next_back().and_then(level)
+                                            else {
+                                                continue;
+                                            };
+                                            let prev = last.insert(full.clone(), v);
+                                            if prev.map(|p| p != v).unwrap_or(false) {
+                                                bump(&mut buckets, active, full);
+                                            }
+                                            continue;
+                                        }
+                                        Sig::Vector { bits } => bits,
+                                    };
+                                    let cur = pad_bits(value, bits.len());
+                                    // KEYED BY THE NET, NOT THE IDENTIFIER. One identifier
+                                    // can name the same vector in several scopes — a port
+                                    // carried down a hierarchy shares one symbol — and a
+                                    // single last-value slot per symbol means the first
+                                    // name consumes the change and updates it, so every
+                                    // other name it aliases compares against the value that
+                                    // was just written and counts nothing. The scalar path
+                                    // keys by net and was right; this one credited the
+                                    // vector's activity to whichever scope was declared
+                                    // first and reported the rest as dead.
+                                    let prev = vprev.entry(bits[0].clone()).or_insert_with(|| {
+                                        std::iter::repeat_n('?', bits.len()).collect()
+                                    });
+                                    for (i, c) in cur.iter().enumerate() {
+                                        let Some(c) = level(*c) else { continue };
+                                        if i < prev.len() {
+                                            let was = prev[i];
+                                            if was != '?' && was != c {
+                                                bump(&mut buckets, active, &bits[i]);
+                                            }
+                                            prev[i] = c;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        'r' | 'R' => {
+                            // Real change: r<value> <sym> — not bit-decomposable, so one
+                            // toggle per CHANGE. The initial dump is not a change, and
+                            // counting it made every real signal report one transition it
+                            // never made — the same off-by-one the scalar path avoids by
+                            // comparing against a previous value.
+                            let value = tok[1..].to_string();
+                            if let Some(sym) = toks.next() {
+                                count_event(&mut buckets, active);
                                 for sig in sym2sig.get(sym).map(Vec::as_slice).unwrap_or(&[]) {
                                     let Sig::Scalar(full) = sig else { continue };
-                                    let prev = last.insert(full.clone(), v);
-                                    if count_now && prev.map(|p| p != v).unwrap_or(false) {
-                                        idx.add_toggles(full, 1);
+                                    let changed = rprev
+                                        .insert(full.clone(), value.clone())
+                                        .map(|p| p != value)
+                                        .unwrap_or(false);
+                                    if changed {
+                                        bump(&mut buckets, active, full);
                                     }
                                 }
                             }
-                            'b' | 'B' => {
-                                // Vector change: b<value> <sym> — count each *bit* that flips.
-                                // Per bit, the same rule as a scalar: an `x`/`z` bit is unknown,
-                                // so it counts nothing and leaves that bit's last known value
-                                // in place.
-                                let value = &tok[1..];
-                                if let Some(sym) = toks.next() {
-                                    for sig in sym2sig.get(sym).map(Vec::as_slice).unwrap_or(&[]) {
-                                        // A ONE-BIT SIGNAL IS OFTEN DUMPED IN VECTOR FORM. The
-                                        // form is the writer's choice, not the signal's: this
-                                        // dumper writes `b0 2` for a plain `reg`, and the same
-                                        // signal may appear as `02` elsewhere in the same file.
-                                        // Handling only the vector case dropped every such
-                                        // signal on the floor — declared, never counted, and
-                                        // reported as a net with no activity rather than as
-                                        // anything unread. It shares `last` with the scalar
-                                        // form so the two spellings agree on one baseline.
-                                        let bits = match sig {
-                                            Sig::Scalar(full) => {
-                                                let Some(v) =
-                                                    value.chars().next_back().and_then(level)
-                                                else {
-                                                    continue;
-                                                };
-                                                let prev = last.insert(full.clone(), v);
-                                                if count_now
-                                                    && prev.map(|p| p != v).unwrap_or(false)
-                                                {
-                                                    idx.add_toggles(full, 1);
-                                                }
-                                                continue;
-                                            }
-                                            Sig::Vector { bits } => bits,
-                                        };
-                                        let cur = pad_bits(value, bits.len());
-                                        // KEYED BY THE NET, NOT THE IDENTIFIER. One identifier
-                                        // can name the same vector in several scopes — a port
-                                        // carried down a hierarchy shares one symbol — and a
-                                        // single last-value slot per symbol means the first
-                                        // name consumes the change and updates it, so every
-                                        // other name it aliases compares against the value that
-                                        // was just written and counts nothing. The scalar path
-                                        // keys by net and was right; this one credited the
-                                        // vector's activity to whichever scope was declared
-                                        // first and reported the rest as dead.
-                                        let prev =
-                                            vprev.entry(bits[0].clone()).or_insert_with(|| {
-                                                std::iter::repeat_n('?', bits.len()).collect()
-                                            });
-                                        for (i, c) in cur.iter().enumerate() {
-                                            let Some(c) = level(*c) else { continue };
-                                            if i < prev.len() {
-                                                let was = prev[i];
-                                                if count_now && was != '?' && was != c {
-                                                    idx.add_toggles(&bits[i], 1);
-                                                }
-                                                prev[i] = c;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            'r' | 'R' => {
-                                // Real change: r<value> <sym> — not bit-decomposable, so one
-                                // toggle per CHANGE. The initial dump is not a change, and
-                                // counting it made every real signal report one transition it
-                                // never made — the same off-by-one the scalar path avoids by
-                                // comparing against a previous value.
-                                let value = tok[1..].to_string();
-                                if let Some(sym) = toks.next() {
-                                    for sig in sym2sig.get(sym).map(Vec::as_slice).unwrap_or(&[]) {
-                                        let Sig::Scalar(full) = sig else { continue };
-                                        let changed = rprev
-                                            .insert(full.clone(), value.clone())
-                                            .map(|p| p != value)
-                                            .unwrap_or(false);
-                                        if count_now && changed {
-                                            idx.add_toggles(full, 1);
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {}
                         }
+                        _ => {}
                     }
                 }
             }
         }
-
-        let last_time_s = time_ticks * tick_s;
-        let sim_time_s = match window {
-            None => last_time_s,
-            Some((f, t)) => {
-                let eff_from = f.clamp(0.0, last_time_s);
-                let eff_to = t.unwrap_or(last_time_s).clamp(eff_from, last_time_s);
-                eff_to - eff_from
-            }
-        };
-        Ok(Vcd { idx, sim_time_s })
     }
+
+    let dump_end_s = time_ticks * tick_s;
+    // A window is measured over the part of it the dump actually covers: a window
+    // running past the end of the dump measured over its nominal length would divide
+    // real transitions by time that was never simulated.
+    let mut windows: Vec<SweepWindow> = buckets
+        .into_iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let (w_from, w_to) = grid.bounds(i);
+            let from_s = w_from.clamp(0.0, dump_end_s);
+            let to_s = w_to.clamp(from_s, dump_end_s);
+            // A span thinner than the finest VCD timescale unit is not a short window, it is
+            // the residue of clamping two nearly-equal floats. Left as-is it becomes a
+            // divisor: a single transition over 7e-24 s reported 1.5e23 toggles/s, and the
+            // power built on it read as terawatts. Below a femtosecond, there is no duration.
+            let span = to_s - from_s;
+            SweepWindow {
+                from_s,
+                to_s,
+                sim_time_s: if span < MIN_WINDOW_S { 0.0 } else { span },
+                events: b.events,
+                toggles: b.toggles,
+            }
+        })
+        .collect();
+    // The dump's last timestamp opens a window that has no time in it. Its transitions are
+    // real and belong to the window that just closed — folding them back keeps the invariant
+    // that matters: the windows partition the dump's transitions, so a sweep and a whole-dump
+    // read count the same events.
+    while windows.len() > 1 && windows.last().is_some_and(|w| w.sim_time_s <= 0.0) {
+        let tail = windows.pop().expect("checked");
+        let prev = windows.last_mut().expect("len > 1");
+        for (path, n) in tail.toggles {
+            *prev.toggles.entry(path).or_insert(0) += n;
+        }
+        prev.events += tail.events;
+    }
+    Ok(VcdSweep {
+        decls: idx,
+        windows,
+        dump_end_s,
+    })
 }
 
 fn parse_timescale(s: &str) -> f64 {
@@ -419,7 +748,11 @@ pub(crate) fn join_scope(scopes: &[String], leaf: &str) -> String {
     // mistook its own terminator for a name. GTKWave's vcd2fst does exactly that, and bakes the
     // literal name `$end` into the converted file — so a Verilator dump and its own conversion
     // described the same hierarchy under two different roots, neither of them the real one.
-    for s in scopes.iter().map(|s| s.trim()).filter(|s| !s.is_empty() && *s != "$end") {
+    for s in scopes
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && *s != "$end")
+    {
         out.push_str(s);
         out.push('.');
     }
@@ -636,6 +969,213 @@ b0000 !
 #10
 b0001 !
 "#;
+
+    #[test]
+    fn sweep_windows_equal_the_same_windows_parsed_one_at_a_time() {
+        // THE PROPERTY THE WHOLE SWEEP RESTS ON. Slicing a dump and measuring each slice
+        // separately is the obvious implementation and the slow one; this walks the file once
+        // and routes each transition into the window covering it. The two must agree exactly,
+        // or the fast path is a different measurement wearing the same name.
+        let sweep = Vcd::parse_sweep(VCD, 0.0, Some(20.0e-9), 5.0e-9, None).unwrap();
+        assert_eq!(sweep.windows.len(), 4);
+        for (i, w) in sweep.windows.iter().enumerate() {
+            let from = i as f64 * 5.0e-9;
+            let one = Vcd::parse_windowed(VCD, Some((from, Some(from + 5.0e-9)))).unwrap();
+            assert_eq!(
+                w.toggles.get("top.clk").copied().unwrap_or(0),
+                one.idx.toggles.get("top.clk").copied().unwrap_or(0),
+                "window {i} disagrees with the same window parsed alone"
+            );
+            assert!((w.sim_time_s - one.sim_time_s).abs() < 1e-18);
+            assert!((sweep.window(i).toggle_rate("clk") - one.toggle_rate("clk")).abs() < 1.0);
+        }
+        // clk toggles at 5, 10, 15, 20 — one per window after the first, and #20 is the dump
+        // end so it lands outside [15,20).
+        assert_eq!(
+            sweep.windows[0]
+                .toggles
+                .get("top.clk")
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            sweep.windows[1]
+                .toggles
+                .get("top.clk")
+                .copied()
+                .unwrap_or(0),
+            1
+        );
+        assert_eq!(
+            sweep.windows[3]
+                .toggles
+                .get("top.clk")
+                .copied()
+                .unwrap_or(0),
+            1
+        );
+    }
+
+    #[test]
+    fn sweep_to_end_of_dump_grows_the_grid_and_partitions_its_transitions() {
+        // No `to`: the grid extends to cover the dump, so a caller does not have to know how
+        // long the simulation ran to sweep all of it.
+        let sweep = Vcd::parse_sweep(VCD, 0.0, None, 10.0e-9, None).unwrap();
+        assert!((sweep.dump_end_s - 20.0e-9).abs() < 1e-18);
+        // [0,10) and [10,20). The dump's final timestamp opens a third window with no time in
+        // it; its transitions are folded back into the window that just closed rather than
+        // being reported over a zero duration.
+        assert_eq!(sweep.windows.len(), 2);
+        assert!((sweep.windows[0].sim_time_s - 10.0e-9).abs() < 1e-18);
+
+        // THE INVARIANT: the windows partition the dump's transitions. A sweep and a
+        // whole-dump read must agree on how many times each net moved, or one of them is
+        // inventing or losing activity.
+        let whole = Vcd::parse(VCD).unwrap();
+        for net in ["top.clk", "top.a"] {
+            let swept: u64 = sweep
+                .windows
+                .iter()
+                .map(|w| w.toggles.get(net).copied().unwrap_or(0))
+                .sum();
+            assert_eq!(
+                swept,
+                whole.idx.toggles.get(net).copied().unwrap_or(0),
+                "{net}: the sweep and the whole dump disagree on total transitions"
+            );
+        }
+    }
+
+    #[test]
+    fn a_window_thinner_than_a_femtosecond_has_no_duration_and_no_rate() {
+        // The bug this pins: clamping a window's bounds to the dump's end can leave a span of
+        // ~1e-23 s, and dividing a real transition by that produced 1e23 toggles/s — and, two
+        // engines later, a power number in terawatts. Nothing about the output said it was
+        // arithmetic rather than a measurement.
+        let sweep = Vcd::parse_sweep(VCD, 0.0, Some(20.0e-9), 20.0e-9, None).unwrap();
+        for w in &sweep.windows {
+            assert!(w.sim_time_s == 0.0 || w.sim_time_s >= 1.0e-15);
+        }
+        // And the guard holds at the API edge regardless of how a window got there.
+        let zero = SweepWindow::default();
+        let view = WindowActivity {
+            decls: &sweep.decls,
+            win: &zero,
+        };
+        assert_eq!(view.toggle_rate("clk"), 0.0);
+    }
+
+    #[test]
+    fn overlapping_windows_count_a_transition_in_each() {
+        // step < window overlaps deliberately (a smoother curve). A transition inside the
+        // overlap belongs to both windows: each is a measurement over its own span.
+        let sweep = Vcd::parse_sweep(VCD, 0.0, Some(20.0e-9), 10.0e-9, Some(5.0e-9)).unwrap();
+        assert_eq!(sweep.windows.len(), 4);
+        // clk changes at #5: inside [0,10) and inside [5,15).
+        assert_eq!(
+            sweep.windows[0]
+                .toggles
+                .get("top.clk")
+                .copied()
+                .unwrap_or(0),
+            1
+        );
+        assert_eq!(
+            sweep.windows[1]
+                .toggles
+                .get("top.clk")
+                .copied()
+                .unwrap_or(0),
+            2
+        ); // #5, #10
+    }
+
+    #[test]
+    fn a_gap_between_windows_counts_nothing() {
+        // step > window samples the dump rather than covering it. Transitions in the gaps are
+        // counted nowhere — sampling, not measuring, and the caller asked for it.
+        let sweep = Vcd::parse_sweep(VCD, 0.0, Some(20.0e-9), 2.0e-9, Some(10.0e-9)).unwrap();
+        assert_eq!(sweep.windows.len(), 2); // [0,2) and [10,12)
+        assert_eq!(
+            sweep.windows[0]
+                .toggles
+                .get("top.clk")
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            sweep.windows[1]
+                .toggles
+                .get("top.clk")
+                .copied()
+                .unwrap_or(0),
+            1
+        ); // #10
+    }
+
+    #[test]
+    fn events_count_value_changes_per_window() {
+        // The activity indicator that makes an empty window legible: a window with no events
+        // is a window where nothing happened, not a window that failed to measure.
+        let sweep = Vcd::parse_sweep(VCD, 0.0, Some(20.0e-9), 5.0e-9, None).unwrap();
+        assert_eq!(sweep.windows[0].events, 2); // #0: 0! 0"
+        assert_eq!(sweep.windows[1].events, 2); // #5: 1! 1"
+        assert_eq!(sweep.windows[2].events, 1); // #10: 0!
+        assert_eq!(sweep.windows[3].events, 1); // #15: 1!
+    }
+
+    #[test]
+    fn shifting_every_timestamp_does_not_change_the_measurement() {
+        // Toggle rates are counts over a duration, so re-anchoring a dump's time origin must
+        // not move them. Cheap to assert, and it pins the one assumption a windowed measurement
+        // makes about absolute time: that it makes none.
+        let shifted: String = VCD
+            .lines()
+            .map(|l| match l.trim().strip_prefix('#') {
+                Some(n) => format!("#{}\n", n.trim().parse::<f64>().unwrap() + 1000.0),
+                None => format!("{l}\n"),
+            })
+            .collect();
+        let base = Vcd::parse_sweep(VCD, 0.0, Some(20.0e-9), 5.0e-9, None).unwrap();
+        let moved = Vcd::parse_sweep(&shifted, 1000.0e-9, Some(1020.0e-9), 5.0e-9, None).unwrap();
+        assert_eq!(base.windows.len(), moved.windows.len());
+        for (i, (b, m)) in base.windows.iter().zip(moved.windows.iter()).enumerate() {
+            assert_eq!(
+                b.toggles, m.toggles,
+                "window {i} changed under a time shift"
+            );
+            assert!((b.sim_time_s - m.sim_time_s).abs() < 1e-18);
+        }
+    }
+
+    #[test]
+    fn a_sweep_finer_than_the_cap_is_refused_not_attempted() {
+        // The failure mode is memory, and a named error beats an allocation storm.
+        let r = Vcd::parse_sweep(VCD, 0.0, None, 1.0e-18, None);
+        assert!(r.is_err());
+        // Zero and negative windows are refused too — neither describes a measurement.
+        assert!(Vcd::parse_sweep(VCD, 0.0, Some(20.0e-9), 0.0, None).is_err());
+        assert!(Vcd::parse_sweep(VCD, 0.0, Some(20.0e-9), 5.0e-9, Some(-1.0e-9)).is_err());
+        assert!(Vcd::parse_sweep(VCD, 20.0e-9, Some(10.0e-9), 5.0e-9, None).is_err());
+    }
+
+    #[test]
+    fn sweep_resolution_is_scope_aware_like_the_single_window() {
+        // One window past the end of the dump: its span is clamped to the 20 ns simulated, so
+        // dut.clk's transitions at #15 and #20 are both inside it.
+        let sweep = Vcd::parse_sweep(VCD_HIER, 0.0, Some(25.0e-9), 25.0e-9, None)
+            .unwrap()
+            .with_scope(Some("dut".to_string()));
+        assert_eq!(sweep.windows.len(), 1);
+        assert!((sweep.windows[0].sim_time_s - 20.0e-9).abs() < 1e-18);
+        assert!((sweep.window(0).toggle_rate("clk") - 1.0e8).abs() < 1.0); // 2 / 20ns
+                                                                           // Without a scope the colliding leaf stays unresolved rather than picking one.
+        let bare = Vcd::parse_sweep(VCD_HIER, 0.0, Some(25.0e-9), 25.0e-9, None).unwrap();
+        assert_eq!(bare.window(0).toggle_rate("clk"), 0.0);
+        assert_eq!(bare.colliding_leaves(), vec!["clk".to_string()]);
+    }
 
     #[test]
     fn vector_multi_transition_within_timestep_all_counted() {

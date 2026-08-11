@@ -44,9 +44,9 @@ use std::collections::HashMap;
 /// Shared storage/resolution for both the VCD and SAIF readers.
 #[derive(Clone, Default)]
 pub struct NetIndex {
-    pub toggles: HashMap<String, u64>,         // full hierarchical path -> transition count
+    pub toggles: HashMap<String, u64>, // full hierarchical path -> transition count
     pub by_leaf: HashMap<String, Vec<String>>, // leaf name -> declared full paths
-    pub scope: Option<String>,                 // design instance path (job `scope:`)
+    pub scope: Option<String>,         // design instance path (job `scope:`)
 }
 
 /// Rendered in **sorted key order**, not the maps' own.
@@ -93,6 +93,19 @@ impl NetIndex {
     /// `None` = unresolved (absent) or ambiguous (leaf in multiple scopes) → the
     /// caller should fall back to the vectorless factor.
     pub fn resolve(&self, net: &str) -> Option<u64> {
+        let path = self.resolve_path(net)?;
+        Some(self.toggles.get(path).copied().unwrap_or(0))
+    }
+
+    /// Resolve a netlist `net` to the **full dumped path** of a unique signal, without
+    /// reading a count. Same rule as [`resolve`](NetIndex::resolve) — ambiguous is
+    /// unresolved.
+    ///
+    /// Separate from `resolve` because a sweep holds **one** declaration index and **many**
+    /// per-window count maps: the name→path join is identical in every window, so it is done
+    /// once here and the counts are looked up per window. Cloning the index per window
+    /// instead would duplicate every declared path for every window measured.
+    pub fn resolve_path(&self, net: &str) -> Option<&str> {
         let leaf = leaf_of(net);
         let target = match &self.scope {
             Some(s) => format!("{s}.{net}"),
@@ -100,19 +113,24 @@ impl NetIndex {
         };
         let dot_target = format!(".{target}");
         let cands = self.by_leaf.get(leaf)?;
-        let mut hits = cands.iter().filter(|p| **p == target || p.ends_with(&dot_target));
+        let mut hits = cands
+            .iter()
+            .filter(|p| **p == target || p.ends_with(&dot_target));
         let first = hits.next()?;
         if hits.next().is_some() {
             None // ambiguous — refuse to guess
         } else {
-            Some(self.toggles.get(first).copied().unwrap_or(0))
+            Some(first.as_str())
         }
     }
 
     /// Number of leaf names declared under more than one scope. When this is > 0 and
     /// no `scope:` is set, bare-leaf lookups for those names are ambiguous.
     pub fn collisions(&self) -> usize {
-        self.by_leaf.values().filter(|paths| paths.len() > 1).count()
+        self.by_leaf
+            .values()
+            .filter(|paths| paths.len() > 1)
+            .count()
     }
 
     /// Leaf names declared under more than one scope (the ambiguous ones), sorted.
