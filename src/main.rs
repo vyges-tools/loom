@@ -34,7 +34,7 @@ commands live here; tool-specific verbs (timing, power, extraction, …) belong 
 the engines (built on the vyges_loom library).
 
 USAGE:
-  vyges-loom <command> [files...] [options]
+  vyges loom <command> [files...] [options]
 
 COMMANDS:
   inspect <files...>   parse files into the design DB and summarize
