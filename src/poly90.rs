@@ -249,6 +249,81 @@ impl Poly90Set {
         self.boolean(other, |a, b| a && b)
     }
 
+    /// Grow the region by the given amounts in each direction (Minkowski dilation by a
+    /// rectangle).
+    ///
+    /// Exact for a rectilinear set: growing every rectangle of the canonical decomposition and
+    /// unioning the results is the dilation, because the set *is* that union.
+    pub fn bloat(&self, west: i32, east: i32, south: i32, north: i32) -> Poly90Set {
+        Poly90Set::from_rects(
+            &self
+                .rects()
+                .into_iter()
+                .map(|r| Rect::new(r.x0 - west, r.y0 - south, r.x1 + east, r.y1 + north))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Shrink the region by the given amounts in each direction (Minkowski erosion).
+    ///
+    /// **Not** the same as shrinking each rectangle: two rectangles that abut form one region,
+    /// and the shared edge must not erode. Computed by duality — erode the region by dilating its
+    /// complement — which gets that right by construction.
+    pub fn shrink(&self, west: i32, east: i32, south: i32, north: i32) -> Poly90Set {
+        if self.is_empty() {
+            return Poly90Set::default();
+        }
+        let (w, e, s, n) = (west.max(0), east.max(0), south.max(0), north.max(0));
+        if w == 0 && e == 0 && s == 0 && n == 0 {
+            return self.clone();
+        }
+        // A frame wide enough that the complement's dilation cannot reach in from outside.
+        let b = self.bounds().expect("non-empty");
+        let pad = w + e + s + n + 1;
+        let frame =
+            Poly90Set::from_rects(&[Rect::new(b.x0 - pad, b.y0 - pad, b.x1 + pad, b.y1 + pad)]);
+        // Directions swap under complement: eroding the region from the west is dilating the
+        // complement toward the east.
+        let outside = frame.difference(self).bloat(e, w, n, s);
+        frame.difference(&outside)
+    }
+
+    /// The bounding box, or `None` when the set is empty.
+    pub fn bounds(&self) -> Option<Rect> {
+        let first = self.slabs.first()?;
+        let mut r = Rect::new(first.x0, i32::MAX, self.slabs.last()?.x1, i32::MIN);
+        for s in &self.slabs {
+            for &(y0, y1) in &s.ys {
+                r.y0 = r.y0.min(y0);
+                r.y1 = r.y1.max(y1);
+            }
+        }
+        Some(r)
+    }
+
+    /// Keep only the connected pieces whose bounding box fits the given limits, inclusive.
+    ///
+    /// The fill algorithm uses this to discard partial shapes: a fill rectangle clipped by the
+    /// area it was tiled into is no longer the right size, and a wrong-sized fill is a DRC
+    /// violation rather than a smaller fill.
+    pub fn keep_sized(&self, min_w: i32, max_w: i32, min_h: i32, max_h: i32) -> Poly90Set {
+        let kept: Vec<Rect> = self
+            .polygons()
+            .into_iter()
+            .filter_map(|p| {
+                let xs = p.outer.iter().map(|q| q.x);
+                let ys = p.outer.iter().map(|q| q.y);
+                let (x0, x1) = (xs.clone().min()?, xs.max()?);
+                let (y0, y1) = (ys.clone().min()?, ys.max()?);
+                let (w, h) = (x1 - x0, y1 - y0);
+                // Only whole, hole-free pieces of the right size survive.
+                (p.holes.is_empty() && (min_w..=max_w).contains(&w) && (min_h..=max_h).contains(&h))
+                    .then_some(Rect::new(x0, y0, x1, y1))
+            })
+            .collect();
+        Poly90Set::from_rects(&kept)
+    }
+
     /// The canonical decomposition into disjoint rectangles (one per slab per interval).
     ///
     /// Useful when a caller wants area or coverage rather than shape — iterating these is much
@@ -772,6 +847,131 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod sizing_tests {
+    use super::*;
+
+    fn set(rects: &[(i32, i32, i32, i32)]) -> Poly90Set {
+        Poly90Set::from_rects(
+            &rects
+                .iter()
+                .map(|&(a, b, c, d)| Rect::new(a, b, c, d))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn bloating_grows_each_side_independently() {
+        let s = set(&[(10, 20, 30, 40)]).bloat(1, 2, 3, 4);
+        assert_eq!(s.rects(), vec![Rect::new(9, 17, 32, 44)]);
+    }
+
+    #[test]
+    fn bloating_merges_shapes_that_grow_into_each_other() {
+        // Two rectangles 4 apart, grown 2 each way, become one.
+        let s = set(&[(0, 0, 10, 10), (14, 0, 24, 10)]).bloat(2, 2, 0, 0);
+        assert_eq!(
+            s.rects(),
+            vec![Rect::new(-2, 0, 26, 10)],
+            "one shape, not two"
+        );
+        assert_eq!(s.polygons().len(), 1);
+    }
+
+    #[test]
+    fn shrinking_does_not_erode_a_shared_edge() {
+        // The reason shrink is not per-rectangle: these two abut, so the region is one 20-wide
+        // rectangle and shrinking by 2 leaves 16 — not two 6-wide pieces with a gap.
+        let s = set(&[(0, 0, 10, 10), (10, 0, 20, 10)]).shrink(2, 2, 0, 0);
+        assert_eq!(s.rects(), vec![Rect::new(2, 0, 18, 10)]);
+    }
+
+    #[test]
+    fn shrinking_past_the_extent_leaves_nothing() {
+        assert!(set(&[(0, 0, 10, 10)]).shrink(6, 6, 0, 0).is_empty());
+        assert!(set(&[(0, 0, 10, 10)]).shrink(0, 0, 20, 20).is_empty());
+        assert!(Poly90Set::new().shrink(1, 1, 1, 1).is_empty());
+    }
+
+    #[test]
+    fn shrink_then_bloat_drops_what_was_too_thin_to_survive() {
+        // The fill algorithm's actual use: a shrink/bloat cycle removes anything too small to
+        // hold the shape about to be placed, and restores the rest to full size.
+        let s = set(&[(0, 0, 100, 100), (200, 40, 204, 60)]); // a block plus a detached 4-wide sliver
+        let cycled = s.shrink(3, 3, 3, 3).bloat(3, 3, 3, 3);
+        assert!(cycled.contains(50, 50), "the body survives");
+        assert!(
+            !cycled.contains(202, 50),
+            "the detached sliver is too thin and goes"
+        );
+        assert_eq!(
+            cycled.bounds(),
+            Some(Rect::new(0, 0, 100, 100)),
+            "and nothing else moved"
+        );
+    }
+
+    #[test]
+    fn a_thin_spur_attached_to_a_body_is_not_removed_by_the_cycle() {
+        // Worth pinning because it is the intuitive-but-wrong reading of shrink/bloat: erosion is
+        // about NEIGHBOURHOODS, so points in a narrow spur next to a wide body still have room
+        // around them and survive, then bloat restores part of the spur. Only DETACHED slivers
+        // vanish.
+        let s = set(&[(0, 0, 100, 100), (100, 40, 104, 60)]);
+        let cycled = s.shrink(3, 3, 3, 3).bloat(3, 3, 3, 3);
+        assert!(
+            cycled.contains(101, 50),
+            "the spur next to the body partly survives"
+        );
+    }
+
+    #[test]
+    fn a_no_op_sizing_returns_the_same_region() {
+        let s = set(&[(0, 0, 10, 10), (20, 20, 30, 30)]);
+        assert_eq!(s.bloat(0, 0, 0, 0), s);
+        assert_eq!(s.shrink(0, 0, 0, 0), s);
+    }
+
+    #[test]
+    fn bounds_covers_every_piece() {
+        let s = set(&[(0, 0, 10, 10), (50, 60, 70, 80)]);
+        assert_eq!(s.bounds(), Some(Rect::new(0, 0, 70, 80)));
+        assert_eq!(Poly90Set::new().bounds(), None);
+    }
+
+    #[test]
+    fn the_size_filter_keeps_only_whole_shapes() {
+        // Fill tiles clipped by their area are the wrong size, and a wrong-sized fill is a DRC
+        // violation rather than a smaller fill.
+        let s = set(&[(0, 0, 10, 10), (20, 0, 26, 10), (40, 0, 50, 10)]);
+        let kept = s.keep_sized(10, 10, 10, 10);
+        assert_eq!(
+            kept.rects(),
+            vec![Rect::new(0, 0, 10, 10), Rect::new(40, 0, 50, 10)]
+        );
+        assert!(!kept.contains(22, 5), "the 6-wide offcut is dropped");
+        // A piece with a hole is not a whole shape either.
+        let ring = set(&[(0, 0, 30, 30)]).difference(&set(&[(10, 10, 20, 20)]));
+        assert!(ring.keep_sized(30, 30, 30, 30).is_empty());
+    }
+
+    #[test]
+    fn shrinking_agrees_with_a_brute_force_erosion() {
+        // Erosion is "every point whose neighbourhood is inside", checked directly on a grid.
+        const N: i32 = 30;
+        let s = set(&[(2, 2, 20, 12), (12, 12, 28, 20)]);
+        let (w, e, so, no) = (2, 3, 1, 2);
+        let got = s.shrink(w, e, so, no);
+        for x in 0..N {
+            for y in 0..N {
+                let inside_all =
+                    (x - w..=x + e).all(|px| (y - so..=y + no).all(|py| s.contains(px, py)));
+                assert_eq!(got.contains(x, y), inside_all, "({x},{y})");
+            }
+        }
+    }
+}
+
 /// Property tests. This module is substrate several engines will trust, and the failure mode that
 /// matters — a boundary traced slightly wrong — produces plausible-looking output that no example
 /// test happens to cover. So the properties are checked against an INDEPENDENT brute force over a
@@ -901,6 +1101,48 @@ mod properties {
         for case in 0..200 {
             let s = Poly90Set::from_rects(&rng.rects(1 + (case % 8), 40));
             assert_eq!(Poly90Set::from_rects(&s.rects()), s, "case {case}");
+        }
+    }
+
+    #[test]
+    fn sizing_round_trips_and_orders_correctly() {
+        // Bloat then shrink by the same amount recovers a set that lost nothing (it may gain,
+        // where a bloat merged two pieces), and shrink never grows the region.
+        let mut rng = Lcg(20260812);
+        for case in 0..120 {
+            let s = Poly90Set::from_rects(&rng.rects(1 + (case % 5), 40));
+            let (w, e, so, no) = (case % 4, (case + 1) % 3, case % 3, (case + 2) % 4);
+            let (w, e, so, no) = (w as i32, e as i32, so as i32, no as i32);
+
+            let grown = s.bloat(w, e, so, no);
+            assert!(
+                grown.area() >= s.area(),
+                "case {case}: bloat shrank the region"
+            );
+            assert_eq!(
+                grown.union(&s),
+                grown,
+                "case {case}: bloat must contain the original"
+            );
+
+            let eroded = s.shrink(w, e, so, no);
+            assert!(
+                eroded.area() <= s.area(),
+                "case {case}: shrink grew the region"
+            );
+            assert_eq!(
+                eroded.union(&s),
+                s,
+                "case {case}: shrink must stay inside the original"
+            );
+
+            // Closing (bloat then shrink) never loses a point of the original.
+            let closed = grown.shrink(w, e, so, no);
+            assert_eq!(
+                closed.union(&s),
+                closed,
+                "case {case}: closing lost part of the region"
+            );
         }
     }
 
