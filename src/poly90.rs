@@ -301,7 +301,8 @@ impl Poly90Set {
         Some(r)
     }
 
-    /// Keep only the connected pieces whose bounding box fits the given limits, inclusive.
+    /// Keep only the connected pieces that **are** rectangles within the given size limits,
+    /// inclusive.
     ///
     /// The fill algorithm uses this to discard partial shapes: a fill rectangle clipped by the
     /// area it was tiled into is no longer the right size, and a wrong-sized fill is a DRC
@@ -316,8 +317,12 @@ impl Poly90Set {
                 let (x0, x1) = (xs.clone().min()?, xs.max()?);
                 let (y0, y1) = (ys.clone().min()?, ys.max()?);
                 let (w, h) = (x1 - x0, y1 - y0);
-                // Only whole, hole-free pieces of the right size survive.
-                (p.holes.is_empty() && (min_w..=max_w).contains(&w) && (min_h..=max_h).contains(&h))
+                // The piece must BE the rectangle, not merely fit in one: an L-shaped offcut has
+                // no holes and the right bounding box, and keeping it would emit a fill shape
+                // that is not the size it claims. Four corners and no holes is exactly a
+                // rectangle, for a rectilinear outline.
+                let is_rectangle = p.outer.len() == 4 && p.holes.is_empty();
+                (is_rectangle && (min_w..=max_w).contains(&w) && (min_h..=max_h).contains(&h))
                     .then_some(Rect::new(x0, y0, x1, y1))
             })
             .collect();
@@ -953,6 +958,13 @@ mod sizing_tests {
         // A piece with a hole is not a whole shape either.
         let ring = set(&[(0, 0, 30, 30)]).difference(&set(&[(10, 10, 20, 20)]));
         assert!(ring.keep_sized(30, 30, 30, 30).is_empty());
+
+        // Nor is an L: it has no holes and a 10x10 bounding box, but it is not the shape.
+        let ell = set(&[(0, 0, 10, 4), (0, 0, 4, 10)]);
+        assert!(
+            ell.keep_sized(10, 10, 10, 10).is_empty(),
+            "a piece must BE the rectangle, not merely fit inside one"
+        );
     }
 
     #[test]
