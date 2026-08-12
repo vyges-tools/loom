@@ -46,6 +46,11 @@ pub mod coverage;
 /// EM geometry sidecar (per-segment layer/width/length) — the physical dimensions
 /// standard SPEF omits but current-density sign-off needs. Companion to [`spef`].
 pub mod emgeom;
+
+/// Rectilinear polygon sets — boolean algebra over axis-aligned rectangles, and the outlines
+/// (with holes) that fall out of it. Shared substrate: tap needs it for row-region boundaries,
+/// pdn for strap-minus-blockage areas.
+pub mod poly90;
 /// KLayout net-dump reader — turns a headless-KLayout extraction dump into a
 /// [`spef::Spef`] + [`emgeom::EmGeom`]. The data boundary for the RCX front-end.
 pub mod klayout;
