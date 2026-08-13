@@ -22,9 +22,15 @@
 //! # Orientation
 //!
 //! Outlines are traced with the **interior on the left**, which makes outer boundaries
-//! counter-clockwise (positive signed area) and holes clockwise (negative). That is the same
-//! convention DEF/GDS readers expect, and it is what lets a hole be told from an island without
-//! a containment test.
+//! counter-clockwise (positive signed area) and holes clockwise (negative). That sign is what lets
+//! a hole be told from an island without a containment test, and it is the only thing the code
+//! relies on.
+//!
+//! ⚠️ It is **not** a universal convention, and this comment used to claim it was. KLayout orients
+//! its contours the other way round — hull clockwise, holes counter-clockwise, interior on the
+//! *right* — and GDS itself does not specify an orientation at all. So the sign here is an
+//! internal invariant, not an interchange format: anything writing these outlines to a stream
+//! format must decide the orientation that format's reader wants rather than assuming this one.
 
 /// A point in database units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
