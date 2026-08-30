@@ -21,6 +21,17 @@ pub struct Netlist {
     pub module: String,
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
+    /// `inout` ports, kept SEPARATE from `inputs` and `outputs`.
+    ///
+    /// ⛔ **They were dropped entirely until 2026-08-30**, and the cost was measured: both
+    /// edge-sensor SoC blocks declare `inout VPWR;` and `inout VGND;`, so this reader reported 322
+    /// ports where OpenROAD built 324 block terminals from the same file.
+    ///
+    /// 🔑 **Separate on purpose, and it must stay that way.** Upstream maps a bidirect port to its
+    /// own `dbIoType::INOUT` (`dbReadVerilog.cc:689`), not to input — and on our side `sta-si`
+    /// reads `inputs`/`outputs` as timing endpoints, which an `inout` supply port is not. Folding
+    /// them in would silently change timing.
+    pub inouts: Vec<String>,
     pub insts: Vec<Inst>,
     /// Every module the file defines, in declaration order.
     ///
@@ -364,7 +375,9 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
                             match d {
                                 "input" => nl.inputs.extend(names),
                                 "output" => nl.outputs.extend(names),
-                                _ => {} // inout: not a timing endpoint in v0, as elsewhere
+                                // ⚠️ Recorded, not folded into inputs: see `Netlist::inouts`.
+                                "inout" => nl.inouts.extend(names),
+                                _ => {}
                             }
                         }
                     }
@@ -466,7 +479,16 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
             // end says `clk[0]` and the other says `clk`, and the two describe the same design
             // differently. The declaration is the only place the answer exists, so it is read
             // rather than skipped.
-            "wire" | "reg" | "inout" | "parameter" | "localparam" | "supply0" | "supply1" => {
+            // ⛔ `inout` used to sit in the group below and was read as a plain wire, so its
+            // names never reached any port list. It carries a range like the others, so the range
+            // handling is shared — only the destination differs.
+            "inout" => {
+                i += 1;
+                let names = read_names(&mut i);
+                note_ranges(&names, &mut decl_range);
+                nl.inouts.extend(names);
+            }
+            "wire" | "reg" | "parameter" | "localparam" | "supply0" | "supply1" => {
                 i += 1;
                 // an optional `[ msb:lsb ]` range, then the names it applies to
                 let mut single: Option<String> = None;
@@ -789,5 +811,58 @@ endmodule
         assert_eq!(nl.insts[1].name, "ANTENNA_u_cpu.irq[1]");
         // no bogus numeric-cell instance leaked in
         assert!(nl.insts.iter().all(|inst| is_ident(&inst.cell)));
+    }
+}
+
+#[cfg(test)]
+mod inout_tests {
+    use super::parse;
+
+    /// ⛔ **`inout` ports were dropped entirely.** Measured on the edge-sensor SoC: both blocks
+    /// declare `inout VPWR;` and `inout VGND;`, and this reader reported 322 ports where OpenROAD
+    /// built 324 block terminals from the same netlist.
+    #[test]
+    fn standalone_inout_declarations_become_ports() {
+        let nl = parse(
+            "module m (a, y, VPWR, VGND);\n\
+              input a;\n\
+              output y;\n\
+              inout VPWR;\n\
+              inout VGND;\n\
+              BUF u1 (.A(a), .X(y));\n\
+             endmodule\n",
+        )
+        .unwrap();
+        assert_eq!(nl.inputs, ["a"]);
+        assert_eq!(nl.outputs, ["y"]);
+        assert_eq!(nl.inouts, ["VPWR", "VGND"]);
+    }
+
+    /// 🔑 **They must NOT be folded into `inputs`.** Upstream gives a bidirect port its own
+    /// `dbIoType::INOUT` (`dbReadVerilog.cc:689`), and `sta-si` reads `inputs`/`outputs` as timing
+    /// endpoints — a supply port is not one. This test is what stops a later tidy-up merging them.
+    #[test]
+    fn inouts_stay_out_of_the_timing_endpoint_lists() {
+        let nl = parse("module m (VPWR);\n inout VPWR;\nendmodule\n").unwrap();
+        assert!(nl.inputs.is_empty(), "an inout is not an input");
+        assert!(nl.outputs.is_empty(), "nor an output");
+        assert_eq!(nl.inouts, ["VPWR"]);
+    }
+
+    /// The ANSI header form, where the direction is inline in the port list.
+    #[test]
+    fn ansi_header_inouts_are_read_too() {
+        let nl = parse("module m (input a, output y, inout VPWR);\n BUF u1 (.A(a), .X(y));\nendmodule\n")
+            .unwrap();
+        assert_eq!(nl.inputs, ["a"]);
+        assert_eq!(nl.outputs, ["y"]);
+        assert_eq!(nl.inouts, ["VPWR"], "the ANSI path dropped these as well");
+    }
+
+    /// ⚠️ An `inout` carries a range like any other declaration, and the bits expand the same way.
+    #[test]
+    fn an_inout_bus_expands_to_bits() {
+        let nl = parse("module m (io);\n inout [3:0] io;\nendmodule\n").unwrap();
+        assert_eq!(nl.inouts, ["io[3]", "io[2]", "io[1]", "io[0]"]);
     }
 }
