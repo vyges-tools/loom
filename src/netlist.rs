@@ -32,6 +32,18 @@ pub struct Netlist {
     /// reads `inputs`/`outputs` as timing endpoints, which an `inout` supply port is not. Folding
     /// them in would silently change timing.
     pub inouts: Vec<String>,
+    /// Canonical names that arrived as ESCAPED identifiers (`\claimed[0] `).
+    ///
+    /// 🔑 **The name itself stays canonical** — see the tokenizer's note: `\foo ` IS `foo` per the
+    /// LRM, and every other file in the flow spells it without the backslash. Keeping it once cost
+    /// 767 of 14,238 nets and 4,527 coupling references that a timer looked up, failed to find and
+    /// dropped silently. That behaviour must not change.
+    ///
+    /// ⚠️ **But a consumer writing OpenDB needs to know.** OpenROAD stores such a net as
+    /// `claimed\[0\]` — each special character backslash-escaped — because the brackets are
+    /// literal rather than a bus index. Without this set an importer cannot tell `claimed[0]` the
+    /// escaped identifier from `claimed[0]` the bus bit, and the two are different nets.
+    pub escaped_names: std::collections::BTreeSet<String>,
     pub insts: Vec<Inst>,
     /// Every module the file defines, in declaration order.
     ///
@@ -127,7 +139,9 @@ fn strip_block_comments(text: &str) -> String {
     out
 }
 
-fn tokenize(text: &str) -> Vec<String> {
+/// Returns the tokens and, separately, the values that arrived as ESCAPED identifiers.
+/// ⚠️ The token VALUE is canonical either way; the set only records where a backslash was.
+fn tokenize(text: &str) -> (Vec<String>, std::collections::BTreeSet<String>) {
     // Strip comments first — BOTH forms.
     //
     // `/* ... */` spans lines and is where tools park disabled code. Left in, its contents
@@ -167,9 +181,13 @@ fn tokenize(text: &str) -> Vec<String> {
     // failed to find, and dropped without a word — silently removing crosstalk from the
     // analysis.
     let mut escaped = false;
+    let mut escaped_vals: std::collections::BTreeSet<String> = Default::default();
     for ch in clean.chars() {
         if escaped {
             if ch.is_whitespace() {
+                if !cur.is_empty() {
+                    escaped_vals.insert(cur.clone());
+                }
                 flush(&mut cur, &mut out);
                 escaped = false;
             } else {
@@ -190,8 +208,12 @@ fn tokenize(text: &str) -> Vec<String> {
             c => cur.push(c),
         }
     }
+    // An escaped identifier at end of input, with no trailing whitespace to close it.
+    if escaped && !cur.is_empty() {
+        escaped_vals.insert(cur.clone());
+    }
     flush(&mut cur, &mut out);
-    out
+    (out, escaped_vals)
 }
 
 /// Recover declared ranges from names already expanded to bits (`a[7]`…`a[0]` -> `a` is 7:0).
@@ -262,7 +284,7 @@ fn is_ident(t: &str) -> bool {
 }
 
 pub fn parse(text: &str) -> Result<Netlist, NetlistError> {
-    let t = tokenize(text);
+    let (t, escaped_vals) = tokenize(text);
     let n = t.len();
     let mut mods: Vec<Netlist> = Vec::new();
     let mut i = 0;
@@ -298,6 +320,9 @@ pub fn parse(text: &str) -> Result<Netlist, NetlistError> {
 
     let mut top = mods.swap_remove(top_idx);
     top.modules = names;
+    // ⚠️ Recorded on the returned module regardless of which one it is: the escaping is a fact
+    // about the FILE's tokens, and a consumer writing OpenDB needs it for any name it creates.
+    top.escaped_names = escaped_vals;
     Ok(top)
 }
 
@@ -864,5 +889,44 @@ mod inout_tests {
     fn an_inout_bus_expands_to_bits() {
         let nl = parse("module m (io);\n inout [3:0] io;\nendmodule\n").unwrap();
         assert_eq!(nl.inouts, ["io[3]", "io[2]", "io[1]", "io[0]"]);
+    }
+}
+
+#[cfg(test)]
+mod escaped_identifier_tests {
+    use super::parse;
+
+    /// ⛔ **The NAME stays canonical** — `\foo ` is `foo` per the LRM, and the tokenizer's own note
+    /// records what keeping the backslash cost: 767 of 14,238 nets and 4,527 coupling references
+    /// that resolved against nothing. This test is what stops that being undone.
+    #[test]
+    fn an_escaped_identifier_keeps_its_canonical_name() {
+        let nl = parse("module m (a);\n input a;\n wire \\claimed[0] ;\n \
+                        BUF u1 (.A(a), .X(\\claimed[0] ));\nendmodule\n")
+            .unwrap();
+        let nets: Vec<&str> =
+            nl.insts[0].conns.iter().map(|(_, n)| n.as_str()).collect();
+        assert!(nets.contains(&"claimed[0]"), "no backslash in the name: {nets:?}");
+    }
+
+    /// 🔑 **But WHICH names were escaped is recorded**, because a consumer writing OpenDB cannot
+    /// otherwise tell the escaped identifier `claimed[0]` from the bus bit `claimed[0]` — and
+    /// OpenROAD stores the first as `claimed\[0\]`.
+    #[test]
+    fn escaped_identifiers_are_reported_separately() {
+        let nl = parse("module m (a);\n input a;\n wire \\claimed[0] ;\n wire [1:0] bus;\n \
+                        BUF u1 (.A(a), .X(\\claimed[0] ));\nendmodule\n")
+            .unwrap();
+        assert!(nl.escaped_names.contains("claimed[0]"), "{:?}", nl.escaped_names);
+        assert!(!nl.escaped_names.contains("bus[0]"), "a real bus bit is NOT escaped");
+    }
+
+    /// A dotted hierarchical name is the other common escaped form.
+    #[test]
+    fn a_dotted_escaped_name_is_recorded_too() {
+        let nl = parse("module m (a);\n input a;\n \
+                        BUF u1 (.A(a), .X(\\u_sub.n1 ));\nendmodule\n")
+            .unwrap();
+        assert!(nl.escaped_names.contains("u_sub.n1"), "{:?}", nl.escaped_names);
     }
 }
