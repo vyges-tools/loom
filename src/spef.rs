@@ -1164,6 +1164,47 @@ impl Spef {
         out.push_str(&body);
         out
     }
+
+    /// Re-key nets to the names the NETLIST uses, and say how many moved.
+    ///
+    /// ⛔ **The two files can spell the same net differently, and nothing complains.** The Verilog
+    /// reader reports a net tied to a port by `assign port = net;` under the PORT's name, because a
+    /// DEF, an SDC and most SPEFs use it. OpenROAD's SPEF for a routed sky130 block does not: it names
+    /// those nets by the local wire (`net2007`, never `tl_o[2]`). Every one of them was then looked up,
+    /// missed, and timed as **ideal wire** — 53 nets and 147 coupling references on that block, with no
+    /// symptom other than optimistic slack.
+    ///
+    /// Applying the reader's own renaming to the file is the join. ⚠️ A key is moved only when the
+    /// destination is free: if a file genuinely carries both spellings they are different entries and
+    /// merging them would invent parasitics.
+    ///
+    /// Coupling aggressors are re-keyed too — they are looked up by name in exactly the same way.
+    pub fn rename_to_design(&mut self, nl: &crate::netlist::Netlist) -> usize {
+        if nl.canonical.is_empty() {
+            return 0;
+        }
+        let mut moved = 0usize;
+        let movable: Vec<(String, String)> = self
+            .nets
+            .keys()
+            .filter_map(|k| nl.canonical.get(k).map(|c| (k.clone(), c.clone())))
+            .filter(|(_, to)| !self.nets.contains_key(to))
+            .collect();
+        for (from, to) in movable {
+            if let Some(rc) = self.nets.remove(&from) {
+                self.nets.insert(to, rc);
+                moved += 1;
+            }
+        }
+        for rc in self.nets.values_mut() {
+            for (agg, _) in rc.coupling.iter_mut() {
+                if let Some(c) = nl.canonical.get(agg.as_str()) {
+                    *agg = c.clone();
+                }
+            }
+        }
+        moved
+    }
 }
 
 /// A node string this net demonstrably has: the first node its own network references, or the
@@ -1628,5 +1669,70 @@ mod name_map_optional_tests {
         assert_eq!(m.nets["sig"].cap_ff, l.nets["sig"].cap_ff);
         assert_eq!(m.nets["sig"].res_ohm, l.nets["sig"].res_ohm);
         assert_eq!(m.wire_load_pf("sig"), l.wire_load_pf("sig"));
+    }
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::*;
+
+    // ⛔ The defect this exists for: the netlist reader reports `assign tl_o[2] = net2007;` as
+    // `tl_o[2]`, and OpenROAD's SPEF for the same block calls that net `net2007`. Without the
+    // rename the parasitics join to nothing and the net is timed as ideal wire.
+    const NL: &str = "module m (tl_o);\n output [3:0] tl_o;\n wire net2007;\n \
+                      CELL u1 (.LO(net2007));\n assign tl_o[2] = net2007;\nendmodule\n";
+
+    fn spef_with(net: &str, agg: &str) -> Spef {
+        Spef::parse(&format!(
+            "*SPEF \"ieee 1481-1999\"\n*DESIGN \"m\"\n*DIVIDER /\n*DELIMITER :\n\
+             *BUS_DELIMITER []\n*T_UNIT 1 NS\n*C_UNIT 1 PF\n*R_UNIT 1 OHM\n*L_UNIT 1 HENRY\n\n\
+             *NAME_MAP\n*1 {net}\n*2 {agg}\n\n*D_NET *1 0.5\n*CAP\n1 *1 *2 0.25\n*END\n\
+             *D_NET *2 0.5\n*END\n"
+        ))
+    }
+
+    #[test]
+    fn a_net_the_reader_renamed_is_re_keyed_to_the_name_the_netlist_uses() {
+        let nl = crate::netlist::parse(NL).expect("parses");
+        assert_eq!(nl.canonical.get("net2007").map(String::as_str), Some("tl_o[2]"));
+
+        let mut sp = spef_with("net2007", "other");
+        assert!(sp.nets.contains_key("net2007") && !sp.nets.contains_key("tl_o[2]"));
+        assert_eq!(sp.rename_to_design(&nl), 1);
+        assert!(sp.nets.contains_key("tl_o[2]"), "the net now joins");
+        assert!(!sp.nets.contains_key("net2007"), "and the old key is gone, not duplicated");
+    }
+
+    // A coupling aggressor is looked up by name in exactly the same way, so it moves too.
+    #[test]
+    fn a_coupling_aggressor_is_re_keyed_as_well() {
+        let nl = crate::netlist::parse(NL).expect("parses");
+        let mut sp = spef_with("other", "net2007");
+        sp.rename_to_design(&nl);
+        let names: Vec<&str> =
+            sp.nets.values().flat_map(|rc| rc.coupling.iter().map(|(a, _)| a.as_str())).collect();
+        assert!(names.contains(&"tl_o[2]"), "aggressor re-keyed, got {names:?}");
+        assert!(!names.contains(&"net2007"));
+    }
+
+    // ⚠️ If the file genuinely carries BOTH spellings they are different entries; merging them
+    // would invent parasitics on one and destroy them on the other.
+    #[test]
+    fn an_occupied_destination_is_left_alone() {
+        let nl = crate::netlist::parse(NL).expect("parses");
+        let mut sp = spef_with("net2007", "tl_o[2]");
+        assert_eq!(sp.rename_to_design(&nl), 0, "nothing may move onto an existing key");
+        assert!(sp.nets.contains_key("net2007") && sp.nets.contains_key("tl_o[2]"));
+    }
+
+    // A netlist with no aliases renames nothing and costs nothing.
+    #[test]
+    fn a_netlist_that_renamed_nothing_moves_nothing() {
+        let nl = crate::netlist::parse("module m (a);\n input a;\n CELL u1 (.A(a));\nendmodule\n")
+            .expect("parses");
+        assert!(nl.canonical.is_empty());
+        let mut sp = spef_with("net2007", "other");
+        assert_eq!(sp.rename_to_design(&nl), 0);
+        assert!(sp.nets.contains_key("net2007"));
     }
 }

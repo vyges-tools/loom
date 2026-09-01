@@ -55,6 +55,18 @@ pub struct Netlist {
     /// Dropping these breaks connectivity rather than merely thinning it: a tool writes
     /// `assign out = n42;` and the output port has no driver at all as far as we are concerned.
     pub aliases: Vec<(String, String)>,
+    /// **The renaming this reader applied**, as `written name -> canonical name`.
+    ///
+    /// 🔑 A net tied to a port by `assign port = net;` is reported under the PORT's name, because
+    /// that is what a DEF, an SDC and *most* SPEFs call it, and because the two front ends
+    /// otherwise disagreed about a net on five of fifteen real designs.
+    ///
+    /// ⛔ **But "most" is not "all", and the renaming is invisible to whoever has to join.**
+    /// OpenROAD's SPEF for a routed sky130 block names those nets by the LOCAL wire — `net2007`,
+    /// never `tl_o[2]` — so 53 nets' parasitics joined to nothing and were timed as ideal wire,
+    /// with no symptom beyond an optimistic slack. Keeping the map is what lets a consumer try
+    /// the other spelling instead of silently missing.
+    pub canonical: std::collections::BTreeMap<String, String>,
     /// Behavioural constructs seen and ignored (`always`, `initial`, `function`, `generate`).
     ///
     /// This reader is structural-only, and handed RTL it does not fail — it returns whatever
@@ -736,6 +748,10 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
     for (ii, ci, c) in renames {
         nl.insts[ii].conns[ci].1 = c;
     }
+    // ⚠️ Recorded even when nothing was renamed, so a consumer never has to ask whether the map
+    // is populated — an empty map and "no renaming happened" are the same statement.
+    nl.canonical =
+        to_port.iter().map(|(from, to)| (from.to_string(), to.to_string())).collect();
 
     (nl, i)
 }
