@@ -15,11 +15,11 @@
 //! in-process cache) mean a changed library is a different entry — never a stale read.
 
 use crate::ccs::{CcsArc, CcsWaveform};
-use crate::liberty::{Arc, Cell, Constraint, Dir, Lib, Pin, RecvCap, Table};
+use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, Pin, RecvCap, Table};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLC5"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLC6"; // Vyges Liberty Cache — bump the trailing digit on any format change
                                  // VLC5: Cell gained `async_reset_pins` (the `ff` group's clear/preset pins), for RDC.
                                  // VLC2: pin `function`, cell `cell_footprint` + `area`.
                                  // VLC3: library `Thresholds` (slew/delay measurement points).
@@ -194,6 +194,14 @@ fn enc_arc(w: &mut W, a: &Arc) {
     enc_ccs(w, &a.ccs);
     // Whether the arc DECLARED a CCS group, which `ccs` alone cannot say once it is empty.
     w.u8(a.ccs_declared as u8);
+    // The launching clock edge of a sequential arc. It MUST survive the cache: dropping it
+    // here would make the arc combinational again on any warm-cache run, and the timer
+    // would silently go back to letting either clock edge launch a flop.
+    w.u8(match a.clk_edge {
+        None => 0,
+        Some(ClkEdge::Rise) => 1,
+        Some(ClkEdge::Fall) => 2,
+    });
     enc_table(w, &a.sigma_rise);
     enc_table(w, &a.sigma_fall);
 }
@@ -207,6 +215,11 @@ fn dec_arc(r: &mut R) -> Option<Arc> {
         fall_transition: dec_table(r)?,
         ccs: dec_ccs(r)?,
         ccs_declared: r.u8()? != 0,
+        clk_edge: match r.u8()? {
+            1 => Some(ClkEdge::Rise),
+            2 => Some(ClkEdge::Fall),
+            _ => None,
+        },
         sigma_rise: dec_table(r)?,
         sigma_fall: dec_table(r)?,
     })
@@ -579,6 +592,53 @@ library (demo) {
   }
 }
 "#;
+
+    /// A sequential arc's launching clock edge must survive the cache. Dropping it here
+    /// would make the arc combinational again on any WARM-cache run, and the timer would
+    /// go back to letting either clock edge launch a flop — silently, and only sometimes,
+    /// which is the worst shape a correctness bug can have.
+    #[test]
+    fn a_sequential_arcs_clock_edge_survives_the_cache() {
+        const SEQ: &str = r#"
+library (seqdemo) {
+  capacitive_load_unit (1, pf);
+  cell (DFF) {
+    pin (CLK) { direction : input; clock : true; capacitance : 0.001; }
+    pin (Q) {
+      direction : output;
+      timing () { related_pin : "CLK"; timing_type : rising_edge;
+        cell_rise (t) { values("0.1, 0.2"); } }
+    }
+  }
+  cell (DFFN) {
+    pin (CLK) { direction : input; clock : true; capacitance : 0.001; }
+    pin (Q) {
+      direction : output;
+      timing () { related_pin : "CLK"; timing_type : falling_edge;
+        cell_rise (t) { values("0.1, 0.2"); } }
+    }
+  }
+  cell (BUF) {
+    pin (A) { direction : input; capacitance : 0.001; }
+    pin (X) {
+      direction : output;
+      timing () { related_pin : "A"; cell_rise (t) { values("0.1, 0.2"); } }
+    }
+  }
+}
+"#;
+        let edge = |l: &Lib, cell: &str, pin: &str| l.cells[cell].pins[pin].arcs[0].clk_edge;
+        let lib = Lib::parse(SEQ).unwrap();
+        // parsed at all — `timing_sense` cannot supply this, these arcs declare none
+        assert_eq!(edge(&lib, "DFF", "Q"), Some(ClkEdge::Rise));
+        assert_eq!(edge(&lib, "DFFN", "Q"), Some(ClkEdge::Fall));
+        assert_eq!(edge(&lib, "BUF", "X"), None, "a combinational arc has no clock edge");
+
+        let back = decode(&encode(&lib)).expect("decode");
+        assert_eq!(edge(&back, "DFF", "Q"), Some(ClkEdge::Rise));
+        assert_eq!(edge(&back, "DFFN", "Q"), Some(ClkEdge::Fall));
+        assert_eq!(edge(&back, "BUF", "X"), None);
+    }
 
     #[test]
     fn codec_round_trips_byte_stable() {

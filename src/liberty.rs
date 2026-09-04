@@ -26,10 +26,27 @@ pub struct Table {
     pub values: Vec<Vec<f64>>, // values[i][j] over (slew_i, load_j)
 }
 
+/// The clock edge a **sequential** delay arc launches on — Liberty `timing_type :
+/// rising_edge` / `falling_edge`.
+///
+/// It is not the same information as `timing_sense`, and it cannot be recovered from it:
+/// sky130's `rising_edge` arcs declare no `timing_sense` at all, so they parse as
+/// `non_unate` and every input edge appears to drive every output edge. A flop's CK->Q may
+/// be launched by ONE clock edge; letting the other launch it is how a min-delay pass ends
+/// up carrying the FALLING edge of the clock into the data path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClkEdge {
+    Rise,
+    Fall,
+}
+
 #[derive(Debug, Clone)]
 pub struct Arc {
     pub related_pin: String,
     pub sense: String,
+    /// `Some` only on a sequential (`rising_edge` / `falling_edge`) arc; `None` on a
+    /// combinational one. See [`ClkEdge`].
+    pub clk_edge: Option<ClkEdge>,
     pub cell_rise: Table,
     pub cell_fall: Table,
     pub rise_transition: Table,
@@ -677,9 +694,18 @@ fn parse_arc(timing_body: &str, skip_ccs: bool) -> Arc {
             .map(|(_, body, _)| parse_table(&body))
             .unwrap_or_default()
     };
+    // `rising_edge` / `falling_edge` name the launching clock edge. Anything else is a
+    // combinational arc; the checks (setup_*/hold_*/recovery_*/removal_*) never reach
+    // here — the caller routes them into the constraint vectors before this point.
+    let clk_edge = match simple_attr(timing_body, "timing_type").as_deref() {
+        Some("rising_edge") => Some(ClkEdge::Rise),
+        Some("falling_edge") => Some(ClkEdge::Fall),
+        _ => None,
+    };
     Arc {
         related_pin: simple_attr(timing_body, "related_pin").unwrap_or_default(),
         sense: simple_attr(timing_body, "timing_sense").unwrap_or_else(|| "non_unate".into()),
+        clk_edge,
         cell_rise: tbl("cell_rise"),
         cell_fall: tbl("cell_fall"),
         rise_transition: tbl("rise_transition"),
