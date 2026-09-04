@@ -290,7 +290,24 @@ impl NetRc {
     /// with `xtalk_cap_ff` spread over the wire (the Miller crosstalk load) — see [`spread_xtalk`].
     /// Returns `None` if the network is not a tree reachable from the driver
     /// (caller falls back to the lumped delay).
-    pub fn elmore(&self, driver: &str, xtalk_cap_ff: f64) -> Option<BTreeMap<String, f64>> {
+    /// Per-sink **Elmore time constant** (`sum R_k * C_downstream(k)`), keyed by SPEF node.
+    ///
+    /// ⚠️ It is a TIME CONSTANT, not a 50 % delay. The reference converts it —
+    /// `wire_delay = -tau * ln(1 - Vth)` in `DelayCalcBase::dspfWireDelaySlew` — so a
+    /// caller that uses tau directly over-states the delay by 1/ln(2) = 1.44x.
+    ///
+    /// `pin_cap_ff` supplies the RECEIVER capacitance at each load node. SPEF carries the
+    /// wire's own capacitance; the load pins' input capacitance comes from Liberty, and
+    /// upstream adds it during parasitic reduction unless the SPEF declared pin caps
+    /// (`read_spef -pin_cap_included`). Omitting it leaves every subtree capacitance short
+    /// and the network too fast — measured on a fanout-298 net, tau came out 4.7x below
+    /// the reference's.
+    pub fn elmore(
+        &self,
+        driver: &str,
+        xtalk_cap_ff: f64,
+        pin_cap_ff: &BTreeMap<String, f64>,
+    ) -> Option<BTreeMap<String, f64>> {
         if self.res.is_empty() {
             return None;
         }
@@ -300,6 +317,18 @@ impl NetRc {
             *cap.entry(node.as_str()).or_default() += c;
         }
         spread_xtalk(&mut cap, &self.ground, driver, xtalk_cap_ff);
+        // Receiver capacitance sits ON its load node, not spread over the wire.
+        for (node, c) in pin_cap_ff {
+            if let Some(k) = self
+                .ground
+                .iter()
+                .map(|(n, _)| n)
+                .chain(self.res.iter().flat_map(|(a, b, _)| [a, b]))
+                .find(|n| *n == node)
+            {
+                *cap.entry(k.as_str()).or_default() += *c;
+            }
+        }
         // adjacency
         let mut adj: HashMap<&str, Vec<(&str, f64)>> = HashMap::new();
         for (a, b, r) in &self.res {
@@ -1440,7 +1469,7 @@ mod writer_tests {
         );
         // and the same through the Elmore path, which shares the defect and the fix
         let e = |xc: f64| {
-            rc.elmore("drv:Y", xc).expect("elmore").values().copied().fold(0.0f64, f64::max)
+            rc.elmore("drv:Y", xc, &BTreeMap::new()).expect("elmore").values().copied().fold(0.0f64, f64::max)
         };
         assert!(e(50.0) > e(0.0) * 1.05, "and through Elmore: {} -> {}", e(0.0), e(50.0));
     }
@@ -1650,7 +1679,7 @@ mod name_map_optional_tests {
             let rc = s.nets.get("sig").expect("net present in both forms");
             let drv = rc.pin_node("u_drv", "Y").expect("driver pin resolves");
             let snk = rc.pin_node("u_snk", "A").expect("sink pin resolves");
-            *rc.elmore(drv, 0.0)
+            *rc.elmore(drv, 0.0, &BTreeMap::new())
                 .expect("RC is a tree")
                 .get(snk)
                 .expect("sink is reachable")
