@@ -532,10 +532,11 @@ impl DriverWaveform {
     fn vl0(&self, t: f64, p3: f64) -> (f64, f64) {
         let d1 = self.k0 * (self.k1 - self.k2 / p3);
         let d3 = -p3 * self.k0 * self.k3 / (self.p1 - p3);
-        let d4 = -p3 * self.k0 * self.k4 / (self.p2 - p3);
+        // one-pole case: k4 = 0 and p2 = INFINITY, so this term is zero by construction
+        let d4 = if self.k4 == 0.0 { 0.0 } else { -p3 * self.k0 * self.k4 / (self.p2 - p3) };
         let d5 = self.k0
             * (self.k2 / p3 - self.k1 + p3 * self.k3 / (self.p1 - p3)
-                + p3 * self.k4 / (self.p2 - p3));
+                + if self.k4 == 0.0 { 0.0 } else { p3 * self.k4 / (self.p2 - p3) });
         let e1 = exp2(-self.p1 * t);
         let e2 = exp2(-self.p2 * t);
         let e3 = exp2(-p3 * t);
@@ -618,6 +619,211 @@ impl DriverWaveform {
     }
 }
 
+/// `DmpZeroC2` — the near capacitance is negligible, so `Ceff` is known (`= c1`) and only
+/// the waveform has to be solved.
+///
+/// ⛔ This case is NOT rare, whatever a big block suggests: a net with a single lumped
+/// capacitance behind a single resistor reduces to `c2 = 0` EXACTLY, because moment
+/// matching on one R and one C gives `c1 = C`, `c2 = y1 − c1 = 0`, `rpi = R`. `fft_top`
+/// never selects it and a two-element SPEF always does.
+///
+/// It differs from `DmpPi` in three ways worth keeping straight: `ceff` is fixed rather
+/// than solved, so the Newton system is TWO equations over `(t0, dt)`; there is one pole
+/// rather than two; and the gate DELAY comes from the waveform (`vo_delay_ = delay`)
+/// rather than from the table.
+struct DmpZeroC2<'a> {
+    rd: f64,
+    rpi: f64,
+    c1: f64,
+    t: Vth,
+    k0: f64,
+    k1: f64,
+    k2: f64,
+    k3: f64,
+    p1: f64,
+    t0: f64,
+    dt: f64,
+    gate: &'a dyn Fn(f64) -> (f64, f64),
+}
+
+impl<'a> DmpZeroC2<'a> {
+    fn new(rd: f64, rpi: f64, c1: f64, t: Vth, gate: &'a dyn Fn(f64) -> (f64, f64)) -> Self {
+        let z1 = 1.0 / (rpi * c1);
+        let p1 = 1.0 / (c1 * (rd + rpi));
+        let k0 = p1 / z1;
+        let k2 = 1.0 / k0;
+        let k1 = (p1 - z1) / (p1 * p1);
+        DmpZeroC2 { rd, rpi, c1, t, k0, k1, k2, k3: -k1, p1, t0: 0.0, dt: 0.0, gate }
+    }
+    fn gate_delays(&self, ceff: f64) -> (f64, f64, f64) {
+        let (t_vth, table_slew) = (self.gate)(ceff);
+        let slew = table_slew * self.t.slew_derate;
+        (t_vth, t_vth - slew * (self.t.vth - self.t.vl) / (self.t.vh - self.t.vl), slew)
+    }
+    fn y0(&self, t: f64, cl: f64) -> f64 {
+        t - self.rd * cl * (1.0 - exp2(-t / (self.rd * cl)))
+    }
+    fn y0dt(&self, t: f64, cl: f64) -> f64 {
+        1.0 - exp2(-t / (self.rd * cl))
+    }
+    fn y(&self, t: f64, t0: f64, dt: f64, cl: f64) -> f64 {
+        let t1 = t - t0;
+        if t1 <= 0.0 {
+            0.0
+        } else if t1 <= dt {
+            self.y0(t1, cl) / dt
+        } else {
+            (self.y0(t1, cl) - self.y0(t1 - dt, cl)) / dt
+        }
+    }
+    /// Partials w.r.t. (t0, dt) only — `ceff` is not an unknown here.
+    fn dy(&self, t: f64, t0: f64, dt: f64, cl: f64) -> (f64, f64) {
+        let t1 = t - t0;
+        if t1 <= 0.0 {
+            (0.0, 0.0)
+        } else if t1 <= dt {
+            (-self.y0dt(t1, cl) / dt, -self.y0(t1, cl) / (dt * dt))
+        } else {
+            (
+                -(self.y0dt(t1, cl) - self.y0dt(t1 - dt, cl)) / dt,
+                -(self.y0(t1, cl) + self.y0(t1 - dt, cl)) / (dt * dt)
+                    + self.y0dt(t1 - dt, cl) / dt,
+            )
+        }
+    }
+    fn v0(&self, t: f64) -> (f64, f64) {
+        let e1 = exp2(-self.p1 * t);
+        (
+            self.k0 * (self.k1 + self.k2 * t + self.k3 * e1),
+            self.k0 * (self.k2 - self.k3 * self.p1 * e1),
+        )
+    }
+    fn vo(&self, t: f64) -> (f64, f64) {
+        let t1 = t - self.t0;
+        if t1 <= 0.0 {
+            (0.0, 0.0)
+        } else if t1 <= self.dt {
+            let (v, dv) = self.v0(t1);
+            (v / self.dt, dv / self.dt)
+        } else {
+            let (v, dv) = self.v0(t1);
+            let (v2, dv2) = self.v0(t1 - self.dt);
+            ((v - v2) / self.dt, (dv - dv2) / self.dt)
+        }
+    }
+    fn find_vo_crossing(&self, v: f64, lo: f64, hi: f64) -> Result<f64, DmpError> {
+        let (mut lo, mut hi) = (lo, hi);
+        let mut t = 0.5 * (lo + hi);
+        for _ in 0..FIND_ROOT_MAX_ITER {
+            let (vo, dvo) = self.vo(t);
+            let err = vo - v;
+            if err.abs() < VTH_TIME_TOL * v.max(1e-12) {
+                return Ok(t);
+            }
+            if err > 0.0 {
+                hi = t;
+            } else {
+                lo = t;
+            }
+            let next = if dvo.abs() > 0.0 { t - err / dvo } else { f64::NAN };
+            t = if next.is_finite() && next > lo && next < hi { next } else { 0.5 * (lo + hi) };
+        }
+        Err(DmpError::RootNotFound)
+    }
+    /// `DmpOnePole::evalDmpEqns` + `DmpAlg::findDriverParams` at `nr_order == 2`.
+    fn solve(&mut self) -> DmpResult {
+        let (t_vth, _tvl, slew) = self.gate_delays(self.c1);
+        let dt = slew / (self.t.vh - self.t.vl);
+        let t0 = t_vth + (1.0 - self.t.vth).ln() * self.rd * self.c1 - self.t.vth * dt;
+        let mut x = [t0, dt];
+        let mut ok = false;
+        for _ in 0..NEWTON_MAX_ITER {
+            let (t_vth, t_vl, _s) = self.gate_delays(self.c1);
+            // the reference repairs a non-positive dt in place rather than failing
+            if x[1] <= 0.0 {
+                x[1] = (t_vl - t_vth) / 100.0;
+            }
+            let f = [
+                self.y(t_vth, x[0], x[1], self.c1) - self.t.vth,
+                self.y(t_vl, x[0], x[1], self.c1) - self.t.vl,
+            ];
+            let (a0, a1) = self.dy(t_vth, x[0], x[1], self.c1);
+            let (b0, b1) = self.dy(t_vl, x[0], x[1], self.c1);
+            let det = a0 * b1 - a1 * b0;
+            if det.abs() < 1e-300 || !det.is_finite() {
+                break;
+            }
+            let p = [
+                (-f[0] * b1 + f[1] * a1) / det,
+                (-a0 * f[1] + b0 * f[0]) / det,
+            ];
+            let mut done = true;
+            for i in 0..2 {
+                if p[i].abs() > x[i].abs() * DRIVER_PARAM_TOL {
+                    done = false;
+                }
+                x[i] += p[i];
+            }
+            if done {
+                ok = true;
+                break;
+            }
+        }
+        self.t0 = x[0];
+        self.dt = x[1];
+        let (table_delay, table_slew) = (self.gate)(self.c1);
+        if ok {
+            // ⚠️ Unlike `DmpPi`, the DELAY comes from the waveform too — `vo_delay_ = delay`.
+            let t_upper = self.t0 + self.dt + self.c1 * (self.rd + self.rpi) * 2.0;
+            let r = (|| -> Result<(f64, f64), DmpError> {
+                let d = self.find_vo_crossing(self.t.vth, self.t0, t_upper)?;
+                let tl = self.find_vo_crossing(self.t.vl, self.t0, d)?;
+                let th = self.find_vo_crossing(self.t.vh, d, t_upper)?;
+                Ok((d, (th - tl) / self.t.slew_derate))
+            })();
+            if let Ok((delay, slew)) = r {
+                return DmpResult {
+                    ceff: self.c1,
+                    delay,
+                    slew,
+                    driver_valid: true,
+                    waveform: Some(DriverWaveform {
+                        t0: self.t0,
+                        dt: self.dt,
+                        vo_delay: delay,
+                        drvr_slew: slew,
+                        driver_valid: true,
+                        // one pole: k4/p2 are zero, which makes `Vl0`'s D4 term vanish and
+                        // leaves exactly `DmpZeroC2::Vl0`.
+                        k0: self.k0,
+                        k1: self.k1,
+                        k2: self.k2,
+                        k3: self.k3,
+                        k4: 0.0,
+                        p1: self.p1,
+                        p2: f64::INFINITY,
+                        rd: self.rd,
+                        rpi: self.rpi,
+                        c1: self.c1,
+                        c2: 0.0,
+                        t: self.t,
+                    }),
+                    fail: None,
+                };
+            }
+        }
+        // "Fall back to table slew."
+        DmpResult {
+            ceff: self.c1,
+            delay: table_delay,
+            slew: table_slew,
+            driver_valid: false,
+            waveform: Some(DriverWaveform::capacitive(table_slew, self.t)),
+            fail: Some(DmpError::NewtonMaxIter),
+        }
+    }
+}
+
 /// Which DMP algorithm the reference picks for a driver — `DmpCeffDelayCalc::setCeffAlgorithm`.
 ///
 /// ⚠️ **One threshold is unit-bearing.** The reference works in SI, so `rd < 1e-2` means
@@ -683,18 +889,7 @@ pub fn solve_driver(
                 fail: None,
             }
         }
-        Alg::ZeroC2 => {
-            let ceff = c1;
-            let (delay, slew) = gate(ceff);
-            DmpResult {
-                ceff,
-                delay,
-                slew,
-                driver_valid: false,
-                waveform: Some(DriverWaveform::capacitive(slew, t)),
-                fail: None,
-            }
-        }
+        Alg::ZeroC2 => DmpZeroC2::new(rd, rpi, c1, t, gate).solve(),
     }
 }
 
@@ -959,6 +1154,30 @@ mod shield_tests {
         assert!(
             (slew - 1.6616).abs() < 0.06,
             "sink slew {slew} should reproduce the reference's 1.6616"
+        );
+    }
+
+    /// ⛔ `ZeroC2` is not exotic: a single lumped C behind a single R reduces to c2 = 0
+    /// EXACTLY. Moment matching on one R and one C gives y1 = C, y2 = −R·C², y3 = R²·C³,
+    /// hence c1 = C, c2 = 0, rpi = R. A two-element SPEF always lands here, and declining
+    /// to solve it cost a real slew degradation on such a net.
+    #[test]
+    fn a_single_rc_selects_zero_c2_and_still_degrades_the_slew() {
+        // 100 fF behind 10 kΩ, driven by a gate with a load-dependent table
+        let (c2, rpi, c1) = (0.0, 10.0, 0.100);
+        let gate = |c: f64| (0.08 + 13.3 * c, 0.03 + 6.7 * c);
+        let rd = gate_model_rd(th().vth, &gate, c1, c2);
+        assert_eq!(select_alg(rd, c2, rpi, c1), Alg::ZeroC2, "one R and one C is the ZeroC2 case");
+        let r = solve_driver(rd, c2, rpi, c1, th(), &gate);
+        assert_eq!(r.ceff, c1, "ZeroC2 does not solve for Ceff, it IS c1");
+        assert!(r.driver_valid, "and the waveform solve must converge, got {:?}", r.fail);
+        let w = r.waveform.unwrap();
+        let (delay, slew) = w.load_delay_slew(1.0); // tau = 10 kΩ × 100 fF = 1 ns
+        assert!(delay > 0.0, "wire delay {delay} must be positive");
+        assert!(
+            slew > r.slew * 1.5,
+            "a 1 ns RC must heavily degrade the edge: sink {slew} vs driver {}",
+            r.slew
         );
     }
 

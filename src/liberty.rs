@@ -460,11 +460,23 @@ fn bracket(g: &[f64], v: f64) -> (usize, usize, f64) {
     if n == 1 {
         return (0, 0, 0.0);
     }
+    // ⛔ EXTRAPOLATE past either end; do not clamp. The reference's `findValueIndex`
+    // returns index 0 below the axis and `size - 2` above it — its comment says "Return
+    // max_index-1 for value too large so interpolation pts are index,index+1" — and
+    // `Table2::findValue` then forms `dx = (x - xl) / (xu - xl)` from the ACTUAL x, which
+    // is negative below the axis and greater than 1 above it.
+    //
+    // Clamping instead makes the table flat outside its characterisation range, so a gate
+    // driving more than it was characterised for shows NO extra delay and NO extra slew.
+    // It also silently zeroes `gateModelRd` — two lookups a hair apart return the same
+    // number — and a zero Rd sends `setCeffAlgorithm` down the capacitive branch, which
+    // degrades no slew at all. That is how a 100 fF load behind 10 kΩ came out with an
+    // undegraded edge.
     if v <= g[0] {
-        return (0, 1, 0.0);
+        return (0, 1, (v - g[0]) / (g[1] - g[0]));
     }
     if v >= g[n - 1] {
-        return (n - 2, n - 1, 1.0);
+        return (n - 2, n - 1, (v - g[n - 2]) / (g[n - 1] - g[n - 2]));
     }
     for k in 0..n - 1 {
         if v <= g[k + 1] {
