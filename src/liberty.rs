@@ -75,10 +75,24 @@ pub struct Constraint {
 
 impl Constraint {
     /// Worst (max) of rise/fall, interpolated at the clock and data transitions.
+    ///
+    /// ⚠️ Use [`Constraint::eval_edge`] when the ARRIVAL is also per edge. A check exists
+    /// for one data edge at a time — `VisitPathEnds::visitCheckEnd` matches
+    /// `check_arc->toEdge()` against the path's `end_rf` — so pairing the earliest arrival
+    /// with the other edge's constraint scores a check that does not exist.
     pub fn eval(&self, clock_slew: f64, data_slew: f64) -> f64 {
         self.rise
             .lookup(clock_slew, data_slew)
             .max(self.fall.lookup(clock_slew, data_slew))
+    }
+
+    /// The constraint for ONE data edge: `rise` when `rising`, else `fall`.
+    pub fn eval_edge(&self, rising: bool, clock_slew: f64, data_slew: f64) -> f64 {
+        if rising {
+            self.rise.lookup(clock_slew, data_slew)
+        } else {
+            self.fall.lookup(clock_slew, data_slew)
+        }
     }
 }
 
