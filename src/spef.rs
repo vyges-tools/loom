@@ -375,7 +375,16 @@ impl NetRc {
         delay.insert(driver.to_string(), 0.0);
         for &nd in order.iter().skip(1) {
             let (p, r) = parent[nd];
-            let d = delay[p] + r * sub[nd] * 1e-6; // R[Ω]·C[fF] -> ns
+            // ⛔ TYPES, from the reference (see `cpp-to-rust-numeric-reference.md` §1):
+            // `ReduceToPiElmore::reduceElmoreDfs` computes
+            //   `double onode_elmore = elmore + r * downstreamCap(onode);`
+            // where BOTH `Parasitics::value(ParasiticResistor*)` and
+            // `ReduceToPi::downstreamCap` return **float**. So the per-step increment is an
+            // f32 multiply — about 7 significant digits — and only the running sum is
+            // double. Computing the increment in f64 is MORE ACCURATE than the reference,
+            // which is a divergence here, not an improvement.
+            let inc = (r as f32 * sub[nd] as f32) as f64 * 1e-6; // R[Ω]·C[fF] -> ns
+            let d = delay[p] + inc;
             delay.insert(nd.to_string(), d);
         }
         Some(delay)
