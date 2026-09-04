@@ -79,6 +79,8 @@ pub struct DmpResult {
     /// reference keeps the same flag and its sink model reads it: with `driver_valid_`
     /// false, `DmpAlg::loadDelaySlew` degrades no slew at all.
     pub driver_valid: bool,
+    /// The state the per-sink solve needs. `None` when there is no waveform to hand on.
+    pub waveform: Option<DriverWaveform>,
     /// Why the solve gave up, when it did. The reference reports the same reasons under
     /// its `dcalc_error` debug group; carrying it means a fallback is never silent.
     pub fail: Option<DmpError>,
@@ -366,6 +368,29 @@ impl<'a> DmpPi<'a> {
         Ok((delay, (th - tl) / self.t.slew_derate))
     }
 
+    /// Hand the solved state to the per-sink model.
+    fn waveform(&self, vo_delay: f64, drvr_slew: f64, driver_valid: bool) -> DriverWaveform {
+        DriverWaveform {
+            t0: self.t0,
+            dt: self.dt,
+            vo_delay,
+            drvr_slew,
+            driver_valid,
+            k0: self.k0,
+            k1: self.k1,
+            k2: self.k2,
+            k3: self.k3,
+            k4: self.k4,
+            p1: self.p1,
+            p2: self.p2,
+            rd: self.rd,
+            rpi: self.rpi,
+            c1: self.c1,
+            c2: self.c2,
+            t: self.t,
+        }
+    }
+
     /// `DmpPi::gateDelaySlew`, fallbacks included.
     pub fn solve(&mut self) -> DmpResult {
         // `findDriverParamsPi`: try the whole load, then the near capacitance alone.
@@ -377,11 +402,12 @@ impl<'a> DmpPi<'a> {
                 let (delay, table_slew) = (self.gate)(ceff);
                 match self.find_driver_delay_slew() {
                     // ⛔ the slew is the WAVEFORM's, not the table's
-                    Ok((_vo_delay, vo_slew)) => DmpResult {
+                    Ok((vo_delay, vo_slew)) => DmpResult {
                         ceff,
                         delay,
                         slew: vo_slew,
                         driver_valid: true,
+                        waveform: Some(self.waveform(vo_delay, vo_slew, true)),
                         fail: None,
                     },
                     // "Fall back to table slew" — the delay still stands
@@ -390,6 +416,7 @@ impl<'a> DmpPi<'a> {
                         delay,
                         slew: table_slew,
                         driver_valid: false,
+                        waveform: Some(self.waveform(0.0, table_slew, false)),
                         fail: Some(e),
                     },
                 }
@@ -398,7 +425,14 @@ impl<'a> DmpPi<'a> {
             Err(e) => {
                 let ceff = self.c1 + self.c2;
                 let (delay, slew) = (self.gate)(ceff);
-                DmpResult { ceff, delay, slew, driver_valid: false, fail: Some(e) }
+                DmpResult {
+                    ceff,
+                    delay,
+                    slew,
+                    driver_valid: false,
+                    waveform: Some(self.waveform(0.0, slew, false)),
+                    fail: Some(e),
+                }
             }
         }
     }
@@ -437,6 +471,151 @@ fn solve3(a: &mut [[f64; 3]; 3], mut b: [f64; 3]) -> Result<[f64; 3], DmpError> 
         return Err(DmpError::NewtonMaxIter);
     }
     Ok(x)
+}
+
+/// Everything the PER-SINK solve needs from the driver solve that ran before it.
+///
+/// 🔑 This is a call-sequence coupling, not a convenience: `DmpAlg::loadDelaySlew` reads
+/// `t0_`, `dt_`, `vo_delay_`, `drvr_slew_` and `driver_valid_`, all set by
+/// `gateDelaySlew` for the SAME driver. Upstream keeps them as members and relies on the
+/// two being called in order within one arc evaluation; we hand them over explicitly so
+/// the order cannot be got wrong silently.
+#[derive(Debug, Clone, Copy)]
+pub struct DriverWaveform {
+    t0: f64,
+    dt: f64,
+    vo_delay: f64,
+    drvr_slew: f64,
+    driver_valid: bool,
+    // the Pi's poles/residues, needed again for the sink waveform
+    k0: f64,
+    k1: f64,
+    k2: f64,
+    k3: f64,
+    k4: f64,
+    p1: f64,
+    p2: f64,
+    rd: f64,
+    rpi: f64,
+    c1: f64,
+    c2: f64,
+    t: Vth,
+}
+
+impl DriverWaveform {
+    /// The capacitive case: no waveform, so every sink takes `delay = elmore` and the
+    /// driver's own slew — `DmpCap::loadDelaySlew`.
+    fn capacitive(drvr_slew: f64, t: Vth) -> DriverWaveform {
+        DriverWaveform {
+            t0: 0.0,
+            dt: 0.0,
+            vo_delay: 0.0,
+            drvr_slew,
+            driver_valid: false,
+            k0: 0.0,
+            k1: 0.0,
+            k2: 0.0,
+            k3: 0.0,
+            k4: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+            rd: 0.0,
+            rpi: 0.0,
+            c1: 0.0,
+            c2: 0.0,
+            t,
+        }
+    }
+
+    /// `DmpPi::Vl0` — the waveform at a LOAD, i.e. the driver waveform with a third pole
+    /// at `p3 = 1/elmore` for the wire between them.
+    fn vl0(&self, t: f64, p3: f64) -> (f64, f64) {
+        let d1 = self.k0 * (self.k1 - self.k2 / p3);
+        let d3 = -p3 * self.k0 * self.k3 / (self.p1 - p3);
+        let d4 = -p3 * self.k0 * self.k4 / (self.p2 - p3);
+        let d5 = self.k0
+            * (self.k2 / p3 - self.k1 + p3 * self.k3 / (self.p1 - p3)
+                + p3 * self.k4 / (self.p2 - p3));
+        let e1 = exp2(-self.p1 * t);
+        let e2 = exp2(-self.p2 * t);
+        let e3 = exp2(-p3 * t);
+        (
+            d1 + t + d3 * e1 + d4 * e2 + d5 * e3,
+            1.0 - d3 * self.p1 * e1 - d4 * self.p2 * e2 - d5 * p3 * e3,
+        )
+    }
+
+    /// `DmpAlg::Vl` — the ramp response built from `Vl0`, same shape as `Vo`.
+    fn vl(&self, t: f64, p3: f64) -> (f64, f64) {
+        let t1 = t - self.t0;
+        if t1 <= 0.0 {
+            (0.0, 0.0)
+        } else if t1 <= self.dt {
+            let (v, dv) = self.vl0(t1, p3);
+            (v / self.dt, dv / self.dt)
+        } else {
+            let (v, dv) = self.vl0(t1, p3);
+            let (v2, dv2) = self.vl0(t1 - self.dt, p3);
+            ((v - v2) / self.dt, (dv - dv2) / self.dt)
+        }
+    }
+
+    fn find_vl_crossing(&self, v: f64, lo: f64, hi: f64, p3: f64) -> Result<f64, DmpError> {
+        let (mut lo, mut hi) = (lo, hi);
+        let mut t = 0.5 * (lo + hi);
+        for _ in 0..FIND_ROOT_MAX_ITER {
+            let (vl, dvl) = self.vl(t, p3);
+            let err = vl - v;
+            if err.abs() < VTH_TIME_TOL * v.max(1e-12) {
+                return Ok(t);
+            }
+            if err > 0.0 {
+                hi = t;
+            } else {
+                lo = t;
+            }
+            let next = if dvl.abs() > 0.0 { t - err / dvl } else { f64::NAN };
+            t = if next.is_finite() && next > lo && next < hi {
+                next
+            } else {
+                0.5 * (lo + hi)
+            };
+        }
+        Err(DmpError::RootNotFound)
+    }
+
+    /// `DmpAlg::loadDelaySlew` — the wire delay and the DEGRADED slew at one sink, given
+    /// that sink's Elmore time constant.
+    ///
+    /// ⛔ The degenerate branch is not a corner case, it is most of the design: when the
+    /// driver solve did not produce a waveform, or the Elmore is small against the driver
+    /// slew, the wire delay IS the Elmore value and the slew is the driver's, undegraded.
+    /// `DmpCap` overrides the whole method with exactly that.
+    pub fn load_delay_slew(&self, elmore: f64) -> (f64, f64) {
+        if !self.driver_valid || elmore == 0.0 || elmore < self.drvr_slew * 1e-3 {
+            return (elmore, self.drvr_slew);
+        }
+        let p3 = 1.0 / elmore;
+        // `vlCrossingUpperBound` = `voCrossingUpperBound` + 2*elmore
+        let t_upper = self.t0
+            + self.dt
+            + (self.c1 + self.c2) * (self.rd + self.rpi) * 2.0
+            + elmore * 2.0;
+        let solved = (|| -> Result<(f64, f64), DmpError> {
+            let load_delay = self.find_vl_crossing(self.t.vth, self.t0, t_upper, p3)?;
+            let tl = self.find_vl_crossing(self.t.vl, self.t0, load_delay, p3)?;
+            let th = self.find_vl_crossing(self.t.vh, load_delay, t_upper, p3)?;
+            Ok((load_delay - self.vo_delay, (th - tl) / self.t.slew_derate))
+        })();
+        match solved {
+            // upstream's two guards, and both fall back rather than propagate
+            Ok((delay, slew)) => (
+                if delay < 0.0 { elmore } else { delay },
+                if slew < self.drvr_slew { self.drvr_slew } else { slew },
+            ),
+            Err(_) => (elmore, self.drvr_slew),
+        }
+    }
 }
 
 /// Which DMP algorithm the reference picks for a driver — `DmpCeffDelayCalc::setCeffAlgorithm`.
@@ -492,12 +671,29 @@ pub fn solve_driver(
         Alg::Cap => {
             let ceff = c1 + c2;
             let (delay, slew) = gate(ceff);
-            DmpResult { ceff, delay, slew, driver_valid: false, fail: None }
+            // `DmpCap::loadDelaySlew` is `delay = elmore; slew = drvr_slew;` — exactly what
+            // a `DriverWaveform` with `driver_valid: false` produces, so the sink model
+            // needs no separate branch.
+            DmpResult {
+                ceff,
+                delay,
+                slew,
+                driver_valid: false,
+                waveform: Some(DriverWaveform::capacitive(slew, t)),
+                fail: None,
+            }
         }
         Alg::ZeroC2 => {
             let ceff = c1;
             let (delay, slew) = gate(ceff);
-            DmpResult { ceff, delay, slew, driver_valid: false, fail: None }
+            DmpResult {
+                ceff,
+                delay,
+                slew,
+                driver_valid: false,
+                waveform: Some(DriverWaveform::capacitive(slew, t)),
+                fail: None,
+            }
         }
     }
 }
@@ -679,6 +875,90 @@ mod shield_tests {
             (r.ceff - 0.6137).abs() < 0.03,
             "Ceff {} should reproduce the reference's 0.6137",
             r.ceff
+        );
+    }
+
+    /// The per-sink solve, on `input55`'s driver. The reference's own numbers for the
+    /// worst sink on that net: wire delay **0.6381** and a sink slew of **1.6616** against
+    /// a driver slew of 1.1048 — the wire degrades the edge by half a nanosecond.
+    #[test]
+    fn the_sink_solve_degrades_the_slew_and_adds_a_wire_delay() {
+        let (c2, rpi, c1) = (0.1879, 0.6019, 1.0222);
+        let gate = |c: f64| {
+            (
+                0.3805 + (c - 0.4019) * (1.1409 - 0.3805) / (1.5317 - 0.4019),
+                0.4086 + (c - 0.4019) * (1.5005 - 0.4086) / (1.5317 - 0.4019),
+            )
+        };
+        let r = solve_driver(0.467, c2, rpi, c1, th(), &gate);
+        let w = r.waveform.expect("a Pi driver hands on a waveform");
+        assert!(r.driver_valid, "the driver solve should have converged");
+        // the reference's implied tau for that sink, from its own wire delay
+        let (delay, slew) = w.load_delay_slew(0.92);
+        eprintln!("wire delay={delay} sink slew={slew} (driver slew {})", r.slew);
+        assert!(delay > 0.0, "a wire delay must be positive, got {delay}");
+        assert!(
+            slew > r.slew,
+            "the wire must DEGRADE the edge: sink slew {slew} vs driver {}",
+            r.slew
+        );
+    }
+
+    /// ⛔ The degenerate branch is most of a real design, not a corner: an Elmore small
+    /// against the driver slew means the wire delay IS the Elmore value and the slew is
+    /// the driver's, undegraded. `DmpCap` overrides the whole method with exactly this.
+    #[test]
+    fn a_small_elmore_takes_the_degenerate_branch() {
+        let (c2, rpi, c1) = (0.1879, 0.6019, 1.0222);
+        let gate = |c: f64| (0.3805 + 0.673 * c, 0.4086 + 0.966 * c);
+        let r = solve_driver(0.467, c2, rpi, c1, th(), &gate);
+        let w = r.waveform.unwrap();
+        let tiny = r.slew * 1e-4; // under the reference's `drvr_slew * 1e-3` threshold
+        assert_eq!(w.load_delay_slew(tiny), (tiny, r.slew));
+        assert_eq!(w.load_delay_slew(0.0), (0.0, r.slew), "zero elmore, zero wire delay");
+    }
+
+    /// A capacitive driver has no waveform to solve against, so every sink takes
+    /// `delay = elmore` and the driver's slew — `DmpCap::loadDelaySlew`.
+    #[test]
+    fn a_capacitive_driver_degrades_no_slew_at_any_sink() {
+        let gate = |c: f64| (0.1 + 0.35 * c, 0.05 + 0.5 * c);
+        // rpi = 0 forces `Alg::Cap` through `setCeffAlgorithm`'s own test
+        let r = solve_driver(0.467, 0.1879, 0.0, 1.0222, th(), &gate);
+        assert_eq!(select_alg(0.467, 0.1879, 0.0, 1.0222), Alg::Cap);
+        let w = r.waveform.unwrap();
+        assert_eq!(w.load_delay_slew(0.5), (0.5, r.slew));
+    }
+
+    /// ⛔ THE TEST THAT RETIRED A WRONG FINDING. `net55`'s worst sink: the reference
+    /// reports a wire delay of **0.6381** and a sink slew of **1.6616**, and our Elmore
+    /// walk gives that sink **tau = 0.658**.
+    ///
+    /// Inverting the CLOSED FORM `delay = -tau*ln(1-Vth)` on the reference's 0.6381 implies
+    /// tau = 0.921, and for two sessions that was recorded as "our tau is 30 % short".
+    /// It never was. The reference does not use the closed form on a gate-driven net; it
+    /// uses this crossing solve, and at tau = 0.658 the crossing solve reproduces BOTH of
+    /// its numbers. 🔑 **Inverting the wrong law to infer an input is how a correct
+    /// component gets blamed.**
+    #[test]
+    fn our_tau_reproduces_the_reference_sink_through_the_crossing_solve() {
+        let (c2, rpi, c1) = (0.1879, 0.6019, 1.0222);
+        let gate = |c: f64| {
+            (
+                0.3805 + (c - 0.4019) * (1.1409 - 0.3805) / (1.5317 - 0.4019),
+                0.4086 + (c - 0.4019) * (1.5005 - 0.4086) / (1.5317 - 0.4019),
+            )
+        };
+        let r = solve_driver(0.467, c2, rpi, c1, th(), &gate);
+        let w = r.waveform.unwrap();
+        let (delay, slew) = w.load_delay_slew(0.658); // our own Elmore for that sink
+        assert!(
+            (delay - 0.6381).abs() < 0.03,
+            "wire delay {delay} should reproduce the reference's 0.6381"
+        );
+        assert!(
+            (slew - 1.6616).abs() < 0.06,
+            "sink slew {slew} should reproduce the reference's 1.6616"
         );
     }
 
