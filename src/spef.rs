@@ -312,23 +312,9 @@ impl NetRc {
             return None;
         }
         // node capacitances
-        let mut cap: HashMap<&str, f64> = HashMap::new();
-        for (node, c) in &self.ground {
-            *cap.entry(node.as_str()).or_default() += c;
-        }
-        spread_xtalk(&mut cap, &self.ground, driver, xtalk_cap_ff);
-        // Receiver capacitance sits ON its load node, not spread over the wire.
-        for (node, c) in pin_cap_ff {
-            if let Some(k) = self
-                .ground
-                .iter()
-                .map(|(n, _)| n)
-                .chain(self.res.iter().flat_map(|(a, b, _)| [a, b]))
-                .find(|n| *n == node)
-            {
-                *cap.entry(k.as_str()).or_default() += *c;
-            }
-        }
+        // Same node capacitances the Pi reduction sees — one source, so the two walks
+        // cannot drift apart.
+        let mut cap = self.node_caps(driver, xtalk_cap_ff, pin_cap_ff)?;
         // adjacency
         let mut adj: HashMap<&str, Vec<(&str, f64)>> = HashMap::new();
         for (a, b, r) in &self.res {
@@ -557,7 +543,85 @@ impl NetRc {
     /// ground cap (sees ~0 resistance); τ = R·C2 ≈ Σ_k c_k·r_k (resistance-weighted
     /// cap, the net's first RC moment), in ns. Returns None if the net has no
     /// resistors (purely lumped — no shielding).
-    pub fn pi_reduce(&self, driver: &str) -> Option<(f64, f64)> {
+    /// The driver's **three-element Pi** `(C2 near, Rpi, C1 far)` in (pF, kΩ-ish, pF) — a
+    /// transcription of `ReduceToPi::reduceToPi` / `reducePiDfs`.
+    ///
+    /// Upstream matches the first three **admittance moments** of the RC tree and solves a
+    /// closed form for the Pi; it does NOT read the driver node's own capacitance. On a
+    /// fanout-298 sky130 net the difference is total: `report_dcalc` gives
+    /// `C2=0.1879 Rpi=0.6019 C1=1.0222`, where reading the driver node's ground cap gives
+    /// **zero** — that node carries none, so the gate saw no near capacitance at all.
+    ///
+    /// `xtalk_cap_ff` and `pin_cap_ff` carry the same content as [`Spef::elmore`]: coupling
+    /// grounded at the reference's `couplingCapFactor`, and the Liberty receiver caps that
+    /// `ReduceToPi::pinCapacitance` adds. The moments are meaningless without them.
+    pub fn pi_reduce(
+        &self,
+        driver: &str,
+        xtalk_cap_ff: f64,
+        pin_cap_ff: &BTreeMap<String, f64>,
+    ) -> Option<(f64, f64, f64)> {
+        let cap = self.node_caps(driver, xtalk_cap_ff, pin_cap_ff)?;
+        let mut adj: HashMap<&str, Vec<(&str, f64)>> = HashMap::new();
+        for (a, b, r) in &self.res {
+            adj.entry(a).or_default().push((b, *r));
+            adj.entry(b).or_default().push((a, *r));
+        }
+        if !adj.contains_key(driver) {
+            return None;
+        }
+        // `reducePiDfs`: y1/y2/y3 are the admittance moments, accumulated in DOUBLE while
+        // the resistor and capacitance values themselves are float in the reference.
+        //   y1 += yd1
+        //   y2 += yd2 - r*yd1^2
+        //   y3 += yd3 - 2*r*yd1*yd2 + r^2*yd1^3
+        fn dfs<'a>(
+            node: &'a str,
+            from: Option<&'a str>,
+            adj: &HashMap<&'a str, Vec<(&'a str, f64)>>,
+            cap: &HashMap<&'a str, f64>,
+            seen: &mut std::collections::HashSet<&'a str>,
+        ) -> (f64, f64, f64) {
+            let mut y1 = cap.get(node).copied().unwrap_or(0.0);
+            let (mut y2, mut y3) = (0.0f64, 0.0f64);
+            for &(o, r) in adj.get(node).map(|v| v.as_slice()).unwrap_or(&[]) {
+                // skip the edge we came in on, self loops, and resistor loops
+                if Some(o) == from || o == node || !seen.insert(o) {
+                    continue;
+                }
+                let (yd1, yd2, yd3) = dfs(o, Some(node), adj, cap, seen);
+                let r = r as f32 as f64; // `value(ParasiticResistor*)` is float
+                y1 += yd1;
+                y2 += yd2 - r * yd1 * yd1;
+                y3 += yd3 - 2.0 * r * yd1 * yd2 + r * r * yd1 * yd1 * yd1;
+            }
+            (y1, y2, y3)
+        }
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        seen.insert(driver);
+        let (y1, y2, y3) = dfs(driver, None, &adj, &cap, &mut seen);
+        // closed form, verbatim from `ReduceToPi::reduceToPi`; c1/c2/rpi are float outputs
+        let (c2, rpi, c1) = if y2 == 0.0 && y3 == 0.0 {
+            (0.0, 0.0, y1) // purely capacitive load
+        } else {
+            (
+                (y1 - y2 * y2 / y3) as f32 as f64,
+                (-y3 * y3 / (y2 * y2 * y2)) as f32 as f64,
+                (y2 * y2 / y3) as f32 as f64,
+            )
+        };
+        Some((c2, rpi, c1))
+    }
+
+    /// Node capacitances as the reference's reduction sees them: SPEF ground caps, plus
+    /// coupling grounded at `couplingCapFactor`, plus Liberty receiver capacitance.
+    /// Shared by [`Spef::elmore`] and [`Spef::pi_reduce`] so the two cannot drift apart.
+    fn node_caps<'a>(
+        &'a self,
+        driver: &'a str,
+        xtalk_cap_ff: f64,
+        pin_cap_ff: &BTreeMap<String, f64>,
+    ) -> Option<HashMap<&'a str, f64>> {
         if self.res.is_empty() {
             return None;
         }
@@ -565,38 +629,25 @@ impl NetRc {
         for (node, c) in &self.ground {
             *cap.entry(node.as_str()).or_default() += c;
         }
-        let mut adj: HashMap<&str, Vec<(&str, f64)>> = HashMap::new();
-        for (a, b, r) in &self.res {
-            adj.entry(a).or_default().push((b, *r));
-            adj.entry(b).or_default().push((a, *r));
+        spread_xtalk(&mut cap, &self.ground, driver, xtalk_cap_ff);
+        for (a, b, _) in &self.res {
             cap.entry(a.as_str()).or_default();
             cap.entry(b.as_str()).or_default();
         }
-        if !adj.contains_key(driver) {
-            return None;
-        }
-        // BFS from driver, accumulating path resistance to each node
-        let mut rpath: HashMap<&str, f64> = HashMap::new();
-        rpath.insert(driver, 0.0);
-        let mut order: Vec<&str> = vec![driver];
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        seen.insert(driver);
-        let mut head = 0;
-        while head < order.len() {
-            let u = order[head];
-            head += 1;
-            let ru = rpath[u];
-            for &(v, r) in adj.get(u).map(|x| x.as_slice()).unwrap_or(&[]) {
-                if seen.insert(v) {
-                    rpath.insert(v, ru + r);
-                    order.push(v);
-                }
+        for (node, c) in pin_cap_ff {
+            if let Some(k) = self
+                .ground
+                .iter()
+                .map(|(n, _)| n)
+                .chain(self.res.iter().flat_map(|(a, b, _)| [a, b]))
+                .find(|n| *n == node)
+            {
+                *cap.entry(k.as_str()).or_default() += *c;
             }
         }
-        let c1 = cap.get(driver).copied().unwrap_or(0.0); // near cap (fF)
-        let m2: f64 = cap.iter().map(|(nd, c)| c * rpath.get(nd).copied().unwrap_or(0.0)).sum();
-        Some((c1, m2 * 1e-6)) // (fF, ns)
+        Some(cap)
     }
+
 
     /// SPEF node token for an instance pin, if present in `*CONN`.
     pub fn pin_node(&self, inst: &str, pin: &str) -> Option<&str> {
