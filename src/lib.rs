@@ -30,6 +30,7 @@ pub mod liberty;
 /// reader populates (NLDM + CCS). The current-source delay *calculation* belongs
 /// to the timing engine (`vyges-sta-si`); loom holds + can evaluate the curves.
 pub mod ccs;
+pub mod dmp;
 /// Cross-process on-disk parse cache for `Lib` (behind `Lib::load_opts`; #38).
 pub mod libcache;
 pub mod netlist;
