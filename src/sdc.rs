@@ -120,6 +120,50 @@ pub struct EnvCmd {
     pub objects: Vec<String>,
 }
 
+/// One `set_driving_cell`: `-lib_cell`, `-library`, `-pin`, `-from_pin`, the input transitions
+/// (`-input_transition_rise/-fall`, in the SDC's user unit; 0 when absent), any other flag, and
+/// the ports.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DrivingCell {
+    pub lib_cell: Option<String>,
+    pub library: Option<String>,
+    pub pin: Option<String>,
+    pub from_pin: Option<String>,
+    pub input_transition: [f64; 2],
+    pub flags: Vec<String>,
+    pub objects: Vec<String>,
+}
+
+fn driving_cell(toks: &[String]) -> DrivingCell {
+    let valued = ["-lib_cell", "-library", "-pin", "-from_pin", "-input_transition_rise", "-input_transition_fall", "-multiply_by"];
+    let mut d = DrivingCell { lib_cell: None, library: None, pin: None, from_pin: None, input_transition: [0.0; 2], flags: Vec::new(), objects: Vec::new() };
+    let mut k = 1;
+    while k < toks.len() {
+        let t = &toks[k];
+        if valued.contains(&t.as_str()) {
+            let v = toks.get(k + 1).map(|v| v.trim_matches(|c| c == '{' || c == '}').to_string());
+            match t.as_str() {
+                "-lib_cell" => d.lib_cell = v,
+                "-library" => d.library = v,
+                "-pin" => d.pin = v,
+                "-from_pin" => d.from_pin = v,
+                "-input_transition_rise" => d.input_transition[0] = v.and_then(|v| v.parse().ok()).unwrap_or(0.0),
+                "-input_transition_fall" => d.input_transition[1] = v.and_then(|v| v.parse().ok()).unwrap_or(0.0),
+                other => d.flags.push(other.to_string()),
+            }
+            k += 2;
+            continue;
+        }
+        if t.starts_with('-') {
+            d.flags.push(t.clone());
+        } else {
+            d.objects.extend(resolve_objs(t));
+        }
+        k += 1;
+    }
+    d
+}
+
 /// `(value, objects)` positionals of an environment command, its flags, and a valued `-clock`.
 fn env_cmd(toks: &[String]) -> Option<EnvCmd> {
     let mut flags = Vec::new();
@@ -163,6 +207,14 @@ pub struct Sdc {
     /// A `set_max_transition` on anything but the design (ports, clocks, cells): there is no
     /// value for it here, so a consumer modelling only [`Sdc::max_transition`] must refuse.
     pub max_transition_on_objects: bool,
+    /// `set_max_fanout V [current_design]`: the design-wide fanout limit (unitless), for a consumer
+    /// that models it. Recorded in [`Sdc::ignored`] as well, like `set_max_transition`.
+    pub max_fanout: Option<f64>,
+    /// A `set_max_fanout` on anything but the design.
+    pub max_fanout_on_objects: bool,
+    /// Every `set_driving_cell`, as written (still in [`Sdc::ignored`] for a consumer that does
+    /// not model input drives).
+    pub driving_cells: Vec<DrivingCell>,
     /// Every `set_load` and `set_input_transition`, per command, for a consumer that models
     /// them per object ([`Sdc::load`] / [`Sdc::input_transition`] keep one design-wide value).
     pub env: Vec<EnvCmd>,
@@ -846,12 +898,23 @@ impl Sdc {
                         sdc.input_transition = Some(v * t_scale);
                     }
                 }
+                "set_max_fanout" => {
+                    match (toks.len() == 3 && toks[2] == "[current_design]", toks.get(1).and_then(|v| v.parse::<f64>().ok())) {
+                        (true, Some(v)) => sdc.max_fanout = Some(v),
+                        _ => sdc.max_fanout_on_objects = true,
+                    }
+                    sdc.ignored.push("set_max_fanout".to_string());
+                }
                 "set_max_transition" => {
                     match (toks.len() == 3 && toks[2] == "[current_design]", toks.get(1).and_then(|v| v.parse::<f64>().ok())) {
                         (true, Some(v)) => sdc.max_transition = Some(v * t_scale),
                         _ => sdc.max_transition_on_objects = true,
                     }
                     sdc.ignored.push("set_max_transition".to_string());
+                }
+                "set_driving_cell" => {
+                    sdc.driving_cells.push(driving_cell(&toks));
+                    sdc.ignored.push("set_driving_cell".to_string());
                 }
                 "set_load" => {
                     sdc.env.extend(env_cmd(&toks));
@@ -1058,6 +1121,28 @@ mod list_obj_tests {
 #[cfg(test)]
 mod max_transition_tests {
     use super::*;
+
+    // Rule: a set_driving_cell keeps its cell, pins, transitions and ports, and stays in `ignored`.
+    #[test]
+    fn driving_cell_is_kept_as_written() {
+        let s = Sdc::parse("set_driving_cell -lib_cell BUF_X1 -pin {Z} -input_transition_rise 0.0100 -input_transition_fall 0.0200 [get_ports {in1}]\n").unwrap();
+        let d = &s.driving_cells[0];
+        assert_eq!((d.lib_cell.as_deref(), d.pin.as_deref(), d.from_pin.as_deref(), d.input_transition), (Some("BUF_X1"), Some("Z"), None, [0.01, 0.02]));
+        assert_eq!(d.objects, vec!["in1".to_string()]);
+        assert!(d.flags.is_empty());
+        assert!(s.ignored_affecting_timing().contains(&"set_driving_cell"));
+    }
+
+    // Rule: the design-wide set_max_fanout keeps its value (unitless) and stays in `ignored`;
+    // any other target is flagged.
+    #[test]
+    fn max_fanout_on_the_design_keeps_its_value() {
+        let s = Sdc::parse("set_max_fanout 5.0000 [current_design]\n").unwrap();
+        assert_eq!((s.max_fanout, s.max_fanout_on_objects), (Some(5.0), false));
+        assert!(s.ignored_affecting_timing().contains(&"set_max_fanout"));
+        let s = Sdc::parse("set_max_fanout 3 [get_ports a]\n").unwrap();
+        assert!(s.max_fanout_on_objects);
+    }
 
     // Rule: each set_load / set_input_transition is kept as written — value unscaled by
     // set_units, flags, accessor and objects.
