@@ -116,6 +116,13 @@ pub struct Sdc {
     pub clock_latency: f64, // source/network latency (ns), applied to the I/O budget
     pub input_transition: Option<f64>,
     pub load: Option<f64>,
+    /// `set_max_transition V [current_design]`, ns: the design-wide slew limit, for a consumer
+    /// that models it. The command is STILL recorded in [`Sdc::ignored`] — a consumer that does
+    /// not model it must keep seeing it as timing-affecting.
+    pub max_transition: Option<f64>,
+    /// A `set_max_transition` on anything but the design (ports, clocks, cells): there is no
+    /// value for it here, so a consumer modelling only [`Sdc::max_transition`] must refuse.
+    pub max_transition_on_objects: bool,
     pub late_derate: Option<f64>,
     pub early_derate: Option<f64>,
     pub exceptions: Vec<Exception>,
@@ -795,6 +802,13 @@ impl Sdc {
                         sdc.input_transition = Some(v * t_scale);
                     }
                 }
+                "set_max_transition" => {
+                    match (toks.len() == 3 && toks[2] == "[current_design]", toks.get(1).and_then(|v| v.parse::<f64>().ok())) {
+                        (true, Some(v)) => sdc.max_transition = Some(v * t_scale),
+                        _ => sdc.max_transition_on_objects = true,
+                    }
+                    sdc.ignored.push("set_max_transition".to_string());
+                }
                 "set_load" => {
                     let v = toks.iter().skip(1).find_map(|t| {
                         if t.starts_with('-') {
@@ -993,5 +1007,22 @@ mod list_obj_tests {
     fn a_plain_get_ports_is_unaffected() {
         assert_eq!(resolve_objs("[get_ports {clk}]"), vec!["clk"]);
         assert_eq!(resolve_objs("[all_inputs]"), vec!["*INPUTS*"]);
+    }
+}
+
+#[cfg(test)]
+mod max_transition_tests {
+    use super::*;
+
+    // Rule: the design-wide form keeps its value; every form stays in `ignored` (timing-
+    // affecting for a consumer that does not model it); any other target is flagged.
+    #[test]
+    fn set_max_transition_keeps_the_design_value_and_flags_other_targets() {
+        let s = Sdc::parse("current_design top\nset_max_transition 0.0800 [current_design]\n").unwrap();
+        assert_eq!((s.max_transition, s.max_transition_on_objects), (Some(0.08), false));
+        assert_eq!(s.ignored_affecting_timing(), vec!["set_max_transition"]);
+        let s = Sdc::parse("set_max_transition 0.1 [get_ports a]\n").unwrap();
+        assert_eq!((s.max_transition, s.max_transition_on_objects), (None, true));
+        assert_eq!(s.ignored_affecting_timing(), vec!["set_max_transition"]);
     }
 }
