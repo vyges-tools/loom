@@ -106,6 +106,46 @@ pub struct IoDelay {
     pub ports: Vec<String>,
 }
 
+/// One `set_load` / `set_input_transition` as written: its value in the SDC's user unit (NOT
+/// scaled by `set_units` — the reference's `set_units` only checks, values stay in the library
+/// unit), its flags (`-min`, `-rise`, `-pin_load`, …), the valued `-clock` if any, and its objects
+/// with the accessor that named them (`get_nets`, `get_ports`, … or `""` for a bare list).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnvCmd {
+    pub cmd: String,
+    pub value: f64,
+    pub flags: Vec<String>,
+    pub clock: Option<String>,
+    pub accessor: String,
+    pub objects: Vec<String>,
+}
+
+/// `(value, objects)` positionals of an environment command, its flags, and a valued `-clock`.
+fn env_cmd(toks: &[String]) -> Option<EnvCmd> {
+    let mut flags = Vec::new();
+    let mut clock = None;
+    let mut pos = Vec::new();
+    let mut k = 1;
+    while k < toks.len() {
+        let t = &toks[k];
+        if t == "-clock" {
+            clock = toks.get(k + 1).cloned();
+            k += 2;
+            continue;
+        }
+        if t.starts_with('-') && t.parse::<f64>().is_err() {
+            flags.push(t.clone());
+        } else {
+            pos.push(t.clone());
+        }
+        k += 1;
+    }
+    let value = pos.first()?.parse::<f64>().ok()?;
+    let obj = pos.get(1)?;
+    let accessor = obj.strip_prefix('[').and_then(|i| tokenize(i.trim_end_matches(']').trim()).into_iter().next()).unwrap_or_default();
+    Some(EnvCmd { cmd: toks[0].clone(), value, flags, clock, accessor, objects: resolve_objs(obj) })
+}
+
 #[derive(Debug, Default)]
 pub struct Sdc {
     pub clocks: Vec<SdcClock>,
@@ -123,6 +163,9 @@ pub struct Sdc {
     /// A `set_max_transition` on anything but the design (ports, clocks, cells): there is no
     /// value for it here, so a consumer modelling only [`Sdc::max_transition`] must refuse.
     pub max_transition_on_objects: bool,
+    /// Every `set_load` and `set_input_transition`, per command, for a consumer that models
+    /// them per object ([`Sdc::load`] / [`Sdc::input_transition`] keep one design-wide value).
+    pub env: Vec<EnvCmd>,
     pub late_derate: Option<f64>,
     pub early_derate: Option<f64>,
     pub exceptions: Vec<Exception>,
@@ -798,6 +841,7 @@ impl Sdc {
                     }
                 }
                 "set_input_transition" => {
+                    sdc.env.extend(env_cmd(&toks));
                     if let Some(v) = toks.get(1).and_then(|t| t.parse::<f64>().ok()) {
                         sdc.input_transition = Some(v * t_scale);
                     }
@@ -810,6 +854,7 @@ impl Sdc {
                     sdc.ignored.push("set_max_transition".to_string());
                 }
                 "set_load" => {
+                    sdc.env.extend(env_cmd(&toks));
                     let v = toks.iter().skip(1).find_map(|t| {
                         if t.starts_with('-') {
                             None
@@ -1013,6 +1058,17 @@ mod list_obj_tests {
 #[cfg(test)]
 mod max_transition_tests {
     use super::*;
+
+    // Rule: each set_load / set_input_transition is kept as written — value unscaled by
+    // set_units, flags, accessor and objects.
+    #[test]
+    fn environment_commands_keep_value_flags_and_objects() {
+        let s = Sdc::parse("set_units -capacitance 1pF\nset_load -pin_load 2000.0 [get_ports {out}]\nset_load  0.0000 [get_nets {out1 out2}]\nset_input_transition -rise 10.0 -clock clk [get_ports {in1}]\n").unwrap();
+        assert_eq!(s.env.len(), 3);
+        assert_eq!((s.env[0].cmd.as_str(), s.env[0].value, s.env[0].flags.clone(), s.env[0].accessor.as_str(), s.env[0].objects.clone()), ("set_load", 2000.0, vec!["-pin_load".to_string()], "get_ports", vec!["out".to_string()]));
+        assert_eq!((s.env[1].accessor.as_str(), s.env[1].objects.clone()), ("get_nets", vec!["out1".to_string(), "out2".to_string()]));
+        assert_eq!((s.env[2].value, s.env[2].clock.as_deref(), s.env[2].flags.clone()), (10.0, Some("clk"), vec!["-rise".to_string()]));
+    }
 
     // Rule: the design-wide form keeps its value; every form stays in `ignored` (timing-
     // affecting for a consumer that does not model it); any other target is flagged.
