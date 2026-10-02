@@ -86,6 +86,9 @@ pub struct SdcClock {
     pub name: String,
     /// Port name or `inst/pin`. **Empty for a virtual clock** — see [`SdcClock::is_virtual`].
     pub source: String,
+    /// Every source object, in the order the command lists them (`source` is the first).
+    /// `create_clock -period P {a b c}` is ONE clock on three ports: each is a clock pin.
+    pub sources: Vec<String>,
     pub period: f64, // ns
 }
 
@@ -773,10 +776,8 @@ impl Sdc {
                             })
                         })?;
                     let obj = trailing_obj(&toks, &["-name", "-period", "-waveform", "-comment"]);
-                    let source = obj
-                        .as_deref()
-                        .map(|o| resolve_objs(o).first().cloned().unwrap_or_default())
-                        .unwrap_or_default();
+                    let sources: Vec<String> = obj.as_deref().map(resolve_objs).unwrap_or_default();
+                    let source = sources.first().cloned().unwrap_or_default();
                     let name = flag_val(&toks, "-name").cloned().unwrap_or_else(|| {
                         if source.is_empty() {
                             "clk".into()
@@ -795,6 +796,7 @@ impl Sdc {
                     sdc.clocks.push(SdcClock {
                         name,
                         source: src,
+                        sources,
                         period: period * t_scale,
                     });
                 }
@@ -998,6 +1000,7 @@ impl Sdc {
             let period = master * div / mul;
             sdc.clocks.push(SdcClock {
                 name,
+                sources: if target.is_empty() { Vec::new() } else { vec![target.clone()] },
                 source: target,
                 period,
             });
@@ -1050,6 +1053,22 @@ fn from_to(toks: &[String]) -> (Vec<String>, Vec<String>) {
 #[cfg(test)]
 mod async_group_tests {
     use super::*;
+    /// Rule (create_clock): one clock on several objects — every object is a source, in the
+    /// order listed; the written form `write_sdc` emits (a `[list …]` over continuation lines)
+    /// reads the same as the brace list a script writes.
+    #[test]
+    fn a_clock_on_several_ports_keeps_every_source() {
+        let written = "create_clock -name clk1 -period 1.0000 \\\n    [list [get_ports {clk1}]\\\n          [get_ports {clk2}]\\\n          [get_ports {clk3}]]\n";
+        let s = Sdc::parse(written).unwrap();
+        assert_eq!(s.clocks.len(), 1);
+        assert_eq!(s.clocks[0].sources, ["clk1", "clk2", "clk3"]);
+        assert_eq!(s.clocks[0].source, "clk1");
+        let scripted = Sdc::parse("create_clock -period 1 [get_ports {clk1 clk2 clk3}]\n").unwrap();
+        assert_eq!(scripted.clocks[0].sources, ["clk1", "clk2", "clk3"]);
+        let virt = Sdc::parse("create_clock -name v -period 1\n").unwrap();
+        assert!(virt.clocks[0].sources.is_empty() && virt.clocks[0].is_virtual());
+    }
+
     #[test]
     fn clock_groups_asynchronous_parses_groups() {
         let s = "create_clock -name a -period 10 [get_ports ca]\n\
