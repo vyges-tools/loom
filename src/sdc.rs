@@ -9,7 +9,9 @@
 //!
 //! Supported commands (others are collected in [`Sdc::ignored`], never fatal):
 //!
-//! - `create_clock -name N -period P [-waveform {e0 e1 …}] {obj}` and
+//! - `create_clock -name N -period P [-waveform {e0 e1 …}] [-add] {obj}` — without `-add` it
+//!   replaces the clocks on its sources, and a name already defined is redefined in place
+//!   (see `Sdc::delete_pin_clocks`) — and
 //!   `create_generated_clock -name N -source S -divide_by D -multiply_by M {obj}`
 //! - `set_input_delay` / `set_output_delay` (default via `all_inputs`/`all_outputs`
 //!   or `-clock`, plus per-port overrides) — the I/O timing budget, each with its
@@ -275,6 +277,9 @@ fn env_cmd(toks: &[String]) -> Option<EnvCmd> {
 #[derive(Debug, Default)]
 pub struct Sdc {
     pub clocks: Vec<SdcClock>,
+    /// Each clock definition a later `create_clock` overwrote (same name) or removed (its sources
+    /// taken without `-add`), as it stood, in file order — not timed; for a linter to report.
+    pub superseded_clocks: Vec<SdcClock>,
     pub input_delays: Vec<IoDelay>,
     pub output_delays: Vec<IoDelay>,
     pub setup_uncertainty: f64,
@@ -377,11 +382,18 @@ const TIMING_AFFECTING: &[&str] = &[
     "set_max_fanout",
     "set_max_capacitance",
     "set_min_capacitance",
+    // ── a clock replaced under an exception that names it ──────────────────────────────
+    CLOCK_REPLACED_UNDER_EXCEPTION,
     // ── SDC 2.x ────────────────────────────────────────────────────────────────────────
     "set_disable_clock_gating_check", // removes a check, so its violations vanish
     "unset_propagated_clock",         // reverts to an ideal network -> latency and skew
     "set_max_trans",                  // Tcl accepts unambiguous abbreviations
 ];
+
+/// Recorded in [`Sdc::ignored`] when a `create_clock` without `-add` removed a clock that a
+/// timing exception names: which of the exception's names meant
+/// the clock is not known, so the exception may be wrong.
+pub const CLOCK_REPLACED_UNDER_EXCEPTION: &str = "create_clock (replaced a clock an exception names)";
 
 /// Explicitly NOT timing-affecting: instructions to synthesis, placement or power
 /// optimisation. Listed rather than merely omitted, so the distinction is a decision on record
@@ -410,6 +422,83 @@ pub const BENIGN_FOR_TIMING: &[&str] = &[
 ];
 
 impl Sdc {
+    /// A `create_clock` without `-add` on `pins`: every other clock on any of them loses those
+    /// pins; one left with none is removed, and so is what referred to it — its I/O delays, its
+    /// latencies, its `set_propagated_clock`, its place in path delays (a `-from`/`-to` left
+    /// empty deletes the command) and in clock groups. `defining` (the clock being made) keeps
+    /// its entry: it is redefined. A virtual clock (no pins) replaces nothing.
+    ///
+    /// Exceptions keep bare names, so one naming the removed clock cannot be told from one
+    /// naming a pin of the same name (a clock's default name is its port's): it is kept, and
+    /// [`CLOCK_REPLACED_UNDER_EXCEPTION`] is recorded in [`Sdc::ignored`] for a consumer to refuse.
+    fn delete_pin_clocks(&mut self, defining: &str, pins: &[String]) {
+        let mut removed = Vec::new();
+        for c in self.clocks.iter_mut().filter(|c| c.name != defining) {
+            let before = c.sources.len();
+            c.sources.retain(|s| !pins.contains(s));
+            if c.sources.len() == before {
+                continue;
+            }
+            match c.sources.first() {
+                Some(first) => c.source = first.clone(),
+                None => removed.push(c.name.clone()),
+            }
+        }
+        let (gone, kept): (Vec<SdcClock>, Vec<SdcClock>) = std::mem::take(&mut self.clocks).into_iter().partition(|c| removed.contains(&c.name));
+        self.clocks = kept;
+        self.superseded_clocks.extend(gone);
+        for name in &removed {
+            self.remove_clock_references(name);
+        }
+    }
+
+    /// Everything that names clock `name`, gone with it (see [`Sdc::delete_pin_clocks`]).
+    fn remove_clock_references(&mut self, name: &str) {
+        let is_it = |c: &Option<String>| c.as_deref() == Some(name);
+        self.input_delays.retain(|d| !is_it(&d.clock));
+        self.output_delays.retain(|d| !is_it(&d.clock));
+        let drop_name = |o: &mut Objects| {
+            if o.accessor == "get_clocks" {
+                o.names.retain(|n| n != name);
+            }
+        };
+        self.clock_latencies.retain_mut(|l| {
+            if is_it(&l.clock) {
+                return false;
+            }
+            if l.accessor == "get_clocks" {
+                l.objects.retain(|n| n != name);
+                return !l.objects.is_empty();
+            }
+            true
+        });
+        self.propagated.retain_mut(|o| {
+            drop_name(o);
+            !o.names.is_empty()
+        });
+        // An exception whose `-from` (else its `-to`) named the clock loses it; one with nothing
+        // left on that side is deleted.
+        self.path_delays.retain_mut(|p| {
+            for side in ["from", "to"] {
+                let on_side = |k: &str| k.trim_start_matches('-').trim_start_matches("rise_").trim_start_matches("fall_") == side;
+                let names_it = p.objects.iter().any(|(k, o)| on_side(k) && o.accessor == "get_clocks" && o.names.iter().any(|n| n == name));
+                if names_it {
+                    p.objects.iter_mut().filter(|(k, _)| on_side(k)).for_each(|(_, o)| drop_name(o));
+                    p.objects.retain(|(k, o)| !(on_side(k) && o.names.is_empty()));
+                    return p.objects.iter().any(|(k, _)| on_side(k));
+                }
+            }
+            true
+        });
+        for g in &mut self.async_groups {
+            g.retain(|n| n != name);
+        }
+        self.async_groups.retain(|g| !g.is_empty());
+        if self.exceptions.iter().any(|e| e.from.iter().chain(&e.to).any(|n| n == name)) {
+            self.ignored.push(CLOCK_REPLACED_UNDER_EXCEPTION.to_string());
+        }
+    }
+
     /// The subset of [`Sdc::ignored`] that can move a reported slack — see [`TIMING_AFFECTING`].
     /// Deduplicated and sorted, so a file constraining forty ports with `set_driving_cell`
     /// yields one name rather than forty.
@@ -891,13 +980,23 @@ impl Sdc {
                     let waveform = flag_val(&toks, "-waveform").map(|w| {
                         w.split_whitespace().map(|e| parse_time(e).map(|t| t * t_scale)).collect::<Option<Vec<f64>>>().unwrap_or_default()
                     });
-                    sdc.clocks.push(SdcClock {
-                        name,
-                        source: src,
-                        sources,
-                        period: period * t_scale,
-                        waveform,
-                    });
+                    // `-add` keeps the clocks already on these sources; without it a new clock
+                    // REPLACES them there (each loses these sources, and one left with none is
+                    // removed with every reference to it). A clock of the same name is redefined
+                    // in place: it keeps its position and its references, and takes the new
+                    // sources, period and waveform.
+                    let add = has_flag(&toks, "-add");
+                    if add && flag_val(&toks, "-name").is_none() {
+                        return Err(SdcError(format!("create_clock -add requires -name: `{}`", line.trim())));
+                    }
+                    if !add {
+                        sdc.delete_pin_clocks(&name, &sources);
+                    }
+                    let clock = SdcClock { name, source: src, sources, period: period * t_scale, waveform };
+                    match sdc.clocks.iter().position(|c| c.name == clock.name) {
+                        Some(i) => sdc.superseded_clocks.push(std::mem::replace(&mut sdc.clocks[i], clock)),
+                        None => sdc.clocks.push(clock),
+                    }
                 }
                 "create_generated_clock" => {
                     let obj = trailing_obj(
@@ -1375,5 +1474,109 @@ mod lossless_tests {
         assert_eq!(p.objects, vec![("-from".to_string(), Objects { accessor: "get_pins".into(), names: vec!["r1/CK".into()] }), ("-to".to_string(), Objects { accessor: "get_clocks".into(), names: vec!["clk".into()] })]);
         assert!(!s.path_delays[1].max && s.path_delays[1].value.is_nan());
         assert!(s.ignored.iter().any(|c| c == "set_propagated_clock") && s.ignored.iter().filter(|c| c.ends_with("_delay")).count() == 2);
+    }
+}
+
+#[cfg(test)]
+mod clock_replace_tests {
+    use super::*;
+
+    fn names(s: &Sdc) -> Vec<&str> {
+        s.clocks.iter().map(|c| c.name.as_str()).collect()
+    }
+
+    // Rule (create_clock): without `-add`, a clock on a source already clocked replaces the clock
+    // there — the old one, left with no source, is removed with its I/O delays. With `-add` both stay.
+    #[test]
+    fn without_add_a_clock_replaces_the_one_on_its_port() {
+        let s = Sdc::parse("create_clock -name a -period 1 [get_ports clk]\nset_input_delay 0.1 -clock a [get_ports in]\ncreate_clock -name b -period 2 [get_ports clk]\n").unwrap();
+        assert_eq!(names(&s), ["b"]);
+        assert!(s.input_delays.is_empty());
+        assert_eq!(s.superseded_clocks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["a"]);
+        let s = Sdc::parse("create_clock -name a -period 1 [get_ports clk]\nset_input_delay 0.1 -clock a [get_ports in]\ncreate_clock -name b -add -period 2 [get_ports clk]\n").unwrap();
+        assert_eq!(names(&s), ["a", "b"]);
+        assert_eq!(s.input_delays.len(), 1);
+        assert_eq!(s.clocks[1].sources, ["clk"]);
+    }
+
+    // Rule: a clock on several sources loses only the ones the new clock takes, and stays.
+    #[test]
+    fn a_clock_on_several_sources_loses_only_the_shared_one() {
+        let s = Sdc::parse("create_clock -name a -period 1 [get_ports {c1 c2}]\ncreate_clock -name b -period 2 [get_ports c1]\n").unwrap();
+        assert_eq!(names(&s), ["a", "b"]);
+        assert_eq!((s.clocks[0].sources.clone(), s.clocks[0].source.as_str()), (vec!["c2".to_string()], "c2"));
+    }
+
+    // Rule: a clock of the same name is redefined IN PLACE — its position and its references kept,
+    // its source, period and waveform replaced. A virtual clock replaces nothing.
+    #[test]
+    fn the_same_name_redefines_in_place() {
+        let s = Sdc::parse("create_clock -name a -period 1 [get_ports c1]\ncreate_clock -name v -period 3\nset_input_delay 0.1 -clock a [get_ports in]\ncreate_clock -name a -period 5 -waveform {1 3} [get_ports c2]\ncreate_clock -name w -period 4\n").unwrap();
+        assert_eq!(names(&s), ["a", "v", "w"]);
+        assert_eq!((s.clocks[0].period, s.clocks[0].sources.clone(), s.clocks[0].waveform.clone()), (5.0, vec!["c2".to_string()], Some(vec![1.0, 3.0])));
+        assert_eq!(s.input_delays.len(), 1);
+        assert_eq!((s.superseded_clocks.len(), s.superseded_clocks[0].period), (1, 1.0));
+    }
+
+    // Rule: `-add` requires `-name`.
+    #[test]
+    fn add_without_a_name_is_an_error() {
+        assert!(Sdc::parse("create_clock -add -period 1 [get_ports clk]\n").is_err());
+    }
+
+    // Rule: what named the removed clock goes with it — its propagated flag, its latencies, its
+    // clock-group membership, and a path delay whose `-from` held only it; a path delay with
+    // another `-from` object keeps that one. A timing exception naming it is flagged, not guessed.
+    #[test]
+    fn references_to_a_removed_clock_go_with_it() {
+        let s = Sdc::parse(
+            "create_clock -name a -period 1 [get_ports clk]\ncreate_clock -name x -period 1 [get_ports clk2]\n\
+             set_propagated_clock [get_clocks {a x}]\nset_clock_latency 0.2 [get_clocks a]\n\
+             set_clock_groups -asynchronous -group {a} -group {x}\n\
+             set_max_delay 1 -from [get_clocks a] -to [get_pins r/D]\nset_max_delay 2 -from [get_clocks a] -from [get_pins r2/CK]\n\
+             create_clock -name b -period 2 [get_ports clk]\n",
+        )
+        .unwrap();
+        assert_eq!(names(&s), ["x", "b"]);
+        assert_eq!(s.propagated.len(), 1);
+        assert_eq!(s.propagated[0].names, ["x"]);
+        assert!(s.clock_latencies.is_empty());
+        assert_eq!(s.async_groups, vec![vec!["x".to_string()]]);
+        assert_eq!(s.path_delays.len(), 1);
+        assert_eq!(s.path_delays[0].value, 2.0);
+        assert!(!s.ignored.iter().any(|i| i == CLOCK_REPLACED_UNDER_EXCEPTION));
+        let s = Sdc::parse("create_clock -name a -period 1 [get_ports clk]\nset_false_path -from [get_clocks a]\ncreate_clock -name b -period 2 [get_ports clk]\n").unwrap();
+        assert!(s.ignored_affecting_timing().contains(&CLOCK_REPLACED_UNDER_EXCEPTION));
+    }
+
+    // The reference's own reading of a mixed sequence (2026-10-11: the file read, then written back
+    // and its clocks listed): a takes {clk din}; b takes clk; c takes din, so a goes with its output
+    // delay, its max delay and its group; v is redefined in place; d is added on clk; b, redefined
+    // onto din without -add, takes din from c, which goes. Left: v (period 9, edges 1 and 4),
+    // b (din, 50, propagated), d (clk, 40, propagated), in that order; one output delay (on v), no
+    // path delay, one clock group holding v.
+    #[test]
+    fn a_mixed_sequence_reads_as_the_reference_reads_it() {
+        let s = Sdc::parse("create_clock -name a -period 10 [get_ports {clk din}]\n\
+             create_clock -name v -period 7\n\
+             set_output_delay 1 -clock a [get_ports qa]\n\
+             set_output_delay 2 -clock v [get_ports qb]\n\
+             set_max_delay 3 -from [get_clocks a] -to [get_ports qb]\n\
+             set_clock_groups -asynchronous -group {a} -group {v}\n\
+             create_clock -name b -period 20 [get_ports clk]\n\
+             create_clock -name c -period 30 [get_ports din]\n\
+             create_clock -name v -period 9 -waveform {1 4}\n\
+             create_clock -name d -add -period 40 [get_ports clk]\n\
+             set_propagated_clock [get_clocks {b d}]\n\
+             create_clock -name b -period 50 [get_ports din]\n").unwrap();
+        assert_eq!(names(&s), ["v", "b", "d"]);
+        let got: Vec<(f64, Vec<String>)> = s.clocks.iter().map(|c| (c.period, c.sources.clone())).collect();
+        assert_eq!(got, [(9.0, vec![]), (50.0, vec!["din".to_string()]), (40.0, vec!["clk".to_string()])]);
+        assert_eq!(s.clocks[0].waveform, Some(vec![1.0, 4.0]));
+        assert_eq!(s.propagated.iter().flat_map(|o| o.names.clone()).collect::<Vec<_>>(), ["b", "d"]);
+        assert_eq!(s.output_delays.iter().map(|d| d.clock.as_deref()).collect::<Vec<_>>(), [Some("v")]);
+        assert!(s.path_delays.is_empty());
+        assert_eq!(s.async_groups, vec![vec!["v".to_string()]]);
+        assert!(!s.ignored.iter().any(|i| i == CLOCK_REPLACED_UNDER_EXCEPTION));
     }
 }
