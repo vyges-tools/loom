@@ -305,6 +305,10 @@ pub struct Sdc {
     pub max_capacitance: Option<f64>,
     /// A `set_max_capacitance` on anything but the design.
     pub max_capacitance_on_objects: bool,
+    /// Every `set_max_capacitance V <objects>` on anything but the design, in file order: the
+    /// value AS WRITTEN (like [`Sdc::max_capacitance`]; NaN when it is not a number) and the
+    /// objects as named, for a consumer that models port or pin limits.
+    pub max_capacitance_objects: Vec<(f64, Objects)>,
     /// Every `set_propagated_clock`'s objects, in file order (still in [`Sdc::ignored`] for a
     /// consumer that does not model a propagated clock).
     pub propagated: Vec<Objects>,
@@ -322,6 +326,10 @@ pub struct Sdc {
     pub late_derate: Option<f64>,
     pub early_derate: Option<f64>,
     pub exceptions: Vec<Exception>,
+    /// Per entry of [`Sdc::exceptions`], index for index: the objects its `-from` side and its
+    /// `-to` side named, accessor kept (`-rise_from` / `-fall_from` on the from side, likewise to).
+    /// [`Exception::from`] / [`Exception::to`] are derived from these.
+    pub exception_objects: Vec<[Vec<Objects>; 2]>,
     /// `set_clock_groups -asynchronous`: each inner vec is one `-group` of clock
     /// names. Two clocks in *different* groups are mutually asynchronous — paths
     /// that launch and capture across them are cut (no setup **or** hold check).
@@ -382,18 +390,11 @@ const TIMING_AFFECTING: &[&str] = &[
     "set_max_fanout",
     "set_max_capacitance",
     "set_min_capacitance",
-    // ── a clock replaced under an exception that names it ──────────────────────────────
-    CLOCK_REPLACED_UNDER_EXCEPTION,
     // ── SDC 2.x ────────────────────────────────────────────────────────────────────────
     "set_disable_clock_gating_check", // removes a check, so its violations vanish
     "unset_propagated_clock",         // reverts to an ideal network -> latency and skew
     "set_max_trans",                  // Tcl accepts unambiguous abbreviations
 ];
-
-/// Recorded in [`Sdc::ignored`] when a `create_clock` without `-add` removed a clock that a
-/// timing exception names: which of the exception's names meant
-/// the clock is not known, so the exception may be wrong.
-pub const CLOCK_REPLACED_UNDER_EXCEPTION: &str = "create_clock (replaced a clock an exception names)";
 
 /// Explicitly NOT timing-affecting: instructions to synthesis, placement or power
 /// optimisation. Listed rather than merely omitted, so the distinction is a decision on record
@@ -427,10 +428,9 @@ impl Sdc {
     /// latencies, its `set_propagated_clock`, its place in path delays (a `-from`/`-to` left
     /// empty deletes the command) and in clock groups. `defining` (the clock being made) keeps
     /// its entry: it is redefined. A virtual clock (no pins) replaces nothing.
-    ///
-    /// Exceptions keep bare names, so one naming the removed clock cannot be told from one
-    /// naming a pin of the same name (a clock's default name is its port's): it is kept, and
-    /// [`CLOCK_REPLACED_UNDER_EXCEPTION`] is recorded in [`Sdc::ignored`] for a consumer to refuse.
+    /// A false path or multicycle path loses the clock the same way, read from
+    /// [`Sdc::exception_objects`] (only a `get_clocks` object names a clock; a port of the same
+    /// name stays).
     fn delete_pin_clocks(&mut self, defining: &str, pins: &[String]) {
         let mut removed = Vec::new();
         for c in self.clocks.iter_mut().filter(|c| c.name != defining) {
@@ -494,9 +494,27 @@ impl Sdc {
             g.retain(|n| n != name);
         }
         self.async_groups.retain(|g| !g.is_empty());
-        if self.exceptions.iter().any(|e| e.from.iter().chain(&e.to).any(|n| n == name)) {
-            self.ignored.push(CLOCK_REPLACED_UNDER_EXCEPTION.to_string());
+        // `deleteExceptionsReferencing`: the `-from` side, if its clocks hold the clock, loses it,
+        // else the `-to` side; a side left with no object deletes the exception.
+        let mut keep = Vec::with_capacity(self.exceptions.len());
+        for (e, objs) in self.exceptions.iter_mut().zip(self.exception_objects.iter_mut()) {
+            let mut kept = true;
+            for (side, list) in objs.iter_mut().enumerate() {
+                if list.iter().any(|o| o.accessor == "get_clocks" && o.names.iter().any(|n| n == name)) {
+                    list.iter_mut().for_each(drop_name);
+                    list.retain(|o| !o.names.is_empty());
+                    kept = !list.is_empty();
+                    let names = reduce_exception_objects(list);
+                    if side == 0 { e.from = names } else { e.to = names }
+                    break;
+                }
+            }
+            keep.push(kept);
         }
+        let mut k = keep.iter();
+        self.exceptions.retain(|_| *k.next().unwrap());
+        let mut k = keep.iter();
+        self.exception_objects.retain(|_| *k.next().unwrap());
     }
 
     /// The subset of [`Sdc::ignored`] that can move a reported slack — see [`TIMING_AFFECTING`].
@@ -1113,7 +1131,12 @@ impl Sdc {
                 "set_max_capacitance" => {
                     match (toks.len() == 3 && toks[2] == "[current_design]", toks.get(1).and_then(|v| v.parse::<f64>().ok())) {
                         (true, Some(v)) => sdc.max_capacitance = Some(v),
-                        _ => sdc.max_capacitance_on_objects = true,
+                        (_, v) => {
+                            sdc.max_capacitance_on_objects = true;
+                            if let Some(o) = toks.get(2) {
+                                sdc.max_capacitance_objects.push((v.unwrap_or(f64::NAN), Objects::of(o)));
+                            }
+                        }
                     }
                     sdc.ignored.push("set_max_capacitance".to_string());
                 }
@@ -1199,6 +1222,7 @@ impl Sdc {
                 }
                 "set_false_path" => {
                     let (from, to) = from_to(&toks);
+                    sdc.exception_objects.push(exception_sides(&toks));
                     sdc.exceptions.push(Exception {
                         kind: ExcKind::FalsePath,
                         from,
@@ -1212,6 +1236,7 @@ impl Sdc {
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(1);
                     let (from, to) = from_to(&toks);
+                    sdc.exception_objects.push(exception_sides(&toks));
                     sdc.exceptions.push(Exception {
                         kind: ExcKind::Multicycle(n),
                         from,
@@ -1247,36 +1272,38 @@ impl Sdc {
 /// A pin object (`reg/Q`) is reduced to its instance (`reg`) so it matches the
 /// engine's instance-level exception matching; a port keeps its name.
 fn from_to(toks: &[String]) -> (Vec<String>, Vec<String>) {
-    // ALL objects each flag names, not the first. A `-from [list a b c]` that cut only `a`
-    // left `b` and `c` timed against the SDC's stated intent.
-    let pick = |flags: &[&str]| -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        for f in flags {
-            if let Some(v) = flag_val(toks, f) {
-                for name in resolve_objs(v) {
-                    if name.starts_with('*') {
-                        continue; // an `all_inputs`-style collection, not a named object
-                    }
-                    // a pin object (`reg/Q`) reduces to its instance, matching the engine's
-                    // instance-level comparison
-                    out.push(match name.rsplit_once('/') {
-                        Some((inst, _pin)) => inst.to_string(),
-                        None => name,
-                    });
-                }
-            }
+    let [from, to] = exception_sides(toks);
+    (reduce_exception_objects(&from), reduce_exception_objects(&to))
+}
+
+/// An exception's objects per side: every `-from` / `-rise_from` / `-fall_from`, then every `-to`
+/// / `-rise_to` / `-fall_to`, accessor kept.
+fn exception_sides(toks: &[String]) -> [Vec<Objects>; 2] {
+    let pick = |flags: &[&str]| -> Vec<Objects> { flags.iter().filter_map(|f| flag_val(toks, f)).map(|v| Objects::of(v)).collect() };
+    [pick(&["-from", "-rise_from", "-fall_from"]), pick(&["-to", "-rise_to", "-fall_to"])]
+}
+
+/// One side of [`Exception`] from its objects. ALL objects each flag names, not the first: a
+/// `-from [list a b c]` that cut only `a` left `b` and `c` timed against the SDC's stated intent.
+fn reduce_exception_objects(objs: &[Objects]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in objs.iter().flat_map(|o| o.names.iter()) {
+        if name.starts_with('*') {
+            continue; // an `all_inputs`-style collection, not a named object
         }
-        out.sort();
-        out.dedup();
-        if out.is_empty() {
-            out.push("*".to_string()); // the flag was absent or named only a collection
-        }
-        out
-    };
-    (
-        pick(&["-from", "-rise_from", "-fall_from"]),
-        pick(&["-to", "-rise_to", "-fall_to"]),
-    )
+        // a pin object (`reg/Q`) reduces to its instance, matching the engine's
+        // instance-level comparison
+        out.push(match name.rsplit_once('/') {
+            Some((inst, _pin)) => inst.to_string(),
+            None => name.clone(),
+        });
+    }
+    out.sort();
+    out.dedup();
+    if out.is_empty() {
+        out.push("*".to_string()); // the flag was absent or named only a collection
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1455,8 +1482,10 @@ mod lossless_tests {
         let s = Sdc::parse("set_units -capacitance 1pF\nset_max_capacitance 46.0800 [current_design]\n").unwrap();
         assert_eq!((s.max_capacitance, s.max_capacitance_on_objects), (Some(46.08), false));
         assert!(s.ignored_affecting_timing().contains(&"set_max_capacitance"));
-        let s = Sdc::parse("set_max_capacitance 3 [get_ports a]\n").unwrap();
+        let s = Sdc::parse("set_max_capacitance 3 [get_ports a]\nset_max_capacitance 0.5 [get_pins {u1/A u2/A}]\n").unwrap();
         assert_eq!((s.max_capacitance, s.max_capacitance_on_objects), (None, true));
+        let objs: Vec<(f64, &str, Vec<&str>)> = s.max_capacitance_objects.iter().map(|(v, o)| (*v, o.accessor.as_str(), o.names.iter().map(String::as_str).collect())).collect();
+        assert_eq!(objs, [(3.0, "get_ports", vec!["a"]), (0.5, "get_pins", vec!["u1/A", "u2/A"])]);
     }
 
     // Rule: set_propagated_clock, set_clock_latency and set_max_delay / set_min_delay are kept
@@ -1544,9 +1573,51 @@ mod clock_replace_tests {
         assert_eq!(s.async_groups, vec![vec!["x".to_string()]]);
         assert_eq!(s.path_delays.len(), 1);
         assert_eq!(s.path_delays[0].value, 2.0);
-        assert!(!s.ignored.iter().any(|i| i == CLOCK_REPLACED_UNDER_EXCEPTION));
-        let s = Sdc::parse("create_clock -name a -period 1 [get_ports clk]\nset_false_path -from [get_clocks a]\ncreate_clock -name b -period 2 [get_ports clk]\n").unwrap();
-        assert!(s.ignored_affecting_timing().contains(&CLOCK_REPLACED_UNDER_EXCEPTION));
+    }
+
+    // Rule (`deleteExceptionsReferencing`): a false or multicycle path whose `-from` clocks hold
+    // the removed clock loses it, else its `-to` side does; a side left empty deletes it. Only a
+    // `get_clocks` object names a clock: a port of the clock's name stays.
+    #[test]
+    fn exceptions_lose_a_removed_clock_by_side() {
+        let s = Sdc::parse(
+            "create_clock -name clk -period 1 [get_ports clk]\ncreate_clock -name x -period 1 [get_ports clk2]\n\
+             set_false_path -from [get_clocks clk]\n\
+             set_false_path -from [get_clocks {clk x}] -to [get_clocks clk]\n\
+             set_multicycle_path 2 -from [get_ports clk] -to [get_clocks clk]\n\
+             set_false_path -from [get_ports clk] -to [get_pins r/D]\n\
+             create_clock -name b -period 2 [get_ports clk]\n",
+        )
+        .unwrap();
+        let rows: Vec<(Vec<&str>, Vec<&str>)> = s.exceptions.iter().map(|e| (e.from.iter().map(String::as_str).collect(), e.to.iter().map(String::as_str).collect())).collect();
+        // 1: from {clk} only -> deleted. 2: from loses clk, to untouched. 3: from is a PORT, so the
+        // to side loses clk and, empty, deletes it. 4: names no clock.
+        assert_eq!(rows, [(vec!["x"], vec!["clk"]), (vec!["clk"], vec!["r"])]);
+        assert_eq!(s.exceptions.len(), s.exception_objects.len());
+        assert!(!s.ignored.iter().any(|i| i.starts_with("create_clock")));
+    }
+
+    // The reference's own reading (2026-10-11, probe exception-replace.sdc read and written back):
+    // b replaces clk; of the five exceptions it keeps the false path from x to qa, the false path
+    // from the PORT clk to a_capture/D and the multicycle 3 to x — the false path from clk alone
+    // and the multicycle from the port clk to the clock clk are gone.
+    #[test]
+    fn exceptions_after_a_replace_read_as_the_reference_reads_them() {
+        let s = Sdc::parse(
+            "create_clock -name clk -period 10 [get_ports clk]\ncreate_clock -name x -period 7 [get_ports din]\n\
+             set_false_path -from [get_clocks clk]\n\
+             set_false_path -from [get_clocks {clk x}] -to [get_ports qa]\n\
+             set_multicycle_path 2 -from [get_ports clk] -to [get_clocks clk]\n\
+             set_false_path -from [get_ports clk] -to [get_pins a_capture/D]\n\
+             set_multicycle_path 3 -to [get_clocks {clk x}]\n\
+             create_clock -name b -period 20 [get_ports clk]\n",
+        )
+        .unwrap();
+        let rows: Vec<(ExcKind, Vec<&str>, Vec<&str>)> = s.exceptions.iter().map(|e| (e.kind.clone(), e.from.iter().map(String::as_str).collect(), e.to.iter().map(String::as_str).collect())).collect();
+        assert_eq!(
+            rows,
+            [(ExcKind::FalsePath, vec!["x"], vec!["qa"]), (ExcKind::FalsePath, vec!["clk"], vec!["a_capture"]), (ExcKind::Multicycle(3), vec!["*"], vec!["x"])]
+        );
     }
 
     // The reference's own reading of a mixed sequence (2026-10-11: the file read, then written back
@@ -1577,6 +1648,6 @@ mod clock_replace_tests {
         assert_eq!(s.output_delays.iter().map(|d| d.clock.as_deref()).collect::<Vec<_>>(), [Some("v")]);
         assert!(s.path_delays.is_empty());
         assert_eq!(s.async_groups, vec![vec!["v".to_string()]]);
-        assert!(!s.ignored.iter().any(|i| i == CLOCK_REPLACED_UNDER_EXCEPTION));
+        assert!(!s.ignored.iter().any(|i| i.starts_with("create_clock")));
     }
 }
