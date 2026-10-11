@@ -9,16 +9,23 @@
 //!
 //! Supported commands (others are collected in [`Sdc::ignored`], never fatal):
 //!
-//! - `create_clock -name N -period P {obj}` and
+//! - `create_clock -name N -period P [-waveform {e0 e1 …}] {obj}` and
 //!   `create_generated_clock -name N -source S -divide_by D -multiply_by M {obj}`
 //! - `set_input_delay` / `set_output_delay` (default via `all_inputs`/`all_outputs`
-//!   or `-clock`, plus per-port overrides) — the I/O timing budget
+//!   or `-clock`, plus per-port overrides) — the I/O timing budget, each with its
+//!   clock, flags (`-max`, `-min`, `-rise`, `-fall`, `-add_delay`, …) and accessor
 //! - `set_clock_uncertainty [-setup|-hold]` — setup/hold guard band
-//! - `set_clock_latency` — captured (source latency applied to the I/O budget)
+//! - `set_clock_latency` — captured (source latency applied to the I/O budget), and
+//!   kept per command
 //! - `set_input_transition`, `set_load` — boundary slew / load
 //! - `set_timing_derate -late|-early` — OCV derate
 //! - `set_false_path` / `set_multicycle_path` — timing exceptions
 //! - `set_units` — time/capacitance scaling to the engine's ns/pF
+//!
+//! Kept for a consumer that models them, and still listed in [`Sdc::ignored`] for
+//! one that does not: `set_max_transition`, `set_max_fanout`, `set_max_capacitance`
+//! on the design; `set_driving_cell`; `set_propagated_clock`'s objects;
+//! `set_max_delay` / `set_min_delay` as written.
 //!
 //! The parser is std-only: it joins `\`-continuations, strips `#` comments,
 //! resolves `set var`/`$var`, and understands `{...}` groups, `[get_* ...]`
@@ -90,6 +97,10 @@ pub struct SdcClock {
     /// `create_clock -period P {a b c}` is ONE clock on three ports: each is a clock pin.
     pub sources: Vec<String>,
     pub period: f64, // ns
+    /// `-waveform {e0 e1 …}`: the edge times as written, scaled like `period`; `None` without the
+    /// flag (the default `{0, period/2}`). Every edge is kept — a consumer that models two must
+    /// refuse any other count, including the empty list an unreadable edge leaves.
+    pub waveform: Option<Vec<f64>>,
 }
 
 impl SdcClock {
@@ -104,9 +115,77 @@ impl SdcClock {
 /// means it came from `all_inputs`/`all_outputs` (or a bare `-clock`).
 #[derive(Debug, Clone)]
 pub struct IoDelay {
+    /// The delay (ns); 0 when it could not be read — see [`IoDelay::value_read`].
     pub value: f64, // ns
+    /// The value positional was a number. False for a missing value or an unresolved variable,
+    /// which leave `value` 0: a consumer that must not guess refuses it.
+    pub value_read: bool,
     pub default: bool,
     pub ports: Vec<String>,
+    /// `-clock`'s clock, resolved (`[get_clocks {c}]` → `c`); `None` without the flag.
+    pub clock: Option<String>,
+    /// Every flag that takes no value, as written and in order: `-max`, `-min`, `-rise`, `-fall`,
+    /// `-add_delay`, `-clock_fall`, `-level_sensitive`, `-network_latency_included`,
+    /// `-source_latency_included`, or any other. A consumer reads the ones it models and refuses
+    /// the rest — without them a `-min`-only delay reads as a setup delay.
+    pub flags: Vec<String>,
+    /// `-reference_pin`, resolved.
+    pub reference_pin: Option<String>,
+    /// The accessor that named the objects (`get_ports`, `get_pins`, `all_inputs`, … or `""`).
+    pub accessor: String,
+}
+
+/// An object list as written: the accessor that named it (`get_clocks`, `get_pins`, … `list`, or
+/// `""` for a bare name or brace list) and the names it resolves to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Objects {
+    pub accessor: String,
+    pub names: Vec<String>,
+}
+
+impl Objects {
+    fn of(tok: &str) -> Objects {
+        let accessor = tok.strip_prefix('[').and_then(|i| tokenize(i.trim_end_matches(']').trim()).into_iter().next()).unwrap_or_default();
+        Objects { accessor, names: resolve_objs(tok) }
+    }
+}
+
+/// One `set_max_delay` / `set_min_delay` as written: the value (scaled like an I/O delay), every
+/// object-valued flag in order (`-from`, `-to`, `-through`, `-rise_from`, …) with its objects, and
+/// every flag that takes no value (`-ignore_clock_latency`, `-probe`, `-reset_path`, …).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathDelayCmd {
+    /// `set_max_delay` (else `set_min_delay`).
+    pub max: bool,
+    /// NaN when the value is not a number (an unresolved variable): never fatal here; a
+    /// consumer that models path delays refuses it.
+    pub value: f64,
+    pub objects: Vec<(String, Objects)>,
+    pub flags: Vec<String>,
+}
+
+/// A command's tokens split into flags with a value (from `valued`), flags without one, and
+/// positionals. A negative number is a positional, not a flag.
+fn split_args<'t>(toks: &'t [String], valued: &[&str]) -> (Vec<(&'t str, &'t String)>, Vec<String>, Vec<&'t String>) {
+    let (mut with, mut flags, mut pos) = (Vec::new(), Vec::new(), Vec::new());
+    let mut k = 1;
+    while k < toks.len() {
+        let t = &toks[k];
+        if valued.contains(&t.as_str()) {
+            if let Some(v) = toks.get(k + 1) {
+                with.push((t.as_str(), v));
+            }
+            k += 2;
+            continue;
+        }
+        if t.starts_with('-') && t.parse::<f64>().is_err() {
+            flags.push(t.clone());
+        } else {
+            pos.push(t);
+        }
+        k += 1;
+    }
+    (with, flags, pos)
 }
 
 /// One `set_load` / `set_input_transition` as written: its value in the SDC's user unit (NOT
@@ -215,6 +294,20 @@ pub struct Sdc {
     pub max_fanout: Option<f64>,
     /// A `set_max_fanout` on anything but the design.
     pub max_fanout_on_objects: bool,
+    /// `set_max_capacitance V [current_design]`: the design-wide capacitance limit AS WRITTEN —
+    /// not scaled by `set_units`, which in the reference only checks the unit; the value is in the
+    /// library's capacitance unit. Recorded in [`Sdc::ignored`] as well, like `set_max_transition`.
+    pub max_capacitance: Option<f64>,
+    /// A `set_max_capacitance` on anything but the design.
+    pub max_capacitance_on_objects: bool,
+    /// Every `set_propagated_clock`'s objects, in file order (still in [`Sdc::ignored`] for a
+    /// consumer that does not model a propagated clock).
+    pub propagated: Vec<Objects>,
+    /// Every `set_clock_latency`, per command (its value is also folded into
+    /// [`Sdc::clock_latency`]); a consumer that does not model latency refuses any.
+    pub clock_latencies: Vec<EnvCmd>,
+    /// Every `set_max_delay` / `set_min_delay`, in file order (still in [`Sdc::ignored`]).
+    pub path_delays: Vec<PathDelayCmd>,
     /// Every `set_driving_cell`, as written (still in [`Sdc::ignored`] for a consumer that does
     /// not model input drives).
     pub driving_cells: Vec<DrivingCell>,
@@ -793,11 +886,17 @@ impl Sdc {
                     // real one and launches and captures through it. An empty source is what
                     // "virtual" means; `is_virtual()` says so at the call site.
                     let src = source;
+                    // An edge that is not a time (an unresolved variable) leaves the list EMPTY
+                    // rather than failing the file: a consumer modelling two edges refuses it.
+                    let waveform = flag_val(&toks, "-waveform").map(|w| {
+                        w.split_whitespace().map(|e| parse_time(e).map(|t| t * t_scale)).collect::<Option<Vec<f64>>>().unwrap_or_default()
+                    });
                     sdc.clocks.push(SdcClock {
                         name,
                         source: src,
                         sources,
                         period: period * t_scale,
+                        waveform,
                     });
                 }
                 "create_generated_clock" => {
@@ -838,25 +937,29 @@ impl Sdc {
                     let _ = source;
                 }
                 "set_input_delay" | "set_output_delay" => {
-                    let val: f64 = toks
-                        .get(1)
-                        .filter(|t| !t.starts_with('-'))
-                        .or_else(|| flag_val(&toks, "-max"))
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0.0);
-                    let obj = trailing_obj(
-                        &toks,
-                        &["-clock", "-max", "-min", "-reference_pin", "-comment"],
-                    );
-                    let objs = obj.as_deref().map(resolve_objs).unwrap_or_default();
+                    // `-max` / `-min` take NO value: `delay_value port_pin_list` are the two
+                    // positionals. Reading `-max` as valued swallowed the port list of
+                    // `set_input_delay 1 -clock clk -max [get_ports a]`.
+                    let (with, flags, pos) = split_args(&toks, &["-clock", "-reference_pin", "-comment"]);
+                    let read: Option<f64> = pos.first().and_then(|v| v.parse().ok());
+                    let val = read.unwrap_or(0.0);
+                    let named = pos.get(1).map(|o| Objects::of(o)).unwrap_or(Objects { accessor: String::new(), names: Vec::new() });
+                    let accessor = named.accessor;
+                    let objs = named.names;
                     let default =
                         objs.is_empty() || objs.iter().any(|o| o == "*INPUTS*" || o == "*OUTPUTS*");
                     let ports: Vec<String> =
                         objs.into_iter().filter(|o| !o.starts_with('*')).collect();
+                    let valued = |f: &str| with.iter().find(|(k, _)| *k == f).and_then(|(_, v)| resolve_objs(v).into_iter().next());
                     let d = IoDelay {
                         value: val * t_scale,
+                        value_read: read.is_some(),
                         default,
                         ports,
+                        clock: valued("-clock"),
+                        flags,
+                        reference_pin: valued("-reference_pin"),
+                        accessor,
                     };
                     if toks[0] == "set_input_delay" {
                         sdc.input_delays.push(d);
@@ -884,6 +987,7 @@ impl Sdc {
                     }
                 }
                 "set_clock_latency" => {
+                    sdc.clock_latencies.extend(env_cmd(&toks));
                     if let Some(v) = toks.iter().skip(1).find_map(|t| {
                         if t.starts_with('-') || t.starts_with('[') {
                             None
@@ -906,6 +1010,31 @@ impl Sdc {
                         _ => sdc.max_fanout_on_objects = true,
                     }
                     sdc.ignored.push("set_max_fanout".to_string());
+                }
+                "set_max_capacitance" => {
+                    match (toks.len() == 3 && toks[2] == "[current_design]", toks.get(1).and_then(|v| v.parse::<f64>().ok())) {
+                        (true, Some(v)) => sdc.max_capacitance = Some(v),
+                        _ => sdc.max_capacitance_on_objects = true,
+                    }
+                    sdc.ignored.push("set_max_capacitance".to_string());
+                }
+                "set_propagated_clock" => {
+                    if let Some(o) = toks.get(1) {
+                        sdc.propagated.push(Objects::of(o));
+                    }
+                    sdc.ignored.push("set_propagated_clock".to_string());
+                }
+                "set_max_delay" | "set_min_delay" => {
+                    let valued = ["-from", "-to", "-through", "-rise_from", "-rise_to", "-fall_from", "-fall_to", "-rise_through", "-fall_through", "-comment"];
+                    let (with, flags, pos) = split_args(&toks, &valued);
+                    let value = pos.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(f64::NAN);
+                    sdc.path_delays.push(PathDelayCmd {
+                        max: toks[0] == "set_max_delay",
+                        value: value * t_scale,
+                        objects: with.iter().filter(|(k, _)| *k != "-comment").map(|(k, v)| (k.to_string(), Objects::of(v))).collect(),
+                        flags,
+                    });
+                    sdc.ignored.push(toks[0].clone());
                 }
                 "set_max_transition" => {
                     match (toks.len() == 3 && toks[2] == "[current_design]", toks.get(1).and_then(|v| v.parse::<f64>().ok())) {
@@ -1003,6 +1132,7 @@ impl Sdc {
                 sources: if target.is_empty() { Vec::new() } else { vec![target.clone()] },
                 source: target,
                 period,
+                waveform: None,
             });
         }
         Ok(sdc)
@@ -1184,5 +1314,66 @@ mod max_transition_tests {
         let s = Sdc::parse("set_max_transition 0.1 [get_ports a]\n").unwrap();
         assert_eq!((s.max_transition, s.max_transition_on_objects), (None, true));
         assert_eq!(s.ignored_affecting_timing(), vec!["set_max_transition"]);
+    }
+}
+
+#[cfg(test)]
+mod lossless_tests {
+    use super::*;
+
+    // Rule (create_clock): `-waveform` keeps every edge as written; none without the flag;
+    // a generated clock has none.
+    #[test]
+    fn a_clock_keeps_its_waveform() {
+        let s = Sdc::parse("create_clock -name clk -period 1.0000 -waveform {0.2000 0.7000} [get_ports {clk}]\ncreate_clock -name v -period 2\n").unwrap();
+        assert_eq!(s.clocks[0].waveform, Some(vec![0.2, 0.7]));
+        assert_eq!(s.clocks[0].sources, vec!["clk".to_string()]);
+        assert_eq!(s.clocks[1].waveform, None);
+        let bad = Sdc::parse("create_clock -name clk -period 1 -waveform {0 $undefined} [get_ports clk]\n").unwrap();
+        assert_eq!(bad.clocks[0].waveform, Some(vec![]));
+    }
+
+    // Rule (set_input_delay): `-max` / `-min` take no value — the value and the port list are
+    // the positionals, wherever the flags sit; the flags, `-clock` and `-reference_pin` are kept.
+    #[test]
+    fn an_io_delay_keeps_its_flags_clock_and_ports() {
+        let s = Sdc::parse("set_input_delay 0.1000 -clock [get_clocks {clk}] -max -add_delay [get_ports {in1 in2}]\nset_input_delay -min -0.2 -clock clk2 -rise [get_ports {in1}]\nset_output_delay 0.3 -clock clk -reference_pin [get_pins {r1/CK}] [get_ports {out}]\n").unwrap();
+        let d = &s.input_delays[0];
+        assert_eq!((d.value, d.clock.as_deref(), d.flags.clone(), d.ports.clone(), d.default), (0.1, Some("clk"), vec!["-max".to_string(), "-add_delay".to_string()], vec!["in1".to_string(), "in2".to_string()], false));
+        let d = &s.input_delays[1];
+        assert_eq!((d.value, d.clock.as_deref(), d.flags.clone(), d.ports.clone()), (-0.2, Some("clk2"), vec!["-min".to_string(), "-rise".to_string()], vec!["in1".to_string()]));
+        let d = &s.output_delays[0];
+        assert_eq!((d.reference_pin.as_deref(), d.ports.clone(), d.accessor.as_str()), (Some("r1/CK"), vec!["out".to_string()], "get_ports"));
+        let d = Sdc::parse("set_input_delay 1 -clock clk\nset_input_delay $undefined -clock clk [get_ports a]\n").unwrap();
+        assert!(d.input_delays[0].default && d.input_delays[0].ports.is_empty() && d.input_delays[0].value_read);
+        assert!(!d.input_delays[1].value_read && d.input_delays[1].value == 0.0);
+    }
+
+    // Rule: the design-wide set_max_capacitance keeps its value AS WRITTEN (set_units only
+    // checks) and stays in `ignored`; any other target is flagged.
+    #[test]
+    fn max_capacitance_on_the_design_keeps_its_value() {
+        let s = Sdc::parse("set_units -capacitance 1pF\nset_max_capacitance 46.0800 [current_design]\n").unwrap();
+        assert_eq!((s.max_capacitance, s.max_capacitance_on_objects), (Some(46.08), false));
+        assert!(s.ignored_affecting_timing().contains(&"set_max_capacitance"));
+        let s = Sdc::parse("set_max_capacitance 3 [get_ports a]\n").unwrap();
+        assert_eq!((s.max_capacitance, s.max_capacitance_on_objects), (None, true));
+    }
+
+    // Rule: set_propagated_clock, set_clock_latency and set_max_delay / set_min_delay are kept
+    // per command (the first and last still in `ignored`), objects with their accessor.
+    #[test]
+    fn propagated_latency_and_path_delays_are_kept_as_written() {
+        let s = Sdc::parse("set_propagated_clock [get_clocks {clk}]\nset_clock_latency -source 0.2 [get_clocks {clk}]\nset_max_delay\\
+    -ignore_clock_latency\\
+    -from [get_pins {r1/CK}]\\
+    -to [get_clocks {clk}] 0.5000\nset_min_delay -from [get_pins {a/Z}] $undefined\n").unwrap();
+        assert_eq!(s.propagated, vec![Objects { accessor: "get_clocks".into(), names: vec!["clk".into()] }]);
+        assert_eq!((s.clock_latencies.len(), s.clock_latencies[0].flags.clone(), s.clock_latency), (1, vec!["-source".to_string()], 0.2));
+        let p = &s.path_delays[0];
+        assert_eq!((p.max, p.value, p.flags.clone()), (true, 0.5, vec!["-ignore_clock_latency".to_string()]));
+        assert_eq!(p.objects, vec![("-from".to_string(), Objects { accessor: "get_pins".into(), names: vec!["r1/CK".into()] }), ("-to".to_string(), Objects { accessor: "get_clocks".into(), names: vec!["clk".into()] })]);
+        assert!(!s.path_delays[1].max && s.path_delays[1].value.is_nan());
+        assert!(s.ignored.iter().any(|c| c == "set_propagated_clock") && s.ignored.iter().filter(|c| c.ends_with("_delay")).count() == 2);
     }
 }
