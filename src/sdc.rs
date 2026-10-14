@@ -201,6 +201,9 @@ pub struct EnvCmd {
     pub flags: Vec<String>,
     pub clock: Option<String>,
     pub accessor: String,
+    /// Flags written inside the object accessor's brackets, e.g. `-no_clocks` in
+    /// `[all_inputs -no_clocks]`. The `*INPUTS*` sentinel alone cannot carry it.
+    pub accessor_flags: Vec<String>,
     pub objects: Vec<String>,
 }
 
@@ -270,8 +273,10 @@ fn env_cmd(toks: &[String]) -> Option<EnvCmd> {
     }
     let value = pos.first()?.parse::<f64>().ok()?;
     let obj = pos.get(1)?;
-    let accessor = obj.strip_prefix('[').and_then(|i| tokenize(i.trim_end_matches(']').trim()).into_iter().next()).unwrap_or_default();
-    Some(EnvCmd { cmd: toks[0].clone(), value, flags, clock, accessor, objects: resolve_objs(obj) })
+    let inner = obj.strip_prefix('[').map(|i| tokenize(i.trim_end_matches(']').trim())).unwrap_or_default();
+    let accessor = inner.first().cloned().unwrap_or_default();
+    let accessor_flags = inner.iter().skip(1).filter(|t| t.starts_with('-')).cloned().collect();
+    Some(EnvCmd { cmd: toks[0].clone(), value, flags, clock, accessor, accessor_flags, objects: resolve_objs(obj) })
 }
 
 #[derive(Debug, Default)]
@@ -1428,6 +1433,16 @@ mod max_transition_tests {
         assert_eq!((s.env[0].cmd.as_str(), s.env[0].value, s.env[0].flags.clone(), s.env[0].accessor.as_str(), s.env[0].objects.clone()), ("set_load", 2000.0, vec!["-pin_load".to_string()], "get_ports", vec!["out".to_string()]));
         assert_eq!((s.env[1].accessor.as_str(), s.env[1].objects.clone()), ("get_nets", vec!["out1".to_string(), "out2".to_string()]));
         assert_eq!((s.env[2].value, s.env[2].clock.as_deref(), s.env[2].flags.clone()), (10.0, Some("clk"), vec!["-rise".to_string()]));
+    }
+
+    // Rule: an `all_inputs` / `all_outputs` collection keeps its sentinel AND the flags written
+    // inside its brackets — the reference's `all_inputs -no_clocks` drops clock-source ports
+    // (`Sdc::allInputs(no_clks)`), which the `*INPUTS*` sentinel alone cannot say.
+    #[test]
+    fn environment_commands_keep_all_ports_collections_and_their_flags() {
+        let s = Sdc::parse("set_load 0.0334 [all_outputs]\nset_input_transition 0.1 [all_inputs -no_clocks]\n").unwrap();
+        assert_eq!((s.env[0].accessor.as_str(), s.env[0].objects.clone(), s.env[0].accessor_flags.clone()), ("all_outputs", vec!["*OUTPUTS*".to_string()], Vec::<String>::new()));
+        assert_eq!((s.env[1].accessor.as_str(), s.env[1].objects.clone(), s.env[1].accessor_flags.clone()), ("all_inputs", vec!["*INPUTS*".to_string()], vec!["-no_clocks".to_string()]));
     }
 
     // Rule: the design-wide form keeps its value; every form stays in `ignored` (timing-
