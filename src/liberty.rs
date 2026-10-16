@@ -888,17 +888,219 @@ fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
     }
 }
 
-fn parse_cell(name: String, body: &str, units: &Units, skip_ccs: bool) -> Cell {
-    let mut pins = BTreeMap::new();
+/// The groups DIRECTLY inside `body` — `kw (args) { body }` at brace depth 0 — in file order.
+///
+/// 🔑 **Depth matters, and the substring scan ([`next_block`]) cannot see it.** A cell's `pin`,
+/// `ff` and `statetable` belong to it only at its own level: the same words inside a `test_cell`
+/// describe the scan-mode view of the cell, and inside a `bus` they name bits of that bus.
+fn top_groups(body: &str) -> Vec<(String, String, String)> {
+    top_group_spans(body)
+        .into_iter()
+        .map(|g| (g.kw, g.args, body[g.body.clone()].to_string()))
+        .collect()
+}
+
+struct GroupSpan {
+    kw: String,
+    args: String,
+    /// The whole group, keyword through closing brace.
+    whole: std::ops::Range<usize>,
+    /// Inside the braces.
+    body: std::ops::Range<usize>,
+}
+
+/// One linear pass over `body`: each depth-0 group with where it lies.
+fn top_group_spans(body: &str) -> Vec<GroupSpan> {
+    let b = body.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    // Start of the current statement: just past the last `;`, `}` or `{` at depth 0.
+    let mut stmt = 0;
+    while i < b.len() {
+        match b[i] {
+            b';' | b'}' => stmt = i + 1,
+            b'{' => {
+                let end = matching(b, i).min(b.len());
+                let raw = &body[stmt..i];
+                let lead = raw.len() - raw.trim_start().len();
+                let head = raw.trim();
+                if let Some(open) = head.find('(') {
+                    let kw = head[..open].trim().to_string();
+                    let args = head[open + 1..].trim_end().trim_end_matches(')').trim().trim_matches('"');
+                    out.push(GroupSpan {
+                        kw,
+                        args: args.to_string(),
+                        whole: stmt + lead..(end + 1).min(b.len()),
+                        body: i + 1..end,
+                    });
+                }
+                i = end;
+                stmt = end + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `body` with every depth-0 group of kind `kw` removed, so a bus's own attributes and timing
+/// are read without its inner `pin` groups'. Linear: a macro's bus can hold thousands of pins.
+fn without_groups(body: &str, kw: &str) -> String {
+    let mut out = String::with_capacity(body.len());
     let mut at = 0;
-    while let Some((pname, pbody, after)) = next_block(body, at, "pin") {
-        let pin = parse_pin(pname.clone(), &pbody, units.cap_f, skip_ccs);
-        pins.insert(pname, pin);
+    for g in top_group_spans(body).into_iter().filter(|g| g.kw == kw) {
+        out.push_str(&body[at..g.whole.start]);
+        at = g.whole.end;
+    }
+    out.push_str(&body[at..]);
+    out
+}
+
+/// `body` with EVERY depth-0 group removed: the attributes stated at this level and no deeper.
+fn own_attrs(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut at = 0;
+    for g in top_group_spans(body) {
+        out.push_str(&body[at..g.whole.start]);
+        at = g.whole.end;
+    }
+    out.push_str(&body[at..]);
+    out
+}
+
+/// Liberty `type (name) { bit_from ; bit_to ; }` groups, anywhere in the file: name -> (from, to).
+fn bus_types(text: &str) -> BTreeMap<String, (i64, i64)> {
+    let mut out = BTreeMap::new();
+    let mut at = 0;
+    while let Some((name, tbody, after)) = next_block(text, at, "type") {
+        let int = |k: &str| simple_attr(&tbody, k).and_then(|v| v.parse::<i64>().ok());
+        if let (Some(from), Some(to)) = (int("bit_from"), int("bit_to")) {
+            out.insert(name, (from, to));
+        }
         at = after;
     }
-    let ff = next_block(body, 0, "ff").or_else(|| next_block(body, 0, "latch"));
-    let is_seq = ff.is_some();
+    out
+}
+
+/// The bit names a pin group inside a bus names: `d[3]` is one, `d[3:0]` is a range, `d` is all.
+fn named_bits(name: &str, bus: &str, all: &[String]) -> Vec<String> {
+    let Some(sub) = name.strip_prefix(bus).and_then(|r| r.strip_prefix('[')).and_then(|r| r.strip_suffix(']')) else {
+        return if name == bus { all.to_vec() } else { vec![name.to_string()] };
+    };
+    match sub.split_once(':') {
+        Some((a, b)) => match (a.trim().parse::<i64>(), b.trim().parse::<i64>()) {
+            (Ok(a), Ok(b)) => bit_range(a, b).map(|k| format!("{bus}[{k}]")).collect(),
+            _ => vec![name.to_string()],
+        },
+        None => vec![format!("{bus}[{}]", sub.trim())],
+    }
+}
+
+/// `from` to `to` inclusive, in either direction — the order Liberty lists a bus's bits in.
+fn bit_range(from: i64, to: i64) -> Box<dyn Iterator<Item = i64>> {
+    if from >= to {
+        Box::new((to..=from).rev())
+    } else {
+        Box::new(from..=to)
+    }
+}
+
+/// A member pin: the group's attributes (a `bus` or `bundle`) with what an inner `pin` group
+/// states over them. The inner group's timing is ADDED to the group's, which applies to every bit.
+fn merged_pin(name: &str, group: &Pin, inner: Option<(&Pin, &str)>) -> Pin {
+    let mut p = group.clone();
+    p.name = name.to_string();
+    if let Some((ip, ibody)) = inner {
+        if ip.direction != Dir::Other {
+            p.direction = ip.direction;
+        }
+        if simple_attr(ibody, "capacitance").is_some() {
+            p.capacitance = ip.capacitance;
+            p.cap_f = ip.cap_f;
+        }
+        if ip.recv.is_some() {
+            p.recv = ip.recv.clone();
+        }
+        p.clock |= ip.clock;
+        if ip.function.is_some() {
+            p.function = ip.function.clone();
+        }
+        p.setup.extend(ip.setup.iter().cloned());
+        p.hold.extend(ip.hold.iter().cloned());
+        p.recovery.extend(ip.recovery.iter().cloned());
+        p.removal.extend(ip.removal.iter().cloned());
+        p.arcs.extend(ip.arcs.iter().cloned());
+    }
+    p
+}
+
+fn parse_cell(
+    name: String,
+    body: &str,
+    units: &Units,
+    skip_ccs: bool,
+    types: &BTreeMap<String, (i64, i64)>,
+) -> Cell {
+    let mut pins = BTreeMap::new();
+    let groups = top_groups(body);
+    // Pins at the CELL's level only, plus the bits of its buses and the members of its bundles.
+    //
+    // ⛔ A `test_cell` group repeats the cell's pins in scan mode — without `clock : true` and
+    // with `signal_type` instead. Read by the substring scan, it came last and overwrote the real
+    // pins: a customer's scan flops lost their clock pin (26 of 31, 2026-10-16).
+    for (kw, args, gbody) in &groups {
+        match kw.as_str() {
+            "pin" => {
+                for pname in args.split(',').map(|n| n.trim().trim_matches('"')).filter(|n| !n.is_empty()) {
+                    pins.insert(pname.to_string(), parse_pin(pname.to_string(), gbody, units.cap_f, skip_ccs));
+                }
+            }
+            // ⛔ A bus's direction and capacitance are on the BUS, and a bus need not repeat them
+            // in per-bit `pin` groups — or have any. Unexpanded, an SRAM's D/Q/DM bits had no
+            // direction at all (customer, 2026-10-16). A bus is its bits `name[i]`, bit_from to
+            // bit_to; the bus's attributes reach every bit; a pin group inside states its own.
+            "bus" | "bundle" => {
+                let own = parse_pin(args.clone(), &without_groups(gbody, "pin"), units.cap_f, skip_ccs);
+                let members: Vec<String> = if kw == "bus" {
+                    match simple_attr(gbody, "bus_type").and_then(|t| types.get(&t).copied()) {
+                        Some((from, to)) => bit_range(from, to).map(|k| format!("{args}[{k}]")).collect(),
+                        None => Vec::new(),
+                    }
+                } else {
+                    next_paren_after(gbody, "members")
+                        .map(|m| m.split(',').map(|x| x.trim().trim_matches('"').to_string()).filter(|x| !x.is_empty()).collect())
+                        .unwrap_or_default()
+                };
+                for m in &members {
+                    pins.insert(m.clone(), merged_pin(m, &own, None));
+                }
+                for (ikw, iargs, ibody) in top_groups(gbody) {
+                    if ikw != "pin" {
+                        continue;
+                    }
+                    let ip = parse_pin(iargs.clone(), &ibody, units.cap_f, skip_ccs);
+                    for bit in named_bits(&iargs, args, &members) {
+                        let base = pins.get(&bit).cloned().unwrap_or_else(|| merged_pin(&bit, &own, None));
+                        pins.insert(bit.clone(), merged_pin(&bit, &base, Some((&ip, &ibody))));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let ff = groups
+        .iter()
+        .find(|(k, _, _)| k == "ff" || k == "latch")
+        .map(|(_, a, b)| (a.clone(), b.clone(), 0usize));
     let clock_pin = pins.iter().find(|(_, p)| p.clock).map(|(n, _)| n.clone());
+    // SEQUENTIAL: an `ff`/`latch` group (or a bank of them), a `statetable` — synchronizer cells
+    // model their state that way and have no `ff` at all — or a clock pin on a cell that is not a
+    // clock gate. ⛔ Read at the cell's own level: a `test_cell`'s `ff` describes scan mode.
+    let is_seq = groups
+        .iter()
+        .any(|(k, _, _)| matches!(k.as_str(), "ff" | "latch" | "ff_bank" | "latch_bank" | "statetable"))
+        || (clock_pin.is_some() && simple_attr(&own_attrs(body), "clock_gating_integrated_cell").is_none());
     // The `clear`/`preset` expressions name the asynchronous reset pins. Take only names the
     // cell actually declares as pins, so an expression referring to an internal node cannot
     // invent one.
@@ -1026,12 +1228,13 @@ impl Lib {
         let units = Units::from_lib(text);
         let voltage = lib_voltage(text).unwrap_or(1.8);
         let thresholds = Thresholds::from_lib(text);
+        let types = bus_types(text);
         let mut cells = BTreeMap::new();
         let mut at = 0;
         while let Some((cname, cbody, after)) = next_block(text, at, "cell") {
             cells.insert(
                 cname.clone(),
-                parse_cell(cname, &cbody, &units, opts.skip_ccs),
+                parse_cell(cname, &cbody, &units, opts.skip_ccs, &types),
             );
             at = after;
         }
@@ -1792,5 +1995,94 @@ mod constant_tests {
         if let Some(inv) = lib.cells.get("sky130_fd_sc_hd__inv_2") {
             assert!(!inv.pins["Y"].is_constant());
         }
+    }
+}
+
+#[cfg(test)]
+mod cell_structure_tests {
+    use super::*;
+
+    // Synthetic library, written for these rules (customer gaps 2026-10-16; no customer data).
+    const LIB: &str = r#"library (gaps) {
+      capacitive_load_unit (1, pf);
+      type (bus4) { base_type : array; data_type : bit; bit_width : 4; bit_from : 3; bit_to : 0; downto : true; }
+      cell (scanff) {
+        ff (IQ, IQN) { clocked_on : "CK"; next_state : "(D&!SE)|(SI&SE)"; }
+        pin (CK) { direction : input; clock : true; capacitance : 0.002; }
+        pin (D) { direction : input; capacitance : 0.001; }
+        pin (SI) { direction : input; capacitance : 0.001; }
+        pin (SE) { direction : input; capacitance : 0.001; }
+        pin (Q) { direction : output; function : "IQ";
+          timing () { related_pin : "CK"; timing_type : rising_edge;
+            cell_rise (scalar) { values ("0.1"); } } }
+        test_cell () {
+          ff (IQ, IQN) { clocked_on : "CK"; next_state : "D"; }
+          pin (CK) { direction : input; }
+          pin (D) { direction : input; }
+          pin (SI) { direction : input; signal_type : test_scan_in; }
+          pin (SE) { direction : input; signal_type : test_scan_enable; }
+          pin (Q) { direction : output; function : "IQ"; signal_type : test_scan_out; }
+        }
+      }
+      cell (sync3) {
+        statetable ("CK D", "Q1") { table : "R L : - : L, R H : - : H, ~R - : - : N"; }
+        pin (CK) { direction : input; clock : true; }
+        pin (D) { direction : input; }
+        pin (Q) { direction : output; state_function : "Q1"; }
+      }
+      cell (icg) {
+        clock_gating_integrated_cell : "latch_posedge";
+        pin (CLK) { direction : input; clock : true; clock_gate_clock_pin : true; }
+        pin (EN) { direction : input; clock_gate_enable_pin : true; }
+        pin (GCLK) { direction : output; clock_gate_out_pin : true; }
+      }
+      cell (sram) {
+        pin (CLK) { direction : input; clock : true; }
+        bus (D) { bus_type : bus4; direction : input; capacitance : 0.003;
+          pin (D[0]) { capacitance : 0.005; }
+          pin (D[3:2]) { capacitance : 0.007; } }
+        bus (Q) { bus_type : bus4; direction : output; }
+        bundle (DM) { members (DM0, DM1); direction : input; capacitance : 0.004; }
+      }
+    }"#;
+
+    // Rule: a `test_cell` describes the scan-mode view; its pins never replace the cell's own.
+    #[test]
+    fn test_cell_pins_do_not_replace_the_real_ones() {
+        let l = Lib::parse(LIB).unwrap();
+        let c = l.cell("scanff").unwrap();
+        assert_eq!(c.clock_pin.as_deref(), Some("CK"));
+        assert!(c.pins["CK"].clock);
+        assert_eq!(c.pins["CK"].capacitance, 0.002);
+        assert_eq!(c.pins["Q"].arcs.len(), 1, "the real Q, with its arc");
+        assert!(c.is_seq);
+    }
+
+    // Rule: sequential = ff/latch (or a bank), a statetable, or a clock pin on a non-clock-gate.
+    #[test]
+    fn a_statetable_cell_is_sequential_and_a_clock_gate_needs_its_latch() {
+        let l = Lib::parse(LIB).unwrap();
+        assert!(l.cell("sync3").unwrap().is_seq, "statetable");
+        assert!(!l.cell("icg").unwrap().is_seq, "a clock gate's clock pin alone is not state");
+        assert!(l.cell("sram").unwrap().is_seq, "a clock pin on a non-clock-gate (the SRAM)");
+    }
+
+    // Rule: a bus is its bits `name[i]`, bit_from to bit_to; the bus's attributes reach every bit;
+    // a pin group inside (one bit or a range) states its own. A bundle is its members likewise.
+    #[test]
+    fn bus_and_bundle_members_get_the_groups_direction() {
+        let l = Lib::parse(LIB).unwrap();
+        let c = l.cell("sram").unwrap();
+        for b in 0..4 {
+            assert_eq!(c.pins[&format!("D[{b}]")].direction, Dir::In);
+            assert_eq!(c.pins[&format!("Q[{b}]")].direction, Dir::Out);
+        }
+        assert_eq!(c.pins["D[1]"].capacitance, 0.003, "the bus's");
+        assert_eq!(c.pins["D[0]"].capacitance, 0.005, "the inner pin's own");
+        assert_eq!(c.pins["D[3]"].capacitance, 0.007, "a range names each bit");
+        assert_eq!(c.pins["D[2]"].capacitance, 0.007);
+        assert_eq!(c.pins["DM1"].direction, Dir::In);
+        assert_eq!(c.pins["DM0"].capacitance, 0.004);
+        assert!(!c.pins.contains_key("D") && !c.pins.contains_key("DM"), "the group is not a pin");
     }
 }
