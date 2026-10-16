@@ -295,7 +295,41 @@ fn is_ident(t: &str) -> bool {
     matches!(t.chars().next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '\\')
 }
 
+/// EVERY module a file defines, with the top marked.
+///
+/// ⛔ **`parse` returns only the top**, and on a hierarchical netlist that is not the design: a
+/// customer flow tracing a ~1,400-module full chip through its hierarchy found every non-top
+/// module's ports and instances gone (2026-10-16). A consumer that walks the hierarchy reads
+/// this instead.
+#[derive(Debug, Clone, Default)]
+pub struct Design {
+    /// Every module, in DECLARATION order. Each carries the file's `escaped_names` and the full
+    /// `modules` name list, exactly as the top returned by `parse` does.
+    pub modules: Vec<Netlist>,
+    /// Index into `modules` of the top: the module no other module instantiates.
+    pub top: usize,
+}
+
+impl Design {
+    pub fn top(&self) -> &Netlist {
+        &self.modules[self.top]
+    }
+
+    /// The module DEFINED under `name`, if the file defines it. An instance whose cell is not
+    /// found here is a leaf — a library cell or a black box.
+    pub fn module(&self, name: &str) -> Option<&Netlist> {
+        self.modules.iter().find(|m| m.module == name)
+    }
+}
+
+/// The top module only. See [`parse_all`] for a hierarchical netlist.
 pub fn parse(text: &str) -> Result<Netlist, NetlistError> {
+    let mut d = parse_all(text)?;
+    Ok(d.modules.swap_remove(d.top))
+}
+
+/// Every module in the file, and which one is the top.
+pub fn parse_all(text: &str) -> Result<Design, NetlistError> {
     let (t, escaped_vals) = tokenize(text);
     let n = t.len();
     let mut mods: Vec<Netlist> = Vec::new();
@@ -323,19 +357,20 @@ pub fn parse(text: &str) -> Result<Netlist, NetlistError> {
         .iter()
         .flat_map(|m| m.insts.iter().map(|x| x.cell.as_str()))
         .collect();
-    let top_idx = names
+    let top = names
         .iter()
         .position(|nm| !instantiated.contains(nm.as_str()))
         // Every module instantiated by another (mutual recursion, or a single module that
         // instantiates itself) — fall back to the last, which is the usual emission order.
         .unwrap_or(mods.len() - 1);
 
-    let mut top = mods.swap_remove(top_idx);
-    top.modules = names;
-    // ⚠️ Recorded on the returned module regardless of which one it is: the escaping is a fact
-    // about the FILE's tokens, and a consumer writing OpenDB needs it for any name it creates.
-    top.escaped_names = escaped_vals;
-    Ok(top)
+    // ⚠️ Recorded on every module regardless of which one it is: the escaping is a fact about
+    // the FILE's tokens, and a consumer writing OpenDB needs it for any name it creates.
+    for m in &mut mods {
+        m.modules = names.clone();
+        m.escaped_names = escaped_vals.clone();
+    }
+    Ok(Design { modules: mods, top })
 }
 
 /// Parse ONE `module … endmodule`, returning it and the index just past `endmodule`.
@@ -824,9 +859,46 @@ pub fn load(path: &str) -> Result<Netlist, NetlistError> {
     parse(&text)
 }
 
+/// [`load`], keeping every module — see [`Design`].
+pub fn load_all(path: &str) -> Result<Design, NetlistError> {
+    let text = std::fs::read_to_string(path).map_err(|e| NetlistError(format!("{path}: {e}")))?;
+    parse_all(&text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rule: a hierarchical netlist keeps EVERY module's contents; the top is the one nothing
+    /// instantiates, wherever it is declared. (Customer gap, 2026-10-16: `parse` returned the top
+    /// and dropped the rest, so nothing below it could be traced.)
+    #[test]
+    fn every_module_of_a_hierarchical_netlist_is_kept() {
+        let src = r#"
+module leaf (input a, output y);
+  sky130_fd_sc_hd__inv_2 u0 (.A(a), .Y(y));
+endmodule
+module mid (input a, output y);
+  wire n;
+  leaf l0 (.a(a), .y(n));
+  leaf l1 (.a(n), .y(y));
+endmodule
+module chip (input a, output y);
+  mid m0 (.a(a), .y(y));
+endmodule
+"#;
+        let d = parse_all(src).unwrap();
+        assert_eq!(d.modules.len(), 3);
+        assert_eq!(d.top().module, "chip");
+        let mid = d.module("mid").expect("mid kept");
+        assert_eq!(mid.inputs, vec!["a"]);
+        assert_eq!(mid.insts.iter().map(|x| x.cell.as_str()).collect::<Vec<_>>(), ["leaf", "leaf"]);
+        let leaf = d.module("leaf").expect("leaf kept");
+        assert_eq!(leaf.insts[0].cell, "sky130_fd_sc_hd__inv_2");
+        assert!(d.module("sky130_fd_sc_hd__inv_2").is_none(), "a library cell is a leaf, not a module");
+        // `parse` still hands back the same top, unchanged.
+        assert_eq!(parse(src).unwrap().module, "chip");
+    }
 
     #[test]
     fn escaped_identifier_instance_names() {
