@@ -43,6 +43,10 @@ const HANDLED: &[&str] = &[
     "receiver_capacitance1_fall", "receiver_capacitance2_fall", "output_current_rise",
     "output_current_fall", "rise_constraint", "fall_constraint", "ocv_sigma_cell_rise",
     "ocv_sigma_cell_fall",
+    // Read since the cell is read at its own level (2026-10-16): these make a cell sequential
+    // or make pins. `test_cell` is NOT here on purpose — it must never perturb what we read.
+    "statetable", "ff_bank", "latch_bank", "clock_gating_integrated_cell", "bus", "bundle",
+    "members", "bus_type", "type", "bit_from", "bit_to",
 ];
 
 /// A library exercising everything this reader claims to read.
