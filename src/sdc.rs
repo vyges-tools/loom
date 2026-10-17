@@ -379,6 +379,13 @@ const TIMING_AFFECTING: &[&str] = &[
     "set_data_check",        // a non-clock setup/hold relationship
     "set_min_pulse_width",
     "group_path",            // path grouping changes what is reported as critical
+    // ── Tcl control structure: what it would have done is unknown without running it ────
+    "if",
+    "foreach",
+    "for",
+    "while",
+    "switch",
+    "proc",
     // ── the clock network ──────────────────────────────────────────────────────────────
     "set_clock_transition",  // the clock's own slew, hence every launch/capture delay
     "set_propagated_clock",  // ideal vs propagated -> latency and skew
@@ -579,29 +586,68 @@ impl std::error::Error for SdcError {}
 
 // ---- Tcl-subset lexing ---------------------------------------------------
 
-/// Join `\`-continuations and split into logical command lines, dropping `#`
-/// comments. A `#` starts a comment only at the beginning of a command (line
-/// start, after whitespace) or after a `;`.
+/// Split the file into COMMANDS, as Tcl does: a command ends at a newline or `;` only OUTSIDE
+/// braces, brackets and quotes; a backslash-newline is a space; `#` starts a comment only where a
+/// command starts, and runs to the end of its line.
+///
+/// ⛔ It split on every newline and `;`, whatever the nesting. The body of `if {0} { … }` then
+/// ran as though unconditional (a clock the file never creates was created), a `foreach` body
+/// was read without its loop, and a brace list written across lines became fragments. A control
+/// structure now arrives whole, as one command this reader does not run — and says so.
 fn logical_lines(text: &str) -> Vec<String> {
-    let mut joined = String::new();
-    for raw in text.lines() {
-        let line = raw.strip_suffix('\r').unwrap_or(raw);
-        if let Some(stripped) = line.strip_suffix('\\') {
-            joined.push_str(stripped);
-            joined.push(' ');
-        } else {
-            joined.push_str(line);
-            joined.push('\n');
-        }
-    }
+    let cs: Vec<char> = text.chars().filter(|&c| c != '\r').collect();
     let mut out = Vec::new();
-    for seg in joined.split(['\n', ';']) {
-        let t = seg.trim();
-        if t.is_empty() || t.starts_with('#') {
+    let mut cur = String::new();
+    let (mut brace, mut bracket, mut quote) = (0i32, 0i32, false);
+    let push = |cur: &mut String, out: &mut Vec<String>| {
+        let t = cur.trim();
+        if !t.is_empty() {
+            out.push(t.to_string());
+        }
+        cur.clear();
+    };
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        if c == '\\' && i + 1 < cs.len() {
+            if cs[i + 1] == '\n' {
+                // a continuation: the newline and the next line's leading blanks are one space
+                cur.push(' ');
+                i += 2;
+                while i < cs.len() && (cs[i] == ' ' || cs[i] == '\t') {
+                    i += 1;
+                }
+            } else {
+                cur.push(c);
+                cur.push(cs[i + 1]);
+                i += 2;
+            }
             continue;
         }
-        out.push(t.to_string());
+        if c == '#' && brace == 0 && bracket == 0 && !quote && cur.trim().is_empty() {
+            // a comment where a command starts, to the end of the line (a backslash continues it)
+            while i < cs.len() && cs[i] != '\n' {
+                i += if cs[i] == '\\' { 2 } else { 1 };
+            }
+            continue;
+        }
+        match c {
+            '{' if !quote => brace += 1,
+            '}' if !quote => brace = (brace - 1).max(0),
+            '[' if brace == 0 && !quote => bracket += 1,
+            ']' if brace == 0 && !quote => bracket = (bracket - 1).max(0),
+            '"' if brace == 0 => quote = !quote,
+            '\n' | ';' if brace == 0 && bracket == 0 && !quote => {
+                push(&mut cur, &mut out);
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+        i += 1;
     }
+    push(&mut cur, &mut out);
     out
 }
 
@@ -666,7 +712,22 @@ fn tokenize(line: &str) -> Vec<String> {
             toks.push(s);
         } else {
             let mut s = String::new();
-            while i < cs.len() && !cs[i].is_whitespace() && cs[i] != '[' && cs[i] != '{' {
+            while i < cs.len() && !cs[i].is_whitespace() && cs[i] != '{' {
+                // A BUS INDEX is part of the word: `a[0]`, `d[7:0]`. The reference's unknown-
+                // command handler gives `[0]` back as written rather than running it, so
+                // `[get_ports a[0]]` names bit 0 of `a`; split there, it named `a` and `[0]`.
+                if cs[i] == '[' {
+                    let close = cs[i..].iter().position(|&c| c == ']').map(|k| i + k);
+                    let index = close.filter(|&e| e > i + 1 && cs[i + 1..e].iter().all(|c| c.is_ascii_digit() || *c == ':'));
+                    match index {
+                        Some(e) if !s.is_empty() => {
+                            s.extend(&cs[i..=e]);
+                            i = e + 1;
+                            continue;
+                        }
+                        _ => break,
+                    }
+                }
                 s.push(cs[i]);
                 i += 1;
             }
@@ -784,6 +845,446 @@ fn parse_time(v: &str) -> Option<f64> {
 /// empty, which failed the whole file — every other constraint in it lost along with the clock.
 /// Tcl reads `::env` from the process environment and so do we, falling back to `set` for a
 /// variable of that name.
+/// What a control command asks for: its chosen commands, a refusal (it cannot be evaluated
+/// here), or nothing (it is not a control command).
+enum Control {
+    Run(Vec<String>),
+    Refuse(String),
+    None,
+}
+
+/// `if` and `foreach`, evaluated as the reference's Tcl would — where they can be.
+///
+/// `if {cond} {body} ?elseif {cond} {body}? ?else {body}?` runs the first branch whose condition
+/// holds; `foreach v {a b} {body}` runs its body once per element with `v` set. A condition or a
+/// list this reader cannot evaluate (a design query, a `proc`) REFUSES the whole command — the
+/// branch it would have taken is unknown, and running every branch is how a file's default and
+/// its override both applied, in file order.
+fn control(raw: &str, vars: &HashMap<String, String>) -> Control {
+    let head = raw.split_whitespace().next().unwrap_or("");
+    match head {
+        "if" => {
+            let toks = tokenize(raw);
+            let mut k = 1;
+            while k + 1 < toks.len() {
+                let cond = subst_vars(&toks[k], vars);
+                let mut body = k + 1;
+                if toks.get(body).map(String::as_str) == Some("then") {
+                    body += 1;
+                }
+                match eval_expr(&cond, vars).map(|v| v.truthy()) {
+                    Some(Some(true)) => return Control::Run(logical_lines(&toks[body])),
+                    Some(Some(false)) => {}
+                    _ => return Control::Refuse("if".into()),
+                }
+                match toks.get(body + 1).map(String::as_str) {
+                    Some("elseif") => k = body + 2,
+                    Some("else") => return Control::Run(logical_lines(toks.get(body + 2).map(String::as_str).unwrap_or(""))),
+                    _ => return Control::Run(Vec::new()),
+                }
+            }
+            Control::Refuse("if".into())
+        }
+        "foreach" => {
+            let toks = tokenize(raw);
+            if toks.len() != 4 || toks[2].starts_with('[') {
+                return Control::Refuse("foreach".into());
+            }
+            let list = subst_vars(&toks[2], vars);
+            if list.contains('[') || list.contains('$') {
+                return Control::Refuse("foreach".into());
+            }
+            let body = logical_lines(&toks[3]);
+            let mut out = Vec::new();
+            for e in list.split_whitespace() {
+                out.push(format!("set {} {{{e}}}", toks[1]));
+                out.extend(body.iter().cloned());
+            }
+            Control::Run(out)
+        }
+        _ => Control::None,
+    }
+}
+
+/// A Tcl `expr` value: integer, double, or string — Tcl keeps the three apart, and integer
+/// division truncates (`10 / 4` is 2).
+#[derive(Debug, Clone, PartialEq)]
+enum Val {
+    Int(i64),
+    Dbl(f64),
+    Str(String),
+}
+
+impl Val {
+    fn num(&self) -> Option<f64> {
+        match self {
+            Val::Int(i) => Some(*i as f64),
+            Val::Dbl(d) => Some(*d),
+            Val::Str(s) => s.trim().parse().ok(),
+        }
+    }
+    /// Tcl's truth: a number is true when non-zero; `true`/`yes`/`on` and their opposites.
+    fn truthy(&self) -> Option<bool> {
+        if let Some(n) = self.num() {
+            return Some(n != 0.0);
+        }
+        match self {
+            Val::Str(s) => match s.to_ascii_lowercase().as_str() {
+                "true" | "yes" | "on" => Some(true),
+                "false" | "no" | "off" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    /// As Tcl prints it: an integer bare, a double in its shortest exact form (with `.0` when
+    /// it is integral, as Tcl writes `3.0`).
+    fn text(&self) -> String {
+        match self {
+            Val::Int(i) => i.to_string(),
+            Val::Dbl(d) if d.fract() == 0.0 && d.is_finite() => format!("{d:.1}"),
+            Val::Dbl(d) => d.to_string(),
+            Val::Str(s) => s.clone(),
+        }
+    }
+    fn of(tok: &str) -> Val {
+        let t = tok.trim();
+        if let Ok(i) = t.parse::<i64>() {
+            Val::Int(i)
+        } else if let Ok(d) = t.parse::<f64>() {
+            Val::Dbl(d)
+        } else {
+            Val::Str(t.to_string())
+        }
+    }
+}
+
+/// Evaluate a Tcl expression — the subset SDC files use: numbers, strings, `$var` / `${var}` /
+/// `$::env(X)` (already substituted by the caller where set), `[info exists name]`, `( )`,
+/// unary `- + !`, `* / %`, `+ -`, `< > <= >=`, `== != eq ne`, `&& ||`, and the functions `int`,
+/// `double`, `round`, `abs`, `floor`, `ceil`, `min`, `max`. `None` for anything else, which the
+/// caller refuses rather than guesses.
+fn eval_expr(src: &str, vars: &HashMap<String, String>) -> Option<Val> {
+    let toks = expr_tokens(src, vars)?;
+    let mut p = ExprParser { t: toks, i: 0 };
+    let v = p.or()?;
+    (p.i == p.t.len()).then_some(v)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ET {
+    V(Val),
+    Op(&'static str),
+    Ident(String),
+}
+
+fn expr_tokens(src: &str, vars: &HashMap<String, String>) -> Option<Vec<ET>> {
+    let s = subst_vars(src.trim(), vars);
+    let cs: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    const OPS: [&str; 20] = ["&&", "||", "==", "!=", "<=", ">=", "<", ">", "+", "-", "*", "/", "%", "!", "(", ")", ",", "?", ":", "**"];
+    while i < cs.len() {
+        let c = cs[i];
+        if c.is_whitespace() || c == '{' || c == '}' {
+            i += 1;
+            continue;
+        }
+        if c == '[' {
+            // `[info exists NAME]` — the only command an SDC condition needs
+            let close = cs[i..].iter().position(|&x| x == ']')? + i;
+            let inner: String = cs[i + 1..close].iter().collect();
+            let w: Vec<&str> = inner.split_whitespace().collect();
+            match w.as_slice() {
+                ["info", "exists", name] => {
+                    let name = name.trim_start_matches("::");
+                    let set = match name.strip_prefix("env(").and_then(|n| n.strip_suffix(')')) {
+                        Some(e) => std::env::var(e).is_ok() || vars.contains_key(e),
+                        None => vars.contains_key(name),
+                    };
+                    out.push(ET::V(Val::Int(set as i64)));
+                }
+                ["expr", rest @ ..] => out.push(ET::V(eval_expr(&rest.join(" "), vars)?)),
+                _ => return None,
+            }
+            i = close + 1;
+            continue;
+        }
+        if c == '"' {
+            let close = cs[i + 1..].iter().position(|&x| x == '"')? + i + 1;
+            out.push(ET::V(Val::Str(cs[i + 1..close].iter().collect())));
+            i = close + 1;
+            continue;
+        }
+        if c == '$' {
+            return None; // a variable left unsubstituted: not set
+        }
+        if c.is_ascii_digit() || (c == '.' && cs.get(i + 1).is_some_and(|d| d.is_ascii_digit())) {
+            let mut j = i;
+            while j < cs.len() && (cs[j].is_ascii_alphanumeric() || cs[j] == '.' || ((cs[j] == '-' || cs[j] == '+') && matches!(cs[j - 1], 'e' | 'E'))) {
+                j += 1;
+            }
+            let t: String = cs[i..j].iter().collect();
+            match Val::of(&t) {
+                Val::Str(_) => return None,
+                v => out.push(ET::V(v)),
+            }
+            i = j;
+            continue;
+        }
+        if c.is_alphabetic() || c == '_' {
+            let mut j = i;
+            while j < cs.len() && (cs[j].is_alphanumeric() || cs[j] == '_') {
+                j += 1;
+            }
+            let w: String = cs[i..j].iter().collect();
+            match w.as_str() {
+                "eq" => out.push(ET::Op("==")),
+                "ne" => out.push(ET::Op("!=")),
+                "true" | "false" | "yes" | "no" | "on" | "off" => out.push(ET::V(Val::Str(w))),
+                _ => out.push(ET::Ident(w)),
+            }
+            i = j;
+            continue;
+        }
+        let two: String = cs[i..(i + 2).min(cs.len())].iter().collect();
+        if let Some(op) = OPS.iter().find(|o| o.len() == 2 && **o == two) {
+            out.push(ET::Op(op));
+            i += 2;
+            continue;
+        }
+        let one = c.to_string();
+        let op = OPS.iter().find(|o| o.len() == 1 && **o == one)?;
+        out.push(ET::Op(op));
+        i += 1;
+    }
+    Some(out)
+}
+
+struct ExprParser {
+    t: Vec<ET>,
+    i: usize,
+}
+
+impl ExprParser {
+    fn peek(&self) -> Option<&ET> {
+        self.t.get(self.i)
+    }
+    fn eat(&mut self, op: &str) -> bool {
+        match self.peek() {
+            Some(ET::Op(o)) if *o == op => {
+                self.i += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+    fn or(&mut self) -> Option<Val> {
+        let mut v = self.and()?;
+        while self.eat("||") {
+            let r = self.and()?;
+            v = Val::Int((v.truthy()? || r.truthy()?) as i64);
+        }
+        Some(v)
+    }
+    fn and(&mut self) -> Option<Val> {
+        let mut v = self.cmp()?;
+        while self.eat("&&") {
+            let r = self.cmp()?;
+            v = Val::Int((v.truthy()? && r.truthy()?) as i64);
+        }
+        Some(v)
+    }
+    fn cmp(&mut self) -> Option<Val> {
+        let mut v = self.add()?;
+        loop {
+            let op = match self.peek() {
+                Some(ET::Op(o @ ("==" | "!=" | "<" | ">" | "<=" | ">="))) => *o,
+                _ => return Some(v),
+            };
+            self.i += 1;
+            let r = self.add()?;
+            let ord = match (v.num(), r.num()) {
+                (Some(a), Some(b)) => a.partial_cmp(&b)?,
+                _ => v.text().cmp(&r.text()),
+            };
+            use std::cmp::Ordering::*;
+            let t = match op {
+                "==" => ord == Equal,
+                "!=" => ord != Equal,
+                "<" => ord == Less,
+                ">" => ord == Greater,
+                "<=" => ord != Greater,
+                _ => ord != Less,
+            };
+            v = Val::Int(t as i64);
+        }
+    }
+    fn add(&mut self) -> Option<Val> {
+        let mut v = self.mul()?;
+        loop {
+            let op = match self.peek() {
+                Some(ET::Op(o @ ("+" | "-"))) => *o,
+                _ => return Some(v),
+            };
+            self.i += 1;
+            let r = self.mul()?;
+            v = arith(op, &v, &r)?;
+        }
+    }
+    fn mul(&mut self) -> Option<Val> {
+        let mut v = self.unary()?;
+        loop {
+            let op = match self.peek() {
+                Some(ET::Op(o @ ("*" | "/" | "%"))) => *o,
+                _ => return Some(v),
+            };
+            self.i += 1;
+            let r = self.unary()?;
+            v = arith(op, &v, &r)?;
+        }
+    }
+    fn unary(&mut self) -> Option<Val> {
+        if self.eat("-") {
+            return arith("-", &Val::Int(0), &self.unary()?);
+        }
+        if self.eat("+") {
+            return self.unary();
+        }
+        if self.eat("!") {
+            return Some(Val::Int(!self.unary()?.truthy()? as i64));
+        }
+        self.atom()
+    }
+    fn atom(&mut self) -> Option<Val> {
+        match self.t.get(self.i).cloned()? {
+            ET::V(v) => {
+                self.i += 1;
+                Some(v)
+            }
+            ET::Op("(") => {
+                self.i += 1;
+                let v = self.or()?;
+                self.eat(")").then_some(v)
+            }
+            ET::Ident(f) => {
+                self.i += 1;
+                if !self.eat("(") {
+                    return None;
+                }
+                let mut args = vec![self.or()?];
+                while self.eat(",") {
+                    args.push(self.or()?);
+                }
+                if !self.eat(")") {
+                    return None;
+                }
+                let x = args[0].num()?;
+                Some(match (f.as_str(), args.len()) {
+                    ("int", 1) => Val::Int(x.trunc() as i64),
+                    ("round", 1) => Val::Int(x.round() as i64),
+                    ("double", 1) => Val::Dbl(x),
+                    ("abs", 1) => match args[0] {
+                        Val::Int(i) => Val::Int(i.abs()),
+                        _ => Val::Dbl(x.abs()),
+                    },
+                    ("floor", 1) => Val::Dbl(x.floor()),
+                    ("ceil", 1) => Val::Dbl(x.ceil()),
+                    ("min" | "max", _) => {
+                        let mut best = args[0].clone();
+                        for a in &args[1..] {
+                            let (b, y) = (best.num()?, a.num()?);
+                            if (f == "min" && y < b) || (f == "max" && y > b) {
+                                best = a.clone();
+                            }
+                        }
+                        best
+                    }
+                    _ => return None,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Tcl arithmetic: two integers stay integer — and Tcl's integer `/` rounds toward NEGATIVE
+/// infinity, not toward zero as C's does (`-7 / 2` is -4), with `%` taking the divisor's sign;
+/// anything with a double is double.
+fn arith(op: &str, a: &Val, b: &Val) -> Option<Val> {
+    let ints = match (a, b) {
+        (Val::Int(x), Val::Int(y)) => Some((*x, *y)),
+        _ => None,
+    };
+    if let Some((x, y)) = ints {
+        return Some(Val::Int(match op {
+            "+" => x.checked_add(y)?,
+            "-" => x.checked_sub(y)?,
+            "*" => x.checked_mul(y)?,
+            "/" | "%" if y != 0 => {
+                let q = x / y - i64::from(x % y != 0 && ((x < 0) != (y < 0)));
+                if op == "/" {
+                    q
+                } else {
+                    x - y * q
+                }
+            }
+            _ => return None,
+        }));
+    }
+    let (x, y) = (a.num()?, b.num()?);
+    Some(Val::Dbl(match op {
+        "+" => x + y,
+        "-" => x - y,
+        "*" => x * y,
+        "/" if y != 0.0 => x / y,
+        _ => return None,
+    }))
+}
+
+/// Replace every `[expr …]` in a command by its value — the evaluation Tcl does before the
+/// command runs. One this reader cannot evaluate is left as written, so a consumer sees an
+/// unread value rather than a guessed one.
+///
+/// ⛔ Unevaluated, `set_input_delay [expr {$period * 0.2}] …` read as a delay of ZERO (marked
+/// unread, and timed as 0 anyway): 130 commands in 41 files of the corpus.
+fn subst_exprs(line: &str, vars: &HashMap<String, String>) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    while let Some(k) = rest.find("[expr") {
+        out.push_str(&rest[..k]);
+        let tail = &rest[k..];
+        // the matching `]`
+        let mut depth = 0;
+        let mut end = None;
+        for (j, c) in tail.char_indices() {
+            match c {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(j);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(e) = end else {
+            out.push_str(tail);
+            return out;
+        };
+        let inner = &tail[5..e];
+        match eval_expr(inner, vars) {
+            Some(v) => out.push_str(&v.text()),
+            None => out.push_str(&tail[..=e]),
+        }
+        rest = &tail[e + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn subst_vars(line: &str, vars: &HashMap<String, String>) -> String {
     if !line.contains('$') {
         return line.to_string();
@@ -930,8 +1431,25 @@ impl Sdc {
                                // (name, source, divide, multiply) for generated clocks, resolved last.
         let mut gen: Vec<(String, String, f64, f64)> = Vec::new();
 
-        for line in logical_lines(text) {
-            let line = subst_vars(&line, &vars);
+        // A QUEUE of commands, not a list: a chosen `if` branch or a `foreach` body is put back at
+        // its front, so it runs in place and in order — and its variables are substituted when
+        // each of its commands runs, as Tcl does, not when the `if` was read.
+        let mut queue: std::collections::VecDeque<String> = logical_lines(text).into();
+        while let Some(raw) = queue.pop_front() {
+            match control(&raw, &vars) {
+                Control::Run(cmds) => {
+                    for c in cmds.into_iter().rev() {
+                        queue.push_front(c);
+                    }
+                    continue;
+                }
+                Control::Refuse(kw) => {
+                    sdc.ignored.push(kw);
+                    continue;
+                }
+                Control::None => {}
+            }
+            let line = subst_exprs(&subst_vars(&raw, &vars), &vars);
             let toks = tokenize(&line);
             if toks.is_empty() {
                 continue;
@@ -1664,5 +2182,102 @@ mod clock_replace_tests {
         assert!(s.path_delays.is_empty());
         assert_eq!(s.async_groups, vec![vec!["v".to_string()]]);
         assert!(!s.ignored.iter().any(|i| i.starts_with("create_clock")));
+    }
+}
+
+/// How the file is split into commands — Tcl's rules, as the reference reads it.
+#[cfg(test)]
+mod tcl_structure_tests {
+    use super::*;
+
+    /// A control structure is ONE command, not run: the body of `if {0}` creates nothing.
+    #[test]
+    fn a_control_structure_is_not_run_line_by_line() {
+        let s = Sdc::parse(
+            "create_clock -name clk -period 10 [get_ports clk]\n\
+             if {0} {\n  create_clock -name bogus -period 1 [get_ports b]\n}\n\
+             foreach p {a b} {\n  set_input_delay 1 -clock clk [get_ports $p]\n}\n",
+        )
+        .unwrap();
+        assert_eq!(s.clocks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["clk"]);
+        // `if {0}` is evaluated (false) and its body skipped; the foreach over a literal list runs
+        assert_eq!(s.input_delays.iter().flat_map(|d| d.ports.clone()).collect::<Vec<_>>(), ["a", "b"]);
+    }
+
+    /// A brace list may run across lines; a `;#` comment and a continued line are Tcl's.
+    #[test]
+    fn a_brace_list_across_lines_and_comments() {
+        let s = Sdc::parse(
+            "create_clock -name clk -period 10 [get_ports {clk}] ;# the clock\n\
+             set_input_delay 1 -clock clk [get_ports {in1\n   in2}]\n\
+             # set_input_delay 9 -clock clk [get_ports nope]\n\
+             set_output_delay 2 \\\n    -clock clk [get_ports out]\n",
+        )
+        .unwrap();
+        assert_eq!(s.clocks.len(), 1);
+        assert_eq!(s.input_delays.len(), 1, "the commented-out delay is not read");
+        assert_eq!(s.input_delays[0].ports, ["in1", "in2"]);
+        assert_eq!(s.output_delays[0].ports, ["out"]);
+    }
+
+    /// An unbraced bus bit is one name: `a[0]`, as the reference keeps it.
+    #[test]
+    fn an_unbraced_bus_bit_is_one_name() {
+        let s = Sdc::parse("create_clock -name clk -period 10 [get_ports clk]\nset_input_delay 1 -clock clk [get_ports a[0]]\n").unwrap();
+        assert_eq!(s.input_delays[0].ports, ["a[0]"]);
+    }
+}
+
+/// Tcl `if` / `foreach` / `expr`, evaluated where the reference's Tcl would evaluate them.
+#[cfg(test)]
+mod tcl_eval_tests {
+    use super::*;
+
+    fn ev(s: &str) -> Option<String> {
+        eval_expr(s, &HashMap::new()).map(|v| v.text())
+    }
+
+    #[test]
+    fn expr_follows_tcl_arithmetic() {
+        assert_eq!(ev("10 / 4").as_deref(), Some("2"), "integer division");
+        assert_eq!(ev("-7 / 2").as_deref(), Some("-4"), "toward negative infinity");
+        assert_eq!(ev("-7 % 2").as_deref(), Some("1"), "the divisor's sign");
+        assert_eq!(ev("10.0 / 4").as_deref(), Some("2.5"));
+        assert_eq!(ev("2 * 1.5").as_deref(), Some("3.0"));
+        assert_eq!(ev("(1 + 2) * 3 - 1").as_deref(), Some("8"));
+        assert_eq!(ev("max(1, 2.5, 2)").as_deref(), Some("2.5"));
+        assert_eq!(ev("1 < 2 && \"a\" eq \"a\"").as_deref(), Some("1"));
+        assert_eq!(ev("[get_ports x] > 0"), None, "a design query is not evaluated");
+    }
+
+    /// The idiom every LibreLane SDC uses: the flow's value when it is set, else a default.
+    /// Only the CHOSEN branch runs.
+    #[test]
+    fn if_runs_only_the_branch_its_condition_chooses() {
+        let src = "if { [info exists ::env(VYGES_TEST_UNSET_PERIOD_X)] } {\n  set p $::env(VYGES_TEST_UNSET_PERIOD_X)\n} else {\n  set p 15.0\n}\n\
+                   set io [expr {$p * 0.20}]\n\
+                   create_clock -name clk -period $p [get_ports clk]\n\
+                   set_input_delay $io -clock clk [get_ports in]\n";
+        let s = Sdc::parse(src).unwrap();
+        assert_eq!(s.clocks[0].period, 15.0);
+        assert!(s.input_delays[0].value_read);
+        assert_eq!(s.input_delays[0].value, 15.0 * 0.20);
+        let s = Sdc::parse("set a 1\nif {$a == 2} { create_clock -name x -period 1 } elseif {$a == 1} { create_clock -name y -period 2 }\n").unwrap();
+        assert_eq!(s.clocks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["y"]);
+    }
+
+    /// `foreach` over a literal list runs its body per element; over a design query it is
+    /// refused, not run once.
+    #[test]
+    fn foreach_over_a_literal_list() {
+        let s = Sdc::parse(
+            "create_clock -name clk -period 10 [get_ports clk]\n\
+             foreach p {a b} { set_input_delay 1 -clock clk [get_ports $p] }\n\
+             foreach q [all_inputs] { set_input_delay 2 -clock clk $q }\n",
+        )
+        .unwrap();
+        let ports: Vec<String> = s.input_delays.iter().flat_map(|d| d.ports.clone()).collect();
+        assert_eq!(ports, ["a", "b"]);
+        assert_eq!(s.ignored_affecting_timing(), ["foreach"]);
     }
 }
