@@ -1115,7 +1115,7 @@ fn unevaluated_query(toks: &[String]) -> Option<String> {
             match with_design(|d| crate::sdc_query::eval(&parts, d)) {
                 Some(Ok(_)) => continue,
                 Some(Err(why)) => return Some(format!("[{}] ({why})", inner.trim())),
-                None => return Some(format!("[{}]", inner.trim())),
+                None => return Some(format!("[{}] (needs the design)", inner.trim())),
             }
         }
         if let Some(q) = unevaluated_query(&parts[1..]) {
@@ -1700,7 +1700,7 @@ impl Sdc {
             // so (a `set` only stores the text; it is checked where the variable is used).
             if toks[0] != "set" {
                 if let Some(q) = unevaluated_query(&toks) {
-                    sdc.rejected.push(format!("{}: {q} needs the design to evaluate; not applied", toks[0]));
+                    sdc.rejected.push(format!("{}: {q} not evaluated; not applied", toks[0]));
                     sdc.unevaluated_queries.push(format!("{}: {q}", toks[0]));
                     continue;
                 }
