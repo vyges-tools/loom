@@ -1316,12 +1316,17 @@ impl Spef {
             // to the fallback below and was interned in the name map as a name with an escaped
             // colon — a node no reader can join to the net it belongs to. A real extraction is
             // almost entirely these.
+            // A head this file does not otherwise name (another net's node, say) is interned on
+            // its own and the suffix kept: interned whole, `m:1` went out as a bare `*7`, which a
+            // reader takes for a top-level port and drops with everything on it.
             if let Some((pre, suf)) = s.split_once(':') {
-                if let Some(id) = id_of.get(pre) {
-                    return format!("*{id}:{suf}");
+                if !id_of.contains_key(pre) {
+                    order.push(pre.to_string());
+                    id_of.insert(pre.to_string(), order.len());
                 }
+                return format!("*{}:{suf}", id_of[pre]);
             }
-            // opaque internal node — intern it and emit its index
+            // a bare name left (a port, after `numbered_internal_nodes`) — intern it, emit its index
             order.push(s.to_string());
             let id = order.len();
             id_of.insert(s.to_string(), id);

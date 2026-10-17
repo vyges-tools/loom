@@ -29,7 +29,7 @@ fn one_net(body: &str, cu: &str, ru: &str) -> Spef {
 fn corner_triplets_are_read_not_dropped() {
     let s = one_net(
         "*NAME_MAP\n*1 neta\n*2 netb\n\n*D_NET *1 10:11:12\n*CONN\n*I *2:A I *L 1.5:1.6:1.7\n\
-         *CAP\n1 *1 8:9:10\n*RES\n1 *1 *2:A 20:21:22\n*END\n",
+         *CAP\n1 *1:1 8:9:10\n*RES\n1 *1:1 *2:A 20:21:22\n*END\n",
         "1 FF",
         "1 OHM",
     );
@@ -50,7 +50,7 @@ fn corner_triplets_are_read_not_dropped() {
 #[test]
 fn keywords_are_case_insensitive() {
     let s = one_net(
-        "*name_map\n*1 neta\n\n*d_net *1 10\n*cap\n1 *1 8\n*res\n1 *1 *1 5\n*end\n",
+        "*name_map\n*1 neta\n\n*d_net *1 10\n*cap\n1 *1:1 8\n*res\n1 *1:1 *1:1 5\n*end\n",
         "1 FF",
         "1 OHM",
     );
@@ -64,7 +64,7 @@ fn keywords_are_case_insensitive() {
 #[test]
 fn escaped_names_are_unescaped() {
     let s = one_net(
-        "*NAME_MAP\n*1 u_a\\.q\\[0\\]\n\n*D_NET *1 10\n*CAP\n1 *1 8\n*END\n",
+        "*NAME_MAP\n*1 u_a\\.q\\[0\\]\n\n*D_NET *1 10\n*CAP\n1 *1:1 8\n*END\n",
         "1 FF",
         "1 OHM",
     );
@@ -81,7 +81,7 @@ fn escaped_names_are_unescaped() {
 #[test]
 fn escaping_round_trips() {
     let src = one_net(
-        "*NAME_MAP\n*1 u_a\\.q\\[0\\]\n\n*D_NET *1 10\n*CAP\n1 *1 8\n*END\n",
+        "*NAME_MAP\n*1 u_a\\.q\\[0\\]\n\n*D_NET *1 10\n*CAP\n1 *1:1 8\n*END\n",
         "1 FF",
         "1 OHM",
     );
@@ -101,7 +101,7 @@ fn escaping_round_trips() {
 #[test]
 fn line_comments_are_stripped() {
     let s = one_net(
-        "// leading comment\n*NAME_MAP\n*1 neta\n\n*D_NET *1 10\n*CAP\n1 *1 8 // trailing\n*END\n",
+        "// leading comment\n*NAME_MAP\n*1 neta\n\n*D_NET *1 10\n*CAP\n1 *1:1 8 // trailing\n*END\n",
         "1 FF",
         "1 OHM",
     );
@@ -113,10 +113,10 @@ fn line_comments_are_stripped() {
 /// Units are applied, in both directions, including the scaled ones.
 #[test]
 fn units_scale() {
-    let pf = one_net("*NAME_MAP\n*1 n\n\n*D_NET *1 0.01\n*CAP\n1 *1 0.008\n*END\n", "1 PF", "1 OHM");
+    let pf = one_net("*NAME_MAP\n*1 n\n\n*D_NET *1 0.01\n*CAP\n1 *1:1 0.008\n*END\n", "1 PF", "1 OHM");
     assert_eq!(pf.nets["n"].cap_ff, 8.0, "PF -> fF");
     let ko = one_net(
-        "*NAME_MAP\n*1 n\n*2 m\n\n*D_NET *1 1\n*RES\n1 *1 *2 0.02\n*END\n",
+        "*NAME_MAP\n*1 n\n*2 m\n\n*D_NET *1 1\n*RES\n1 *1:1 *2:1 0.02\n*END\n",
         "1 FF",
         "1 KOHM",
     );
@@ -126,14 +126,14 @@ fn units_scale() {
 /// The name map is optional in IEEE 1481; literal names must work.
 #[test]
 fn a_file_without_a_name_map_parses() {
-    let s = one_net("*D_NET neta 10\n*CAP\n1 neta 8\n*END\n", "1 FF", "1 OHM");
+    let s = one_net("*D_NET neta 10\n*CAP\n1 neta:1 8\n*END\n", "1 FF", "1 OHM");
     assert_eq!(s.nets["neta"].cap_ff, 8.0);
 }
 
 /// Scientific notation is a number.
 #[test]
 fn scientific_notation_parses() {
-    let s = one_net("*NAME_MAP\n*1 n\n\n*D_NET *1 1.0e-2\n*CAP\n1 *1 8.5e-3\n*END\n", "1 FF", "1 OHM");
+    let s = one_net("*NAME_MAP\n*1 n\n\n*D_NET *1 1.0e-2\n*CAP\n1 *1:1 8.5e-3\n*END\n", "1 FF", "1 OHM");
     // read at the reference's float precision
     assert_eq!(s.nets["n"].ground[0].1, 8.5e-3f32 as f64);
     assert_eq!(s.nets["n"].cap_ff, 8.5e-3f32 as f64);
@@ -143,12 +143,12 @@ fn scientific_notation_parses() {
 /// or the next gap is as quiet as the last four.
 #[test]
 fn unreadable_entries_are_counted_not_ignored() {
-    let clean = one_net("*NAME_MAP\n*1 n\n\n*D_NET *1 10\n*CAP\n1 *1 8\n*END\n", "1 FF", "1 OHM");
+    let clean = one_net("*NAME_MAP\n*1 n\n\n*D_NET *1 10\n*CAP\n1 *1:1 8\n*END\n", "1 FF", "1 OHM");
     assert_eq!(clean.skipped, 0);
     assert!(clean.health().is_none(), "a clean read reports nothing");
 
     let junk = one_net(
-        "*NAME_MAP\n*1 n\n\n*D_NET *1 10\n*CAP\n1 *1 8\n2 *1 not_a_number\n*END\n",
+        "*NAME_MAP\n*1 n\n\n*D_NET *1 10\n*CAP\n1 *1:1 8\n2 *1:1 not_a_number\n*END\n",
         "1 FF",
         "1 OHM",
     );
@@ -183,7 +183,7 @@ fn reduced_nets_are_reported_not_silently_empty() {
 fn power_net_blocks_are_skipped_cleanly() {
     let s = one_net(
         "*NAME_MAP\n*1 VDD\n*2 neta\n\n*D_PNET *1 99\n*CAP\n1 *1 77\n*END\n\
-         \n*D_NET *2 10\n*CAP\n1 *2 8\n*END\n",
+         \n*D_NET *2 10\n*CAP\n1 *2:1 8\n*END\n",
         "1 FF",
         "1 OHM",
     );
