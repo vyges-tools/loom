@@ -81,6 +81,13 @@ fn endpoint_matches(set: &[String], name: &str) -> bool {
     set.is_empty() || set.iter().any(|o| o == "*" || o == name || (o.contains(['*', '?']) && glob(o, name)))
 }
 
+/// Does an SDC object name match `name` — itself, or as a `*` / `?` pattern the way the
+/// reference's object queries match one (`get_ports in*`)? For a consumer applying a per-object
+/// constraint: an exact-name lookup silently never applied `set_input_delay … [get_ports in*]`.
+pub fn object_matches(pattern: &str, name: &str) -> bool {
+    pattern == name || (pattern.contains(['*', '?']) && glob(pattern, name))
+}
+
 /// Tcl `string match` for `*` and `?` — what `get_ports in*` matches against.
 fn glob(pat: &str, s: &str) -> bool {
     let (p, t): (Vec<char>, Vec<char>) = (pat.chars().collect(), s.chars().collect());
@@ -336,6 +343,9 @@ pub struct Sdc {
     /// stays in the library's units, as the reference reads them; a consumer compares these with
     /// its library and warns on a mismatch, as the reference does.
     pub declared_units: Vec<(String, String)>,
+    /// Commands the reference would REJECT (an error, not a warning) — so they were not applied
+    /// here either — each with why.
+    pub rejected: Vec<String>,
     pub input_transition: Option<f64>,
     pub load: Option<f64>,
     /// `set_max_transition V [current_design]`, ns: the design-wide slew limit, for a consumer
@@ -609,6 +619,9 @@ impl Sdc {
                 "clock(s) with no usable period: {} — every check against them is vacuous",
                 bad.join(", ")
             ));
+        }
+        if !self.rejected.is_empty() {
+            notes.push(format!("{} command(s) rejected: {}", self.rejected.len(), self.rejected.join("; ")));
         }
         let refused = self.exceptions.iter().filter(|e| e.refused.is_some()).count();
         if refused > 0 {
@@ -1671,13 +1684,17 @@ impl Sdc {
                     let (with, flags, pos) = split_args(&toks, &["-clock", "-reference_pin", "-comment"]);
                     let read: Option<f64> = pos.first().and_then(|v| v.parse().ok());
                     let val = read.unwrap_or(0.0);
-                    let named = pos.get(1).map(|o| Objects::of(o)).unwrap_or(Objects { accessor: String::new(), names: Vec::new() });
+                    // ⛔ NO OBJECTS is an error to the reference (STA-0567), not "every port": read as
+                    // a default it applied to every input. An EMPTY list applies to nothing.
+                    let Some(named) = pos.get(1).map(|o| Objects::of(o)) else {
+                        sdc.rejected.push(format!("{} without a port list", toks[0]));
+                        continue;
+                    };
                     let accessor = named.accessor;
                     let objs = named.names;
-                    let default =
-                        objs.is_empty() || objs.iter().any(|o| o == "*INPUTS*" || o == "*OUTPUTS*");
-                    let ports: Vec<String> =
-                        objs.into_iter().filter(|o| !o.starts_with('*')).collect();
+                    // the `all_*` collections, by exact name — a pattern like `*_in` is a name
+                    let default = objs.iter().any(|o| o == "*INPUTS*" || o == "*OUTPUTS*");
+                    let ports: Vec<String> = objs.into_iter().filter(|o| !SENTINELS.contains(&o.as_str())).collect();
                     let valued = |f: &str| with.iter().find(|(k, _)| *k == f).and_then(|(_, v)| resolve_objs(v).into_iter().next());
                     let d = IoDelay {
                         value: val,
@@ -2113,9 +2130,10 @@ mod lossless_tests {
         assert_eq!((d.value, d.clock.as_deref(), d.flags.clone(), d.ports.clone()), (-0.2, Some("clk2"), vec!["-min".to_string(), "-rise".to_string()], vec!["in1".to_string()]));
         let d = &s.output_delays[0];
         assert_eq!((d.reference_pin.as_deref(), d.ports.clone(), d.accessor.as_str()), (Some("r1/CK"), vec!["out".to_string()], "get_ports"));
+        // no port list is rejected (the reference's STA-0567), not read as every input
         let d = Sdc::parse("set_input_delay 1 -clock clk\nset_input_delay $undefined -clock clk [get_ports a]\n").unwrap();
-        assert!(d.input_delays[0].default && d.input_delays[0].ports.is_empty() && d.input_delays[0].value_read);
-        assert!(!d.input_delays[1].value_read && d.input_delays[1].value == 0.0);
+        assert_eq!(d.rejected.len(), 1);
+        assert!(!d.input_delays[0].value_read && d.input_delays[0].value == 0.0);
     }
 
     // Rule: the design-wide set_max_capacitance keeps its value AS WRITTEN (set_units only
@@ -2474,5 +2492,28 @@ mod generated_clock_tests {
         let s = Sdc::parse("create_generated_clock -name g -source [get_pins u/Q] -divide_by 2 [get_pins r/CK]\n").unwrap();
         assert_eq!(s.clocks[0].period, 0.0);
         assert!(s.health().unwrap().contains("no usable period"));
+    }
+}
+
+/// I/O delays name what they constrain: no list is rejected, an empty list is nothing, a
+/// pattern is a pattern.
+#[cfg(test)]
+mod io_delay_object_tests {
+    use super::*;
+
+    #[test]
+    fn an_io_delay_names_its_ports() {
+        let s = Sdc::parse(
+            "create_clock -name c -period 10 [get_ports clk]\n\
+             set_input_delay 1 -clock c\n\
+             set_input_delay 2 -clock c [list]\n\
+             set_input_delay 3 -clock c [get_ports *_in]\n\
+             set_input_delay 4 -clock c [all_inputs]\n",
+        )
+        .unwrap();
+        assert_eq!(s.rejected.len(), 1, "no port list is an error");
+        let d: Vec<(f64, bool, Vec<String>)> = s.input_delays.iter().map(|d| (d.value, d.default, d.ports.clone())).collect();
+        assert_eq!(d, [(2.0, false, vec![]), (3.0, false, vec!["*_in".to_string()]), (4.0, true, vec![])]);
+        assert!(object_matches("*_in", "a_in") && !object_matches("*_in", "a_out") && object_matches("a", "a"));
     }
 }
