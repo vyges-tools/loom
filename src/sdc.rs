@@ -388,6 +388,10 @@ pub struct Sdc {
     /// Commands the reference would REJECT (an error, not a warning) — so they were not applied
     /// here either — each with why.
     pub rejected: Vec<String>,
+    /// Commands NOT applied because an object query in them needs the design to evaluate
+    /// (`-filter`, `-of_objects`, `-regexp`), each as `<command>: [<query>]`; also in
+    /// [`Sdc::rejected`]. An engine that refuses rather than approximates refuses on any of these.
+    pub unevaluated_queries: Vec<String>,
     pub input_transition: Option<f64>,
     pub load: Option<f64>,
     /// `set_max_transition V [current_design]`, ns: the design-wide slew limit, for a consumer
@@ -887,12 +891,24 @@ fn resolve_objs(tok: &str) -> Vec<String> {
                 return names;
             }
             "get_ports" | "get_pins" | "get_clocks" | "get_nets" | "get_cells" => {
+                // The patterns are the POSITIONAL arguments: a key (`-filter`, `-of_objects`,
+                // `-hsc`, abbreviated or not) takes the next word as its value, a flag
+                // (`-hierarchical`, `-quiet`) none. ⛔ Skipping only the `-` words read a filter
+                // expression or an `-of_objects` query as object names.
+                let parts = expand_abbreviations(parts);
+                let keys = crate::sdc_flags::FLAGS.iter().find(|(n, _, _)| *n == parts[0]).map_or(&[][..], |(_, k, _)| *k);
                 let mut names = Vec::new();
-                for p in &parts[1..] {
-                    if p.starts_with('-') {
-                        continue; // e.g. -hierarchical
+                let mut k = 1;
+                while k < parts.len() {
+                    let p = &parts[k];
+                    if keys.contains(&p.as_str()) {
+                        k += 2;
+                        continue;
                     }
-                    names.extend(p.split_whitespace().map(|s| s.to_string()));
+                    if !p.starts_with('-') {
+                        names.extend(p.split_whitespace().map(|s| s.to_string()));
+                    }
+                    k += 1;
                 }
                 return names;
             }
@@ -1076,6 +1092,26 @@ fn expand_abbreviations(mut toks: Vec<String>) -> Vec<String> {
         k += 1;
     }
     toks
+}
+
+/// The first object query in `toks` (at any depth of `[...]`) this reader cannot evaluate, as
+/// written: `-filter`, `-of_objects` and `-regexp` select objects by the design's properties and
+/// connectivity (and `-regexp` by a different pattern language), which needs the design. Matched
+/// as names they selected the wrong objects or none, silently; the caller refuses the command.
+fn unevaluated_query(toks: &[String]) -> Option<String> {
+    const NEEDS_DESIGN: [&str; 3] = ["-filter", "-of_objects", "-regexp"];
+    for t in toks {
+        let Some(inner) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else { continue };
+        let parts = expand_abbreviations(tokenize(inner.trim()));
+        let Some(cmd) = parts.first() else { continue };
+        if cmd.starts_with("get_") && parts.iter().any(|p| NEEDS_DESIGN.contains(&p.as_str())) {
+            return Some(format!("[{}]", inner.trim()));
+        }
+        if let Some(q) = unevaluated_query(&parts[1..]) {
+            return Some(q);
+        }
+    }
+    None
 }
 
 /// What a control command asks for: its chosen commands, a refusal (it cannot be evaluated
@@ -1648,6 +1684,15 @@ impl Sdc {
             let toks = expand_abbreviations(tokenize(&line));
             if toks.is_empty() {
                 continue;
+            }
+            // An object query this reader cannot evaluate: the command is NOT applied, and says
+            // so (a `set` only stores the text; it is checked where the variable is used).
+            if toks[0] != "set" {
+                if let Some(q) = unevaluated_query(&toks) {
+                    sdc.rejected.push(format!("{}: {q} needs the design to evaluate; not applied", toks[0]));
+                    sdc.unevaluated_queries.push(format!("{}: {q}", toks[0]));
+                    continue;
+                }
             }
             match toks[0].as_str() {
                 "set" => {
@@ -2752,5 +2797,39 @@ mod abbreviation_tests {
         assert_eq!(s.clocks[0].waveform, Some(vec![0.0, 5.0]));
         assert_eq!(s.max_transition, Some(0.5));
         assert_eq!((s.input_delays[0].clock.as_deref(), s.input_delays[0].flags.clone()), (Some("c"), vec!["-max".to_string()]));
+    }
+}
+
+#[cfg(test)]
+mod object_queries {
+    use super::*;
+
+    /// A query's patterns are its positional arguments: a key takes the next word (abbreviated or
+    /// not), a flag none. The filter expression or -hsc separator is never read as a name.
+    #[test]
+    fn a_query_key_value_is_not_an_object_name() {
+        assert_eq!(resolve_objs("[get_ports -quiet {a b}]"), vec!["a", "b"]);
+        assert_eq!(resolve_objs("[get_pins -hsc / u1/A]"), vec!["u1/A"]);
+        assert_eq!(resolve_objs("[get_cells -hier -hs / top*]"), vec!["top*"]);
+    }
+
+    /// -filter, -of_objects and -regexp need the design: the command is not applied, and is
+    /// listed — never matched as names (it was: `ref_name==DFF` and `[get_nets` became names).
+    #[test]
+    fn a_query_that_needs_the_design_refuses_its_command() {
+        let s = Sdc::parse(
+            "create_clock -name clk -period 10 [get_ports clk]\n\
+             set_input_delay 1 -clock clk [get_ports -filter \"direction==in\" *]\n\
+             set_false_path -to [get_pins -of_obj [get_nets n1]]\n\
+             set_load 0.1 [get_ports -regexp {out_[0-9]+}]\n\
+             set ports [get_ports -filter {is_clock==false}]\n\
+             set_output_delay 2 -clock clk [list [get_ports o1] [get_ports -filt x *]]\n",
+        )
+        .unwrap();
+        assert_eq!(s.clocks.len(), 1, "an ordinary query still applies");
+        assert!(s.input_delays.is_empty() && s.output_delays.is_empty() && s.exceptions.is_empty() && s.load.is_none());
+        assert_eq!(s.unevaluated_queries.len(), 4, "{:?}", s.unevaluated_queries);
+        assert!(s.unevaluated_queries[1].starts_with("set_false_path: [get_pins -of_obj"));
+        assert!(s.health().unwrap().contains("needs the design"));
     }
 }
