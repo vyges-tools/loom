@@ -187,8 +187,12 @@ pub struct ViaDef {
     /// The routing layers it bridges (`LAYERS` first and last).
     pub below: String,
     pub above: String,
-    /// Cuts in the array: `ROWCOL rows cols` multiplied out, else 1.
+    /// Cuts in the array: `ROWCOL rows cols` multiplied out, else 1 — or, for a via given by
+    /// its shapes and read with the LEF, its rectangles on the cut layer.
     pub cuts: u32,
+    /// The layer of each `+ RECT` / `+ POLYGON` shape, in order (a via given by its shapes has
+    /// no `LAYERS`: the LEF says which are routing and which the cut).
+    pub shape_layers: Vec<String>,
 }
 
 /// A placed instance from the DEF `COMPONENTS` section.
@@ -222,6 +226,68 @@ pub struct Def {
     pub via_defs: BTreeMap<String, ViaDef>,
     /// `PINS` — block terminals with their port shapes, absolute. Where supply enters the die.
     pub pins: Vec<DefPin>,
+    /// Via placements in routed paths whose two layers could not be found (a LEF via read
+    /// without the LEF, or an undefined via): the path stayed on its layer past them, where the
+    /// reference continues on the via's other layer. Zero when every switch was known.
+    pub unresolved_vias: usize,
+}
+
+impl ViaDef {
+    /// A via given by its shapes: its routing layers (bottom, top) and cut from the LEF stack.
+    fn resolve_shapes(&mut self, lef: &crate::lef::Lef) {
+        if !self.below.is_empty() || self.shape_layers.is_empty() {
+            return;
+        }
+        let pos = |l: &str| lef.routing_order.iter().position(|r| r == l);
+        let mut routing: Vec<&String> = self.shape_layers.iter().filter(|l| pos(l).is_some()).collect();
+        routing.sort_by_key(|l| pos(l));
+        routing.dedup();
+        if let (Some(b), Some(t)) = (routing.first(), routing.last()) {
+            (self.below, self.above) = (b.to_string(), t.to_string());
+        }
+        let cut: Vec<&String> = self.shape_layers.iter().filter(|l| pos(l).is_none() && lef.layers.contains_key(l.as_str())).collect();
+        if let Some(c) = cut.first() {
+            self.cut_layer = c.to_string();
+            self.cuts = cut.iter().filter(|l| l == &c).count() as u32;
+        }
+    }
+}
+
+/// The two routing layers of a via, as the reference finds them for a path: the technology's
+/// via first, then the design's (`VIAS`). A path on one of the two continues on the other.
+struct Vias<'a> {
+    lef: Option<&'a crate::lef::Lef>,
+    defs: &'a BTreeMap<String, ViaDef>,
+    unresolved: std::cell::Cell<usize>,
+}
+
+impl Vias<'_> {
+    fn layers(&self, name: &str) -> Option<(String, String)> {
+        if let Some(lef) = self.lef {
+            if let Some(ls) = lef.vias.get(name) {
+                let pos = |l: &str| lef.routing_order.iter().position(|r| r == l);
+                let mut r: Vec<&String> = ls.iter().filter(|l| pos(l).is_some()).collect();
+                r.sort_by_key(|l| pos(l));
+                if let (Some(b), Some(t)) = (r.first(), r.last()) {
+                    return Some((b.to_string(), t.to_string()));
+                }
+            }
+        }
+        self.defs.get(name).filter(|v| !v.below.is_empty() && !v.above.is_empty()).map(|v| (v.below.clone(), v.above.clone()))
+    }
+
+    /// The layer a path is on past via `name`, from `cur`: the via's other layer, or `cur`
+    /// unchanged (counted) when the via's layers are unknown or do not include `cur`.
+    fn exit(&self, name: &str, cur: &str) -> String {
+        match self.layers(name) {
+            Some((b, t)) if t == cur => b,
+            Some((b, t)) if b == cur => t,
+            _ => {
+                self.unresolved.set(self.unresolved.get() + 1);
+                cur.to_string()
+            }
+        }
+    }
 }
 
 const POWER_NAMES: &[&str] = &["VPWR", "VDD", "VCCD", "VCC", "VDDP"];
@@ -241,17 +307,36 @@ impl Def {
     }
 
     pub fn parse(text: &str) -> Result<Def, DefError> {
+        Def::parse_inner(text, None)
+    }
+
+    /// [`Def::parse`] with the technology LEF, as the reference reads a DEF into a database that
+    /// holds the technology: a routed path continues, after a via, on that via's OTHER layer —
+    /// see [`Vias`] — which needs the LEF's vias and layer stack. Without it only vias the DEF
+    /// itself defines by `LAYERS` can switch the layer.
+    pub fn parse_with(text: &str, lef: &crate::lef::Lef) -> Result<Def, DefError> {
+        Def::parse_inner(text, Some(lef))
+    }
+
+    fn parse_inner(text: &str, lef: Option<&crate::lef::Lef>) -> Result<Def, DefError> {
         let tv = tokenize(text);
         let scale = units(&tv);
         let ndr = parse_ndr(&tv, scale);
-        let nets = parse_signal(&tv, scale, &ndr)?;
         let tref: Vec<&str> = tv.iter().map(|s| s.as_str()).collect();
+        let mut via_defs = parse_vias(&tref);
+        if let Some(l) = lef {
+            for v in via_defs.values_mut() {
+                v.resolve_shapes(l);
+            }
+        }
+        let vias = Vias { lef, defs: &via_defs, unresolved: std::cell::Cell::new(0) };
+        let nets = parse_signal(&tv, scale, &ndr, &vias)?;
         let power_nets = match section_start(&tref, "SPECIALNETS") {
-            Some(s) => parse_specialnets(&tref[s + 1..section_end(&tref, "SPECIALNETS", s)]),
+            Some(s) => parse_specialnets(&tref[s + 1..section_end(&tref, "SPECIALNETS", s)], &vias),
             None => Vec::new(),
         };
+        let unresolved_vias = vias.unresolved.get();
         let comps = parse_components(&tref);
-        let via_defs = parse_vias(&tref);
         let pins = parse_pins(&tref);
         Ok(Def {
             units_per_um: scale,
@@ -261,12 +346,19 @@ impl Def {
             comps,
             via_defs,
             pins,
+            unresolved_vias,
         })
     }
 
     pub fn load(path: &str) -> Result<Def, DefError> {
         let text = std::fs::read_to_string(path).map_err(|e| DefError(format!("{path}: {e}")))?;
         Def::parse(&text)
+    }
+
+    /// [`Def::load`] with the technology LEF — see [`Def::parse_with`].
+    pub fn load_with(path: &str, lef: &crate::lef::Lef) -> Result<Def, DefError> {
+        let text = std::fs::read_to_string(path).map_err(|e| DefError(format!("{path}: {e}")))?;
+        Def::parse_with(&text, lef)
     }
 }
 
@@ -418,6 +510,7 @@ fn parse_signal(
     t: &[String],
     scale: f64,
     ndr: &BTreeMap<String, BTreeMap<String, f64>>,
+    vias: &Vias,
 ) -> Result<Vec<DefNet>, DefError> {
     let mut nets = Vec::new();
     let tref: Vec<&str> = t.iter().map(String::as_str).collect();
@@ -593,6 +686,10 @@ fn parse_signal(
                                 layer: l.clone(),
                                 name: t[i].clone(),
                             });
+                        }
+                        // the path goes on from the via's other layer
+                        if let Some(l) = layer.as_mut() {
+                            *l = vias.exit(&t[i], l);
                         }
                     }
                     i += 1;
@@ -869,6 +966,12 @@ fn parse_vias(toks: &[&str]) -> BTreeMap<String, ViaDef> {
                 }
                 i += 4;
             }
+            "RECT" | "POLYGON" if cur.is_some() && i > 0 && toks[i - 1] == "+" => {
+                if let Some(l) = toks.get(i + 1) {
+                    cur.as_mut().unwrap().shape_layers.push(l.to_string());
+                }
+                i += 2;
+            }
             "ROWCOL" if cur.is_some() => {
                 if i + 2 < end {
                     let r: u32 = toks[i + 1].parse().unwrap_or(1);
@@ -894,7 +997,7 @@ fn parse_vias(toks: &[&str]) -> BTreeMap<String, ViaDef> {
 /// previous path's last point. `+ RECT <layer> ( ) ( )` is a box, not a route; a via followed by
 /// `DO n BY m STEP dx dy` is an array of n×m vias. Layer and width do not carry from one net to
 /// the next.
-fn parse_specialnets(body: &[&str]) -> Vec<NetGeom> {
+fn parse_specialnets(body: &[&str], vias: &Vias) -> Vec<NetGeom> {
     let mut nets: Vec<NetGeom> = Vec::new();
     let mut cur: Option<NetGeom> = None;
     let mut layer = String::new();
@@ -1047,6 +1150,10 @@ fn parse_specialnets(body: &[&str]) -> Vec<NetGeom> {
                                 n.vias.push(q);
                                 n.via_names.push((other.to_string(), q.0, q.1));
                             }
+                        }
+                        // the path goes on from the via's other layer
+                        if !layer.is_empty() {
+                            layer = vias.exit(other, &layer);
                         }
                         i += skip;
                     }
@@ -1561,5 +1668,58 @@ mod special_rule_tests {
         assert_eq!(n.vias.len(), 6);
         assert!(n.vias.contains(&(1600, 2400)));
         assert!(n.via_names.iter().all(|v| v.0 == "M1M2_PR"));
+    }
+}
+
+#[cfg(test)]
+mod via_exit_layer {
+    use super::*;
+
+    const LEF: &str = "\
+LAYER met1\n  TYPE ROUTING ;\n  WIDTH 0.14 ;\nEND met1\n\
+LAYER via\n  TYPE CUT ;\nEND via\n\
+LAYER met2\n  TYPE ROUTING ;\n  WIDTH 0.14 ;\nEND met2\n\
+VIARULE M1M2_GEN GENERATE\n  LAYER met1 ;\n    ENCLOSURE 0 0 ;\n  LAYER met2 ;\n    ENCLOSURE 0 0 ;\n  LAYER via ;\n    RECT -0.05 -0.05 0.05 0.05 ;\n    SPACING 0.2 BY 0.2 ;\nEND M1M2_GEN\n\
+VIA M1M2_PR DEFAULT\n  LAYER met1 ;\n    RECT -0.1 -0.1 0.1 0.1 ;\n  LAYER via ;\n    RECT -0.05 -0.05 0.05 0.05 ;\n  LAYER met2 ;\n    RECT -0.1 -0.1 0.1 0.1 ;\nEND M1M2_PR\n";
+
+    const DEF: &str = "\
+VERSION 5.8 ;\nDESIGN t ;\nUNITS DISTANCE MICRONS 1000 ;\n\
+VIAS 2 ;\n\
+- V_RULE + VIARULE M1M2_GEN + CUTSIZE 100 100 + LAYERS met1 via met2 + CUTSPACING 100 100 + ENCLOSURE 0 0 0 0 + ROWCOL 1 2 ;\n\
+- V_RECT + RECT met2 ( -100 -100 ) ( 100 100 ) + RECT via ( -150 -50 ) ( -50 50 ) + RECT via ( 50 -50 ) ( 150 50 ) + RECT met1 ( -200 -100 ) ( 200 100 ) ;\n\
+END VIAS\n\
+NETS 3 ;\n\
+- a ( u1 A ) ( u2 Y ) + ROUTED met1 ( 0 0 ) ( 1000 0 ) M1M2_PR ( * 2000 ) M1M2_PR ( 3000 * ) ;\n\
+- b ( u3 A ) + ROUTED met2 ( 0 0 ) ( 0 1000 ) V_RULE ( 1000 * ) ;\n\
+- c ( u4 A ) + ROUTED met1 ( 0 0 ) ( 1000 0 ) V_RECT ( * 1000 ) ;\n\
+END NETS\nEND DESIGN\n";
+
+    fn layers(d: &Def, net: &str) -> Vec<String> {
+        d.nets.iter().find(|n| n.name == net).unwrap().segments.iter().map(|s| s.layer.clone()).collect()
+    }
+
+    /// Reference rule (its DEF reader's path via): a path on the via's top layer goes on from
+    /// its bottom, one on its bottom from its top; the via is the technology's first, then the
+    /// design's. A via given by shapes takes its layers from the LEF's routing stack.
+    #[test]
+    fn a_path_continues_on_the_vias_other_layer() {
+        let lef = crate::lef::Lef::parse(LEF).unwrap();
+        let d = Def::parse_with(DEF, &lef).unwrap();
+        assert_eq!(layers(&d, "a"), vec!["met1", "met2", "met1"]);
+        assert_eq!(layers(&d, "b"), vec!["met2", "met1"]);
+        assert_eq!(layers(&d, "c"), vec!["met1", "met2"]);
+        assert_eq!(d.unresolved_vias, 0);
+        let v = &d.via_defs["V_RECT"];
+        assert_eq!((v.below.as_str(), v.above.as_str(), v.cut_layer.as_str(), v.cuts), ("met1", "met2", "via", 2));
+    }
+
+    /// Without the LEF a technology via cannot switch the layer: the path stays (as before) and
+    /// the reader counts it; a via the DEF defines by LAYERS still switches.
+    #[test]
+    fn without_the_lef_the_unknown_switches_are_counted() {
+        let d = Def::parse(DEF).unwrap();
+        assert_eq!(layers(&d, "a"), vec!["met1", "met1", "met1"]);
+        assert_eq!(layers(&d, "b"), vec!["met2", "met1"]);
+        assert_eq!(d.unresolved_vias, 3);
     }
 }
