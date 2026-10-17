@@ -38,14 +38,15 @@ use std::collections::HashMap;
 /// A timing exception kind (`set_false_path` / `set_multicycle_path`). Defined
 /// here in loom (the data plane) so the SDC model is self-contained; engines
 /// consume these as part of the shared design DB.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ExcKind {
+    #[default]
     FalsePath,
     Multicycle(u32),
 }
 
 /// One timing exception: a kind plus its `-from`/`-to` endpoints (`*` = any).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Exception {
     pub kind: ExcKind,
     /// Every object named by `-from` / `-rise_from` / `-fall_from`. Empty, or containing
@@ -59,11 +60,51 @@ pub struct Exception {
     pub from: Vec<String>,
     /// Every object named by `-to` / `-rise_to` / `-fall_to`. See [`Exception::from`].
     pub to: Vec<String>,
+    /// A multicycle that applies to the HOLD check (`-hold`); setup otherwise.
+    pub hold: bool,
+    /// The multiplier counts the LAUNCH clock (`-start`) rather than the capture clock (`-end`).
+    /// The reference's defaults: `-end` for setup, `-start` for hold.
+    pub start: bool,
+    /// Why an instance-level match cannot express this exception, when it cannot: then
+    /// [`Exception::covers`] is false — it is NOT applied — and the reason is reported.
+    ///
+    /// ⛔ **Never "any" by default.** A `-through`-only false path, read without its `-through`,
+    /// became `-from * -to *`; `-to [get_pins */SETN]`, reduced to its instance, became `*`; both
+    /// cut EVERY path in the design. Not applying an exception is pessimistic and visible;
+    /// applying it to everything is optimistic and silent.
+    pub refused: Option<String>,
 }
 
-/// Is `name` in an exception endpoint set? An empty set, or one holding `*`, matches anything.
+/// Is `name` in an exception endpoint set? An empty set, or one holding `*`, matches anything;
+/// a pattern with `*` / `?` matches as the reference's object query does (a glob).
 fn endpoint_matches(set: &[String], name: &str) -> bool {
-    set.is_empty() || set.iter().any(|o| o == "*" || o == name)
+    set.is_empty() || set.iter().any(|o| o == "*" || o == name || (o.contains(['*', '?']) && glob(o, name)))
+}
+
+/// Tcl `string match` for `*` and `?` — what `get_ports in*` matches against.
+fn glob(pat: &str, s: &str) -> bool {
+    let (p, t): (Vec<char>, Vec<char>) = (pat.chars().collect(), s.chars().collect());
+    let (mut i, mut j, mut star, mut mark) = (0usize, 0usize, None, 0usize);
+    while j < t.len() {
+        if i < p.len() && (p[i] == '?' || p[i] == t[j]) {
+            i += 1;
+            j += 1;
+        } else if i < p.len() && p[i] == '*' {
+            star = Some(i);
+            mark = j;
+            i += 1;
+        } else if let Some(st) = star {
+            i = st + 1;
+            mark += 1;
+            j = mark;
+        } else {
+            return false;
+        }
+    }
+    while i < p.len() && p[i] == '*' {
+        i += 1;
+    }
+    i == p.len()
 }
 
 impl Exception {
@@ -75,9 +116,9 @@ impl Exception {
     pub fn to_matches(&self, name: &str) -> bool {
         endpoint_matches(&self.to, name)
     }
-    /// Does it cover this launch→capture pair?
+    /// Does it cover this launch→capture pair? Never, when it is [`Exception::refused`].
     pub fn covers(&self, launch: &str, capture: &str) -> bool {
-        self.from_matches(launch) && self.to_matches(capture)
+        self.refused.is_none() && self.from_matches(launch) && self.to_matches(capture)
     }
     /// Endpoint names that are not the `*` wildcard — what a linter can check for existence.
     pub fn named_endpoints(&self) -> impl Iterator<Item = (&'static str, &String)> {
@@ -521,8 +562,9 @@ impl Sdc {
                     list.iter_mut().for_each(drop_name);
                     list.retain(|o| !o.names.is_empty());
                     kept = !list.is_empty();
-                    let names = reduce_exception_objects(list);
+                    let (names, refused) = reduce_exception_objects(list);
                     if side == 0 { e.from = names } else { e.to = names }
+                    e.refused = e.refused.take().or(refused);
                     break;
                 }
             }
@@ -566,6 +608,13 @@ impl Sdc {
             notes.push(format!(
                 "clock(s) with no usable period: {} — every check against them is vacuous",
                 bad.join(", ")
+            ));
+        }
+        let refused = self.exceptions.iter().filter(|e| e.refused.is_some()).count();
+        if refused > 0 {
+            notes.push(format!(
+                "{refused} timing exception(s) NOT applied — they name a -through list or a pin pattern, \
+                 which an instance-level match cannot express"
             ));
         }
         let affecting = self.ignored_affecting_timing();
@@ -1717,26 +1766,35 @@ impl Sdc {
                     sdc.async_groups.extend(groups);
                 }
                 "set_false_path" => {
-                    let (from, to) = from_to(&toks);
+                    let (from, to, refused) = from_to(&toks);
                     sdc.exception_objects.push(exception_sides(&toks));
-                    sdc.exceptions.push(Exception {
-                        kind: ExcKind::FalsePath,
-                        from,
-                        to,
-                    });
+                    sdc.exceptions.push(Exception { kind: ExcKind::FalsePath, from, to, refused, ..Default::default() });
                 }
                 "set_multicycle_path" => {
-                    let n: u32 = toks
-                        .get(1)
-                        .filter(|t| !t.starts_with('-'))
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(1);
-                    let (from, to) = from_to(&toks);
+                    // The multiplier is THE positional left after the flags, wherever it is
+                    // written (`-setup 3 -from …` as often as `3 -setup -from …`); it must be an
+                    // integer, as the reference requires. `-hold` makes it a hold multicycle, and
+                    // `-start` / `-end` say which clock it counts — `-end` for setup and `-start`
+                    // for hold when neither is given, as the reference defaults them.
+                    let (_, flags, pos) = split_args(&toks, &EXC_VALUED);
+                    let (from, to, mut refused) = from_to(&toks);
+                    let n = match pos.as_slice() {
+                        [v] => v.parse::<u32>().ok(),
+                        _ => None,
+                    };
+                    if n.is_none() && refused.is_none() {
+                        refused = Some(format!("multiplier {:?} is not one integer", pos));
+                    }
+                    let has = |f: &str| flags.iter().any(|x| x == f);
+                    let hold = has("-hold");
                     sdc.exception_objects.push(exception_sides(&toks));
                     sdc.exceptions.push(Exception {
-                        kind: ExcKind::Multicycle(n),
+                        kind: ExcKind::Multicycle(n.unwrap_or(1)),
                         from,
                         to,
+                        hold,
+                        start: has("-start") || (hold && !has("-end")),
+                        refused,
                     });
                 }
                 other => sdc.ignored.push(other.to_string()),
@@ -1767,9 +1825,20 @@ impl Sdc {
 /// Extract `-from`/`-to` object names (first object of each), `*` if absent.
 /// A pin object (`reg/Q`) is reduced to its instance (`reg`) so it matches the
 /// engine's instance-level exception matching; a port keeps its name.
-fn from_to(toks: &[String]) -> (Vec<String>, Vec<String>) {
+/// The flags of an exception command that take a value.
+const EXC_VALUED: [&str; 10] =
+    ["-from", "-to", "-through", "-rise_from", "-rise_to", "-fall_from", "-fall_to", "-rise_through", "-fall_through", "-comment"];
+
+/// An exception's two sides, and why it cannot be applied at instance level, if it cannot.
+fn from_to(toks: &[String]) -> (Vec<String>, Vec<String>, Option<String>) {
     let [from, to] = exception_sides(toks);
-    (reduce_exception_objects(&from), reduce_exception_objects(&to))
+    let mut refused = None;
+    if ["-through", "-rise_through", "-fall_through"].iter().any(|f| has_flag(toks, f)) {
+        refused = Some("a -through list, which an instance-level match cannot express".to_string());
+    }
+    let (f, rf) = reduce_exception_objects(&from);
+    let (t, rt) = reduce_exception_objects(&to);
+    (f, t, refused.or(rf).or(rt))
 }
 
 /// An exception's objects per side: every `-from` / `-rise_from` / `-fall_from`, then every `-to`
@@ -1779,13 +1848,27 @@ fn exception_sides(toks: &[String]) -> [Vec<Objects>; 2] {
     [pick(&["-from", "-rise_from", "-fall_from"]), pick(&["-to", "-rise_to", "-fall_to"])]
 }
 
-/// One side of [`Exception`] from its objects. ALL objects each flag names, not the first: a
-/// `-from [list a b c]` that cut only `a` left `b` and `c` timed against the SDC's stated intent.
-fn reduce_exception_objects(objs: &[Objects]) -> Vec<String> {
+/// The names the `all_*` accessors resolve to — collections, not objects.
+const SENTINELS: [&str; 3] = ["*INPUTS*", "*OUTPUTS*", "*REGS*"];
+
+/// One side of [`Exception`] from its objects, and a refusal if the side cannot be expressed at
+/// instance level. ALL objects each flag names, not the first: a `-from [list a b c]` that cut only
+/// `a` left `b` and `c` timed against the SDC's stated intent.
+fn reduce_exception_objects(objs: &[Objects]) -> (Vec<String>, Option<String>) {
     let mut out: Vec<String> = Vec::new();
+    let mut refused = None;
     for name in objs.iter().flat_map(|o| o.names.iter()) {
-        if name.starts_with('*') {
-            continue; // an `all_inputs`-style collection, not a named object
+        // ⛔ A COLLECTION is one of these exact names — not anything starting with `*`, which
+        // dropped `*sync_rst*` as though it named nothing, leaving the side "any".
+        if SENTINELS.contains(&name.as_str()) {
+            continue;
+        }
+        // A wildcard PIN pattern (`*/SETN`, `u_core/*/D`) names pins of many instances: reduced
+        // to its instance part it would match instances whatever the pin, and `*/SETN` became
+        // every path. Refused; a wildcard instance or port name stays a pattern.
+        if name.contains(['*', '?']) && name.contains('/') {
+            refused = Some(format!("the pin pattern `{name}`, which an instance-level match cannot express"));
+            continue;
         }
         // a pin object (`reg/Q`) reduces to its instance, matching the engine's
         // instance-level comparison
@@ -1799,7 +1882,7 @@ fn reduce_exception_objects(objs: &[Objects]) -> Vec<String> {
     if out.is_empty() {
         out.push("*".to_string()); // the flag was absent or named only a collection
     }
-    out
+    (out, refused)
 }
 
 #[cfg(test)]
@@ -2266,5 +2349,44 @@ mod units_tests {
         assert_eq!(s.clocks[0].period, 10.0);
         assert_eq!(s.input_delays[0].value, 2.0);
         assert_eq!(s.load, Some(3.0));
+    }
+}
+
+/// Exceptions as the reference applies them — and never "every path" by accident.
+#[cfg(test)]
+mod exception_rule_tests {
+    use super::*;
+
+    fn exc(cmd: &str) -> Exception {
+        Sdc::parse(&format!("create_clock -name c -period 10 [get_ports clk]\n{cmd}\n")).unwrap().exceptions.remove(0)
+    }
+
+    /// A `-through` list and a wildcard pin pattern cannot be expressed at instance level: they
+    /// are refused — not applied — rather than read as `* -> *`.
+    #[test]
+    fn an_exception_that_cannot_be_expressed_is_not_applied_to_every_path() {
+        for cmd in ["set_false_path -through [get_pins u1/Z]", "set_false_path -to [get_pins */SETN]"] {
+            let e = exc(cmd);
+            assert!(e.refused.is_some(), "{cmd}");
+            assert!(!e.covers("r1", "r2"), "{cmd} must not cut an unrelated path");
+        }
+        // a name that merely starts with `*` is a pattern, not a collection
+        let e = exc("set_false_path -from [get_ports *sync_rst*]");
+        assert_eq!(e.from, ["*sync_rst*"]);
+        assert!(e.covers("a_sync_rst_n", "r2") && !e.covers("data_in", "r2"));
+        // a plain bus pattern on ports globs
+        assert!(exc("set_false_path -from [get_ports in*]").covers("in1", "x"));
+    }
+
+    /// The multiplier is the positional wherever it is written; `-hold` / `-start` / `-end`.
+    #[test]
+    fn a_multicycle_keeps_its_multiplier_check_and_clock() {
+        let e = exc("set_multicycle_path -setup 3 -from [get_cells a] -to [get_cells b]");
+        assert_eq!((e.kind.clone(), e.hold, e.start), (ExcKind::Multicycle(3), false, false));
+        let e = exc("set_multicycle_path -hold 2 -from [get_cells a]");
+        assert_eq!((e.kind.clone(), e.hold, e.start), (ExcKind::Multicycle(2), true, true));
+        let e = exc("set_multicycle_path 2 -setup -start -to [get_cells b]");
+        assert_eq!((e.kind.clone(), e.hold, e.start), (ExcKind::Multicycle(2), false, true));
+        assert!(exc("set_multicycle_path 2.0 -to [get_cells b]").refused.is_some(), "not an integer");
     }
 }
