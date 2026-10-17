@@ -2962,7 +2962,7 @@ mod derived_sense {
     use super::*;
 
     /// Reference rule: a combinational group with no `timing_sense` takes it from the output's
-    /// function (`portTimingSense`); a three-state pin's enable pin, absent from the function, is
+    /// function; a three-state pin's enable pin, absent from the function, is
     /// non-unate. Checked on this library: the reference times exactly these edges (`report_edges`:
     /// AND2 A ^->^ v->v; NOR2 A ^->v v->^; MUX2 S all four, B ^->^ v->v; XOR2 A all four; TBUF A
     /// ^->v v->^, EN all four).
