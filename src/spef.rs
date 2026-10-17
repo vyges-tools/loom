@@ -241,8 +241,10 @@ enum Sect {
     None,
     Header,
     NameMap,
-    /// a section whose entries are not needed (`*PORTS`, `*POWER_NETS`, `*DEFINE`, …)
+    /// a section whose entries are not needed (`*POWER_NETS`, `*DEFINE`, …)
     Ignore,
+    /// `*PORTS`: each entry's port name is kept (a node without a delimiter must be one)
+    Ports,
     Conn,
     Cap,
     Res,
@@ -675,7 +677,11 @@ impl NetRc {
             adj.entry(a).or_default().push((b, *r));
             adj.entry(b).or_default().push((a, *r));
         }
-        if !adj.contains_key(driver) {
+        // A driver node with no resistor on it is still a network: `reducePiDfs` from it sees its
+        // own capacitance only (a purely capacitive load, `c1 = y1`) — what a net whose resistors
+        // were all dropped (a bare node) reduces to. A load pin not reached adds nothing, its pin
+        // capacitance included.
+        if !adj.contains_key(driver) && !cap.contains_key(driver) {
             return None;
         }
         // `reducePiDfs`: y1/y2/y3 are the admittance moments, accumulated in DOUBLE while
@@ -730,9 +736,6 @@ impl NetRc {
         xtalk_cap_ff: f64,
         pin_cap_ff: &BTreeMap<String, f64>,
     ) -> Option<HashMap<&'a str, f64>> {
-        if self.res.is_empty() {
-            return None;
-        }
         let mut cap: HashMap<&str, f64> = HashMap::new();
         for (node, c) in &self.ground {
             *cap.entry(node.as_str()).or_default() += c;
@@ -806,6 +809,11 @@ impl Spef {
         let mut pending_cc: Vec<PendingCc> = Vec::new();
         let (mut skipped, mut unresolved, mut reduced, mut pnets) = (0usize, 0usize, 0usize, 0usize);
         let mut triplets = false;
+        // The design's top-level ports as the file declares them (`*PORTS`, and `*CONN`'s `*P`):
+        // a node named without a delimiter is a port or nothing — the reference resolves it as
+        // a top-level port only, warns "pin X not found" and drops the cap or resistor on it.
+        let mut ports: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut port_name_next = true;
 
         let finish = |cur: &mut Option<(String, usize, NetRc)>,
                       nets: &mut BTreeMap<String, NetRc>,
@@ -855,8 +863,12 @@ impl Spef {
                     "*NAME_MAP" => sect = Sect::NameMap,
                     // These sections END the name map. Read as more of it, an indexed port entry
                     // `*13 I *C 0 0` renamed index 13 to "I". Their entries are not needed here.
-                    "*POWER_NETS" | "*GROUND_NETS" | "*PORTS" | "*PHYSICAL_PORTS" | "*DEFINE" | "*PDEFINE" => {
+                    "*POWER_NETS" | "*GROUND_NETS" | "*PHYSICAL_PORTS" | "*DEFINE" | "*PDEFINE" => {
                         sect = Sect::Ignore
+                    }
+                    "*PORTS" => {
+                        sect = Sect::Ports;
+                        port_name_next = true;
                     }
                     "*D_NET" => {
                         finish(&mut cur, &mut nets, &mut winner);
@@ -918,6 +930,24 @@ impl Spef {
                         }
                     }
                 }
+                Sect::Ports => {
+                    // `<port> <I|O|B> {*C x y | *L cap | *S r1 r2 | *D cell}`
+                    match t.to_ascii_uppercase().as_str() {
+                        "*C" | "*S" => i += 3,
+                        "*L" | "*D" => i += 2,
+                        "I" | "O" | "B" if !port_name_next => {
+                            port_name_next = true;
+                            i += 1;
+                        }
+                        _ => {
+                            if let Some(p) = resolve(t, &names) {
+                                ports.insert(p);
+                            }
+                            port_name_next = false;
+                            i += 1;
+                        }
+                    }
+                }
                 Sect::Conn => {
                     let up = t.to_ascii_uppercase();
                     if up != "*P" && up != "*I" && up != "*N" {
@@ -963,7 +993,9 @@ impl Spef {
                     // `*P <port>` names a top-level port, whose node is the port itself and not
                     // `<inst>:<pin>`, so it never matched the instance form.
                     let hookup = if is_port {
-                        resolve(node, &names).map(|p| (String::new(), p))
+                        resolve(node, &names).inspect(|p| {
+                            ports.insert(p.clone());
+                        }).map(|p| (String::new(), p))
                     } else {
                         pin_of(node, &names, delim)
                     };
@@ -1005,11 +1037,14 @@ impl Spef {
                     };
                     triplets |= is_triplet(vt);
                     let Some((name, ser, rc)) = cur.as_mut() else { continue };
-                    let na = node_tok(a, &names, delim);
+                    // a node without the delimiter is a top-level port, else nothing
+                    // (`SpefReader::findParasiticNode`, warning 1656)
+                    let node_of = |raw: &str| node_tok(raw, &names, delim).filter(|n| raw.contains(delim) || ports.contains(n));
+                    let na = node_of(a);
                     match sect {
                         Sect::Induc => {}
                         Sect::Res => {
-                            let nb = node_tok(b, &names, delim);
+                            let nb = node_of(b);
                             let (Some(na), Some(nb)) = (na, nb) else {
                                 unresolved += 1;
                                 continue;
@@ -1030,7 +1065,7 @@ impl Spef {
                         }
                         // A two-node cap: which end is LOCAL is only known once every block has
                         // said which nodes it owns, so it is resolved after the loop.
-                        _ => pending_cc.push((*ser, name.clone(), na, node_tok(b, &names, delim), v)),
+                        _ => pending_cc.push((*ser, name.clone(), na, node_of(b), v)),
                     }
                 }
                 _ => i += 1,
@@ -1158,7 +1193,52 @@ impl Spef {
     /// (`*<id>` / `*<id>:<pin>`); any other node string is name-mapped verbatim.
     /// Grounded cap / resistor node strings equal to a net name resolve to that
     /// net's node, so a star network built as `(net_name → pin)` writes cleanly.
+    /// A copy whose bare internal nodes — a name with no `:`, not the net's own name and not a
+    /// top-level port (a klayout dump's `clk^met1`) — are numbered nodes of their net,
+    /// `<net>:<k>` past the net's highest `<net>:<n>`; the same node renamed in every grounded
+    /// cap, resistor and coupling cap. `None` when there is nothing to rename. A reader resolves a
+    /// node without the delimiter as a top-level port only.
+    fn numbered_internal_nodes(&self) -> Option<Spef> {
+        let ports: std::collections::HashSet<&str> = self.nets.values().flat_map(|rc| rc.conns.iter().filter(|c| c.is_port).map(|c| c.pin.as_str())).collect();
+        let mut renamed: BTreeMap<String, String> = BTreeMap::new();
+        for (net, rc) in &self.nets {
+            let bare = |n: &str| !n.contains(':') && n != net && !ports.contains(n);
+            let nodes = rc.ground.iter().map(|(n, _)| n.as_str()).chain(rc.res.iter().flat_map(|(a, b, _)| [a.as_str(), b.as_str()])).chain(rc.coupling_nodes.iter().map(|(_, own, _, _)| own.as_str()));
+            let mut next = nodes.clone().filter_map(|n| n.strip_prefix(net.as_str()).and_then(|r| r.strip_prefix(':')).and_then(|k| k.parse::<u64>().ok())).max().unwrap_or(0);
+            for n in nodes {
+                if bare(n) && !renamed.contains_key(n) {
+                    next += 1;
+                    renamed.insert(n.to_string(), format!("{net}:{next}"));
+                }
+            }
+        }
+        if renamed.is_empty() {
+            return None;
+        }
+        let r = |n: &String| renamed.get(n).cloned().unwrap_or_else(|| n.clone());
+        let mut out = self.clone();
+        for rc in out.nets.values_mut() {
+            for (n, _) in rc.ground.iter_mut() {
+                *n = r(n);
+            }
+            for (a, b, _) in rc.res.iter_mut() {
+                *a = r(a);
+                *b = r(b);
+            }
+            for (_, own, other, _) in rc.coupling_nodes.iter_mut() {
+                *own = r(own);
+                *other = r(other);
+            }
+        }
+        Some(out)
+    }
+
     pub fn to_spef(&self, opts: &WriteOpts) -> String {
+        // A node named neither as a pin, a port, nor the net itself is an internal node: written
+        // bare it would be read as a port and dropped with everything on it.
+        if let Some(numbered) = self.numbered_internal_nodes() {
+            return numbered.to_spef(opts);
+        }
         // Name map: nets first (so a net's node index is stable), then instances,
         // then any leftover named nodes appearing in the RC network.
         let mut id_of: BTreeMap<String, usize> = BTreeMap::new();
@@ -1552,14 +1632,14 @@ mod writer_tests {
 
 *D_NET *1 10
 *CAP
-1 *1 8
-2 *1 *2 2
+1 *1:1 8
+2 *1:1 *2:1 2
 *END
 
 *D_NET *2 7
 *CAP
-1 *2 5
-2 *1 *2 2
+1 *2:1 5
+2 *1:1 *2:1 2
 *END
 ";
         let s = Spef::parse(text);
@@ -1733,10 +1813,10 @@ mod writer_tests {
 *CONN
 *I *3:A I
 *RES
-1 *1 *3:A 100
+1 *1:1 *3:A 100
 *CAP
-1 *1 8
-2 *1 *3:A 2
+1 *1:1 8
+2 *1:1 *3:A 2
 *END
 ";
         let s = Spef::parse(text);
@@ -1912,7 +1992,7 @@ mod rename_tests {
         Spef::parse(&format!(
             "*SPEF \"ieee 1481-1999\"\n*DESIGN \"m\"\n*DIVIDER /\n*DELIMITER :\n\
              *BUS_DELIMITER []\n*T_UNIT 1 NS\n*C_UNIT 1 PF\n*R_UNIT 1 OHM\n*L_UNIT 1 HENRY\n\n\
-             *NAME_MAP\n*1 {net}\n*2 {agg}\n\n*D_NET *1 0.5\n*CAP\n1 *1 *2 0.25\n*END\n\
+             *NAME_MAP\n*1 {net}\n*2 {agg}\n\n*D_NET *1 0.5\n*CAP\n1 *1:1 *2:1 0.25\n*END\n\
              *D_NET *2 0.5\n*END\n"
         ))
     }
@@ -1993,10 +2073,26 @@ mod reference_rule_tests {
         assert!(one.elmore("u1:Y", 0.0, &BTreeMap::new()).is_some());
     }
 
+    /// Rule (`SpefReader::findParasiticNode`): a node without the delimiter is a TOP-LEVEL PORT
+    /// or nothing — the reference warns "pin X not found" (1656) and drops the cap or resistor on
+    /// it. A bare net name is not a node of that net: its caps and resistors vanish, and the net
+    /// keeps only its pin nodes. A declared port (`*PORTS`, or `*P` in `*CONN`) stays a node.
+    #[test]
+    fn a_node_without_the_delimiter_is_a_port_or_nothing() {
+        let text = format!(
+            "{HEAD}*NAME_MAP\n*1 n1\n*2 u1\n*3 u2\n*4 y\n*PORTS\ny O *C 1 2\n\
+             *D_NET *1 9.0\n*CONN\n*I *2:Y O\n*I *3:A I\n\
+             *CAP\n1 *2:Y 3.0\n2 *1 4.0\n3 *4 2.0\n*RES\n1 *2:Y *1 10\n2 *1 *3:A 20\n3 *2:Y *4 5\n*END\n"
+        );
+        let rc = n1(&text);
+        assert_eq!(rc.ground, [("u1:Y".to_string(), 3.0), ("y".to_string(), 2.0)], "the bare net node's 4 fF is dropped, the port's kept");
+        assert_eq!(rc.res, [("u1:Y".to_string(), "y".to_string(), 5.0)], "only the resistor between two real nodes");
+    }
+
     /// The pin delimiter is the one the header declares, and a node splits at its LAST one.
     #[test]
     fn the_declared_delimiter_is_honoured() {
-        let s = n1(&format!("{HEAD}{BODY}").replace("*DELIMITER :", "*DELIMITER |").replace("*2:Y", "*2|Y").replace("*3:A", "*3|A"));
+        let s = n1(&format!("{HEAD}{BODY}").replace("*DELIMITER :", "*DELIMITER |").replace("*2:Y", "*2|Y").replace("*3:A", "*3|A").replace("*1:1", "*1|1"));
         assert_eq!(s.pins, [("u1".into(), "Y".into(), "u1:Y".into()), ("u2".into(), "A".into(), "u2:A".into())]);
         assert!(s.elmore("u1:Y", 0.0, &BTreeMap::new()).is_some());
     }
