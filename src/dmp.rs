@@ -89,6 +89,59 @@ pub struct DmpResult {
 const DRIVER_PARAM_TOL: f64 = 0.01; // `driver_param_tol`
 const VTH_TIME_TOL: f64 = 0.01; // `vth_time_tol`
 const FIND_ROOT_MAX_ITER: usize = 20;
+
+/// `findRoot(func, x1, x2, x_tol, max_iter)` as `findVoCrossing` / `findVlCrossing` call it: the
+/// time in `[x1, x2]` where `f(t) = v` (`f` returns the value and its slope), by Newton steps that
+/// fall back to bisection when out of range or not decreasing fast enough; converged when a step is
+/// within `vth_time_tol` of the root — a TIME tolerance relative to the root, not a voltage one.
+/// Transcribed in its order: the end values first, a root at an end returned as is, the ends
+/// swapped so `f(x1) < v`, the first guess the midpoint. A failure is the reference's `DmpError`.
+fn find_root(f: impl Fn(f64) -> (f64, f64), v: f64, x1: f64, x2: f64) -> Result<f64, DmpError> {
+    let func = |x: f64| {
+        let (y, dy) = f(x);
+        (y - v, dy)
+    };
+    let (mut x1, mut x2) = (x1, x2);
+    let (y1, _) = func(x1);
+    let (y2, _) = func(x2);
+    if (y1 > 0.0 && y2 > 0.0) || (y1 < 0.0 && y2 < 0.0) {
+        return Err(DmpError::RootNotFound);
+    }
+    if y1 == 0.0 {
+        return Ok(x1);
+    }
+    if y2 == 0.0 {
+        return Ok(x2);
+    }
+    if y1 > 0.0 {
+        std::mem::swap(&mut x1, &mut x2);
+    }
+    let mut root = (x1 + x2) * 0.5;
+    let mut dx_prev = (x2 - x1).abs();
+    let mut dx = dx_prev;
+    let (mut y, mut dy) = func(root);
+    for _ in 0..FIND_ROOT_MAX_ITER {
+        if ((root - x2) * dy - y) * ((root - x1) * dy - y) > 0.0 || (2.0 * y).abs() > (dx_prev * dy).abs() {
+            dx_prev = dx;
+            dx = (x2 - x1) * 0.5;
+            root = x1 + dx;
+        } else {
+            dx_prev = dx;
+            dx = y / dy;
+            root -= dx;
+        }
+        if dx.abs() <= VTH_TIME_TOL * root.abs() {
+            return Ok(root);
+        }
+        (y, dy) = func(root);
+        if y < 0.0 {
+            x1 = root;
+        } else {
+            x2 = root;
+        }
+    }
+    Err(DmpError::RootNotFound)
+}
 const NEWTON_MAX_ITER: usize = 100;
 
 /// One driver's DMP state: the Pi, the gate's output resistance, and the pole/residue
@@ -333,29 +386,7 @@ impl<'a> DmpPi<'a> {
     }
     /// `DmpAlg::findVoCrossing` — safeguarded root find for `Vo(t) = v`.
     fn find_vo_crossing(&self, v: f64, lo: f64, hi: f64) -> Result<f64, DmpError> {
-        let (mut lo, mut hi) = (lo, hi);
-        let mut t = 0.5 * (lo + hi);
-        for _ in 0..FIND_ROOT_MAX_ITER {
-            let (vo, dvo) = self.vo(t);
-            let err = vo - v;
-            if err.abs() < VTH_TIME_TOL * v.max(1e-12) {
-                return Ok(t);
-            }
-            if err > 0.0 {
-                hi = t;
-            } else {
-                lo = t;
-            }
-            // Newton step when it stays inside the bracket, bisection otherwise —
-            // the shape of the reference's `findRoot`.
-            let next = if dvo.abs() > 0.0 { t - err / dvo } else { f64::NAN };
-            t = if next.is_finite() && next > lo && next < hi {
-                next
-            } else {
-                0.5 * (lo + hi)
-            };
-        }
-        Err(DmpError::RootNotFound)
+        find_root(|t| self.vo(t), v, lo, hi)
     }
     /// `DmpAlg::findDriverDelaySlew` — the waveform's Vth crossing and its Vl→Vh slew.
     fn find_driver_delay_slew(&self) -> Result<(f64, f64), DmpError> {
@@ -538,12 +569,16 @@ impl DriverWaveform {
             * (self.k2 / p3 - self.k1 + p3 * self.k3 / (self.p1 - p3)
                 + if self.k4 == 0.0 { 0.0 } else { p3 * self.k4 / (self.p2 - p3) });
         let e1 = exp2(-self.p1 * t);
-        let e2 = exp2(-self.p2 * t);
         let e3 = exp2(-p3 * t);
-        (
-            d1 + t + d3 * e1 + d4 * e2 + d5 * e3,
-            1.0 - d3 * self.p1 * e1 - d4 * self.p2 * e2 - d5 * p3 * e3,
-        )
+        // one pole: no second-pole term at all, in the value or its slope (`DmpZeroC2::Vl0`) —
+        // written as 0 x INFINITY it is NaN, which the crossing search then steps on
+        let (v4, dv4) = if self.k4 == 0.0 {
+            (0.0, 0.0)
+        } else {
+            let e2 = exp2(-self.p2 * t);
+            (d4 * e2, d4 * self.p2 * e2)
+        };
+        (d1 + t + d3 * e1 + v4 + d5 * e3, 1.0 - d3 * self.p1 * e1 - dv4 - d5 * p3 * e3)
     }
 
     /// `DmpAlg::Vl` — the ramp response built from `Vl0`, same shape as `Vo`.
@@ -562,27 +597,7 @@ impl DriverWaveform {
     }
 
     fn find_vl_crossing(&self, v: f64, lo: f64, hi: f64, p3: f64) -> Result<f64, DmpError> {
-        let (mut lo, mut hi) = (lo, hi);
-        let mut t = 0.5 * (lo + hi);
-        for _ in 0..FIND_ROOT_MAX_ITER {
-            let (vl, dvl) = self.vl(t, p3);
-            let err = vl - v;
-            if err.abs() < VTH_TIME_TOL * v.max(1e-12) {
-                return Ok(t);
-            }
-            if err > 0.0 {
-                hi = t;
-            } else {
-                lo = t;
-            }
-            let next = if dvl.abs() > 0.0 { t - err / dvl } else { f64::NAN };
-            t = if next.is_finite() && next > lo && next < hi {
-                next
-            } else {
-                0.5 * (lo + hi)
-            };
-        }
-        Err(DmpError::RootNotFound)
+        find_root(|t| self.vl(t, p3), v, lo, hi)
     }
 
     /// `DmpAlg::loadDelaySlew` — the wire delay and the DEGRADED slew at one sink, given
@@ -712,23 +727,7 @@ impl<'a> DmpZeroC2<'a> {
         }
     }
     fn find_vo_crossing(&self, v: f64, lo: f64, hi: f64) -> Result<f64, DmpError> {
-        let (mut lo, mut hi) = (lo, hi);
-        let mut t = 0.5 * (lo + hi);
-        for _ in 0..FIND_ROOT_MAX_ITER {
-            let (vo, dvo) = self.vo(t);
-            let err = vo - v;
-            if err.abs() < VTH_TIME_TOL * v.max(1e-12) {
-                return Ok(t);
-            }
-            if err > 0.0 {
-                hi = t;
-            } else {
-                lo = t;
-            }
-            let next = if dvo.abs() > 0.0 { t - err / dvo } else { f64::NAN };
-            t = if next.is_finite() && next > lo && next < hi { next } else { 0.5 * (lo + hi) };
-        }
-        Err(DmpError::RootNotFound)
+        find_root(|t| self.vo(t), v, lo, hi)
     }
     /// `DmpOnePole::evalDmpEqns` + `DmpAlg::findDriverParams` at `nr_order == 2`.
     fn solve(&mut self) -> DmpResult {
@@ -863,12 +862,9 @@ pub fn select_alg_r(rd: f64, c2: f64, rpi: f64, c1: f64, ohm_per_r: f64) -> Alg 
 
 /// Solve a driver the way the reference would, choosing the algorithm first.
 ///
-/// ⬜ `ZeroC2` is NOT transcribed. Upstream gives it its own two-unknown solve; here it
-/// takes its `init` value `ceff = c1` with table delay and slew, and reports
-/// `driver_valid: false` so nothing downstream mistakes it for a waveform result. It is
-/// selected only when the near capacitance is under a thousandth of the far one — and
-/// routing it into `DmpPi` instead would be worse than declining: `k0 = 1/(rd·c2)` blows
-/// up as `c2` goes to zero, which is the reason the reference separates the case at all.
+/// `ZeroC2` has its own two-unknown solve ([`DmpZeroC2`]), selected when the near capacitance is
+/// under a thousandth of the far one — routing it into `DmpPi` would be wrong: `k0 = 1/(rd·c2)`
+/// blows up as `c2` goes to zero, which is the reason the reference separates the case at all.
 pub fn solve_driver(
     rd: f64,
     c2: f64,
