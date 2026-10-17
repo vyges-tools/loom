@@ -16,6 +16,35 @@
 /// The most threads the default picks.
 pub const AUTO_CAP: usize = 16;
 
+/// The `threads` block of a tool descriptor (`--describe`), for an engine whose results do NOT
+/// depend on the thread count — the same text in every engine, so an agent learns the rule once.
+/// An engine embeds it as the value of a top-level `"threads"` key.
+pub const DESCRIBE_THREADS: &str = r#"{
+    "parallel": true,
+    "flag": "--threads",
+    "env": "VYGES_THREADS",
+    "default": "balanced",
+    "default_rule": "the machine's physical cores (within this process's CPU affinity), one fewer when there are more than four, at most 16",
+    "zero": "the default",
+    "serial": 1,
+    "deterministic": true,
+    "reported": "the run logs the count it chose and why",
+    "guidance": "Leave it unset: the default is chosen from the machine and the results are identical at any count. Pass --threads N only to bound CPU or memory, for example when running several jobs at once (give each a share of the cores)."
+  }"#;
+
+/// The `threads` block of a tool descriptor for an engine that runs on ONE thread.
+pub const DESCRIBE_SINGLE_THREADED: &str = r#"{
+    "parallel": false,
+    "guidance": "Runs on one thread; there is no thread option. Several jobs can run side by side, one core each."
+  }"#;
+
+/// The paragraph a command's `--help` carries about threads.
+pub const HELP: &str = "THREADS:
+  --threads N   worker threads. Default: chosen from the machine — its physical cores, one
+                fewer above four, at most 16 (VYGES_THREADS sets it for every engine).
+                0 = the default, 1 = serial. Results are the same at any count; the run
+                says what it chose.";
+
 /// Where the count came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -158,6 +187,18 @@ mod tests {
         assert_eq!(balanced(88, 44), AUTO_CAP);
         assert_eq!(balanced(4, 8), 4, "never more than this process may use");
         assert_eq!(balanced(2, 0), 1);
+    }
+
+    /// The descriptor blocks are JSON an agent can parse, and say the same thing as the code.
+    #[test]
+    fn the_descriptor_blocks_are_json() {
+        for b in [DESCRIBE_THREADS, DESCRIBE_SINGLE_THREADED] {
+            let v = crate::json::parse(b).expect("valid JSON");
+            assert!(v.get("parallel").is_some() && v.get("guidance").is_some());
+        }
+        let v = crate::json::parse(DESCRIBE_THREADS).unwrap();
+        assert_eq!(v.get("flag").and_then(|f| f.as_str()), Some("--threads"));
+        assert!(DESCRIBE_THREADS.contains(&format!("at most {AUTO_CAP}")) && HELP.contains(&format!("at most {AUTO_CAP}")));
     }
 
     #[test]
