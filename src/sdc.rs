@@ -899,6 +899,74 @@ fn parse_time(v: &str) -> Option<f64> {
 /// empty, which failed the whole file — every other constraint in it lost along with the clock.
 /// Tcl reads `::env` from the process environment and so do we, falling back to `set` for a
 /// variable of that name.
+/// What `create_generated_clock` asks of its master.
+struct GenSpec {
+    divide_by: Option<i64>,
+    multiply_by: Option<i64>,
+    duty_cycle: Option<f64>,
+    edges: Vec<i64>,
+    edge_shift: Vec<f64>,
+    invert: bool,
+}
+
+/// A generated clock's period and waveform from its master — the reference's `Clock::generate`:
+/// a power-of-two divide keeps the master's rise and gives a 50% duty cycle; any other divide or
+/// a multiply SCALES the master's waveform (or applies `-duty_cycle`); `-edges` picks master edges
+/// (1-based, counting through the master's edge list cycle after cycle), shifted by `-edge_shift`;
+/// `-invert` then rotates the edges by one. `None` when the request cannot be built.
+fn generate(master: &SdcClock, g: &GenSpec) -> Option<(f64, Vec<f64>)> {
+    let mp = master.period;
+    let mw: Vec<f64> = match &master.waveform {
+        Some(w) if w.len() >= 2 => w.clone(),
+        _ => vec![0.0, mp / 2.0],
+    };
+    let scaled = |scale: f64| -> (f64, Vec<f64>) {
+        let p = mp * scale;
+        match g.duty_cycle {
+            Some(d) if d != 0.0 => {
+                let rise = mw[0] * scale;
+                (p, vec![rise, rise + p * d / 100.0])
+            }
+            _ => (p, mw.iter().map(|t| t * scale).collect()),
+        }
+    };
+    let (period, mut wave) = match (g.divide_by, g.multiply_by) {
+        (Some(1), _) | (None, None) if g.edges.is_empty() => (mp, vec![mw[0], mw[1]]),
+        (Some(d), _) if d > 1 => {
+            if d & (d - 1) == 0 {
+                let p = mp * d as f64;
+                (p, vec![mw[0], mw[0] + p / 2.0])
+            } else {
+                scaled(d as f64)
+            }
+        }
+        (_, Some(m)) if m >= 1 => scaled(1.0 / m as f64),
+        _ if g.edges.len() == 3 => {
+            let n = mw.len() as i64;
+            let at = |e: i64| -> f64 {
+                let k = e - 1;
+                mw[k.rem_euclid(n) as usize] + k.div_euclid(n) as f64 * mp
+            };
+            let sh = |k: usize| g.edge_shift.get(k).copied().unwrap_or(0.0);
+            let rise = at(g.edges[0]) + sh(0);
+            let fall = at(g.edges[1]) + sh(1);
+            let period = at(g.edges[2]) - rise + sh(2);
+            (period, vec![rise, fall])
+        }
+        _ => return None,
+    };
+    if g.invert {
+        let first = wave[0];
+        let offset = if first >= period { period } else { 0.0 };
+        let n = wave.len();
+        for k in 0..n - 1 {
+            wave[k] = wave[k + 1] - offset;
+        }
+        wave[n - 1] = first - offset + period;
+    }
+    Some((period, wave))
+}
+
 /// What a control command asks for: its chosen commands, a refusal (it cannot be evaluated
 /// here), or nothing (it is not a control command).
 enum Control {
@@ -1446,8 +1514,6 @@ impl Sdc {
     pub fn parse(text: &str) -> Result<Sdc, SdcError> {
         let mut sdc = Sdc::default();
         let mut vars: HashMap<String, String> = HashMap::new();
-                               // (name, source, divide, multiply) for generated clocks, resolved last.
-        let mut gen: Vec<(String, String, f64, f64)> = Vec::new();
 
         // A QUEUE of commands, not a list: a chosen `if` branch or a `foreach` body is put back at
         // its front, so it runs in place and in order — and its variables are substituted when
@@ -1562,41 +1628,41 @@ impl Sdc {
                     }
                 }
                 "create_generated_clock" => {
-                    let obj = trailing_obj(
+                    let (with, flags, pos) = split_args(
                         &toks,
-                        &[
-                            "-name",
-                            "-source",
-                            "-divide_by",
-                            "-multiply_by",
-                            "-edges",
-                            "-comment",
-                            "-master_clock",
-                        ],
+                        &["-name", "-source", "-divide_by", "-multiply_by", "-edges", "-edge_shift", "-duty_cycle", "-comment", "-master_clock"],
                     );
-                    let target = obj
-                        .as_deref()
-                        .map(|o| resolve_objs(o).first().cloned().unwrap_or_default())
-                        .unwrap_or_default();
-                    let name = flag_val(&toks, "-name")
-                        .cloned()
-                        .unwrap_or_else(|| target.clone());
-                    let source = flag_val(&toks, "-source")
-                        .map(|o| resolve_objs(o).first().cloned().unwrap_or_default())
-                        .unwrap_or_default();
-                    let div: f64 = flag_val(&toks, "-divide_by")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(1.0);
-                    let mul: f64 = flag_val(&toks, "-multiply_by")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(1.0);
-                    let tgt = if target.is_empty() {
-                        name.clone()
-                    } else {
-                        target
+                    let val = |f: &str| with.iter().find(|(k, _)| *k == f).map(|(_, v)| v.as_str());
+                    let has = |f: &str| flags.iter().any(|x| x == f);
+                    let sources: Vec<String> = pos.iter().flat_map(|o| resolve_objs(o)).collect();
+                    let name = val("-name").map(str::to_string).or_else(|| sources.first().cloned()).unwrap_or_default();
+                    let src_obj = val("-source").and_then(|o| resolve_objs(o).into_iter().next());
+                    // THE MASTER is `-master_clock`, else the clock on the `-source` pin — not the
+                    // file's first clock, which gave a divide-by-2 of a 4 ns clock the period of an
+                    // unrelated 10 ns one.
+                    let master = match val("-master_clock") {
+                        Some(m) => resolve_objs(m).into_iter().next().and_then(|m| sdc.clocks.iter().find(|c| c.name == m)),
+                        None => src_obj.as_ref().and_then(|s| sdc.clocks.iter().find(|c| c.sources.iter().any(|x| x == s))),
                     };
-                    gen.push((name, tgt, div.max(1.0), mul.max(1.0)));
-                    let _ = source;
+                    let nums = |f: &str| -> Option<Vec<f64>> {
+                        val(f).map(|v| v.split_whitespace().filter_map(|x| x.parse::<f64>().ok()).collect())
+                    };
+                    let spec = GenSpec {
+                        divide_by: val("-divide_by").and_then(|v| v.parse::<f64>().ok()).filter(|d| d.fract() == 0.0).map(|d| d as i64),
+                        multiply_by: val("-multiply_by").and_then(|v| v.parse::<f64>().ok()).filter(|d| d.fract() == 0.0).map(|d| d as i64),
+                        duty_cycle: val("-duty_cycle").and_then(|v| v.parse().ok()),
+                        edges: nums("-edges").map(|v| v.into_iter().map(|e| e as i64).collect()).unwrap_or_default(),
+                        edge_shift: nums("-edge_shift").unwrap_or_default(),
+                        invert: has("-invert"),
+                    };
+                    let (period, waveform) = match master.and_then(|m| generate(m, &spec)) {
+                        Some((p, w)) => (p, Some(w)),
+                        // no master this reader can find: no usable period, which `health` reports
+                        None => (0.0, None),
+                    };
+                    let source = sources.first().cloned().unwrap_or_default();
+                    // In DEFINITION order, as the reference keeps clocks.
+                    sdc.clocks.push(SdcClock { name, source, sources, period, waveform });
                 }
                 "set_input_delay" | "set_output_delay" => {
                     // `-max` / `-min` take NO value: `delay_value port_pin_list` are the two
@@ -1801,18 +1867,6 @@ impl Sdc {
             }
         }
 
-        // resolve generated clocks against their master period.
-        for (name, target, div, mul) in gen {
-            let master = sdc.clocks.first().map(|c| c.period).unwrap_or(0.0);
-            let period = master * div / mul;
-            sdc.clocks.push(SdcClock {
-                name,
-                sources: if target.is_empty() { Vec::new() } else { vec![target.clone()] },
-                source: target,
-                period,
-                waveform: None,
-            });
-        }
         Ok(sdc)
     }
 
@@ -2388,5 +2442,37 @@ mod exception_rule_tests {
         let e = exc("set_multicycle_path 2 -setup -start -to [get_cells b]");
         assert_eq!((e.kind.clone(), e.hold, e.start), (ExcKind::Multicycle(2), false, true));
         assert!(exc("set_multicycle_path 2.0 -to [get_cells b]").refused.is_some(), "not an integer");
+    }
+}
+
+/// Generated clocks from their master, as the reference's `Clock::generate` builds them; the
+/// values are the reference's own, measured on the same commands.
+#[cfg(test)]
+mod generated_clock_tests {
+    use super::*;
+
+    #[test]
+    fn a_generated_clock_is_built_from_the_clock_on_its_source() {
+        let s = Sdc::parse(
+            "create_clock -name c1 -period 10 -waveform {2 7} [get_ports clk1]\n\
+             create_clock -name c2 -period 4 [get_ports clk2]\n\
+             create_generated_clock -name g_div -source [get_ports clk2] -divide_by 2 [get_pins r3/CK]\n\
+             create_generated_clock -name g_inv -source [get_ports clk1] -divide_by 1 -invert [get_pins r2/Q]\n\
+             create_generated_clock -name g_edge -source [get_ports clk1] -edges {1 3 5} [get_pins u1/Z]\n\
+             create_generated_clock -name g_d2 -source [get_ports clk1] -divide_by 2 [get_pins r4/CK]\n\
+             create_clock -name c3 -period 3 [get_ports clk3]\n",
+        )
+        .unwrap();
+        let get = |n: &str| s.clocks.iter().find(|c| c.name == n).map(|c| (c.period, c.waveform.clone().unwrap_or_default())).unwrap();
+        assert_eq!(get("g_div"), (8.0, vec![0.0, 4.0]), "the master is clk2's clock, not the first");
+        assert_eq!(get("g_inv"), (10.0, vec![7.0, 12.0]));
+        assert_eq!(get("g_edge"), (20.0, vec![2.0, 12.0]));
+        assert_eq!(get("g_d2"), (20.0, vec![2.0, 12.0]), "a power-of-two divide keeps the rise");
+        let order: Vec<&str> = s.clocks.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(order, ["c1", "c2", "g_div", "g_inv", "g_edge", "g_d2", "c3"], "definition order");
+        // no master this reader can find: no usable period, reported
+        let s = Sdc::parse("create_generated_clock -name g -source [get_pins u/Q] -divide_by 2 [get_pins r/CK]\n").unwrap();
+        assert_eq!(s.clocks[0].period, 0.0);
+        assert!(s.health().unwrap().contains("no usable period"));
     }
 }
