@@ -19,7 +19,8 @@ use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, OutEdges, Pin, Pi
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLCB"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLCC"; // Vyges Liberty Cache — bump the trailing digit on any format change
+                                 // VLCC: bare-number table rows; tables padded to their axes.
                                  // VLCB: an arc with no timing_sense takes it from the pin's function.
                                  // VLCA: one arc per related BIT (a multi-pin / bus related_pin was one arc).
                                  // VLC9: Pin gained `caps` (rise/fall x min/max, library defaults).

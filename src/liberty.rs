@@ -855,18 +855,28 @@ fn parse_table(body: &str) -> Table {
     };
     let index_1 = idx("index_1");
     let index_2 = idx("index_2");
-    // values ( "a, b", "c, d" ) — collect each quoted row
+    // values ( "a, b", "c, d" ): each quoted string is a row. A BARE number is a row of its own
+    // (the reference's rule), so `values (0.1, 0.2)` is two one-entry rows — `orient` then pads
+    // them to the axes as the reference does. ⛔ Bare numbers were dropped: the table came back
+    // empty and the arc lost that edge's delay without a word.
     let values = next_paren_after(body, "values")
         .map(|v| {
             let mut rows = Vec::new();
-            let mut rest = v.as_str();
-            while let Some(start) = rest.find('"') {
-                let after = &rest[start + 1..];
-                if let Some(endq) = after.find('"') {
-                    rows.push(floats(&after[..endq]));
-                    rest = &after[endq + 1..];
-                } else {
-                    break;
+            let b = v.as_bytes();
+            let mut k = 0;
+            while k < b.len() {
+                match b[k] {
+                    b'"' => {
+                        let end = v[k + 1..].find('"').map_or(b.len(), |e| k + 1 + e);
+                        rows.push(floats(&v[k + 1..end.min(b.len())]));
+                        k = end + 1;
+                    }
+                    c if c == b'-' || c == b'+' || c == b'.' || c.is_ascii_digit() => {
+                        let end = v[k..].find(|ch: char| ch == ',' || ch.is_whitespace() || ch == '"').map_or(b.len(), |e| k + e);
+                        rows.push(floats(&v[k..end]));
+                        k = end;
+                    }
+                    _ => k += 1,
                 }
             }
             rows
@@ -1201,6 +1211,21 @@ fn orient(mut t: Table, tpl: Option<&Template>, kind: Axes) -> Table {
     }
     if t.index_2.is_empty() {
         t.index_2 = tpl.index[1].clone();
+    }
+    // The reference's shape: rows x columns from the axes (two axes: |1| x |2|; one: 1 x |1|),
+    // each short row padded with 0 and missing rows added as 0 (warnings 1259 / 1261). Entries
+    // past the axes are never read by a lookup; they are dropped here.
+    let (rows, cols) = match (t.index_1.len(), t.index_2.len()) {
+        (0, _) => (0, 0),
+        (n, 0) => (1, n),
+        (n, m) => (n, m),
+    };
+    if rows > 0 && !t.values.is_empty() {
+        t.values.truncate(rows);
+        t.values.resize(rows, Vec::new());
+        for r in &mut t.values {
+            r.resize(cols, 0.0);
+        }
     }
     let (r1, r2) = (axis_role(&tpl.vars[0], kind), axis_role(&tpl.vars[1], kind));
     // one axis means one VARIABLE; a template that declares none says nothing about its axes
@@ -1779,6 +1804,46 @@ fn lib_cache(
 /// SEMANTICS. They are different things and both are needed.
 const LIB_PARSER_STAMP: &str = env!("VYGES_LIB_PARSER_STAMP");
 
+/// `include_file (name) ;` replaced by that file's text, as the reference's lexer reads it: the
+/// name as written (opened from the working directory, not the library's), one level only — an
+/// include inside an included file is not followed — and a file that cannot be opened leaves
+/// nothing (the reference warns and reads on). ⛔ The statement was skipped: every cell, template
+/// or default it brought in was missing, and nothing said so.
+fn splice_includes(text: String) -> String {
+    const KW: &str = "include_file";
+    if !text.contains(KW) {
+        return text;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(at) = rest.find(KW) {
+        let before_ok = at == 0 || !is_ident(rest.as_bytes()[at - 1]);
+        let tail = &rest[at + KW.len()..];
+        let open = tail.len() - tail.trim_start().len();
+        let parsed = tail[open..].strip_prefix('(').and_then(|t| t.find(')').map(|c| (t[..c].trim().trim_matches('"').to_string(), open + 1 + c + 1)));
+        match (before_ok, parsed) {
+            (true, Some((name, used))) => {
+                out.push_str(&rest[..at]);
+                let mut after = &tail[used..];
+                let semi = after.len() - after.trim_start().len();
+                if after[semi..].starts_with(';') {
+                    after = &after[semi + 1..];
+                }
+                if let Ok(inc) = std::fs::read_to_string(&name) {
+                    out.push_str(&inc);
+                }
+                rest = after;
+            }
+            _ => {
+                out.push_str(&rest[..at + KW.len()]);
+                rest = tail;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn lib_cache_key(text: &str, opts: LibOpts) -> LibCacheKey {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1862,7 +1927,8 @@ impl Lib {
     /// on-disk cross-process (`VYGES_LIB_CACHE`, #37/#38) → parse.
     pub fn load_opts(path: &str, opts: LibOpts) -> Result<Lib, LibError> {
         let text = std::fs::read_to_string(path).map_err(|e| LibError(format!("{path}: {e}")))?;
-        // keyed on the file as read: a cache hit costs no lexing at all
+        let text = splice_includes(text);
+        // keyed on the file as read (its includes spliced in): a cache hit costs no lexing at all
         let key = lib_cache_key(&text, opts);
         // 1) in-process cache
         if let Some(hit) = lib_cache().lock().ok().and_then(|m| m.get(&key).cloned()) {
@@ -3093,5 +3159,47 @@ mod sequential_without_timing_type {
             assert_eq!(q.arcs.len(), 1, "{c}: only the clock arc is a delay arc");
             assert_eq!((q.arcs[0].related_pin.as_str(), q.arcs[0].clk_edge), (ck, Some(ClkEdge::Rise)), "{c}");
         }
+    }
+}
+
+#[cfg(test)]
+mod table_rows_and_includes {
+    use super::*;
+
+    /// Reference rule: a bare number in `values` is a row of one; rows are padded to the axes with
+    /// 0. Checked on the reference: this cell's fall delay at (0.1 ns, 0.001 pF) is 0.2 and its
+    /// rise 0.3 (it warns 1259 / 1261 on the fall table).
+    #[test]
+    fn bare_numbers_are_rows_padded_to_the_axes() {
+        let l = Lib::parse(
+            r#"library(u) {
+  delay_model : table_lookup; time_unit : "1ns"; capacitive_load_unit (1, pf);
+  lu_table_template (t) { variable_1 : input_net_transition; variable_2 : total_output_net_capacitance; index_1 ("0.01, 0.1"); index_2 ("0.001, 0.01"); }
+  cell (INVQ) { pin(A) { direction : input; capacitance : 0.002; }
+    pin(Y) { direction : output; function : "!A";
+      timing () { related_pin : "A"; timing_sense : negative_unate;
+        cell_rise (t) { values ("0.1, 0.2", "0.3, 0.4"); }
+        cell_fall (t) { values (0.1, 0.2, 0.3, 0.4); } } } }
+}"#,
+        )
+        .unwrap();
+        let a = &l.cells["INVQ"].pins["Y"].arcs[0];
+        assert_eq!(a.cell_fall.values, vec![vec![0.1f32 as f64, 0.0], vec![0.2f32 as f64, 0.0]]);
+        assert!((a.cell_fall.lookup(0.1, 0.001) - 0.2).abs() < 1e-6);
+        assert!((a.cell_rise.lookup(0.1, 0.001) - 0.3).abs() < 1e-6);
+    }
+
+    /// `include_file` splices the named file in (one level), as the reference's lexer does.
+    #[test]
+    fn include_file_brings_its_cells() {
+        let dir = std::env::temp_dir().join(format!("vyges_inc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let extra = dir.join("extra.lib");
+        std::fs::write(&extra, "  cell (BUFX) { pin(A) { direction : input; capacitance : 0.003; } pin(Y) { direction : output; function : \"A\"; } }\n").unwrap();
+        let main = dir.join("main.lib");
+        std::fs::write(&main, format!("library(u) {{\n  time_unit : \"1ns\";\n  include_file ({});\n  cell (INV) {{ pin(A) {{ direction : input; }} }}\n}}\n", extra.display())).unwrap();
+        let l = Lib::load(main.to_str().unwrap()).unwrap();
+        assert!(l.cells.contains_key("BUFX") && l.cells.contains_key("INV"), "{:?}", l.cells.keys().collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
