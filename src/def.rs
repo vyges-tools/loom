@@ -258,7 +258,11 @@ impl ViaDef {
 struct Vias<'a> {
     lef: Option<&'a crate::lef::Lef>,
     defs: &'a BTreeMap<String, ViaDef>,
+    /// Vias whose layers were unknown AND that a segment followed (so it may be on the wrong
+    /// layer). A via that ends its path changes nothing and is not counted.
     unresolved: std::cell::Cell<usize>,
+    /// The last via could not switch the layer; cleared by the next segment or a new path.
+    stale: std::cell::Cell<bool>,
 }
 
 impl Vias<'_> {
@@ -277,18 +281,31 @@ impl Vias<'_> {
     }
 
     /// The layer a path is on past via `name`, from `cur`: the via's other layer, or `cur`
-    /// unchanged (counted) when the via's layers are unknown or do not include `cur`.
+    /// unchanged when the via's layers are unknown or do not include `cur`.
     fn exit(&self, name: &str, cur: &str) -> String {
         match self.layers(name) {
             Some((b, t)) if t == cur => b,
             Some((b, t)) if b == cur => t,
             _ => {
-                self.unresolved.set(self.unresolved.get() + 1);
+                self.stale.set(true);
                 cur.to_string()
             }
         }
     }
+
+    /// A segment is being added on the path's current layer.
+    fn segment(&self) {
+        if self.stale.replace(false) {
+            self.unresolved.set(self.unresolved.get() + 1);
+        }
+    }
+
+    /// A new path starts (its layer is stated).
+    fn new_path(&self) {
+        self.stale.set(false);
+    }
 }
+
 
 const POWER_NAMES: &[&str] = &["VPWR", "VDD", "VCCD", "VCC", "VDDP"];
 
@@ -329,7 +346,7 @@ impl Def {
                 v.resolve_shapes(l);
             }
         }
-        let vias = Vias { lef, defs: &via_defs, unresolved: std::cell::Cell::new(0) };
+        let vias = Vias { lef, defs: &via_defs, unresolved: std::cell::Cell::new(0), stale: std::cell::Cell::new(false) };
         let nets = parse_signal(&tv, scale, &ndr, &vias)?;
         let power_nets = match section_start(&tref, "SPECIALNETS") {
             Some(s) => parse_specialnets(&tref[s + 1..section_end(&tref, "SPECIALNETS", s)], &vias),
@@ -575,6 +592,7 @@ fn parse_signal(
                     if matches!(status, "ROUTED" | "FIXED" | "COVER" | "NOSHIELD") {
                         in_routing = true;
                         layer = t.get(i + 2).cloned();
+                        vias.new_path();
                         prev = None;
                         wire_rule = None;
                         i += 3;
@@ -599,6 +617,7 @@ fn parse_signal(
                 }
                 "NEW" => {
                     layer = t.get(i + 1).cloned();
+                    vias.new_path();
                     prev = None;
                     wire_rule = None;
                     i += 2;
@@ -654,6 +673,7 @@ fn parse_signal(
                         let jump = std::mem::take(&mut virtual_next);
                         if let (Some(l), Some((ox, oy)), false) = (&layer, prev, jump) {
                             if (x - ox).abs() + (y - oy).abs() > 0.0 {
+                                vias.segment();
                                 net.segments.push(Segment {
                                     layer: l.clone(),
                                     x0: ox,
@@ -1048,6 +1068,7 @@ fn parse_specialnets(body: &[&str], vias: &Vias) -> Vec<NetGeom> {
                         match (word(at), body.get(at + 1).and_then(|w| w.parse::<f64>().ok())) {
                             (Some(l), Some(w)) => {
                                 (layer, width) = (l.to_string(), w);
+                                vias.new_path();
                                 (last, wiring) = (None, true);
                                 i = at + 2;
                             }
@@ -1104,6 +1125,7 @@ fn parse_specialnets(body: &[&str], vias: &Vias) -> Vec<NetGeom> {
             }
             "NEW" if wiring => {
                 layer = body.get(i + 1).copied().unwrap_or("").to_string();
+                vias.new_path();
                 width = body.get(i + 2).and_then(|w| w.parse().ok()).unwrap_or(0.0);
                 last = None;
                 i += 3;
@@ -1117,6 +1139,7 @@ fn parse_specialnets(body: &[&str], vias: &Vias) -> Vec<NetGeom> {
                             }
                             if let Some((px, py)) = last {
                                 if px != x || py != y {
+                                    vias.segment();
                                     n.segs.push(Seg { layer: layer.clone(), width_dbu: width, x1: px, y1: py, x2: x, y2: y });
                                 }
                             }
