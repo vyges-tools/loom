@@ -256,6 +256,36 @@ pub struct EnvCmd {
     pub objects: Vec<String>,
 }
 
+/// One `set_clock_groups` command: its kind (`asynchronous`, `logically_exclusive`,
+/// `physically_exclusive`), `-allow_paths`, and its `-group`s of clock names.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ClockGroups {
+    pub kind: String,
+    pub allow_paths: bool,
+    pub groups: Vec<Vec<String>>,
+}
+
+/// Are clocks `a` and `b` separated by any `set_clock_groups` — the reference's rule: one
+/// command puts them in DIFFERENT groups, or a command of ONE group holds exactly one of them (a
+/// single group separates its clocks from every other clock). `-asynchronous -allow_paths`
+/// separates nothing.
+///
+/// ⛔ Merged into one list across commands, clocks named in two different commands were cut
+/// from each other, though no command separated them; and a single group cut nothing.
+pub fn clocks_unrelated(groups: &[ClockGroups], a: &str, b: &str) -> bool {
+    if a == b {
+        return false;
+    }
+    groups.iter().filter(|g| !g.allow_paths).any(|g| {
+        let at = |c: &str| g.groups.iter().position(|grp| grp.iter().any(|n| n == c));
+        match (at(a), at(b), g.groups.len()) {
+            (Some(x), Some(y), _) => x != y,
+            (Some(_), None, 1) | (None, Some(_), 1) => true,
+            _ => false,
+        }
+    })
+}
+
 /// One `set_clock_uncertainty`: a value for `-setup`, `-hold` or both, on clocks or pins (objects)
 /// or between two clocks (`-from` / `-to`, and their `-rise_` / `-fall_` forms).
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -415,6 +445,10 @@ pub struct Sdc {
     /// names. Two clocks in *different* groups are mutually asynchronous — paths
     /// that launch and capture across them are cut (no setup **or** hold check).
     pub async_groups: Vec<Vec<String>>,
+    /// Every `set_clock_groups`, PER COMMAND — see [`ClockGroups`] and [`clocks_unrelated`].
+    /// [`Sdc::async_groups`] is every command's groups in one list, and cannot say which clocks
+    /// one command separated.
+    pub clock_groups: Vec<ClockGroups>,
     pub ignored: Vec<String>, // commands we recognised but do not model
 }
 
@@ -1911,6 +1945,15 @@ impl Sdc {
                     // A CDC check reads exactly that, and dropping it made a design whose SDC
                     // declared its clocks related report every one of those pairs as a
                     // crossing. Store what the file said; leave the reading to each consumer.
+                    let kind = ["-asynchronous", "-logically_exclusive", "-physically_exclusive"]
+                        .iter()
+                        .find(|f| has_flag(&toks, f))
+                        .map(|f| f.trim_start_matches('-').to_string());
+                    match kind {
+                        Some(kind) => sdc.clock_groups.push(ClockGroups { kind, allow_paths: has_flag(&toks, "-allow_paths"), groups: groups.clone() }),
+                        // a type is required (the reference's STA-0400)
+                        None => sdc.rejected.push("set_clock_groups without -asynchronous / -logically_exclusive / -physically_exclusive".into()),
+                    }
                     sdc.async_groups.extend(groups);
                 }
                 "set_false_path" => {
@@ -2626,5 +2669,29 @@ mod per_command_tests {
         assert_eq!(s.input_transition, Some(0.2));
         assert_eq!(s.load, Some(3.0));
         assert_eq!(s.env.len(), 5);
+    }
+}
+
+#[cfg(test)]
+mod clock_group_tests {
+    use super::*;
+
+    /// Clocks are separated only by the command that separates them; one group separates its
+    /// clocks from all others; `-allow_paths` separates nothing.
+    #[test]
+    fn clock_groups_are_per_command() {
+        let s = Sdc::parse(
+            "set_clock_groups -asynchronous -group [get_clocks c1] -group [get_clocks c2]\n\
+             set_clock_groups -asynchronous -group [get_clocks c1] -group [get_clocks c3]\n\
+             set_clock_groups -logically_exclusive -group [get_clocks c4]\n\
+             set_clock_groups -asynchronous -allow_paths -group [get_clocks c5] -group [get_clocks c6]\n",
+        )
+        .unwrap();
+        let u = |a, b| clocks_unrelated(&s.clock_groups, a, b);
+        assert!(u("c1", "c2") && u("c1", "c3"));
+        assert!(!u("c2", "c3"), "no command separated c2 from c3");
+        assert!(u("c4", "c1") && u("c2", "c4"), "a single group separates its clock from every other");
+        assert!(!u("c5", "c6"), "-allow_paths");
+        assert_eq!(s.clock_groups[2].kind, "logically_exclusive");
     }
 }
