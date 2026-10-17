@@ -428,6 +428,8 @@ impl Cell {
 #[derive(Debug, Clone, Default)]
 pub struct Lib {
     pub cells: BTreeMap<String, Cell>,
+    /// The units its times and capacitances are in (see [`LibUnits`]).
+    pub units: LibUnits,
     pub voltage: f64, // nominal supply (V) — power; 0.0 if unknown
     /// How this library measures transitions and delays. Needed by any consumer that
     /// builds a *waveform* from a Liberty slew: the number is only meaningful together
@@ -958,19 +960,26 @@ fn parse_arc(timing_body: &str, own: &str, spans: &[GroupSpan], ctx: &Ctx) -> Ar
         ccs: if ctx.skip_ccs {
             crate::ccs::CcsArc::default()
         } else {
-            parse_ccs(timing_body)
+            parse_ccs(timing_body, ctx.ccs_current)
         },
         sigma_rise: tbl("ocv_sigma_cell_rise"),
         sigma_fall: tbl("ocv_sigma_cell_fall"),
     }
 }
 
-/// Parse CCS `output_current_rise`/`output_current_fall` waveforms from an arc.
-fn parse_ccs(timing_body: &str) -> crate::ccs::CcsArc {
-    crate::ccs::CcsArc {
+/// Parse CCS `output_current_rise`/`output_current_fall` waveforms from an arc, each current
+/// scaled by `current` into the library's capacitance unit per time unit.
+fn parse_ccs(timing_body: &str, current: f64) -> crate::ccs::CcsArc {
+    let mut arc = crate::ccs::CcsArc {
         rise: parse_ccs_set(timing_body, "output_current_rise"),
         fall: parse_ccs_set(timing_body, "output_current_fall"),
+    };
+    if current != 1.0 {
+        for w in arc.rise.iter_mut().chain(arc.fall.iter_mut()) {
+            w.current.iter_mut().for_each(|i| *i *= current);
+        }
     }
+    arc
 }
 
 /// Collect every `vector (...) { ... }` under an output_current group.
@@ -1158,6 +1167,9 @@ type Templates = BTreeMap<String, Template>;
 /// Everything a cell's reading needs from its library.
 struct Ctx<'a> {
     cap_f: f64,
+    /// CCS current in the library's (capacitance unit / time unit), per its `current_unit`: see
+    /// [`Units::ccs_current`].
+    ccs_current: f64,
     skip_ccs: bool,
     templates: &'a Templates,
     /// `default_input_pin_cap`, `default_output_pin_cap`, `default_inout_pin_cap`
@@ -1614,7 +1626,7 @@ fn parse_cell(
     templates: &Templates,
     default_cap: [f64; 3],
 ) -> Cell {
-    let ctx = Ctx { cap_f: units.cap_f, skip_ccs, templates, default_cap };
+    let ctx = Ctx { cap_f: units.cap_f, ccs_current: units.ccs_current(), skip_ccs, templates, default_cap };
     let mut pins = BTreeMap::new();
     let mut scan_pins = BTreeMap::new();
     // Each bus or bundle's members in order, and for each member: its place in that bus and how
@@ -1913,6 +1925,7 @@ impl Lib {
         }
         Ok(Lib {
             cells,
+            units: units.timing,
             voltage,
             thresholds,
         })
@@ -1953,13 +1966,61 @@ impl Lib {
         self.cells.get(name)
     }
 
-    /// Merge another lib's cells into this one (multi-lib jobs). Existing cells win.
-    pub fn merge(&mut self, other: Lib) {
+    /// Merge another lib's cells into this one (multi-lib jobs), in this one's units. Existing
+    /// cells win: the reference links a cell from the first library holding it.
+    pub fn merge(&mut self, mut other: Lib) {
         if self.voltage == 0.0 {
             self.voltage = other.voltage;
         }
+        other.rescale_to(self.units);
         for (k, v) in other.cells {
             self.cells.entry(k).or_insert(v);
+        }
+    }
+
+    /// Put every time and capacitance in `to`'s units: table axes (a delay's slew and load, a
+    /// constraint's two slews) and values, pin capacitances, receiver models, sigma tables and CCS
+    /// waveforms (whose currents are in capacitance per time, so they scale with both).
+    pub fn rescale_to(&mut self, to: LibUnits) {
+        let (t, c) = (self.units.time_s / to.time_s, self.units.cap_f / to.cap_f);
+        self.units = to;
+        let one = |f: f64| (f - 1.0).abs() < 1e-12;
+        if one(t) && one(c) {
+            return;
+        }
+        let table = |tb: &mut Table, i1: f64, i2: f64, v: f64| {
+            tb.index_1.iter_mut().for_each(|x| *x *= i1);
+            tb.index_2.iter_mut().for_each(|x| *x *= i2);
+            tb.values.iter_mut().flatten().for_each(|x| *x *= v);
+        };
+        for cell in self.cells.values_mut() {
+            for pin in cell.pins.values_mut() {
+                pin.capacitance *= c;
+                for x in [&mut pin.caps.rise_min, &mut pin.caps.rise_max, &mut pin.caps.fall_min, &mut pin.caps.fall_max] {
+                    *x *= c;
+                }
+                if let Some(r) = pin.recv.as_mut() {
+                    for tb in [&mut r.c1_rise, &mut r.c2_rise, &mut r.c1_fall, &mut r.c2_fall] {
+                        table(tb, t, c, c);
+                    }
+                }
+                for k in pin.setup.iter_mut().chain(pin.hold.iter_mut()).chain(pin.recovery.iter_mut()).chain(pin.removal.iter_mut()) {
+                    table(&mut k.rise, t, t, t);
+                    table(&mut k.fall, t, t, t);
+                }
+                for a in &mut pin.arcs {
+                    for tb in [&mut a.cell_rise, &mut a.cell_fall, &mut a.rise_transition, &mut a.fall_transition, &mut a.sigma_rise, &mut a.sigma_fall] {
+                        table(tb, t, c, t);
+                    }
+                    for w in a.ccs.rise.iter_mut().chain(a.ccs.fall.iter_mut()) {
+                        w.in_slew *= t;
+                        w.out_cap *= c;
+                        w.ref_time *= t;
+                        w.time.iter_mut().for_each(|x| *x *= t);
+                        w.current.iter_mut().for_each(|x| *x *= c / t);
+                    }
+                }
+            }
         }
     }
 
@@ -2080,6 +2141,8 @@ struct Units {
     cap_f: f64,    // Farads per capacitance unit
     leak_w: f64,   // Watts per leakage_power_unit
     energy_j: f64, // Joules per dynamic-energy unit (voltage·current·time)
+    /// The timing units, the reference's way: see [`LibUnits`].
+    timing: LibUnits,
 }
 
 impl Units {
@@ -2107,8 +2170,99 @@ impl Units {
             cap_f,
             leak_w,
             energy_j: v * a * time_s,
+            timing: LibUnits::from_lib(text),
         }
     }
+
+    /// The factor that puts a CCS current in the library's capacitance unit per time unit, so a
+    /// waveform's current × time / capacitance is in volts whatever its units (1 for ns, pF, mA).
+    fn ccs_current(&self) -> f64 {
+        let u = &self.timing;
+        let f = u.current_a * u.time_s / u.cap_f;
+        if (f - 1.0).abs() < 1e-9 {
+            1.0
+        } else {
+            f
+        }
+    }
+}
+
+/// A library's timing units as SI scales: `time_unit`, `capacitive_load_unit` and `current_unit`,
+/// each defaulting as the reference's reader does (1 ns, 1 pF, 1 mA), and a capacitance unit
+/// other than `ff` or `pf` left at the default as it leaves it.
+///
+/// The reference scales every library's values to SI as it reads them and reports in the FIRST
+/// library's units (`Sta::readLiberty`: "Set units from default (first) library"); SDC values are
+/// read in those units too. Values here stay in their library's units, so libraries are put in
+/// the first one's units when merged ([`Lib::merge`]) — the same numbers the reference reports.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LibUnits {
+    pub time_s: f64,
+    pub cap_f: f64,
+    pub current_a: f64,
+}
+
+impl Default for LibUnits {
+    fn default() -> Self {
+        LibUnits { time_s: 1e-9, cap_f: 1e-12, current_a: 1e-3 }
+    }
+}
+
+impl LibUnits {
+    fn from_lib(text: &str) -> LibUnits {
+        let d = LibUnits::default();
+        let time_s = simple_attr(text, "time_unit").as_deref().map(parse_si_time).unwrap_or(d.time_s);
+        let current_a = simple_attr(text, "current_unit").as_deref().map(parse_si_current).unwrap_or(d.current_a);
+        let cap_f = match cap_load_unit(text) {
+            Some(c) if cap_load_suffix(text).is_some_and(|s| s == "ff" || s == "pf") => c,
+            _ => d.cap_f,
+        };
+        LibUnits { time_s, cap_f, current_a }
+    }
+
+    /// The unit's name as the reference prints it (`1ns`, `1ps`, `1pF`, `1fF`), or the scale in
+    /// SI when it is none of those.
+    pub fn time_name(&self) -> String {
+        unit_name(self.time_s, &[(1e-9, "ns"), (1e-12, "ps"), (1e-6, "us"), (1e-15, "fs")], "s")
+    }
+
+    pub fn cap_name(&self) -> String {
+        unit_name(self.cap_f, &[(1e-12, "pF"), (1e-15, "fF")], "F")
+    }
+
+    /// The time unit as a label after a value: `ns`, `ps`, or `10ps` for a unit of ten.
+    pub fn time_label(&self) -> String {
+        let n = self.time_name();
+        match n.strip_prefix('1') {
+            Some(rest) if rest.starts_with(|c: char| c.is_ascii_alphabetic()) => rest.to_string(),
+            _ => n,
+        }
+    }
+
+    /// Nanoseconds per time unit.
+    pub fn ns_per_unit(&self) -> f64 {
+        self.time_s / 1e-9
+    }
+}
+
+fn unit_name(scale: f64, known: &[(f64, &str)], si: &str) -> String {
+    for &(base, name) in known {
+        let k = scale / base;
+        if (1.0..1000.0).contains(&(k * (1.0 + 1e-9))) {
+            let k = if (k - k.round()).abs() < 1e-9 { k.round() } else { k };
+            return format!("{k}{name}");
+        }
+    }
+    format!("{scale:e}{si}")
+}
+
+/// The suffix of `capacitive_load_unit (n, suffix)`, lower-cased.
+fn cap_load_suffix(lib_body: &str) -> Option<String> {
+    let p = lib_body.find("capacitive_load_unit")?;
+    let open = lib_body[p..].find('(')? + p;
+    let close = lib_body[open..].find(')')? + open;
+    let suffix = lib_body[open + 1..close].split(',').nth(1)?;
+    Some(suffix.trim().trim_matches('"').trim().to_lowercase())
 }
 
 fn parse_si(s: &str, units: &[(&str, f64)]) -> f64 {
@@ -2169,7 +2323,8 @@ fn cap_load_unit(lib_body: &str) -> Option<f64> {
     let close = lib_body[open..].find(')')? + open;
     let mut parts = lib_body[open + 1..close].split(',');
     let scale: f64 = parts.next()?.trim().parse().unwrap_or(1.0);
-    let base = match parts.next().unwrap_or("pf").trim().to_lowercase().as_str() {
+    // the suffix may be quoted (`"ff"`): the reference's lexer reads it as the string either way
+    let base = match parts.next().unwrap_or("pf").trim().trim_matches('"').trim().to_lowercase().as_str() {
         "ff" => 1e-15,
         "pf" => 1e-12,
         "nf" => 1e-9,
@@ -3201,5 +3356,82 @@ mod table_rows_and_includes {
         let l = Lib::load(main.to_str().unwrap()).unwrap();
         assert!(l.cells.contains_key("BUFX") && l.cells.contains_key("INV"), "{:?}", l.cells.keys().collect::<Vec<_>>());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Library units, the reference's way: each library's own, defaults 1 ns / 1 pF / 1 mA, and a
+/// merged library is in the FIRST one's units.
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    /// One inverter, its numbers given in nanoseconds and picofarads and written in `time` /
+    /// `cap` units (`scale` converts: 1000 for ps and fF), with a CCS vector.
+    fn inv(name: &str, time: &str, cap: &str, current: &str, scale: f64) -> String {
+        let n = |v: f64| format!("{}", v * scale);
+        format!(
+            "library ({name}) {{\n delay_model : table_lookup;\n time_unit : \"{time}\";\n capacitive_load_unit (1, {cap});\n current_unit : \"{current}\";\n\
+             lu_table_template (t) {{ variable_1 : input_net_transition; variable_2 : total_output_net_capacitance; index_1 (\"{a}, {b}\"); index_2 (\"{c}, {d}\"); }}\n\
+             cell (INV_{name}) {{\n pin (A) {{ direction : input; capacitance : {cap_a}; }}\n pin (Y) {{ direction : output; function : \"!A\";\n\
+             timing () {{ related_pin : \"A\"; timing_sense : negative_unate;\n\
+             cell_rise (t) {{ values (\"{v1}, {v2}\", \"{v3}, {v4}\"); }}\n cell_fall (t) {{ values (\"{v1}, {v2}\", \"{v3}, {v4}\"); }}\n\
+             rise_transition (t) {{ values (\"{v1}, {v2}\", \"{v3}, {v4}\"); }}\n fall_transition (t) {{ values (\"{v1}, {v2}\", \"{v3}, {v4}\"); }}\n\
+             output_current_rise () {{ vector (ccs) {{ reference_time : {rt}; index_1 (\"{a}\"); index_2 (\"{c}\"); index_3 (\"{t0}, {t1}\"); values (\"0.1, 0.2\"); }} }}\n\
+             }} }} }}\n}}\n",
+            a = n(0.01), b = n(0.08), c = n(0.001), d = n(0.01), cap_a = n(0.0015),
+            v1 = n(0.08), v2 = n(0.2), v3 = n(0.12), v4 = n(0.28), rt = n(0.005), t0 = n(0.01), t1 = n(0.02),
+        )
+    }
+
+    #[test]
+    fn units_default_as_the_reference_reads_them() {
+        let l = Lib::parse("library (d) { cell (X) { pin (A) { direction : input; } } }").unwrap();
+        assert_eq!(l.units, LibUnits::default());
+        assert_eq!((l.units.time_name(), l.units.cap_name()), ("1ns".to_string(), "1pF".to_string()));
+        let ps = Lib::parse(&inv("p", "1ps", "ff", "1uA", 1000.0)).unwrap();
+        assert_eq!((ps.units.time_name(), ps.units.cap_name()), ("1ps".to_string(), "1fF".to_string()));
+        assert_eq!((ps.units.time_label(), l.units.time_label()), ("ps".to_string(), "ns".to_string()));
+        let ten = LibUnits { time_s: 1e-11, ..LibUnits::default() };
+        assert_eq!((ten.time_name(), ten.time_label()), ("10ps".to_string(), "10ps".to_string()));
+        // a quoted suffix is the same unit
+        let quoted = Lib::parse(&inv("q", "1ps", "\"ff\"", "1uA", 1000.0)).unwrap();
+        assert_eq!(quoted.units, ps.units);
+        // `nf` is not a capacitance unit the reference reads: the default stays.
+        let nf = Lib::parse(&inv("n", "1ns", "nf", "1mA", 1.0)).unwrap();
+        assert_eq!(nf.units.cap_f, 1e-12);
+    }
+
+    /// The same inverter in ps / fF merged into a ns / pF library is the ns / pF inverter.
+    #[test]
+    fn a_merged_library_is_in_the_first_ones_units() {
+        let ns = Lib::parse(&inv("a", "1ns", "pf", "1mA", 1.0)).unwrap();
+        let mut merged = Lib::parse(&inv("b", "1ns", "pf", "1mA", 1.0)).unwrap();
+        merged.cells.clear();
+        merged.merge(Lib::parse(&inv("a", "1ps", "ff", "1uA", 1000.0)).unwrap());
+        let (want, got) = (&ns.cells["INV_a"], &merged.cells["INV_a"]);
+        // values are read as `strtof` reads them, so the two spellings agree to float precision
+        let close = |x: f64, y: f64| (x - y).abs() <= 1e-6 * y.abs().max(1e-9);
+        assert!(close(got.pins["A"].capacitance, want.pins["A"].capacitance));
+        let (wa, ga) = (&want.pins["Y"].arcs[0], &got.pins["Y"].arcs[0]);
+        for (w, g) in [(&wa.cell_rise, &ga.cell_rise), (&wa.fall_transition, &ga.fall_transition)] {
+            assert!(w.index_1.iter().zip(&g.index_1).all(|(x, y)| close(*y, *x)));
+            assert!(w.index_2.iter().zip(&g.index_2).all(|(x, y)| close(*y, *x)));
+            assert!(w.values.iter().flatten().zip(g.values.iter().flatten()).all(|(x, y)| close(*y, *x)));
+        }
+        // CCS: the time axis in ns, the current in pF/ns = mA (1 uA here is 1e-3 of it).
+        let (ww, gw) = (&wa.ccs.rise[0], &ga.ccs.rise[0]);
+        assert!(close(gw.ref_time, ww.ref_time) && close(gw.time[1], ww.time[1]) && close(gw.in_slew, ww.in_slew));
+        assert!(close(gw.current[1], ww.current[1] * 1e-3));
+        assert_eq!(merged.units, LibUnits::default());
+    }
+
+    /// The first library holding a cell is the one it comes from.
+    #[test]
+    fn the_first_library_holding_a_cell_wins() {
+        let mut first = Lib::parse(&inv("a", "1ns", "pf", "1mA", 1.0)).unwrap();
+        let second = Lib::parse(&inv("a", "1ns", "pf", "1mA", 2.0)).unwrap();
+        let cap = first.cells["INV_a"].pins["A"].capacitance;
+        first.merge(second);
+        assert_eq!(first.cells["INV_a"].pins["A"].capacitance, cap);
     }
 }

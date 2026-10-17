@@ -19,7 +19,7 @@ use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, OutEdges, Pin, Pi
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLCC"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLCD"; // Vyges Liberty Cache — bump the trailing digit on any format change
                                  // VLCC: bare-number table rows; tables padded to their axes.
                                  // VLCB: an arc with no timing_sense takes it from the pin's function.
                                  // VLCA: one arc per related BIT (a multi-pin / bus related_pin was one arc).
@@ -465,6 +465,9 @@ pub fn encode(lib: &Lib) -> Vec<u8> {
     let mut w = W::default();
     w.b.extend_from_slice(MAGIC);
     w.f64(lib.voltage);
+    w.f64(lib.units.time_s);
+    w.f64(lib.units.cap_f);
+    w.f64(lib.units.current_a);
     // Thresholds: without these here, a field parsed but not cached silently reverts to
     // the default on the SECOND load — working once and then quietly not.
     let t = &lib.thresholds;
@@ -497,6 +500,7 @@ pub fn decode(bytes: &[u8]) -> Option<Lib> {
     }
     let mut r = R { b: bytes, i: 4 };
     let voltage = r.f64()?;
+    let units = crate::liberty::LibUnits { time_s: r.f64()?, cap_f: r.f64()?, current_a: r.f64()? };
     let thresholds = crate::liberty::Thresholds {
         slew_lower_rise: r.f64()?,
         slew_upper_rise: r.f64()?,
@@ -516,6 +520,7 @@ pub fn decode(bytes: &[u8]) -> Option<Lib> {
     }
     Some(Lib {
         cells,
+        units,
         voltage,
         thresholds,
     })
@@ -699,6 +704,7 @@ library (seqdemo) {
         assert_eq!(bytes, encode(&back));
         assert_eq!(back.cells.len(), lib.cells.len());
         assert!((back.voltage - lib.voltage).abs() < 1e-12);
+        assert_eq!(back.units, lib.units, "units lost across the cache");
         // Thresholds must survive the cache. A field parsed but not encoded works on the
         // FIRST load and silently reverts to the default on every one after — the worst
         // shape of bug, because it passes any test that parses and uses in one breath.
