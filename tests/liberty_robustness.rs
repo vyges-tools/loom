@@ -161,14 +161,15 @@ fn the_known_good_library_reads_as_expected() {
     assert_eq!(c.area, 3.5);
     assert!((c.leakage_w - 2.0e-9).abs() < 1e-18, "2 nW, got {}", c.leakage_w);
     let a = c.pins.get("A").expect("pin A");
-    assert_eq!(a.capacitance, 0.004, "library units (pF), the NLDM load axis");
+    // numbers are read as the reference lexer reads them: strtof, one rounding to f32
+    assert_eq!(a.capacitance, 0.004f32 as f64, "library units (pF), the NLDM load axis");
     assert!((a.cap_f - 4.0e-15).abs() < 1e-21, "4 fF in SI, got {}", a.cap_f);
     let y = c.pins.get("Y").expect("pin Y");
     assert_eq!(y.function.as_deref(), Some("!A"));
     assert_eq!(y.arcs.len(), 1);
     // exactly on a table corner, so interpolation cannot hide a mis-parse
-    assert!((y.arcs[0].cell_rise.lookup(0.01, 0.001) - 0.10).abs() < 1e-12);
-    assert!((y.arcs[0].cell_fall.lookup(0.1, 0.01) - 0.41).abs() < 1e-12);
+    assert_eq!(y.arcs[0].cell_rise.lookup(0.01f32 as f64, 0.001f32 as f64), 0.10f32 as f64);
+    assert_eq!(y.arcs[0].cell_fall.lookup(0.1f32 as f64, 0.01f32 as f64), 0.41f32 as f64);
 }
 
 /// **The generated sweep.** Every attribute name real libraries use, injected at each scope.
@@ -252,7 +253,8 @@ fn per_state_leakage_groups_are_read_when_the_scalar_is_absent() {
     // Two states: (A*Y) = 496.771 + 0, (!A*!Y) = 286.02. Mean = 391.3955 nW.
     let want = 391.3955e-9;
     let got = l.cells["INV"].leakage_w;
-    assert!((got - want).abs() < 1e-15, "want {want:e}, got {got:e}");
+    // each value is an f32 (strtof), so agreement is to f32 precision
+    assert!((got - want).abs() < want * 1e-7, "want {want:e}, got {got:e}");
 
     // the explicit scalar still wins where a library provides both
     let both = good_lib("", groups, "", "");

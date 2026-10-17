@@ -432,7 +432,7 @@ impl Thresholds {
         // Liberty states these as percentages; store fractions.
         let pct = |key: &str, fallback: f64| -> f64 {
             simple_attr(text, key)
-                .and_then(|s| s.trim().parse::<f64>().ok())
+                .and_then(|s| lnum(&s))
                 .map(|v| v / 100.0)
                 .filter(|v| (0.0..=1.0).contains(v))
                 .unwrap_or(fallback)
@@ -447,7 +447,7 @@ impl Thresholds {
             output_rise: pct("output_threshold_pct_rise", d.output_rise),
             output_fall: pct("output_threshold_pct_fall", d.output_fall),
             slew_derate: simple_attr(text, "slew_derate_from_library")
-                .and_then(|s| s.trim().parse::<f64>().ok())
+                .and_then(|s| lnum(&s))
                 .filter(|v| *v > 0.0)
                 .unwrap_or(d.slew_derate),
         }
@@ -555,7 +555,7 @@ fn state_leakage(body: &str) -> f64 {
     let mut at = 0;
     while let Some((_, gbody, after)) = next_block(body, at, "leakage_power") {
         at = after;
-        let Some(v) = simple_attr(&gbody, "value").and_then(|s| s.parse::<f64>().ok()) else {
+        let Some(v) = simple_attr(&gbody, "value").and_then(|s| lnum(&s)) else {
             continue;
         };
         // Groups with no `when` are unconditional; keep each on its own so they are averaged
@@ -654,9 +654,68 @@ fn simple_attr(body: &str, key: &str) -> Option<String> {
     }
 }
 
+/// A number as the reference's Liberty lexer reads it: `strtof`, straight to `float` — ONE
+/// rounding. ⛔ Not `parse::<f64>() as f32`, which rounds twice; that is the SPEF reader's rule
+/// (`(float)atof`), and the two differ on decimals whose `double` lands near a `float` tie
+/// (cpp-to-rust-numeric-reference §18).
+fn lnum(s: &str) -> Option<f64> {
+    s.trim().parse::<f32>().ok().map(f64::from)
+}
+
+/// The lexer's view of the text, applied before anything reads it: `/* */` comments outside a
+/// quoted string become blanks, and a backslash-newline inside one is a continuation. Byte
+/// offsets do not move — every replaced byte becomes a space, newlines inside a comment stay —
+/// so nothing downstream sees a different layout.
+///
+/// ⛔ Without it a commented-out `cell (X) { … }` was a real cell, and a commented-out
+/// `area : 7.0;` set the area: this reader scans text for keywords, and a comment is text.
+fn lex_clean(b: &mut [u8]) {
+    let (mut i, mut quoted) = (0, false);
+    while i < b.len() {
+        match b[i] {
+            b'"' => quoted = !quoted,
+            // inside a string a backslash escapes the next byte; before a line end it is a
+            // continuation, and both go (`\r\n` counts as one line end)
+            b'\\' if quoted => {
+                if matches!(b.get(i + 1), Some(b'\n' | b'\r')) {
+                    b[i] = b' ';
+                    i += 1;
+                    let crlf = b[i] == b'\r' && b.get(i + 1) == Some(&b'\n');
+                    b[i] = b' ';
+                    if crlf {
+                        i += 1;
+                        b[i] = b' ';
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            b'/' if !quoted && b.get(i + 1) == Some(&b'*') => {
+                while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                    if b[i] != b'\n' {
+                        b[i] = b' ';
+                    }
+                    i += 1;
+                }
+                for c in b.iter_mut().skip(i).take(2) {
+                    *c = b' ';
+                }
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// Does the text need [`lex_clean`]? Cheap, so a clean file is not copied.
+fn needs_lex_clean(text: &str) -> bool {
+    text.contains("/*") || text.contains("\\\n") || text.contains("\\\r")
+}
+
 fn floats(s: &str) -> Vec<f64> {
     s.split(',')
-        .filter_map(|t| t.trim().parse::<f64>().ok())
+        .filter_map(lnum)
         .collect()
 }
 
@@ -801,7 +860,7 @@ fn parse_ccs_set(timing_body: &str, group: &str) -> Vec<crate::ccs::CcsWaveform>
                 in_slew: first("index_1", &vbody).first().copied().unwrap_or(0.0),
                 out_cap: first("index_2", &vbody).first().copied().unwrap_or(0.0),
                 ref_time: simple_attr(&vbody, "reference_time")
-                    .and_then(|s| s.parse().ok())
+                    .and_then(|s| lnum(&s))
                     .unwrap_or(0.0),
                 time,
                 current,
@@ -833,7 +892,7 @@ fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
         _ => Dir::Other,
     };
     let capacitance = simple_attr(body, "capacitance")
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| lnum(&s))
         .unwrap_or(0.0);
     let cap_f = capacitance * cap_unit_f;
     // CCS receiver capacitance group (input pins): the Miller-aware two-segment load.
@@ -1168,7 +1227,7 @@ fn parse_cell(
     // INSTEAD — asap7 has 222 of them and no per-cell attribute — and reading only the scalar
     // reports those cells as leaking exactly nothing, which is not a number anyone would query.
     let leakage_w =
-        match simple_attr(body, "cell_leakage_power").and_then(|s| s.parse::<f64>().ok()) {
+        match simple_attr(body, "cell_leakage_power").and_then(|s| lnum(&s)) {
             Some(v) => v * units.leak_w,
             None => state_leakage(body) * units.leak_w,
         };
@@ -1180,7 +1239,7 @@ fn parse_cell(
     };
     let cell_footprint = simple_attr(body, "cell_footprint").filter(|f| !f.is_empty());
     let area = simple_attr(body, "area")
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| lnum(&s))
         .unwrap_or(0.0);
     Cell {
         name,
@@ -1271,6 +1330,16 @@ impl Lib {
 
     /// Like [`Lib::parse`] but honoring [`LibOpts`] (e.g. `skip_ccs` for NLDM-only).
     pub fn parse_opts(text: &str, opts: LibOpts) -> Result<Lib, LibError> {
+        let cleaned;
+        let text = if needs_lex_clean(text) {
+            let mut b = text.as_bytes().to_vec();
+            lex_clean(&mut b);
+            // only ASCII bytes were replaced, by ASCII, so the text is still UTF-8
+            cleaned = String::from_utf8(b).map_err(|e| LibError(e.to_string()))?;
+            cleaned.as_str()
+        } else {
+            text
+        };
         let units = Units::from_lib(text);
         let voltage = lib_voltage(text).unwrap_or(1.8);
         let thresholds = Thresholds::from_lib(text);
@@ -1303,6 +1372,10 @@ impl Lib {
     /// on-disk cross-process (`VYGES_LIB_CACHE`, #37/#38) → parse.
     pub fn load_opts(path: &str, opts: LibOpts) -> Result<Lib, LibError> {
         let text = std::fs::read_to_string(path).map_err(|e| LibError(format!("{path}: {e}")))?;
+        // Cleaned IN PLACE: a large CCS library is not copied a second time.
+        let mut b = text.into_bytes();
+        lex_clean(&mut b);
+        let text = String::from_utf8(b).map_err(|e| LibError(format!("{path}: {e}")))?;
         let key = lib_cache_key(&text, opts);
         // 1) in-process cache
         if let Some(hit) = lib_cache().lock().ok().and_then(|m| m.get(&key).cloned()) {
@@ -1549,12 +1622,12 @@ fn cap_load_unit(lib_body: &str) -> Option<f64> {
 
 /// nom_voltage, else an operating_conditions `voltage :`, else None.
 fn lib_voltage(text: &str) -> Option<f64> {
-    if let Some(v) = simple_attr(text, "nom_voltage").and_then(|s| s.parse().ok()) {
+    if let Some(v) = simple_attr(text, "nom_voltage").and_then(|s| lnum(&s)) {
         return Some(v);
     }
     let mut at = 0;
     while let Some((_, oc, after)) = next_block(text, at, "operating_conditions") {
-        if let Some(v) = simple_attr(&oc, "voltage").and_then(|s| s.parse().ok()) {
+        if let Some(v) = simple_attr(&oc, "voltage").and_then(|s| lnum(&s)) {
             return Some(v);
         }
         at = after;
@@ -1593,7 +1666,7 @@ fn internal_values(cell_body: &str) -> Vec<f64> {
             for tok in ip[open + 1..close].split(|c: char| {
                 !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E')
             }) {
-                if let Ok(v) = tok.trim().parse::<f64>() {
+                if let Some(v) = lnum(tok) {
                     out.push(v.abs());
                 }
             }
@@ -1630,7 +1703,7 @@ library (demo) {
     #[test]
     fn parses_power_units_leakage_caps_energy() {
         let lib = Lib::parse(LIB).unwrap();
-        assert!((lib.voltage - 1.8).abs() < 1e-9);
+        assert_eq!(lib.voltage, 1.8f32 as f64, "read as strtof");
         let inv = lib.cell("INV").unwrap();
         assert!((inv.leakage_w - 2.0e-9).abs() < 1e-18); // 2 nW
         assert!((inv.input_cap("A") - 0.004e-12).abs() < 1e-21); // 0.004 pF -> F
@@ -2099,7 +2172,7 @@ mod cell_structure_tests {
         let c = l.cell("scanff").unwrap();
         assert_eq!(c.clock_pin.as_deref(), Some("CK"));
         assert!(c.pins["CK"].clock);
-        assert_eq!(c.pins["CK"].capacitance, 0.002);
+        assert_eq!(c.pins["CK"].capacitance, 0.002f32 as f64);
         assert_eq!(c.pins["Q"].arcs.len(), 1, "the real Q, with its arc");
         assert!(c.is_seq);
     }
@@ -2123,12 +2196,12 @@ mod cell_structure_tests {
             assert_eq!(c.pins[&format!("D[{b}]")].direction, Dir::In);
             assert_eq!(c.pins[&format!("Q[{b}]")].direction, Dir::Out);
         }
-        assert_eq!(c.pins["D[1]"].capacitance, 0.003, "the bus's");
-        assert_eq!(c.pins["D[0]"].capacitance, 0.005, "the inner pin's own");
-        assert_eq!(c.pins["D[3]"].capacitance, 0.007, "a range names each bit");
-        assert_eq!(c.pins["D[2]"].capacitance, 0.007);
+        assert_eq!(c.pins["D[1]"].capacitance, 0.003f32 as f64, "the bus's");
+        assert_eq!(c.pins["D[0]"].capacitance, 0.005f32 as f64, "the inner pin's own");
+        assert_eq!(c.pins["D[3]"].capacitance, 0.007f32 as f64, "a range names each bit");
+        assert_eq!(c.pins["D[2]"].capacitance, 0.007f32 as f64);
         assert_eq!(c.pins["DM1"].direction, Dir::In);
-        assert_eq!(c.pins["DM0"].capacitance, 0.004);
+        assert_eq!(c.pins["DM0"].capacitance, 0.004f32 as f64);
         assert!(!c.pins.contains_key("D") && !c.pins.contains_key("DM"), "the group is not a pin");
     }
 
@@ -2149,5 +2222,48 @@ mod cell_structure_tests {
         let roles: Vec<(&str, &str)> = c.scan_pins.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         assert_eq!(roles, [("Q", "test_scan_out"), ("SE", "test_scan_enable"), ("SI", "test_scan_in")]);
         assert!(l.cell("sync3").unwrap().scan_pins.is_empty());
+    }
+}
+
+/// The lexer's rules, each the reference's (`LibertyLex.ll`).
+#[cfg(test)]
+mod lexer_tests {
+    use super::*;
+
+    const LIB: &str = "library (l) {\n  capacitive_load_unit (1, pf);\n\
+        /* cell (GHOST) { area : 9.0; pin (A) { direction : input; } } */\n\
+        cell (INV) {\n    area : 2.0; /* area : 7.0; */\n\
+        pin (A) { direction : input; capacitance : 0.1; }\n\
+        pin (Y) { direction : output; function : \"!A\";\n\
+          timing () { related_pin : \"A\";\n\
+            cell_rise (scalar) { index_1 (\"0.01, \\\n 0.02\"); values (\"0.1, \\\n 0.2\"); } } }\n  }\n}\n";
+
+    /// A comment is not text: a commented-out cell or attribute is not read.
+    #[test]
+    fn comments_are_not_read() {
+        let l = Lib::parse(LIB).unwrap();
+        assert!(l.cell("GHOST").is_none());
+        assert_eq!(l.cell("INV").unwrap().area, 2.0);
+    }
+
+    /// A backslash-newline inside a quoted string is a continuation.
+    #[test]
+    fn a_continued_string_is_one_string() {
+        let l = Lib::parse(LIB).unwrap();
+        let t = &l.cell("INV").unwrap().pins["Y"].arcs[0].cell_rise;
+        assert_eq!(t.index_1, [0.01f32 as f64, 0.02f32 as f64]);
+        assert_eq!(t.values[0], [0.1f32 as f64, 0.2f32 as f64]);
+    }
+
+    /// A number is `strtof`: one rounding, straight to f32.
+    #[test]
+    fn a_number_is_read_as_strtof() {
+        assert_eq!(lnum("0.1"), Some(0.1f32 as f64));
+        assert_ne!(lnum("0.1"), Some(0.1));
+        // a cleaned file keeps its layout byte for byte
+        let mut b = LIB.as_bytes().to_vec();
+        lex_clean(&mut b);
+        assert_eq!(b.len(), LIB.len());
+        assert_eq!(b.iter().filter(|&&c| c == b'\n').count() + 2, LIB.matches('\n').count());
     }
 }
