@@ -896,6 +896,13 @@ fn resolve_objs(tok: &str) -> Vec<String> {
                 // (`-hierarchical`, `-quiet`) none. ⛔ Skipping only the `-` words read a filter
                 // expression or an `-of_objects` query as object names.
                 let parts = expand_abbreviations(parts);
+                // Against a linked design, a query that selects by property or connectivity is
+                // evaluated there (one it cannot evaluate was refused by the command already).
+                if parts.iter().any(|p| p == "-filter" || p == "-of_objects") {
+                    if let Some(Ok(names)) = with_design(|d| crate::sdc_query::eval(&parts, d)) {
+                        return names;
+                    }
+                }
                 let keys = crate::sdc_flags::FLAGS.iter().find(|(n, _, _)| *n == parts[0]).map_or(&[][..], |(_, k, _)| *k);
                 let mut names = Vec::new();
                 let mut k = 1;
@@ -1105,7 +1112,11 @@ fn unevaluated_query(toks: &[String]) -> Option<String> {
         let parts = expand_abbreviations(tokenize(inner.trim()));
         let Some(cmd) = parts.first() else { continue };
         if cmd.starts_with("get_") && parts.iter().any(|p| NEEDS_DESIGN.contains(&p.as_str())) {
-            return Some(format!("[{}]", inner.trim()));
+            match with_design(|d| crate::sdc_query::eval(&parts, d)) {
+                Some(Ok(_)) => continue,
+                Some(Err(why)) => return Some(format!("[{}] ({why})", inner.trim())),
+                None => return Some(format!("[{}]", inner.trim())),
+            }
         }
         if let Some(q) = unevaluated_query(&parts[1..]) {
             return Some(q);
@@ -2087,6 +2098,56 @@ impl Sdc {
         let text = std::fs::read_to_string(path).map_err(|e| SdcError(format!("{path}: {e}")))?;
         Sdc::parse(&text)
     }
+
+    /// [`Sdc::parse`] against a linked design, as the reference reads constraints after linking:
+    /// object queries (`-filter`, `-of_objects`) are evaluated on `design`, by the reference's
+    /// rules, instead of refusing their commands. What the design view cannot
+    /// answer still refuses, in [`Sdc::unevaluated_queries`].
+    pub fn parse_with(text: &str, design: &SdcDesign) -> Result<Sdc, SdcError> {
+        let _scope = DesignScope::enter(design);
+        Sdc::parse(text)
+    }
+
+    /// [`Sdc::load`] against a linked design — see [`Sdc::parse_with`].
+    pub fn load_with(path: &str, design: &SdcDesign) -> Result<Sdc, SdcError> {
+        let text = std::fs::read_to_string(path).map_err(|e| SdcError(format!("{path}: {e}")))?;
+        Sdc::parse_with(&text, design)
+    }
+}
+
+pub use crate::sdc_query::SdcDesign;
+
+// The design a `parse_with` reads against, for the queries resolved deep in the command parsers.
+// Set only for the length of that call (the guard clears it, on unwind too), on this thread.
+thread_local! {
+    static DESIGN: std::cell::Cell<*const SdcDesign> = const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+struct DesignScope(*const SdcDesign);
+
+impl DesignScope {
+    fn enter(d: &SdcDesign) -> DesignScope {
+        DesignScope(DESIGN.with(|c| c.replace(d as *const SdcDesign)))
+    }
+}
+
+impl Drop for DesignScope {
+    fn drop(&mut self) {
+        DESIGN.with(|c| c.set(self.0));
+    }
+}
+
+/// The query evaluated on the design in scope: `None` without one.
+fn with_design<T>(f: impl FnOnce(&SdcDesign) -> T) -> Option<T> {
+    let p = DESIGN.with(|c| c.get());
+    // SAFETY: `p` is set only by `DesignScope::enter` from a reference that outlives the scope,
+    // and cleared when the scope ends; it is read on the same thread inside that scope.
+    (!p.is_null()).then(|| f(unsafe { &*p }))
+}
+
+/// A bracketed query's words, abbreviations expanded.
+pub(crate) fn query_words(inner: &str) -> Vec<String> {
+    expand_abbreviations(tokenize(inner.trim()))
 }
 
 /// Extract `-from`/`-to` object names (first object of each), `*` if absent.

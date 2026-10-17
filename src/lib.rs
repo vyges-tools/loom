@@ -43,6 +43,7 @@ pub mod yosys_json;
 /// The netlist front end LVS compares against an extracted layout.
 pub mod spice;
 pub mod sdc;
+mod sdc_query;
 pub mod threads;
 mod sdc_flags;
 pub mod spef;
