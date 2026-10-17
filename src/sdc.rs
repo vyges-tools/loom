@@ -256,6 +256,18 @@ pub struct EnvCmd {
     pub objects: Vec<String>,
 }
 
+/// One `set_clock_uncertainty`: a value for `-setup`, `-hold` or both, on clocks or pins (objects)
+/// or between two clocks (`-from` / `-to`, and their `-rise_` / `-fall_` forms).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ClockUncertainty {
+    pub value: f64,
+    pub setup: bool,
+    pub hold: bool,
+    pub objects: Vec<String>,
+    pub from: Vec<String>,
+    pub to: Vec<String>,
+}
+
 /// One `set_driving_cell`: `-lib_cell`, `-library`, `-pin`, `-from_pin`, the input transitions
 /// (`-input_transition_rise/-fall`, in the SDC's user unit; 0 when absent), any other flag, and
 /// the ports.
@@ -384,8 +396,16 @@ pub struct Sdc {
     /// Every `set_load` and `set_input_transition`, per command, for a consumer that models
     /// them per object ([`Sdc::load`] / [`Sdc::input_transition`] keep one design-wide value).
     pub env: Vec<EnvCmd>,
+    /// The design-wide derates: from `set_timing_derate` commands that name no objects and no
+    /// delay or path type — the only ones a single value can stand for. See [`Sdc::derates`].
     pub late_derate: Option<f64>,
     pub early_derate: Option<f64>,
+    /// Every `set_timing_derate`, per command: its value (the positional — `-early` / `-late` are
+    /// FLAGS, not valued), its flags (`-early`, `-late`, `-cell_delay`, `-net_delay`, `-data`, …)
+    /// and its objects.
+    pub derates: Vec<EnvCmd>,
+    /// Every `set_clock_uncertainty`, per command — see [`ClockUncertainty`].
+    pub uncertainties: Vec<ClockUncertainty>,
     pub exceptions: Vec<Exception>,
     /// Per entry of [`Sdc::exceptions`], index for index: the objects its `-from` side and its
     /// `-to` side named, accessor kept (`-rise_from` / `-fall_from` on the from side, likewise to).
@@ -435,6 +455,7 @@ const TIMING_AFFECTING: &[&str] = &[
     "set_data_check",        // a non-clock setup/hold relationship
     "set_min_pulse_width",
     "group_path",            // path grouping changes what is reported as critical
+    "set_timing_derate",     // recorded here only when SCOPED (objects, a delay or path type)
     // ── Tcl control structure: what it would have done is unknown without running it ────
     "if",
     "foreach",
@@ -1713,23 +1734,41 @@ impl Sdc {
                     }
                 }
                 "set_clock_uncertainty" => {
-                    let val: f64 = toks
-                        .iter()
-                        .skip(1)
-                        .find(|t| {
-                            !t.starts_with('-') && !t.starts_with('[') && t.parse::<f64>().is_ok()
-                        })
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0.0);
-                    let v = val;
-                    let setup = has_flag(&toks, "-setup");
-                    let hold = has_flag(&toks, "-hold");
-                    if setup || !hold {
-                        sdc.setup_uncertainty = sdc.setup_uncertainty.max(v);
+                    // ⛔ PER TARGET, LAST WRITE WINS — the reference keeps one value per clock or
+                    // pin (and per clock pair for `-from`/`-to`). Folded to one maximum over every
+                    // command, a later, smaller uncertainty never took effect and one clock's set
+                    // every clock's. The design-wide scalar is the largest clock's FINAL value;
+                    // inter-clock values stay in `uncertainties`.
+                    let valued = ["-from", "-to", "-rise_from", "-fall_from", "-rise_to", "-fall_to"];
+                    let (with, flags, pos) = split_args(&toks, &valued);
+                    let side = |names: &[&str]| -> Vec<String> {
+                        with.iter().filter(|(k, _)| names.contains(k)).flat_map(|(_, v)| resolve_objs(v)).collect()
+                    };
+                    let has = |f: &str| flags.iter().any(|x| x == f);
+                    let (setup, hold) = (has("-setup") || !has("-hold"), has("-hold") || !has("-setup"));
+                    let (Some(value), objects) = (pos.first().and_then(|v| v.parse::<f64>().ok()), pos.iter().skip(1).flat_map(|o| resolve_objs(o)).collect::<Vec<_>>()) else {
+                        sdc.rejected.push("set_clock_uncertainty without a value".into());
+                        continue;
+                    };
+                    let u = ClockUncertainty { value, setup, hold, objects, from: side(&["-from", "-rise_from", "-fall_from"]), to: side(&["-to", "-rise_to", "-fall_to"]) };
+                    if u.objects.is_empty() && u.from.is_empty() && u.to.is_empty() {
+                        sdc.rejected.push("set_clock_uncertainty without objects (the reference requires them)".into());
+                        continue;
                     }
-                    if hold || !setup {
-                        sdc.hold_uncertainty = sdc.hold_uncertainty.max(v);
-                    }
+                    sdc.uncertainties.push(u);
+                    let fold = |hold_side: bool| -> f64 {
+                        let mut last: std::collections::BTreeMap<&str, f64> = Default::default();
+                        for u in &sdc.uncertainties {
+                            if u.from.is_empty() && u.to.is_empty() && (if hold_side { u.hold } else { u.setup }) {
+                                for o in &u.objects {
+                                    last.insert(o.as_str(), u.value);
+                                }
+                            }
+                        }
+                        last.values().fold(0.0f64, |a, b| a.max(*b))
+                    };
+                    sdc.setup_uncertainty = fold(false);
+                    sdc.hold_uncertainty = fold(true);
                 }
                 "set_clock_latency" => {
                     sdc.clock_latencies.extend(env_cmd(&toks));
@@ -1744,9 +1783,14 @@ impl Sdc {
                     }
                 }
                 "set_input_transition" => {
-                    sdc.env.extend(env_cmd(&toks));
-                    if let Some(v) = toks.get(1).and_then(|t| t.parse::<f64>().ok()) {
-                        sdc.input_transition = Some(v);
+                    // the value is the positional wherever it is written (`-max 0.2 …` too); the
+                    // design-wide scalar is not set by a `-min`-only command
+                    if let Some(e) = env_cmd(&toks) {
+                        let min_only = e.flags.iter().any(|f| f == "-min") && !e.flags.iter().any(|f| f == "-max");
+                        if !min_only {
+                            sdc.input_transition = Some(e.value);
+                        }
+                        sdc.env.push(e);
                     }
                 }
                 "set_max_fanout" => {
@@ -1798,25 +1842,46 @@ impl Sdc {
                     sdc.ignored.push("set_driving_cell".to_string());
                 }
                 "set_load" => {
-                    sdc.env.extend(env_cmd(&toks));
-                    let v = toks.iter().skip(1).find_map(|t| {
-                        if t.starts_with('-') {
-                            None
-                        } else {
-                            t.parse::<f64>().ok()
+                    // ⛔ The design-wide load is a PORT pin load: not a net's load, not a `-min`-only
+                    // value, not a `-wire_load`. Taken from the last `set_load` of any kind, a net
+                    // load late in the file became every output's load.
+                    if let Some(e) = env_cmd(&toks) {
+                        let has = |f: &str| e.flags.iter().any(|x| x == f);
+                        let port_pin_load = e.accessor != "get_nets"
+                            && !(has("-min") && !has("-max"))
+                            && !(has("-wire_load") && !has("-pin_load"));
+                        if port_pin_load {
+                            sdc.load = Some(e.value);
                         }
-                    });
-                    if let Some(v) = v {
-                        sdc.load = Some(v);
+                        sdc.env.push(e);
                     }
                 }
                 "set_timing_derate" => {
-                    if let Some(v) = flag_val(&toks, "-late").and_then(|v| v.parse().ok()) {
-                        sdc.late_derate = Some(v);
+                    // ⛔ `-early` / `-late` are FLAGS; the value is the positional. Read as valued,
+                    // `set_timing_derate -late 1.05` was fine by luck and `-early -cell_delay 0.95`
+                    // set nothing, while an object-scoped `-late 1.1 [get_cells u1]` became the
+                    // design's late derate.
+                    let (_, flags, pos) = split_args(&toks, &[]);
+                    let has = |f: &str| flags.iter().any(|x| x == f);
+                    let Some(value) = pos.first().and_then(|v| v.parse::<f64>().ok()) else {
+                        sdc.rejected.push("set_timing_derate without a value".into());
+                        continue;
+                    };
+                    let objects: Vec<String> = pos.iter().skip(1).flat_map(|o| resolve_objs(o)).collect();
+                    let scoped = !objects.is_empty()
+                        || ["-cell_delay", "-net_delay", "-cell_check", "-data", "-clock", "-rise", "-fall"].iter().any(|f| has(f));
+                    if scoped {
+                        sdc.ignored.push("set_timing_derate".into());
+                    } else {
+                        let (early, late) = (has("-early") || !has("-late"), has("-late") || !has("-early"));
+                        if late {
+                            sdc.late_derate = Some(value);
+                        }
+                        if early {
+                            sdc.early_derate = Some(value);
+                        }
                     }
-                    if let Some(v) = flag_val(&toks, "-early").and_then(|v| v.parse().ok()) {
-                        sdc.early_derate = Some(v);
-                    }
+                    sdc.derates.push(EnvCmd { cmd: toks[0].clone(), value, flags, clock: None, accessor: String::new(), accessor_flags: Vec::new(), objects });
                 }
                 "set_clock_groups" | "set_clock_group" => {
                     // -asynchronous / -exclusive: clocks in different -group blocks are
@@ -2515,5 +2580,51 @@ mod io_delay_object_tests {
         let d: Vec<(f64, bool, Vec<String>)> = s.input_delays.iter().map(|d| (d.value, d.default, d.ports.clone())).collect();
         assert_eq!(d, [(2.0, false, vec![]), (3.0, false, vec!["*_in".to_string()]), (4.0, true, vec![])]);
         assert!(object_matches("*_in", "a_in") && !object_matches("*_in", "a_out") && object_matches("a", "a"));
+    }
+}
+
+/// Uncertainty, derates, transitions and loads per command — the values are the reference's, on
+/// the same commands.
+#[cfg(test)]
+mod per_command_tests {
+    use super::*;
+
+    #[test]
+    fn uncertainty_is_per_clock_and_last_write_wins() {
+        let s = Sdc::parse(
+            "create_clock -name c1 -period 10 [get_ports clk1]\ncreate_clock -name c2 -period 5 [get_ports clk2]\n\
+             set_clock_uncertainty 0.5 [get_clocks c1]\nset_clock_uncertainty 0.2 [get_clocks c1]\n\
+             set_clock_uncertainty -setup 0.3 [get_clocks c2]\n\
+             set_clock_uncertainty -from [get_clocks c1] -to [get_clocks c2] -hold 0.9\n\
+             set_clock_uncertainty 0.7\n",
+        )
+        .unwrap();
+        // reference: c1 0.2 (the later write), c2 setup 0.3, c1->c2 hold 0.9 between clocks
+        assert_eq!((s.setup_uncertainty, s.hold_uncertainty), (0.3, 0.2), "not the maximum over commands");
+        let inter = s.uncertainties.iter().find(|u| !u.from.is_empty()).unwrap();
+        assert_eq!((inter.value, inter.hold, inter.setup, inter.to.clone()), (0.9, true, false, vec!["c2".to_string()]));
+        assert_eq!(s.rejected.len(), 1, "no objects is an error");
+    }
+
+    #[test]
+    fn derate_flags_take_no_value_and_scoped_derates_are_not_global() {
+        let s = Sdc::parse(
+            "set_timing_derate 1.05 -late\nset_timing_derate -early -cell_delay 0.95\n\
+             set_timing_derate -late 1.1 [get_cells u1]\nset_timing_derate -early -net_delay 0.9\n",
+        )
+        .unwrap();
+        assert_eq!((s.late_derate, s.early_derate), (Some(1.05), None));
+        let v: Vec<f64> = s.derates.iter().map(|d| d.value).collect();
+        assert_eq!(v, [1.05, 0.95, 1.1, 0.9]);
+        assert_eq!(s.derates[2].objects, ["u1"]);
+        assert!(s.ignored_affecting_timing().contains(&"set_timing_derate"));
+    }
+
+    #[test]
+    fn a_transition_or_load_value_is_the_positional_and_a_net_load_is_not_the_port_load() {
+        let s = Sdc::parse("set_input_transition -max 0.2 [all_inputs]\nset_input_transition -min 0.05 [all_inputs]\nset_load 3 [get_ports out]\nset_load 9 [get_nets n1]\nset_load -min 1 [get_ports out]\n").unwrap();
+        assert_eq!(s.input_transition, Some(0.2));
+        assert_eq!(s.load, Some(3.0));
+        assert_eq!(s.env.len(), 5);
     }
 }
