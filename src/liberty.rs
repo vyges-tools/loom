@@ -818,12 +818,8 @@ fn next_paren_after(s: &str, kw: &str) -> Option<String> {
     }
 }
 
-fn parse_arc(timing_body: &str, own: &str, skip_ccs: bool) -> Arc {
-    let tbl = |name: &str| {
-        next_block(timing_body, 0, name)
-            .map(|(_, body, _)| parse_table(&body))
-            .unwrap_or_default()
-    };
+fn parse_arc(timing_body: &str, own: &str, spans: &[GroupSpan], skip_ccs: bool) -> Arc {
+    let tbl = |name: &str| span_table(timing_body, spans, name);
     // `rising_edge` / `falling_edge` name the launching clock edge. Anything else is a
     // combinational arc; the checks (setup_*/hold_*/recovery_*/removal_*) never reach
     // here — the caller routes them into the constraint vectors before this point.
@@ -841,7 +837,7 @@ fn parse_arc(timing_body: &str, own: &str, skip_ccs: bool) -> Arc {
         rise_transition: tbl("rise_transition"),
         fall_transition: tbl("fall_transition"),
         // CCS output_current waveforms — skipped (empty) for NLDM-only parses.
-        ccs_declared: declares_ccs(timing_body),
+        ccs_declared: spans.iter().any(|g| g.kw == "output_current_rise" || g.kw == "output_current_fall"),
         ccs: if skip_ccs {
             crate::ccs::CcsArc::default()
         } else {
@@ -858,18 +854,6 @@ fn parse_ccs(timing_body: &str) -> crate::ccs::CcsArc {
         rise: parse_ccs_set(timing_body, "output_current_rise"),
         fall: parse_ccs_set(timing_body, "output_current_fall"),
     }
-}
-
-/// Did this timing group DECLARE a CCS current table, whatever we managed to read from it?
-///
-/// The distinction the counter below needs: a library with no CCS at all is an ordinary NLDM
-/// library and the engine is right to use NLDM. A library that carries `output_current_rise` and
-/// yields no usable waveform is a different situation entirely — we are falling back to NLDM on
-/// a library characterised for something better, and the run reports a number without saying so.
-/// One is a fact about the library; the other is a fact about this reader.
-fn declares_ccs(timing_body: &str) -> bool {
-    next_block(timing_body, 0, "output_current_rise").is_some()
-        || next_block(timing_body, 0, "output_current_fall").is_some()
 }
 
 /// Collect every `vector (...) { ... }` under an output_current group.
@@ -904,20 +888,15 @@ fn parse_ccs_set(timing_body: &str, group: &str) -> Vec<crate::ccs::CcsWaveform>
 }
 
 /// Parse a setup/hold constraint group's rise/fall tables.
-fn parse_constraint(timing_body: &str) -> Constraint {
-    let tbl = |name: &str| {
-        next_block(timing_body, 0, name)
-            .map(|(_, b, _)| parse_table(&b))
-            .unwrap_or_default()
-    };
+fn parse_constraint(timing_body: &str, spans: &[GroupSpan]) -> Constraint {
     Constraint {
-        rise: tbl("rise_constraint"),
-        fall: tbl("fall_constraint"),
+        rise: span_table(timing_body, spans, "rise_constraint"),
+        fall: span_table(timing_body, spans, "fall_constraint"),
     }
 }
 
 fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
-    let own = own_attrs(body);
+    let (own, pin_groups) = level(body);
     let direction = match simple_attr(&own, "direction").as_deref() {
         Some("input") => Dir::In,
         Some("output") => Dir::Out,
@@ -933,12 +912,10 @@ fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
     let recv = if skip_ccs {
         None
     } else {
-        next_block(body, 0, "receiver_capacitance").map(|(_, rbody, _)| {
-            let tbl = |name: &str| {
-                next_block(&rbody, 0, name)
-                    .map(|(_, b, _)| parse_table(&b))
-                    .unwrap_or_default()
-            };
+        pin_groups.iter().find(|g| g.kw == "receiver_capacitance").map(|g| {
+            let rbody = &body[g.body.clone()];
+            let (_, rspans) = level(rbody);
+            let tbl = |name: &str| span_table(rbody, &rspans, name);
             RecvCap {
                 c1_rise: tbl("receiver_capacitance1_rise"),
                 c2_rise: tbl("receiver_capacitance2_rise"),
@@ -956,17 +933,17 @@ fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
     let mut hold: Vec<Constraint> = Vec::new();
     let mut recovery: Vec<Constraint> = Vec::new();
     let mut removal: Vec<Constraint> = Vec::new();
-    let mut at = 0;
-    while let Some((_, tbody, after)) = next_block(body, at, "timing") {
-        let town = own_attrs(&tbody);
+    for g in pin_groups.iter().filter(|g| g.kw == "timing") {
+        let tbody = &body[g.body.clone()];
+        let (town, tspans) = level(tbody);
         match simple_attr(&town, "timing_type").as_deref() {
-            Some(tt) if tt.starts_with("setup") => setup.push(parse_constraint(&tbody)),
-            Some(tt) if tt.starts_with("hold") => hold.push(parse_constraint(&tbody)),
+            Some(tt) if tt.starts_with("setup") => setup.push(parse_constraint(tbody, &tspans)),
+            Some(tt) if tt.starts_with("hold") => hold.push(parse_constraint(tbody, &tspans)),
             // recovery/removal are CHECKS on the async set/reset pin, with their own
             // tables — kept, and applied by the timer as the async counterparts of
             // setup/hold. They are not max-delay data arcs.
-            Some(tt) if tt.starts_with("recovery") => recovery.push(parse_constraint(&tbody)),
-            Some(tt) if tt.starts_with("removal") => removal.push(parse_constraint(&tbody)),
+            Some(tt) if tt.starts_with("recovery") => recovery.push(parse_constraint(tbody, &tspans)),
+            Some(tt) if tt.starts_with("removal") => removal.push(parse_constraint(tbody, &tspans)),
             // clear/preset are async *effect* arcs (dfrtp RESET_B->Q), not launch paths —
             // propagating data through them would invent a path that cannot exist.
             // min_pulse_width is a check we do not implement yet.
@@ -974,9 +951,8 @@ fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
                 if tt.starts_with("clear")
                     || tt.starts_with("preset")
                     || tt.contains("pulse_width") => {}
-            _ => arcs.push(parse_arc(&tbody, &town, skip_ccs)), // delay arc (incl. rising_edge CK->Q)
+            _ => arcs.push(parse_arc(tbody, &town, &tspans, skip_ccs)), // delay arc (incl. rising_edge CK->Q)
         }
-        at = after;
     }
     Pin {
         name,
@@ -999,11 +975,29 @@ fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
 /// 🔑 **Depth matters, and the substring scan ([`next_block`]) cannot see it.** A cell's `pin`,
 /// `ff` and `statetable` belong to it only at its own level: the same words inside a `test_cell`
 /// describe the scan-mode view of the cell, and inside a `bus` they name bits of that bus.
-fn top_groups(body: &str) -> Vec<(String, String, String)> {
+fn top_groups(body: &str) -> Vec<(String, String, &str)> {
     top_group_spans(body)
         .into_iter()
-        .map(|g| (g.kw, g.args, body[g.body.clone()].to_string()))
+        .map(|g| (g.kw, g.args, &body[g.body]))
         .collect()
+}
+
+/// ONE pass over `body` at depth 0: the attributes stated at this level, and its groups.
+fn level(body: &str) -> (String, Vec<GroupSpan>) {
+    let spans = top_group_spans(body);
+    let mut own = String::with_capacity(256);
+    let mut at = 0;
+    for g in &spans {
+        own.push_str(&body[at..g.whole.start]);
+        at = g.whole.end;
+    }
+    own.push_str(&body[at..]);
+    (own, spans)
+}
+
+/// The first group named `kw` among `spans` of `body`, as a parsed table.
+fn span_table(body: &str, spans: &[GroupSpan], kw: &str) -> Table {
+    spans.iter().find(|g| g.kw == kw).map(|g| parse_table(&body[g.body.clone()])).unwrap_or_default()
 }
 
 struct GroupSpan {
@@ -1068,14 +1062,7 @@ fn without_groups(body: &str, kw: &str) -> String {
 
 /// `body` with EVERY depth-0 group removed: the attributes stated at this level and no deeper.
 fn own_attrs(body: &str) -> String {
-    let mut out = String::with_capacity(body.len());
-    let mut at = 0;
-    for g in top_group_spans(body) {
-        out.push_str(&body[at..g.whole.start]);
-        at = g.whole.end;
-    }
-    out.push_str(&body[at..]);
-    out
+    level(body).0
 }
 
 /// Liberty `type (name) { bit_from ; bit_to ; }` groups, anywhere in the file: name -> (from, to).
@@ -1167,7 +1154,8 @@ fn parse_cell(
 ) -> Cell {
     let mut pins = BTreeMap::new();
     let mut scan_pins = BTreeMap::new();
-    let groups = top_groups(body);
+    let (own, spans) = level(body);
+    let groups: Vec<(String, String, &str)> = spans.into_iter().map(|g| (g.kw, g.args, &body[g.body])).collect();
     // Pins at the CELL's level only, plus the bits of its buses and the members of its bundles.
     //
     // ⛔ A `test_cell` group repeats the cell's pins in scan mode — without `clock : true` and
@@ -1204,10 +1192,10 @@ fn parse_cell(
                     if ikw != "pin" {
                         continue;
                     }
-                    let ip = parse_pin(iargs.clone(), &ibody, units.cap_f, skip_ccs);
+                    let ip = parse_pin(iargs.clone(), ibody, units.cap_f, skip_ccs);
                     for bit in named_bits(&iargs, args, &members) {
                         let base = pins.get(&bit).cloned().unwrap_or_else(|| merged_pin(&bit, &own, None));
-                        pins.insert(bit.clone(), merged_pin(&bit, &base, Some((&ip, &ibody))));
+                        pins.insert(bit.clone(), merged_pin(&bit, &base, Some((&ip, ibody))));
                     }
                 }
             }
@@ -1217,7 +1205,7 @@ fn parse_cell(
                     if ikw != "pin" {
                         continue;
                     }
-                    let Some(role) = simple_attr(&own_attrs(&ibody), "signal_type").filter(|r| SCAN_SIGNAL_TYPES.contains(&r.as_str())) else {
+                    let Some(role) = simple_attr(&own_attrs(ibody), "signal_type").filter(|r| SCAN_SIGNAL_TYPES.contains(&r.as_str())) else {
                         continue;
                     };
                     for pname in iargs.split(',').map(|n| n.trim().trim_matches('"')).filter(|n| !n.is_empty()) {
@@ -1231,12 +1219,11 @@ fn parse_cell(
     let ff = groups
         .iter()
         .find(|(k, _, _)| k == "ff" || k == "latch")
-        .map(|(_, a, b)| (a.clone(), b.clone(), 0usize));
+        .map(|(_, a, b)| (a.clone(), b.to_string(), 0usize));
     let clock_pin = pins.iter().find(|(_, p)| p.clock).map(|(n, _)| n.clone());
     // SEQUENTIAL: an `ff`/`latch` group (or a bank of them), a `statetable` — synchronizer cells
     // model their state that way and have no `ff` at all — or a clock pin on a cell that is not a
     // clock gate. ⛔ Read at the cell's own level: a `test_cell`'s `ff` describes scan mode.
-    let own = own_attrs(body);
     let clock_gating = simple_attr(&own, "clock_gating_integrated_cell").filter(|v| !v.is_empty());
     let is_seq = groups
         .iter()
