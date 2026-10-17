@@ -101,7 +101,9 @@ pub struct Lef {
 /// `SPACINGTABLE ... WIDTH 3 0.28` arrives here as one `SPACINGTABLE` statement and matches
 /// nothing, where a line-based reader would have seen a bare `WIDTH 3 0.28` row.
 fn apply_layer_stmt(stmt: &[String], l: &mut Layer) {
-    let t: Vec<&str> = stmt.iter().map(String::as_str).collect();
+    // keywords match without case, as the reference's lexer matches them; a number is unchanged
+    let up: Vec<String> = stmt.iter().map(|x| x.to_ascii_uppercase()).collect();
+    let t: Vec<&str> = up.iter().map(String::as_str).collect();
     let num = |s: &str| s.parse::<f64>().ok();
     match t.as_slice() {
         ["WIDTH", w] => {
@@ -212,6 +214,7 @@ impl Lef {
         // geometry and only needs shielding.
         let mut cur_via: Option<(String, Vec<String>, bool)> = None;
         let mut in_propdefs = false;
+        let mut shield: Option<String> = None;
         // A LEF statement is `;`-terminated and may span lines; these carry the partial one.
         let mut stmt: Vec<String> = Vec::new();
         let mut in_quote = false;
@@ -222,7 +225,43 @@ impl Lef {
                 Some(i) => &raw[..i],
                 None => raw,
             };
-            let toks: Vec<&str> = line.split_whitespace().collect();
+            // ⛔ KEYWORDS WITHOUT CASE, as the reference reads them: IHP writes `Via`, and a cell
+            // LEF in lower case (`macro` / `size` / `pin`) is legal. Matched as written, IHP's tech
+            // LEF gave none of its 300 vias. Only keywords are folded — a name keeps its case.
+            let words: Vec<String> = line
+                .split_whitespace()
+                .enumerate()
+                .map(|(k, w)| {
+                    let u = w.to_ascii_uppercase();
+                    if k == 0 || matches!(u.as_str(), "BY" | "UNITS" | "PROPERTYDEFINITIONS" | "LIBRARY") {
+                        u
+                    } else {
+                        w.to_string()
+                    }
+                })
+                .collect();
+            let toks: Vec<&str> = words.iter().map(String::as_str).collect();
+
+            // ---- shielded blocks: NONDEFAULTRULE and SITE, to their `END <name>` ----
+            // A NONDEFAULTRULE carries its own `LAYER met1 … END met1`; read as a tech layer, it
+            // REPLACED met1 with the rule's width, losing the layer's resistance and thickness.
+            if let Some(n) = &shield {
+                if let ["END", e, ..] = toks.as_slice() {
+                    if e == n {
+                        shield = None;
+                    }
+                }
+                continue;
+            }
+            // a block HEADER ends no statement: `NONDEFAULTRULE ndr1` alone on its line — not the
+            // `NONDEFAULTRULE ndrsp STRING ;` a PROPERTYDEFINITIONS block declares
+            let header = !line.trim_end().ends_with(';');
+            if header && cur_macro.is_none() && cur.is_none() && cur_via.is_none() && !in_propdefs && !in_units {
+                if let ["NONDEFAULTRULE" | "SITE", name, ..] = toks.as_slice() {
+                    shield = Some(name.to_string());
+                    continue;
+                }
+            }
 
             // ---- via mode: record the layers a VIA joins, shield tech parsing ----
             if let Some((name, ls, record)) = cur_via.as_mut() {
@@ -259,11 +298,14 @@ impl Lef {
                     in_units = true;
                     continue;
                 }
-                ["VIA", name, ..] => {
+                // ⛔ A TOP-LEVEL via definition only. Inside a MACRO, `VIA 0.3 0.3 M1M2_PR ;` is a
+                // port's or an obstruction's via; read as a definition it opened via mode, which
+                // never closed, and every macro after it was lost.
+                ["VIA", name, ..] if cur_macro.is_none() => {
                     cur_via = Some((name.to_string(), Vec::new(), true));
                     continue;
                 }
-                ["VIARULE", name, ..] => {
+                ["VIARULE", name, ..] if cur_macro.is_none() => {
                     cur_via = Some((name.to_string(), Vec::new(), false));
                     continue;
                 }
@@ -646,5 +688,47 @@ END DFF_X1
         assert_eq!(lef.pin_dir("INV_X1", "Y"), PinDir::Output);
         assert_eq!(lef.pin_dir("DFF_X1", "Q"), PinDir::Output);
         assert_eq!(lef.pin_dir("INV_X1", "ZZ"), PinDir::Unknown);
+    }
+}
+
+/// Blocks and keywords as the reference's LEF reader takes them.
+#[cfg(test)]
+mod reference_rule_tests {
+    use super::*;
+
+    const TECH: &str = "VERSION 5.8 ;\nUNITS\n  DATABASE MICRONS 1000 ;\nEND UNITS\n\
+        LAYER met1\n  TYPE ROUTING ;\n  WIDTH 0.14 ;\n  RESISTANCE RPERSQ 0.125 ;\nEND met1\n\
+        LAYER via1\n  TYPE CUT ;\nEND via1\n\
+        LAYER met2\n  TYPE ROUTING ;\n  WIDTH 0.14 ;\nEND met2\n\
+        VIA M1M2_PR DEFAULT\n  LAYER met1 ;\n  RECT -0.1 -0.1 0.1 0.1 ;\n  LAYER via1 ;\n  RECT -0.05 -0.05 0.05 0.05 ;\n  LAYER met2 ;\n  RECT -0.1 -0.1 0.1 0.1 ;\nEND M1M2_PR\n";
+
+    /// A VIA inside a MACRO is geometry, not a definition: the macros after it are kept.
+    #[test]
+    fn a_via_inside_a_macro_does_not_swallow_the_file() {
+        let cells = "MACRO A\n  SIZE 1 BY 2 ;\n  PIN Y\n    DIRECTION OUTPUT ;\n    PORT\n      VIA 0.3 0.3 M1M2_PR ;\n    END\n  END Y\nEND A\n\
+                     MACRO B\n  SIZE 3 BY 2 ;\nEND B\n";
+        let l = Lef::parse(&format!("{TECH}{cells}")).unwrap();
+        assert!(l.macros.contains_key("A") && l.macros.contains_key("B"));
+        assert_eq!(l.macros["B"].size_um, (3.0, 2.0));
+    }
+
+    /// Keywords without case (IHP writes `Via`); a name keeps its case.
+    #[test]
+    fn keywords_match_without_case() {
+        let mixed = TECH.replace("VIA M1M2_PR DEFAULT", "Via M1M2_PR DEFAULT").replace("  TYPE ROUTING ;\n  WIDTH 0.14 ;\n  RESISTANCE", "  type routing ;\n  width 0.14 ;\n  resistance");
+        let l = Lef::parse(&format!("{mixed}macro Lower\n  size 2 by 4 ;\n  pin A\n    direction input ;\n  end A\nend Lower\n")).unwrap();
+        assert!(l.vias.contains_key("M1M2_PR"));
+        assert_eq!(l.widths.get("met1"), Some(&0.14));
+        assert_eq!(l.macros["Lower"].size_um, (2.0, 4.0));
+        assert!(l.macros["Lower"].pins.contains_key("A"));
+    }
+
+    /// A NONDEFAULTRULE's LAYER is the rule's, not the tech layer.
+    #[test]
+    fn a_nondefault_rule_does_not_replace_the_layer() {
+        let ndr = "NONDEFAULTRULE wide\n  LAYER met1\n    WIDTH 0.28 ;\n  END met1\nEND wide\n";
+        let l = Lef::parse(&format!("{TECH}{ndr}")).unwrap();
+        assert_eq!(l.widths.get("met1"), Some(&0.14));
+        assert!(l.routing_order.contains(&"met1".to_string()));
     }
 }
