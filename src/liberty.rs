@@ -67,7 +67,11 @@ impl OutEdges {
 
 #[derive(Debug, Clone)]
 pub struct Arc {
+    /// The ONE pin this arc is timed from. A timing group's `related_pin` may name several pins
+    /// and buses; the reader makes one arc per bit, as the reference does (see `expand_arcs`).
     pub related_pin: String,
+    /// `related_bus_pins` as read, until `expand_arcs` turns it into arcs (then empty).
+    pub(crate) related_bus_pins: String,
     pub sense: String,
     /// The output edges this arc drives — see [`OutEdges`].
     pub out_edges: OutEdges,
@@ -925,6 +929,7 @@ fn parse_arc(timing_body: &str, own: &str, spans: &[GroupSpan], ctx: &Ctx) -> Ar
     };
     Arc {
         related_pin: simple_attr(own, "related_pin").unwrap_or_default(),
+        related_bus_pins: simple_attr(own, "related_bus_pins").unwrap_or_default(),
         sense: simple_attr(own, "timing_sense").unwrap_or_else(|| "non_unate".into()),
         out_edges,
         clk_edge,
@@ -1378,6 +1383,62 @@ fn pin_caps(own: &str, dir: Dir, default_cap: [f64; 3]) -> PinCaps {
     }
 }
 
+/// One arc per (from bit, to bit), as the reference's reader builds them
+/// (`LibertyReader::makeTimingArcs`): `related_pin` and `related_bus_pins` are lists of names,
+/// split on spaces and tabs, each name a pin, a bus or a bus range. Per timing group and to-pin,
+/// the `related_pin` names in order, then the `related_bus_pins` names; per name its bits:
+///   * to a plain pin (or a bus bit's own timing group): one arc from each bit (one/bus -> one);
+///   * to a bus, from the BUS-level group: from one pin, an arc to every bit; from a bus,
+///     `related_pin` pairs the bits one to one — when the sizes differ the LEADING bits of the
+///     larger side are dropped — and `related_bus_pins` takes the cross product.
+/// A name the cell does not declare makes no arc (the reference warns, port not found), and
+/// neither does a delay group with no related pin at all (warning 1243).
+fn expand_arcs(pins: &mut BTreeMap<String, Pin>, buses: &[(String, Vec<String>)], bus_bits: &BTreeMap<String, (usize, usize, usize)>) {
+    let names: std::collections::BTreeSet<String> = pins.keys().cloned().collect();
+    let bits_of = |name: &str| -> Vec<String> {
+        if let Some((_, m)) = buses.iter().find(|(b, _)| b == name) {
+            return m.clone();
+        }
+        if let Some((b, m)) = buses.iter().find(|(b, _)| name.starts_with(b.as_str()) && name[b.len()..].starts_with('[')) {
+            return named_bits(name, b, m).into_iter().filter(|x| names.contains(x)).collect();
+        }
+        if names.contains(name) {
+            vec![name.to_string()]
+        } else {
+            Vec::new()
+        }
+    };
+    for (pname, pin) in pins.iter_mut() {
+        let place = bus_bits.get(pname);
+        let mut out = Vec::with_capacity(pin.arcs.len());
+        for (j, arc) in pin.arcs.iter().enumerate() {
+            // to a bus only for the arcs its BUS-level groups gave this bit
+            let to_bus = place.filter(|&&(_, _, k)| j < k).map(|&(i, t, _)| (i, t));
+            let lists = [(arc.related_pin.as_str(), true), (arc.related_bus_pins.as_str(), false)];
+            for (list, one_to_one) in lists {
+                for name in list.split([' ', '\t']).filter(|n| !n.is_empty()) {
+                    let from = bits_of(name);
+                    let chosen: Vec<&String> = match to_bus {
+                        Some((i, t)) if from.len() > 1 && one_to_one => {
+                            let f = from.len();
+                            let (skip_from, skip_to) = (f.saturating_sub(t), t.saturating_sub(f));
+                            if i < skip_to { Vec::new() } else { from.get(skip_from + i - skip_to).into_iter().collect() }
+                        }
+                        _ => from.iter().collect(),
+                    };
+                    for b in chosen {
+                        let mut a = arc.clone();
+                        a.related_pin = b.clone();
+                        a.related_bus_pins = String::new();
+                        out.push(a);
+                    }
+                }
+            }
+        }
+        pin.arcs = out;
+    }
+}
+
 fn merged_pin(name: &str, group: &Pin, inner: Option<(&Pin, &str)>) -> Pin {
     let mut p = group.clone();
     p.name = name.to_string();
@@ -1437,6 +1498,10 @@ fn parse_cell(
     let ctx = Ctx { cap_f: units.cap_f, skip_ccs, templates, default_cap };
     let mut pins = BTreeMap::new();
     let mut scan_pins = BTreeMap::new();
+    // Each bus or bundle's members in order, and for each member: its place in that bus and how
+    // many of its leading arcs came from the BUS-level timing groups — what `expand_arcs` needs.
+    let mut buses: Vec<(String, Vec<String>)> = Vec::new();
+    let mut bus_bits: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
     let (own, spans) = level(body);
     let groups: Vec<(String, String, &str)> = spans.into_iter().map(|g| (g.kw, g.args, &body[g.body])).collect();
     // Pins at the CELL's level only, plus the bits of its buses and the members of its bundles.
@@ -1468,9 +1533,11 @@ fn parse_cell(
                         .map(|m| m.split(',').map(|x| x.trim().trim_matches('"').to_string()).filter(|x| !x.is_empty()).collect())
                         .unwrap_or_default()
                 };
-                for m in &members {
+                for (i, m) in members.iter().enumerate() {
                     pins.insert(m.clone(), merged_pin(m, &own, None));
+                    bus_bits.insert(m.clone(), (i, members.len(), own.arcs.len()));
                 }
+                buses.push((args.clone(), members.clone()));
                 for (ikw, iargs, ibody) in top_groups(gbody) {
                     if ikw != "pin" {
                         continue;
@@ -1499,6 +1566,7 @@ fn parse_cell(
             _ => {}
         }
     }
+    expand_arcs(&mut pins, &buses, &bus_bits);
     let ff = groups
         .iter()
         .find(|(k, _, _)| k == "ff" || k == "latch")
@@ -2760,5 +2828,78 @@ mod pin_cap_tests {
         assert_eq!(pin(lib, "", "output").capacitance, 0.25);
         let only_rise = pin("", "rise_capacitance : 3; fall_capacitance : 2;", "input");
         assert_eq!(only_rise.capacitance, 3.0, "the largest, not zero");
+    }
+}
+
+#[cfg(test)]
+mod related_pin_lists {
+    use super::*;
+
+    fn lib() -> Lib {
+        Lib::parse(
+            r#"library(t) {
+  time_unit : "1ns";
+  capacitive_load_unit (1, pf);
+  type (b4) { base_type : array; data_type : bit; bit_width : 4; bit_from : 3; bit_to : 0; }
+  type (b2) { base_type : array; data_type : bit; bit_width : 2; bit_from : 1; bit_to : 0; }
+  cell (AO) {
+    pin(A) { direction : input; }
+    pin(B) { direction : input; }
+    pin(Y) { direction : output;
+      timing () { related_pin : "A  B"; cell_rise (scalar) { values("0.1"); } }
+      timing () { related_pin : "NOPE"; cell_rise (scalar) { values("0.3"); } }
+      timing () { cell_rise (scalar) { values("0.4"); } }
+    }
+  }
+  cell (MEM) {
+    pin(CK) { direction : input; clock : true; }
+    bus (D) { bus_type : b4; direction : input; }
+    bus (S) { bus_type : b2; direction : input; }
+    pin(P) { direction : output; timing () { related_pin : "D"; cell_rise (scalar) { values("0.2"); } } }
+    bus (Q) { bus_type : b4; direction : output;
+      timing () { related_pin : "CK"; timing_type : rising_edge; cell_rise (scalar) { values("0.5"); } }
+      timing () { related_pin : "D"; cell_rise (scalar) { values("0.6"); } }
+      timing () { related_pin : "S"; cell_rise (scalar) { values("0.7"); } }
+      timing () { related_bus_pins : "S"; cell_rise (scalar) { values("0.8"); } }
+    }
+  }
+}"#,
+        )
+        .unwrap()
+    }
+
+    fn from(p: &Pin) -> Vec<&str> {
+        p.arcs.iter().map(|a| a.related_pin.as_str()).collect()
+    }
+
+    /// Reference rule (makeTimingArcs): `related_pin` is a list split on spaces and tabs, one arc
+    /// set per name in order; a group with no related pin makes none (warning 1243). Checked on
+    /// this library: the reference's `report_lib_cell` lists exactly these arcs for AO and MEM.
+    /// ⚠️ A name the cell lacks: the reference warns (1294, port not found) and then CRASHES (its
+    /// empty iterator takes the bus-to-bus branch); here it makes no arc.
+    #[test]
+    fn a_related_pin_list_is_one_arc_per_pin() {
+        let l = lib();
+        assert_eq!(from(&l.cells["AO"].pins["Y"]), vec!["A", "B"]);
+    }
+
+    /// bus -> one: every bit of the bus, in bus order.
+    #[test]
+    fn a_bus_related_pin_to_one_pin_is_every_bit() {
+        let l = lib();
+        assert_eq!(from(&l.cells["MEM"].pins["P"]), vec!["D[3]", "D[2]", "D[1]", "D[0]"]);
+    }
+
+    /// one -> bus: the pin to each bit. bus -> bus by `related_pin`: one to one, the larger
+    /// side's LEADING bits dropped when the sizes differ (S has 2 bits, Q 4: Q[3], Q[2] get none
+    /// from S). bus -> bus by `related_bus_pins`: the cross product.
+    #[test]
+    fn bus_to_bus_pairs_bits_and_related_bus_pins_crosses_them() {
+        let l = lib();
+        let m = &l.cells["MEM"];
+        assert_eq!(from(&m.pins["Q[3]"]), vec!["CK", "D[3]", "S[1]", "S[0]"]);
+        assert_eq!(from(&m.pins["Q[1]"]), vec!["CK", "D[1]", "S[1]", "S[1]", "S[0]"]);
+        assert_eq!(from(&m.pins["Q[0]"]), vec!["CK", "D[0]", "S[0]", "S[1]", "S[0]"]);
+        assert!(m.pins["Q[0]"].arcs.iter().all(|a| a.related_bus_pins.is_empty()));
     }
 }
