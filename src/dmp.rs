@@ -894,10 +894,16 @@ pub fn solve_driver(
 }
 
 /// `gateModelRd` — the driver's output resistance, from two table lookups a hair apart.
-/// ⚠️ The reference perturbs by `1e-15` FARADS; in our pF units that is `1e-3`.
+/// ⚠️ The reference perturbs by `1e-15` FARADS; in pF that is `1e-3` (this function). A library
+/// in other units passes the step in its own: [`gate_model_rd_step`].
 pub fn gate_model_rd(vth: f64, gate: &dyn Fn(f64) -> (f64, f64), c1: f64, c2: f64) -> f64 {
+    gate_model_rd_step(vth, gate, c1, c2, 1e-3)
+}
+
+/// [`gate_model_rd`] perturbing by `cap_step`: 1e-15 F in the capacitance unit (1 for fF).
+pub fn gate_model_rd_step(vth: f64, gate: &dyn Fn(f64) -> (f64, f64), c1: f64, c2: f64, cap_step: f64) -> f64 {
     let cap1 = c1 + c2;
-    let cap2 = cap1 + 1e-3;
+    let cap2 = cap1 + cap_step;
     let (d1, _) = gate(cap1);
     let (d2, _) = gate(cap2);
     -(vth.ln()) * (d1 - d2).abs() / (cap2 - cap1)
