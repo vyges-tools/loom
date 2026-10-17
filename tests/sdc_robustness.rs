@@ -156,7 +156,8 @@ fn every_unmodelled_command_is_recorded() {
             continue;
         }
         let s = parse(&good_sdc(&format!("{c} 1.0 [get_ports a]\n")));
-        if !s.ignored.iter().any(|i| i == c) {
+        // an abbreviation is recorded under the command it expands to, as the reference runs it
+        if !s.ignored.iter().any(|i| i == c || i.starts_with(c)) {
             missing.push(c);
         }
     }

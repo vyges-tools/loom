@@ -1035,6 +1035,49 @@ fn generate(master: &SdcClock, g: &GenSpec) -> Option<(f64, Vec<f64>)> {
     Some((period, wave))
 }
 
+/// Abbreviations, expanded as the reference expands them before a command runs: a command name
+/// that begins exactly one SDC command is that command (`set_max_trans`), and an argument that
+/// is not one of the command's keys or flags exactly is the FIRST key it begins, else the first
+/// flag, in the reference's order (`-per` is `-period`). Lists the reference parses on their own
+/// (`-through`, `-group`) are left as written.
+///
+/// ⛔ Unexpanded, `create_clock -per 10` failed the whole file, and `set_max_trans 0.5` was an
+/// unknown command whose limit was lost.
+fn expand_abbreviations(mut toks: Vec<String>) -> Vec<String> {
+    use crate::sdc_flags::{COMMANDS, FLAGS};
+    const OWN: [&str; 4] = ["-through", "-rise_through", "-fall_through", "-group"];
+    let Some(c) = toks.first() else { return toks };
+    if !COMMANDS.contains(&c.as_str()) && c.starts_with(|ch: char| ch.is_ascii_lowercase()) && c.contains('_') {
+        let m: Vec<&&str> = COMMANDS.iter().filter(|k| k.starts_with(c.as_str())).collect();
+        if m.len() == 1 {
+            toks[0] = m[0].to_string();
+        }
+    }
+    let Some((_, keys, flags)) = FLAGS.iter().find(|(n, _, _)| *n == toks[0]) else { return toks };
+    let mut k = 1;
+    while k < toks.len() {
+        let t = toks[k].as_str();
+        if t.len() > 1 && t.starts_with('-') && t.parse::<f64>().is_err() {
+            if keys.contains(&t) {
+                k += 2;
+                continue;
+            }
+            if !flags.contains(&t) && !OWN.contains(&t) {
+                if let Some(full) = keys.iter().find(|x| x.starts_with(t)) {
+                    toks[k] = full.to_string();
+                    k += 2;
+                    continue;
+                }
+                if let Some(full) = flags.iter().find(|x| x.starts_with(t)) {
+                    toks[k] = full.to_string();
+                }
+            }
+        }
+        k += 1;
+    }
+    toks
+}
+
 /// What a control command asks for: its chosen commands, a refusal (it cannot be evaluated
 /// here), or nothing (it is not a control command).
 enum Control {
@@ -1602,7 +1645,7 @@ impl Sdc {
                 Control::None => {}
             }
             let line = subst_exprs(&subst_vars(&raw, &vars), &vars);
-            let toks = tokenize(&line);
+            let toks = expand_abbreviations(tokenize(&line));
             if toks.is_empty() {
                 continue;
             }
@@ -2693,5 +2736,21 @@ mod clock_group_tests {
         assert!(u("c4", "c1") && u("c2", "c4"), "a single group separates its clock from every other");
         assert!(!u("c5", "c6"), "-allow_paths");
         assert_eq!(s.clock_groups[2].kind, "logically_exclusive");
+    }
+}
+
+#[cfg(test)]
+mod abbreviation_tests {
+    use super::*;
+
+    /// A flag is the FIRST key (else flag) it begins, in the reference's order; a command name the
+    /// one SDC command it begins.
+    #[test]
+    fn abbreviations_expand_as_the_reference_expands_them() {
+        let s = Sdc::parse("create_clock -n c -per 10 -wave {0 5} [get_ports clk]\nset_max_trans 0.5 [current_design]\nset_input_delay 1 -cl c -ma [get_ports a]\n").unwrap();
+        assert_eq!((s.clocks[0].name.as_str(), s.clocks[0].period), ("c", 10.0));
+        assert_eq!(s.clocks[0].waveform, Some(vec![0.0, 5.0]));
+        assert_eq!(s.max_transition, Some(0.5));
+        assert_eq!((s.input_delays[0].clock.as_deref(), s.input_delays[0].flags.clone()), (Some("c"), vec!["-max".to_string()]));
     }
 }
