@@ -289,7 +289,12 @@ pub fn load(path: &str) -> Result<Def, DefError> {
 
 // ─────────────────────────── shared tokenize / units ───────────────────────────
 
-/// Tokenize DEF, treating `(`, `)`, and `;` as standalone tokens.
+/// Tokenize DEF, treating `(`, `)`, and `;` as standalone tokens — with the reference lexer's
+/// two other rules: `#` starts a comment to the end of the line, and a quoted string is ONE token
+/// (its `;` and parentheses are text).
+///
+/// ⛔ Without them `( uE A ) # was ( uW A )` gave the net a phantom connection, and a quoted
+/// property value holding `;` ended its statement early.
 fn tokenize(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -298,8 +303,26 @@ fn tokenize(text: &str) -> Vec<String> {
             out.push(std::mem::take(cur));
         }
     };
-    for ch in text.chars() {
+    let mut it = text.chars().peekable();
+    while let Some(ch) = it.next() {
         match ch {
+            '#' if cur.is_empty() => {
+                for c in it.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+            }
+            '"' if cur.is_empty() => {
+                cur.push('"');
+                for c in it.by_ref() {
+                    cur.push(c);
+                    if c == '"' {
+                        break;
+                    }
+                }
+                flush(&mut cur, &mut out);
+            }
             '(' | ')' | ';' => {
                 flush(&mut cur, &mut out);
                 out.push(ch.to_string());
@@ -312,7 +335,8 @@ fn tokenize(text: &str) -> Vec<String> {
     out
 }
 
-/// `UNITS DISTANCE MICRONS <n>` → n (default 1000).
+/// `UNITS DISTANCE MICRONS <n>` → n; without the statement, 100 — the reference's default
+/// (DEF's own), where 1000 put every coordinate ten times too small.
 fn units(t: &[String]) -> f64 {
     for w in t.windows(4) {
         if w[0] == "UNITS" && w[1] == "DISTANCE" && w[2] == "MICRONS" {
@@ -321,16 +345,18 @@ fn units(t: &[String]) -> f64 {
             }
         }
     }
-    1000.0
+    100.0
 }
 
 // ─────────────────────────── signal pass (extraction) ──────────────────────────
 
 fn is_decoration(tok: &str) -> bool {
-    matches!(
-        tok,
-        "TAPER" | "TAPERRULE" | "RECT" | "MASK" | "STYLE" | "VIRTUAL" | "ORIENT"
-    )
+    matches!(tok, "TAPER" | "TAPERRULE" | "RECT" | "STYLE" | "ORIENT")
+}
+
+/// A via's rotation, written right after its name (`M2M3_PR FS`) — not a via of its own.
+fn is_orient(tok: &str) -> bool {
+    matches!(tok, "N" | "S" | "E" | "W" | "FN" | "FS" | "FE" | "FW")
 }
 
 fn coord(tok: &str, prev: f64, scale: f64) -> Result<f64, DefError> {
@@ -438,6 +464,7 @@ fn parse_signal(
         // (`TAPERRULE r`); the per-wire override wins while it is in effect.
         let mut net_rule: Option<String> = None;
         let mut wire_rule: Option<String> = None;
+        let mut virtual_next = false;
         // width (µm) for the current layer under the effective rule (0 = default)
         let width_of = |layer: &Option<String>, wire: &Option<String>, net: &Option<String>| {
             let rule = wire.as_ref().or(net.as_ref());
@@ -460,10 +487,22 @@ fn parse_signal(
                         i += 3;
                     } else if status == "NONDEFAULTRULE" {
                         net_rule = t.get(i + 2).cloned();
+                        in_routing = false;
                         i += 3;
                     } else {
+                        // ⛔ ANY OTHER attribute ends the wiring. `+ USE SIGNAL`, `+ SOURCE
+                        // TIMING`, `+ WEIGHT 2` after the routing — where the reference's own
+                        // writer puts them — were read as vias at the last point, one per word.
+                        in_routing = false;
                         i += 1;
                     }
+                }
+                // `MASK n` colours the next segment or via; its digit is not a via
+                "MASK" => i += if t.get(i + 1).is_some_and(|d| d.parse::<u32>().is_ok()) { 2 } else { 1 },
+                // `VIRTUAL ( x y )` is a jump to a new point, not metal
+                "VIRTUAL" => {
+                    virtual_next = true;
+                    i += 1;
                 }
                 "NEW" => {
                     layer = t.get(i + 1).cloned();
@@ -519,7 +558,8 @@ fn parse_signal(
                         let (px, py) = prev.unwrap_or((0.0, 0.0));
                         let x = coord(&inner[0], px, scale)?;
                         let y = coord(&inner[1], py, scale)?;
-                        if let (Some(l), Some((ox, oy))) = (&layer, prev) {
+                        let jump = std::mem::take(&mut virtual_next);
+                        if let (Some(l), Some((ox, oy)), false) = (&layer, prev, jump) {
                             if (x - ox).abs() + (y - oy).abs() > 0.0 {
                                 net.segments.push(Segment {
                                     layer: l.clone(),
@@ -536,6 +576,9 @@ fn parse_signal(
                     i = j + 1;
                 }
                 tok if is_decoration(tok) => {
+                    i += 1;
+                }
+                tok if in_routing && is_orient(tok) && i > 0 && t[i - 1] != ")" => {
                     i += 1;
                 }
                 _ => {
@@ -1337,5 +1380,57 @@ END SPECIALNETS
         let d = Def::parse("DESIGN top ;\n").unwrap();
         assert!(d.nets.is_empty() && d.power_nets.is_empty() && d.comps.is_empty());
         assert!(d.power_net().is_none());
+    }
+}
+
+/// Signal-net wiring as the reference reads it (`definReader`, the Si2 lexer).
+#[cfg(test)]
+mod reference_rule_tests {
+    use super::*;
+
+    fn net(body: &str) -> DefNet {
+        let def = format!("UNITS DISTANCE MICRONS 1000 ;\nNETS 1 ;\n- n1 ( u1 A ) ( u2 Z )\n{body} ;\nEND NETS\n");
+        Def::parse(&def).unwrap().nets.remove(0)
+    }
+
+    /// Attributes after the wiring end it: they are not vias.
+    #[test]
+    fn attributes_after_the_routing_are_not_vias() {
+        let n = net("  + ROUTED met1 ( 0 0 ) ( 1000 0 ) via1\n  + USE SIGNAL + SOURCE TIMING + WEIGHT 2 + PROPERTY note \"a ; b\"");
+        assert_eq!(n.vias, 1);
+        assert_eq!(n.via_points.len(), 1);
+    }
+
+    /// `MASK n` and a via's rotation are not vias.
+    #[test]
+    fn a_mask_digit_and_a_via_rotation_are_not_vias() {
+        let n = net("  + ROUTED met2 ( 0 0 ) MASK 1 ( 1000 * ) M2M3_PR FS ( 1000 500 )");
+        assert_eq!(n.vias, 1);
+        assert_eq!(n.via_points[0].name, "M2M3_PR");
+    }
+
+    /// `VIRTUAL ( x y )` is a jump, not metal.
+    #[test]
+    fn a_virtual_point_is_a_jump() {
+        let n = net("  + ROUTED met1 ( 0 0 ) ( 1000 0 ) VIRTUAL ( 5000 0 ) ( 6000 0 )");
+        assert_eq!(n.segments.len(), 2, "no wire across the jump");
+        assert!(n.segments.iter().all(|s| (s.len_um() - 1.0).abs() < 1e-9));
+    }
+
+    /// A `#` comment is not a connection.
+    #[test]
+    fn a_comment_is_not_a_connection() {
+        let def = "UNITS DISTANCE MICRONS 1000 ;\nNETS 1 ;\n- n1 ( u1 A ) # ( u9 Z )\n ( u2 Z ) ;\nEND NETS\n";
+        let n = Def::parse(def).unwrap().nets.remove(0);
+        assert_eq!(n.pins.len(), 2);
+        assert!(n.pins.iter().all(|(i, _)| i != "u9"));
+    }
+
+    /// Without `UNITS`, DEF's default is 100 per micron.
+    #[test]
+    fn the_default_unit_is_100() {
+        let d = Def::parse("NETS 1 ;\n- n1 ( u1 A )\n  + ROUTED met1 ( 0 0 ) ( 100 0 ) ;\nEND NETS\n").unwrap();
+        assert_eq!(d.units_per_um, 100.0);
+        assert!((d.nets[0].segments[0].len_um() - 1.0).abs() < 1e-9);
     }
 }
