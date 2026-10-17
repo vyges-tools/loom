@@ -318,6 +318,11 @@ pub struct Cell {
     /// default (`false`). A design may still instantiate the cell; only a resize/insert move
     /// may not choose it (see [`Lib::equivalence_class`]).
     pub dont_use: bool,
+    /// Its own library's slew and delay thresholds, when they are not the merged library's
+    /// ([`Lib::merge`] sets it on a later library's cells whose thresholds differ). The reference
+    /// times a driver with its own library's thresholds and converts each wire delay and load
+    /// slew to the load's (`thresholdAdjust`). `None`: the library's own ([`Lib::cell_thresholds`]).
+    pub thresholds: Option<Thresholds>,
 }
 
 impl Lib {
@@ -1778,6 +1783,7 @@ fn parse_cell(
         clock_gating,
         scan_pins,
         dont_use,
+        thresholds: None,
     }
 }
 
@@ -1984,9 +1990,19 @@ impl Lib {
             self.voltage = other.voltage;
         }
         other.rescale_to(self.units);
-        for (k, v) in other.cells {
+        let own = (other.thresholds != self.thresholds).then_some(other.thresholds);
+        for (k, mut v) in other.cells {
+            if v.thresholds.is_none() {
+                v.thresholds = own;
+            }
             self.cells.entry(k).or_insert(v);
         }
+    }
+
+    /// The thresholds a cell is timed with: its own library's ([`Cell::thresholds`]), else this
+    /// library's. An unknown cell, like a port, takes this (the first-read) library's.
+    pub fn cell_thresholds(&self, cell: &str) -> Thresholds {
+        self.cells.get(cell).and_then(|c| c.thresholds).unwrap_or(self.thresholds)
     }
 
     /// Put every time and capacitance in `to`'s units: table axes (a delay's slew and load, a
@@ -3484,5 +3500,38 @@ mod dont_use_cells {
         // the cache round-trips the flag
         let back = crate::libcache::decode(&crate::libcache::encode(&l)).unwrap();
         assert!(back.cells["INV_X2"].dont_use && !back.cells["INV_X4"].dont_use);
+    }
+}
+
+#[cfg(test)]
+mod per_library_thresholds {
+    use super::*;
+
+    fn lib(name: &str, cell: &str, lower: u32, upper: u32) -> Lib {
+        Lib::parse(&format!(
+            r#"library ({name}) {{ time_unit : "1ns"; capacitive_load_unit (1, pf);
+  slew_lower_threshold_pct_rise : {lower}; slew_lower_threshold_pct_fall : {lower};
+  slew_upper_threshold_pct_rise : {upper}; slew_upper_threshold_pct_fall : {upper};
+  input_threshold_pct_rise : 50; input_threshold_pct_fall : 50;
+  output_threshold_pct_rise : 50; output_threshold_pct_fall : 50;
+  cell ({cell}) {{ pin (A) {{ direction : input; capacitance : 0.001; }}
+    pin (Y) {{ direction : output; function : "!A"; }} }} }}"#
+        ))
+        .unwrap()
+    }
+
+    /// Reference rule: each cell is timed with ITS OWN library's thresholds (the driver's for its
+    /// waveform, the load's after `thresholdAdjust`); a port, with the first-read library's.
+    #[test]
+    fn a_later_librarys_cells_keep_their_own_thresholds() {
+        let mut a = lib("a", "INV_A", 20, 80);
+        a.merge(lib("b", "INV_B", 10, 90));
+        a.merge(lib("c", "INV_C", 20, 80));
+        assert_eq!(a.cell_thresholds("INV_A"), a.thresholds);
+        assert_eq!(a.cell_thresholds("INV_C"), a.thresholds, "same thresholds: nothing to carry");
+        assert_eq!(a.cells["INV_C"].thresholds, None);
+        let b = a.cell_thresholds("INV_B");
+        assert_eq!((b.slew_lower_rise, b.slew_upper_fall), (0.1, 0.9));
+        assert_eq!(a.cell_thresholds("no_such_cell"), a.thresholds, "a port: the first library's");
     }
 }

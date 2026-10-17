@@ -827,8 +827,10 @@ impl<'a> DmpZeroC2<'a> {
 /// Which DMP algorithm the reference picks for a driver — `DmpCeffDelayCalc::setCeffAlgorithm`.
 ///
 /// ⚠️ **One threshold is unit-bearing.** The reference works in SI, so `rd < 1e-2` means
-/// "under a hundredth of an OHM", i.e. essentially no output resistance. In this module's
-/// kΩ that is `1e-5`. Every other test is a ratio and so unit-free.
+/// "under a hundredth of an OHM", i.e. essentially no output resistance. This module works in
+/// the library's time per capacitance — kΩ for ns/pF and ps/fF, Ω for ps/pF — so the caller
+/// says how many ohms one of its R units is ([`select_alg_r`], [`solve_driver_r`]); the
+/// unsuffixed functions assume kΩ. Every other test is a ratio and so unit-free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Alg {
     /// The load is effectively a lump: `ceff = c1 + c2`, and no waveform solve.
@@ -840,7 +842,12 @@ pub enum Alg {
 }
 
 pub fn select_alg(rd: f64, c2: f64, rpi: f64, c1: f64) -> Alg {
-    if rd < 1e-5            // `rd < 1e-2` ohms; table is constant, load looks capacitive
+    select_alg_r(rd, c2, rpi, c1, 1e3)
+}
+
+/// [`select_alg`] with resistances in units of `ohm_per_r` ohms (1e3 for kΩ, 1 for Ω).
+pub fn select_alg_r(rd: f64, c2: f64, rpi: f64, c1: f64, ohm_per_r: f64) -> Alg {
+    if rd * ohm_per_r < 1e-2 // ohms: the table is constant, the load looks capacitive
         || rpi < rd * 1e-3  // Rpi small against Rd
         || c1 == 0.0
         || c1 < c2 * 1e-3   // c1/Rpi can be ignored
@@ -870,7 +877,21 @@ pub fn solve_driver(
     t: Vth,
     gate: &dyn Fn(f64) -> (f64, f64),
 ) -> DmpResult {
-    match select_alg(rd, c2, rpi, c1) {
+    solve_driver_r(rd, c2, rpi, c1, t, gate, 1e3)
+}
+
+/// [`solve_driver`] with resistances in units of `ohm_per_r` ohms — the library's time unit
+/// over its capacitance unit (1e3 for ns/pF and ps/fF, 1 for ps/pF).
+pub fn solve_driver_r(
+    rd: f64,
+    c2: f64,
+    rpi: f64,
+    c1: f64,
+    t: Vth,
+    gate: &dyn Fn(f64) -> (f64, f64),
+    ohm_per_r: f64,
+) -> DmpResult {
+    match select_alg_r(rd, c2, rpi, c1, ohm_per_r) {
         Alg::Pi => DmpPi::new(rd, c2, rpi, c1, t, gate).solve(),
         // `DmpCap::init` sets `ceff_ = c1 + c2`; `gateDelaySlew` then takes BOTH the delay
         // and the slew from the tables — there is no waveform for a capacitive load.
@@ -1129,6 +1150,16 @@ mod shield_tests {
         assert_eq!(select_alg(0.467, 0.1879, 0.0, 1.0222), Alg::Cap);
         let w = r.waveform.unwrap();
         assert_eq!(w.load_delay_slew(0.5), (0.5, r.slew));
+    }
+
+    /// `setCeffAlgorithm`: `rd < 1e-2` is in OHMS (the reference works in SI). A library in ps
+    /// and pF has R in ohms: 5 mΩ is a constant table (capacitive), though as kΩ it would not be.
+    #[test]
+    fn the_rd_threshold_is_in_ohms_whatever_the_library_units() {
+        assert_eq!(select_alg_r(0.005, 1.0, 1.0, 1.0, 1.0), Alg::Cap, "5 mΩ (ps/pF)");
+        assert_eq!(select_alg(0.005, 1.0, 1.0, 1.0), Alg::Pi, "5 Ω (ns/pF)");
+        assert_eq!(select_alg_r(0.009e-3, 1.0, 1.0, 1.0, 1e3), Alg::Cap, "9 mΩ as kΩ");
+        assert_eq!(select_alg_r(0.011e-3, 1.0, 1.0, 1.0, 1e3), Alg::Pi, "11 mΩ as kΩ");
     }
 
     /// ⛔ THE TEST THAT RETIRED A WRONG FINDING. `net55`'s worst sink: the reference

@@ -461,6 +461,8 @@ fn dec_cell(r: &mut R) -> Option<Cell> {
         clock_gating,
         scan_pins,
         dont_use,
+        // a cached file is one library: its cells carry their own thresholds only once merged
+        thresholds: None,
     })
 }
 
