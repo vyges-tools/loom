@@ -702,65 +702,76 @@ fn lnum(s: &str) -> Option<f64> {
 /// ⛔ Without it a commented-out `cell (X) { … }` was a real cell, and a commented-out
 /// `area : 7.0;` set the area: this reader scans text for keywords, and a comment is text.
 fn lex_clean(b: &mut [u8]) {
-    let (mut i, mut quoted) = (0, false);
-    while i < b.len() {
-        match b[i] {
-            b'"' => quoted = !quoted,
-            // inside a string a backslash escapes the next byte; before a line end it is a
-            // continuation, and both go (`\r\n` counts as one line end)
-            b'\\' if quoted => {
-                if matches!(b.get(i + 1), Some(b'\n' | b'\r')) {
-                    b[i] = b' ';
-                    i += 1;
-                    let crlf = b[i] == b'\r' && b.get(i + 1) == Some(&b'\n');
-                    b[i] = b' ';
-                    if crlf {
-                        i += 1;
-                        b[i] = b' ';
-                    }
-                } else {
-                    i += 1;
-                }
+    let edits = lex_edits(b);
+    blank(b, edits);
+}
+
+/// Apply [`lex_edits`]: each byte becomes a space, a comment keeping its newlines.
+fn blank(b: &mut [u8], edits: Vec<(std::ops::Range<usize>, bool)>) {
+    for (r, keep_newlines) in edits {
+        for c in &mut b[r] {
+            if !(keep_newlines && *c == b'\n') {
+                *c = b' ';
             }
-            b'/' if !quoted && b.get(i + 1) == Some(&b'*') => {
-                while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
-                    if b[i] != b'\n' {
-                        b[i] = b' ';
-                    }
-                    i += 1;
-                }
-                for c in b.iter_mut().skip(i).take(2) {
-                    *c = b' ';
-                }
-                i += 1;
-            }
-            _ => {}
         }
-        i += 1;
     }
 }
 
-/// Would [`lex_clean`] change anything? The same walk, read-only, stopping at the first change —
-/// so a file with nothing to clean is not copied. (A backslash-newline OUTSIDE a string is common
-/// in CCS tables and is left alone by both.)
-fn needs_lex_clean(text: &str) -> bool {
-    let b = text.as_bytes();
-    let (mut i, mut quoted) = (0, false);
-    while i < b.len() {
-        match b[i] {
-            b'"' => quoted = !quoted,
-            b'\\' if quoted => {
-                if matches!(b.get(i + 1), Some(b'\n' | b'\r')) {
-                    return true;
-                }
-                i += 1;
+/// What [`lex_clean`] blanks: `(range, keep its newlines)`, in order. Empty for a file with
+/// nothing to clean, which is then not copied.
+///
+/// ⚡ It jumps between the only bytes that can start an edit — `/` and `\` — and tracks whether
+/// it is inside a string by counting the quotes in each gap. CCS tables are dense with quoted
+/// rows; a walk over every byte cost a large library a third of a second, this about half that.
+fn lex_edits(b: &[u8]) -> Vec<(std::ops::Range<usize>, bool)> {
+    let mut edits = Vec::new();
+    let (mut at, mut quoted) = (0usize, false);
+    while let Some(k) = find2(b, at, b'/', b'\\') {
+        quoted ^= b[at..k].iter().filter(|&&c| c == b'"').count() % 2 == 1;
+        let next = b.get(k + 1).copied();
+        if b[k] == b'\\' {
+            if quoted && matches!(next, Some(b'\n' | b'\r')) {
+                // `\r\n` counts as one line end
+                let end = if next == Some(b'\r') && b.get(k + 2) == Some(&b'\n') { k + 3 } else { k + 2 };
+                edits.push((k..end, false));
+                at = end;
+            } else if quoted {
+                // an escaped byte — a quote included — is not a toggle
+                at = (k + 2).min(b.len());
+            } else {
+                at = k + 1;
             }
-            b'/' if !quoted && b.get(i + 1) == Some(&b'*') => return true,
-            _ => {}
+        } else if !quoted && next == Some(b'*') {
+            let mut j = k + 2;
+            while j < b.len() && !(b[j] == b'*' && b.get(j + 1) == Some(&b'/')) {
+                j += 1;
+            }
+            let end = (j + 2).min(b.len());
+            edits.push((k..end, true));
+            at = end;
+        } else {
+            at = k + 1;
         }
-        i += 1;
     }
-    false
+    edits
+}
+
+/// The next index at or after `from` holding `x` or `y`, eight bytes at a time.
+fn find2(b: &[u8], from: usize, x: u8, y: u8) -> Option<usize> {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let (bx, by) = (LO * x as u64, LO * y as u64);
+    let mut i = from;
+    while i + 8 <= b.len() {
+        let w = u64::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3], b[i + 4], b[i + 5], b[i + 6], b[i + 7]]);
+        let (p, q) = (w ^ bx, w ^ by);
+        // a zero byte in either word means a match in this word
+        if ((p.wrapping_sub(LO) & !p) | (q.wrapping_sub(LO) & !q)) & HI != 0 {
+            break;
+        }
+        i += 8;
+    }
+    b.get(i..)?.iter().position(|&c| c == x || c == y).map(|k| i + k)
 }
 
 fn floats(s: &str) -> Vec<f64> {
@@ -1373,11 +1384,12 @@ impl Lib {
 
     /// Like [`Lib::parse`] but honoring [`LibOpts`] (e.g. `skip_ccs` for NLDM-only).
     pub fn parse_opts(text: &str, opts: LibOpts) -> Result<Lib, LibError> {
-        if !needs_lex_clean(text) {
+        let edits = lex_edits(text.as_bytes());
+        if edits.is_empty() {
             return Lib::parse_lexed(text, opts);
         }
         let mut b = text.as_bytes().to_vec();
-        lex_clean(&mut b);
+        blank(&mut b, edits);
         // only ASCII bytes were replaced, by ASCII, so the text is still UTF-8
         let cleaned = String::from_utf8(b).map_err(|e| LibError(e.to_string()))?;
         Lib::parse_lexed(&cleaned, opts)
