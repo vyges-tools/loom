@@ -234,6 +234,19 @@ pub struct Cell {
     /// deliberately NOT collected here: it is timed like any other path and cannot cause the
     /// deassertion race an RDC check exists to find.
     pub async_reset_pins: Vec<String>,
+    /// `clock_gating_integrated_cell` as written (`latch_posedge`, `latch_negedge_precontrol`,
+    /// …), or `None` when the cell is not an integrated clock gate. The sequential rule already
+    /// reads it — a clock gate's clock pin does not make it a register — and a consumer that
+    /// traces clocks needs the same answer.
+    pub clock_gating: Option<String>,
+    /// Scan roles, `pin -> signal_type` as the cell's `test_cell` states them
+    /// — one of the nine `test_scan_*` values (`test_scan_in`, `test_scan_enable`, `test_scan_out`,
+    /// their `_inverted` forms, `test_scan_clock`, `_a`, `_b`); any other value is ignored. Empty
+    /// for a cell with no `test_cell`.
+    ///
+    /// 🔑 This is the ONLY thing read from a `test_cell`. Its pins repeat the real ones in scan
+    /// mode and must never replace them (see `parse_cell`), but the roles exist nowhere else.
+    pub scan_pins: BTreeMap<String, String>,
 }
 
 impl Lib {
@@ -1035,6 +1048,20 @@ fn merged_pin(name: &str, group: &Pin, inner: Option<(&Pin, &str)>) -> Pin {
     p
 }
 
+/// The `signal_type` values a scan role is taken from; any other value is ignored, as the
+/// reference reader does (it warns and drops it).
+const SCAN_SIGNAL_TYPES: [&str; 9] = [
+    "test_scan_enable",
+    "test_scan_enable_inverted",
+    "test_scan_clock",
+    "test_scan_clock_a",
+    "test_scan_clock_b",
+    "test_scan_in",
+    "test_scan_in_inverted",
+    "test_scan_out",
+    "test_scan_out_inverted",
+];
+
 fn parse_cell(
     name: String,
     body: &str,
@@ -1043,12 +1070,14 @@ fn parse_cell(
     types: &BTreeMap<String, (i64, i64)>,
 ) -> Cell {
     let mut pins = BTreeMap::new();
+    let mut scan_pins = BTreeMap::new();
     let groups = top_groups(body);
     // Pins at the CELL's level only, plus the bits of its buses and the members of its bundles.
     //
     // ⛔ A `test_cell` group repeats the cell's pins in scan mode — without `clock : true` and
     // with `signal_type` instead. Read by the substring scan, it came last and overwrote the real
-    // pins: a customer's scan flops lost their clock pin (26 of 31, 2026-10-16).
+    // pins: scan flops lost their clock pin, caps, checks and arcs — the public sky130 `sdf*` cells
+    // among them.
     for (kw, args, gbody) in &groups {
         match kw.as_str() {
             "pin" => {
@@ -1058,7 +1087,7 @@ fn parse_cell(
             }
             // ⛔ A bus's direction and capacitance are on the BUS, and a bus need not repeat them
             // in per-bit `pin` groups — or have any. Unexpanded, an SRAM's D/Q/DM bits had no
-            // direction at all (customer, 2026-10-16). A bus is its bits `name[i]`, bit_from to
+            // direction at all. A bus is its bits `name[i]`, bit_from to
             // bit_to; the bus's attributes reach every bit; a pin group inside states its own.
             "bus" | "bundle" => {
                 let own = parse_pin(args.clone(), &without_groups(gbody, "pin"), units.cap_f, skip_ccs);
@@ -1086,6 +1115,20 @@ fn parse_cell(
                     }
                 }
             }
+            // Only the scan ROLES — see `Cell::scan_pins`.
+            "test_cell" => {
+                for (ikw, iargs, ibody) in top_groups(gbody) {
+                    if ikw != "pin" {
+                        continue;
+                    }
+                    let Some(role) = simple_attr(&own_attrs(&ibody), "signal_type").filter(|r| SCAN_SIGNAL_TYPES.contains(&r.as_str())) else {
+                        continue;
+                    };
+                    for pname in iargs.split(',').map(|n| n.trim().trim_matches('"')).filter(|n| !n.is_empty()) {
+                        scan_pins.insert(pname.to_string(), role.clone());
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1097,10 +1140,11 @@ fn parse_cell(
     // SEQUENTIAL: an `ff`/`latch` group (or a bank of them), a `statetable` — synchronizer cells
     // model their state that way and have no `ff` at all — or a clock pin on a cell that is not a
     // clock gate. ⛔ Read at the cell's own level: a `test_cell`'s `ff` describes scan mode.
+    let clock_gating = simple_attr(&own_attrs(body), "clock_gating_integrated_cell").filter(|v| !v.is_empty());
     let is_seq = groups
         .iter()
         .any(|(k, _, _)| matches!(k.as_str(), "ff" | "latch" | "ff_bank" | "latch_bank" | "statetable"))
-        || (clock_pin.is_some() && simple_attr(&own_attrs(body), "clock_gating_integrated_cell").is_none());
+        || (clock_pin.is_some() && clock_gating.is_none());
     // The `clear`/`preset` expressions name the asynchronous reset pins. Take only names the
     // cell actually declares as pins, so an expression referring to an internal node cannot
     // invent one.
@@ -1148,6 +1192,8 @@ fn parse_cell(
         cell_footprint,
         area,
         async_reset_pins,
+        clock_gating,
+        scan_pins,
     }
 }
 
@@ -2002,7 +2048,7 @@ mod constant_tests {
 mod cell_structure_tests {
     use super::*;
 
-    // Synthetic library, written for these rules (customer gaps 2026-10-16; no customer data).
+    // Synthetic library, written for these rules.
     const LIB: &str = r#"library (gaps) {
       capacitive_load_unit (1, pf);
       type (bus4) { base_type : array; data_type : bit; bit_width : 4; bit_from : 3; bit_to : 0; downto : true; }
@@ -2018,7 +2064,7 @@ mod cell_structure_tests {
         test_cell () {
           ff (IQ, IQN) { clocked_on : "CK"; next_state : "D"; }
           pin (CK) { direction : input; }
-          pin (D) { direction : input; }
+          pin (D) { direction : input; signal_type : not_a_scan_role; }
           pin (SI) { direction : input; signal_type : test_scan_in; }
           pin (SE) { direction : input; signal_type : test_scan_enable; }
           pin (Q) { direction : output; function : "IQ"; signal_type : test_scan_out; }
@@ -2084,5 +2130,24 @@ mod cell_structure_tests {
         assert_eq!(c.pins["DM1"].direction, Dir::In);
         assert_eq!(c.pins["DM0"].capacitance, 0.004);
         assert!(!c.pins.contains_key("D") && !c.pins.contains_key("DM"), "the group is not a pin");
+    }
+
+    // Rule: `clock_gating_integrated_cell` is exposed as written; a cell without it has `None`.
+    #[test]
+    fn a_clock_gate_says_so() {
+        let l = Lib::parse(LIB).unwrap();
+        assert_eq!(l.cell("icg").unwrap().clock_gating.as_deref(), Some("latch_posedge"));
+        assert_eq!(l.cell("scanff").unwrap().clock_gating, None);
+    }
+
+    // Rule: scan roles are the `test_cell` pins' `signal_type`, and the only thing taken from it;
+    // a value outside the nine `test_scan_*` roles is ignored (D's `not_a_scan_role`).
+    #[test]
+    fn scan_roles_come_from_the_test_cell() {
+        let l = Lib::parse(LIB).unwrap();
+        let c = l.cell("scanff").unwrap();
+        let roles: Vec<(&str, &str)> = c.scan_pins.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(roles, [("Q", "test_scan_out"), ("SE", "test_scan_enable"), ("SI", "test_scan_in")]);
+        assert!(l.cell("sync3").unwrap().scan_pins.is_empty());
     }
 }

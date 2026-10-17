@@ -19,7 +19,8 @@ use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, Pin, RecvCap, Tab
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLC6"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLC7"; // Vyges Liberty Cache — bump the trailing digit on any format change
+                                 // VLC7: Cell gained `clock_gating` + `scan_pins` (test_cell signal_type).
                                  // VLC5: Cell gained `async_reset_pins` (the `ff` group's clear/preset pins), for RDC.
                                  // VLC2: pin `function`, cell `cell_footprint` + `area`.
                                  // VLC3: library `Thresholds` (slew/delay measurement points).
@@ -370,6 +371,18 @@ fn enc_cell(w: &mut W, c: &Cell) {
         None => w.u8(0),
     }
     w.f64(c.area);
+    match &c.clock_gating {
+        Some(s) => {
+            w.u8(1);
+            w.s(s);
+        }
+        None => w.u8(0),
+    }
+    w.u64(c.scan_pins.len() as u64);
+    for (k, v) in &c.scan_pins {
+        w.s(k);
+        w.s(v);
+    }
 }
 fn dec_cell(r: &mut R) -> Option<Cell> {
     let name = r.s()?;
@@ -397,6 +410,16 @@ fn dec_cell(r: &mut R) -> Option<Cell> {
         _ => return None,
     };
     let area = r.f64()?;
+    let clock_gating = match r.u8()? {
+        0 => None,
+        1 => Some(r.s()?),
+        _ => return None,
+    };
+    let mut scan_pins = BTreeMap::new();
+    for _ in 0..r.u64()? {
+        let k = r.s()?;
+        scan_pins.insert(k, r.s()?);
+    }
     Some(Cell {
         name,
         pins,
@@ -407,6 +430,8 @@ fn dec_cell(r: &mut R) -> Option<Cell> {
         cell_footprint,
         area,
         async_reset_pins,
+        clock_gating,
+        scan_pins,
     })
 }
 
