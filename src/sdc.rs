@@ -117,7 +117,8 @@ impl SdcClock {
 /// means it came from `all_inputs`/`all_outputs` (or a bare `-clock`).
 #[derive(Debug, Clone)]
 pub struct IoDelay {
-    /// The delay (ns); 0 when it could not be read — see [`IoDelay::value_read`].
+    /// The delay, in the library's time units (as written — see `set_units`); 0 when it could
+    /// not be read — see [`IoDelay::value_read`].
     pub value: f64, // ns
     /// The value positional was a number. False for a missing value or an unresolved variable,
     /// which leave `value` 0: a consumer that must not guess refuses it.
@@ -289,7 +290,11 @@ pub struct Sdc {
     pub output_delays: Vec<IoDelay>,
     pub setup_uncertainty: f64,
     pub hold_uncertainty: f64,
-    pub clock_latency: f64, // source/network latency (ns), applied to the I/O budget
+    pub clock_latency: f64, // source/network latency (library time units), applied to the I/O budget
+    /// What `set_units` declared, `(flag, value)` — `("-time", "1ps")`. NOT applied: every value
+    /// stays in the library's units, as the reference reads them; a consumer compares these with
+    /// its library and warns on a mismatch, as the reference does.
+    pub declared_units: Vec<(String, String)>,
     pub input_transition: Option<f64>,
     pub load: Option<f64>,
     /// `set_max_transition V [current_design]`, ns: the design-wide slew limit, for a consumer
@@ -1385,40 +1390,6 @@ fn trailing_obj(toks: &[String], valued_flags: &[&str]) -> Option<String> {
 
 // ---- unit scaling --------------------------------------------------------
 
-/// Parse a `set_units` magnitude like `1ns`, `10ps`, `1pF`, `1ff` into a scale
-/// to the engine's base (ns for time, pF for cap). Returns multiplier.
-fn unit_scale(spec: &str, time: bool) -> Option<f64> {
-    let s = spec.trim().to_lowercase();
-    let (num, unit): (String, String) = s
-        .chars()
-        .partition(|c| c.is_ascii_digit() || *c == '.' || *c == 'e' || *c == '-' || *c == '+');
-    let mag: f64 = if num.is_empty() {
-        1.0
-    } else {
-        num.parse().ok()?
-    };
-    let base = if time {
-        match unit.as_str() {
-            "s" => 1e9,
-            "ms" => 1e6,
-            "us" => 1e3,
-            "ns" => 1.0,
-            "ps" => 1e-3,
-            "fs" => 1e-6,
-            _ => return None,
-        }
-    } else {
-        match unit.as_str() {
-            "f" => 1e6,
-            "pf" => 1.0,
-            "ff" => 1e-3,
-            "nf" => 1e3,
-            "uf" => 1e6,
-            _ => return None,
-        }
-    };
-    Some(mag * base)
-}
 
 // ---- parse ---------------------------------------------------------------
 
@@ -1426,8 +1397,6 @@ impl Sdc {
     pub fn parse(text: &str) -> Result<Sdc, SdcError> {
         let mut sdc = Sdc::default();
         let mut vars: HashMap<String, String> = HashMap::new();
-        let mut t_scale = 1.0; // -> ns
-        let mut c_scale = 1.0; // -> pF
                                // (name, source, divide, multiply) for generated clocks, resolved last.
         let mut gen: Vec<(String, String, f64, f64)> = Vec::new();
 
@@ -1466,14 +1435,18 @@ impl Sdc {
                 // paths between clocks that never relate get checked and report false
                 // violations. Found by diffing our command inventory against SDC 2.1.
                 "set_units" | "set_unit" => {
-                    if let Some(v) = flag_val(&toks, "-time") {
-                        if let Some(s) = unit_scale(v, true) {
-                            t_scale = s;
-                        }
-                    }
-                    if let Some(v) = flag_val(&toks, "-capacitance") {
-                        if let Some(s) = unit_scale(v, false) {
-                            c_scale = s;
+                    // ⛔ CHECKED, NOT APPLIED — the reference's rule. `set_units` only asserts what
+                    // the library's units are (it warns when they differ); every value in the file
+                    // stays in the library's units. Applied as a scale, `set_units -time ps` on an
+                    // ns library turned a 10 ns period into 0.01. Kept, for a consumer to check
+                    // against its library.
+                    let mut k = 1;
+                    while k + 1 < toks.len() {
+                        if toks[k].starts_with('-') {
+                            sdc.declared_units.push((toks[k].clone(), toks[k + 1].clone()));
+                            k += 2;
+                        } else {
+                            k += 1;
                         }
                     }
                 }
@@ -1519,7 +1492,7 @@ impl Sdc {
                     // An edge that is not a time (an unresolved variable) leaves the list EMPTY
                     // rather than failing the file: a consumer modelling two edges refuses it.
                     let waveform = flag_val(&toks, "-waveform").map(|w| {
-                        w.split_whitespace().map(|e| parse_time(e).map(|t| t * t_scale)).collect::<Option<Vec<f64>>>().unwrap_or_default()
+                        w.split_whitespace().map(parse_time).collect::<Option<Vec<f64>>>().unwrap_or_default()
                     });
                     // `-add` keeps the clocks already on these sources; without it a new clock
                     // REPLACES them there (each loses these sources, and one left with none is
@@ -1533,7 +1506,7 @@ impl Sdc {
                     if !add {
                         sdc.delete_pin_clocks(&name, &sources);
                     }
-                    let clock = SdcClock { name, source: src, sources, period: period * t_scale, waveform };
+                    let clock = SdcClock { name, source: src, sources, period, waveform };
                     match sdc.clocks.iter().position(|c| c.name == clock.name) {
                         Some(i) => sdc.superseded_clocks.push(std::mem::replace(&mut sdc.clocks[i], clock)),
                         None => sdc.clocks.push(clock),
@@ -1592,7 +1565,7 @@ impl Sdc {
                         objs.into_iter().filter(|o| !o.starts_with('*')).collect();
                     let valued = |f: &str| with.iter().find(|(k, _)| *k == f).and_then(|(_, v)| resolve_objs(v).into_iter().next());
                     let d = IoDelay {
-                        value: val * t_scale,
+                        value: val,
                         value_read: read.is_some(),
                         default,
                         ports,
@@ -1616,7 +1589,7 @@ impl Sdc {
                         })
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0.0);
-                    let v = val * t_scale;
+                    let v = val;
                     let setup = has_flag(&toks, "-setup");
                     let hold = has_flag(&toks, "-hold");
                     if setup || !hold {
@@ -1635,13 +1608,13 @@ impl Sdc {
                             t.parse::<f64>().ok()
                         }
                     }) {
-                        sdc.clock_latency = sdc.clock_latency.max(v * t_scale);
+                        sdc.clock_latency = sdc.clock_latency.max(v);
                     }
                 }
                 "set_input_transition" => {
                     sdc.env.extend(env_cmd(&toks));
                     if let Some(v) = toks.get(1).and_then(|t| t.parse::<f64>().ok()) {
-                        sdc.input_transition = Some(v * t_scale);
+                        sdc.input_transition = Some(v);
                     }
                 }
                 "set_max_fanout" => {
@@ -1675,7 +1648,7 @@ impl Sdc {
                     let value = pos.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(f64::NAN);
                     sdc.path_delays.push(PathDelayCmd {
                         max: toks[0] == "set_max_delay",
-                        value: value * t_scale,
+                        value,
                         objects: with.iter().filter(|(k, _)| *k != "-comment").map(|(k, v)| (k.to_string(), Objects::of(v))).collect(),
                         flags,
                     });
@@ -1683,7 +1656,7 @@ impl Sdc {
                 }
                 "set_max_transition" => {
                     match (toks.len() == 3 && toks[2] == "[current_design]", toks.get(1).and_then(|v| v.parse::<f64>().ok())) {
-                        (true, Some(v)) => sdc.max_transition = Some(v * t_scale),
+                        (true, Some(v)) => sdc.max_transition = Some(v),
                         _ => sdc.max_transition_on_objects = true,
                     }
                     sdc.ignored.push("set_max_transition".to_string());
@@ -1702,7 +1675,7 @@ impl Sdc {
                         }
                     });
                     if let Some(v) = v {
-                        sdc.load = Some(v * c_scale);
+                        sdc.load = Some(v);
                     }
                 }
                 "set_timing_derate" => {
@@ -2279,5 +2252,19 @@ mod tcl_eval_tests {
         let ports: Vec<String> = s.input_delays.iter().flat_map(|d| d.ports.clone()).collect();
         assert_eq!(ports, ["a", "b"]);
         assert_eq!(s.ignored_affecting_timing(), ["foreach"]);
+    }
+}
+
+/// `set_units` asserts the library's units; it does not rescale the file — the reference's rule.
+#[cfg(test)]
+mod units_tests {
+    use super::*;
+
+    #[test]
+    fn set_units_does_not_scale_values() {
+        let s = Sdc::parse("set_units -time ps -capacitance fF\ncreate_clock -name c -period 10 [get_ports clk]\nset_input_delay 2 -clock c [get_ports a]\nset_load 3 [get_ports y]\n").unwrap();
+        assert_eq!(s.clocks[0].period, 10.0);
+        assert_eq!(s.input_delays[0].value, 2.0);
+        assert_eq!(s.load, Some(3.0));
     }
 }
