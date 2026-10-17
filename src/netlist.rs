@@ -4,15 +4,26 @@
 //! port declarations, and cell instances of the form
 //! `CELL inst ( .PIN(net), .PIN(net) );`. `wire`/`reg` declarations and the
 //! header port list are skipped (port direction comes from `input`/`output`);
-//! `assign`/`parameter` are skipped; constant nets (`1'b0`) are dropped. Bus
+//! `assign`/`parameter` are skipped; a pin tied to a constant (`1'b0`) is recorded in
+//! `Inst::ties`, not as a connection. Bus
 //! ranges (`[7:0]`) are tolerated by skipping the range — v0 treats nets as
 //! scalar. Pure std — fully unit-tested offline.
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Inst {
     pub cell: String,
     pub name: String,
     pub conns: Vec<(String, String)>, // (pin, net)
+    /// Pins tied to a CONSTANT, `(pin, value)` — `.E(1'b0)` gives `("E", false)`. Kept apart
+    /// from `conns` because a constant is not a net; without them a tie cannot drive case
+    /// analysis or constant propagation.
+    ///
+    /// 🔑 Bit for bit as the reference reader binds them to its `zero_`/`one_` nets: a constant
+    /// is `size` bits wide (an unsized one is one bit), filled from its least significant digit
+    /// with missing digits 0, and an `x`/`z` digit reads as 0. A bussed pin's bits are named
+    /// `P[i]` exactly as `conns` names them. A positional constant has an empty pin name, as a
+    /// positional net does.
+    pub ties: Vec<(String, bool)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -49,6 +60,10 @@ pub struct Netlist {
     ///
     /// Reading only the first was wrong on any hierarchical netlist: a file whose leaf cells
     /// come before the top gave a leaf as the design, silently.
+    ///
+    /// ⚠️ Filled on the TOP only (as is `escaped_names`): they describe the file, and a copy per
+    /// module grows with the square of the module count. From [`parse_all`], read them through
+    /// [`Design::module_names`] and [`Design::escaped_names`].
     pub modules: Vec<String>,
     /// `assign lhs = rhs ;` — two names for one net.
     ///
@@ -126,106 +141,200 @@ impl std::fmt::Display for NetlistError {
 }
 impl std::error::Error for NetlistError {}
 
-/// Remove `/* ... */` comments, preserving line structure so line-based `//` stripping and any
-/// future diagnostics still line up. Unterminated comments run to end of file, as Verilog says.
-fn strip_block_comments(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let b = text.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
-            i += 2;
-            while i < b.len() && !(b[i] == b'*' && i + 1 < b.len() && b[i + 1] == b'/') {
-                // keep newlines so line numbers and `//` handling are unaffected
-                if b[i] == b'\n' {
-                    out.push('\n');
-                }
-                i += 1;
-            }
-            i = (i + 2).min(b.len());
-            continue;
-        }
-        out.push(b[i] as char);
-        i += 1;
-    }
-    out
+/// The tokens of a netlist, ONE AT A TIME, each a slice of the text, with the values that
+/// arrived as ESCAPED identifiers collected on the side.
+/// ⚠️ The token VALUE is canonical either way; the set only records where a backslash was.
+///
+/// ⛔ **Tokens BORROW from the text, and are not all held at once.** An owned `String` per token
+/// for the whole file, plus two cleaned copies of it, put the peak at many times the file size
+/// before parsing began. Every delimiter is ASCII, so a token is a slice of the source; comments
+/// are skipped in the same pass; and [`parse_all`] holds one module's tokens at a time.
+struct Tokens<'a> {
+    text: &'a str,
+    it: std::str::CharIndices<'a>,
+    /// a punctuation token found while closing the token before it
+    queued: Option<&'a str>,
+    /// inside an escaped identifier
+    escaped: bool,
+    escaped_vals: std::collections::BTreeSet<String>,
 }
 
-/// Returns the tokens and, separately, the values that arrived as ESCAPED identifiers.
-/// ⚠️ The token VALUE is canonical either way; the set only records where a backslash was.
-fn tokenize(text: &str) -> (Vec<String>, std::collections::BTreeSet<String>) {
-    // Strip comments first — BOTH forms.
-    //
-    // `/* ... */` spans lines and is where tools park disabled code. Left in, its contents
-    // tokenize like anything else, and `/* INV bogus (.A(a)); */` becomes a real instance in
-    // the netlist: connectivity invented out of a comment, which no downstream tool can tell
-    // from the real thing.
-    let no_block = strip_block_comments(text);
-    let mut clean = String::with_capacity(no_block.len());
-    for line in no_block.lines() {
-        let l = match line.find("//") {
-            Some(i) => &line[..i],
-            None => line,
-        };
-        clean.push_str(l);
-        clean.push('\n');
+impl<'a> Tokens<'a> {
+    fn new(text: &'a str) -> Self {
+        Tokens { text, it: text.char_indices(), queued: None, escaped: false, escaped_vals: Default::default() }
     }
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let flush = |cur: &mut String, out: &mut Vec<String>| {
-        if !cur.is_empty() {
-            out.push(std::mem::take(cur));
+
+    /// Close the token open since `start`, if any, at byte `at`.
+    fn cut(&mut self, start: &mut Option<usize>, at: usize) -> Option<&'a str> {
+        let tok = start.take().filter(|&s0| s0 < at).map(|s0| &self.text[s0..at]);
+        if let (Some(t), true) = (tok, self.escaped) {
+            self.escaped_vals.insert(t.to_string());
+        }
+        self.escaped = false;
+        tok
+    }
+}
+
+impl<'a> Iterator for Tokens<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        if let Some(q) = self.queued.take() {
+            return Some(q);
+        }
+        let b = self.text.as_bytes();
+        let mut start: Option<usize> = None;
+        while let Some((i, ch)) = self.it.next() {
+            // Comments — BOTH forms — end whatever token is open, escaped or not.
+            //
+            // `/* ... */` spans lines and is where tools park disabled code. Left in, its contents
+            // tokenize like anything else, and `/* INV bogus (.A(a)); */` becomes a real instance in
+            // the netlist: connectivity invented out of a comment, which no downstream tool can tell
+            // from the real thing. An unterminated one runs to the end of the file.
+            if ch == '/' && b.get(i + 1) == Some(&b'/') {
+                let tok = self.cut(&mut start, i);
+                for (_, c) in self.it.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+                if tok.is_some() {
+                    return tok;
+                }
+                continue;
+            }
+            if ch == '/' && b.get(i + 1) == Some(&b'*') {
+                let tok = self.cut(&mut start, i);
+                self.it.next();
+                let mut prev = '\0';
+                for (_, c) in self.it.by_ref() {
+                    if prev == '*' && c == '/' {
+                        break;
+                    }
+                    prev = c;
+                }
+                if tok.is_some() {
+                    return tok;
+                }
+                continue;
+            }
+            // A Verilog *escaped identifier* starts with `\` and runs until the next whitespace,
+            // which terminates it (and is not part of the name). Punctuation inside it —
+            // `\clkbuf_0_gpio_in[0]`, `\ANTENNA_u_cpu.foo[1]` — is part of the name, so it must NOT
+            // be split on `[`/`]`/`.`; otherwise the real instance is missed and the leftover
+            // `0 ] (` fragment mis-parses as a bogus cell.
+            //
+            // THE BACKSLASH IS NOT PART OF THE NAME EITHER. Per the LRM an escaped identifier
+            // denotes the same identifier as the equivalent simple one — `\foo ` IS `foo` — so it is
+            // dropped here, exactly as the terminating whitespace is. Keeping it is not cosmetic:
+            // every other file in the flow spells the name without it. A SPEF says
+            // `u_adapter.req_addr_q[0]` and a DEF says `u_adapter\.req_addr_q\[0\]`, both of which
+            // resolve to the same characters, and a netlist net called `\u_adapter.req_addr_q[0]`
+            // matches neither. On a real block that was 767 of 14238 nets, and 4527 coupling
+            // aggressor references that a timer looked up, failed to find, and dropped without a
+            // word — silently removing crosstalk from the analysis.
+            if self.escaped {
+                if ch.is_whitespace() {
+                    if let Some(tok) = self.cut(&mut start, i) {
+                        return Some(tok);
+                    }
+                } else if start.is_none() {
+                    start = Some(i);
+                }
+                continue;
+            }
+            match ch {
+                '\\' => {
+                    let tok = self.cut(&mut start, i);
+                    self.escaped = true;
+                    if tok.is_some() {
+                        return tok;
+                    }
+                }
+                '(' | ')' | ';' | ',' | '.' | '[' | ']' | '=' => {
+                    let punct = &self.text[i..i + 1];
+                    return match self.cut(&mut start, i) {
+                        Some(tok) => {
+                            self.queued = Some(punct);
+                            Some(tok)
+                        }
+                        None => Some(punct),
+                    };
+                }
+                c if c.is_whitespace() => {
+                    if let Some(tok) = self.cut(&mut start, i) {
+                        return Some(tok);
+                    }
+                }
+                _ => {
+                    if start.is_none() {
+                        start = Some(i);
+                    }
+                }
+            }
+        }
+        // the last token — an escaped identifier at end of input has no whitespace to close it
+        let end = self.text.len();
+        self.cut(&mut start, end)
+    }
+}
+
+/// A constant's bits, MOST significant first, as the reference reader parses it: `size` bits
+/// (an unsized or unusable size is one bit), filled from the least significant digit with
+/// missing digits 0. An `x`/`z` digit reads as 0, and so does every bit of a constant with an
+/// unknown base or a decimal past 64 bits — each exactly as the reference does it.
+fn const_bits(c: &str) -> Vec<bool> {
+    // a size the reader would allocate without limit is not a netlist; cap it
+    const MAX_BITS: usize = 1 << 16;
+    let Some(q) = c.find('\'') else { return vec![false] };
+    let size = c[..q]
+        .trim_start_matches(['+', '-'])
+        .replace('_', "")
+        .parse::<usize>()
+        .ok()
+        .filter(|&n| n > 0)
+        .unwrap_or(1)
+        .min(MAX_BITS);
+    let mut bits = vec![false; size]; // LSB first
+    let rest = &c[q + 1..];
+    let (base, digits) = match rest.chars().next() {
+        Some(ch) => (ch.to_ascii_lowercase(), &rest[1..]),
+        None => return bits,
+    };
+    let per_digit = match base {
+        'b' => 1,
+        'o' => 3,
+        'h' => 4,
+        'd' => {
+            let d: String = digits.chars().filter(|&ch| ch != '_').collect();
+            if let Ok(v) = d.parse::<u64>() {
+                for (k, bit) in bits.iter_mut().enumerate().take(64) {
+                    *bit = (v >> k) & 1 == 1;
+                }
+            }
+            bits.reverse();
+            return bits;
+        }
+        _ => {
+            bits.reverse();
+            return bits;
         }
     };
-    // A Verilog *escaped identifier* starts with `\` and runs until the next
-    // whitespace, which terminates it (and is not part of the name). Punctuation
-    // inside it — `\clkbuf_0_gpio_in[0]`, `\ANTENNA_u_cpu.foo[1]` — is part of the
-    // name, so it must NOT be split on `[`/`]`/`.`; otherwise the real instance is
-    // missed and the leftover `0 ] (` fragment mis-parses as a bogus cell.
-    //
-    // THE BACKSLASH IS NOT PART OF THE NAME EITHER. Per the LRM an escaped identifier denotes
-    // the same identifier as the equivalent simple one — `\foo ` IS `foo` — so it is dropped
-    // here, exactly as the terminating whitespace is. Keeping it is not cosmetic: every other
-    // file in the flow spells the name without it. A SPEF says `u_adapter.req_addr_q[0]` and a
-    // DEF says `u_adapter\.req_addr_q\[0\]`, both of which resolve to the same characters,
-    // and a netlist net called `\u_adapter.req_addr_q[0]` matches neither. On a real block that
-    // was 767 of 14238 nets, and 4527 coupling aggressor references that a timer looked up,
-    // failed to find, and dropped without a word — silently removing crosstalk from the
-    // analysis.
-    let mut escaped = false;
-    let mut escaped_vals: std::collections::BTreeSet<String> = Default::default();
-    for ch in clean.chars() {
-        if escaped {
-            if ch.is_whitespace() {
-                if !cur.is_empty() {
-                    escaped_vals.insert(cur.clone());
-                }
-                flush(&mut cur, &mut out);
-                escaped = false;
-            } else {
-                cur.push(ch);
+    let mut k = 0;
+    for ch in digits.chars().rev().filter(|&ch| ch != '_') {
+        let v = ch.to_digit(16).unwrap_or(0);
+        for j in 0..per_digit {
+            if k < size {
+                bits[k] = (v >> j) & 1 == 1;
+                k += 1;
             }
-            continue;
         }
-        match ch {
-            '\\' => {
-                flush(&mut cur, &mut out);
-                escaped = true;
-            }
-            '(' | ')' | ';' | ',' | '.' | '[' | ']' | '=' => {
-                flush(&mut cur, &mut out);
-                out.push(ch.to_string());
-            }
-            c if c.is_whitespace() => flush(&mut cur, &mut out),
-            c => cur.push(c),
+        if k >= size {
+            break;
         }
     }
-    // An escaped identifier at end of input, with no trailing whitespace to close it.
-    if escaped && !cur.is_empty() {
-        escaped_vals.insert(cur.clone());
-    }
-    flush(&mut cur, &mut out);
-    (out, escaped_vals)
+    bits.reverse();
+    bits
 }
 
 /// Recover declared ranges from names already expanded to bits (`a[7]`…`a[0]` -> `a` is 7:0).
@@ -297,17 +406,18 @@ fn is_ident(t: &str) -> bool {
 
 /// EVERY module a file defines, with the top marked.
 ///
-/// ⛔ **`parse` returns only the top**, and on a hierarchical netlist that is not the design: a
-/// customer flow tracing a ~1,400-module full chip through its hierarchy found every non-top
-/// module's ports and instances gone (2026-10-16). A consumer that walks the hierarchy reads
-/// this instead.
+/// ⛔ **`parse` returns only the top**, and on a hierarchical netlist that is not the design:
+/// every non-top module's ports and instances are gone, so nothing below the top can be traced.
+/// A consumer that walks the hierarchy reads this instead.
 #[derive(Debug, Clone, Default)]
 pub struct Design {
-    /// Every module, in DECLARATION order. Each carries the file's `escaped_names` and the full
-    /// `modules` name list, exactly as the top returned by `parse` does.
+    /// Every module, in DECLARATION order. The file-wide lists (`modules`, `escaped_names`) are
+    /// on the top only — see [`Design::module_names`].
     pub modules: Vec<Netlist>,
     /// Index into `modules` of the top: the module no other module instantiates.
     pub top: usize,
+    /// `name -> index`, so a hierarchy walk looks each module up once rather than scanning.
+    by_name: std::collections::HashMap<String, usize>,
 }
 
 impl Design {
@@ -316,9 +426,20 @@ impl Design {
     }
 
     /// The module DEFINED under `name`, if the file defines it. An instance whose cell is not
-    /// found here is a leaf — a library cell or a black box.
+    /// found here is a leaf — a library cell or a black box. A name defined twice gives the
+    /// first definition.
     pub fn module(&self, name: &str) -> Option<&Netlist> {
-        self.modules.iter().find(|m| m.module == name)
+        self.by_name.get(name).map(|&i| &self.modules[i])
+    }
+
+    /// Every module name, in declaration order (the top's `modules`).
+    pub fn module_names(&self) -> &[String] {
+        &self.top().modules
+    }
+
+    /// Names that arrived as escaped identifiers anywhere in the file (the top's `escaped_names`).
+    pub fn escaped_names(&self) -> &std::collections::BTreeSet<String> {
+        &self.top().escaped_names
     }
 }
 
@@ -330,22 +451,25 @@ pub fn parse(text: &str) -> Result<Netlist, NetlistError> {
 
 /// Every module in the file, and which one is the top.
 pub fn parse_all(text: &str) -> Result<Design, NetlistError> {
-    let (t, escaped_vals) = tokenize(text);
-    let n = t.len();
+    let mut toks = Tokens::new(text);
     let mut mods: Vec<Netlist> = Vec::new();
-    let mut i = 0;
+    // ONE module's tokens at a time, `module` through `endmodule`; the buffer is reused, so the
+    // peak is the largest module rather than the file.
+    let mut t: Vec<&str> = Vec::new();
     // EVERY module, not just the first. A hierarchical netlist that lists its leaves before its
     // top otherwise hands back a leaf as the design.
-    while i < n {
-        match t[i..].iter().position(|x| x == "module") {
-            Some(p) => {
-                let (m, next) = parse_module(&t, i + p);
-                mods.push(m);
-                i = next;
+    while let Some(m) = toks.by_ref().find(|&x| x == "module") {
+        t.clear();
+        t.push(m);
+        for tok in toks.by_ref() {
+            t.push(tok);
+            if tok == "endmodule" {
+                break;
             }
-            None => break,
         }
+        mods.push(parse_module(&t, 0).0);
     }
+    let escaped_vals = std::mem::take(&mut toks.escaped_vals);
     if mods.is_empty() {
         return Err(NetlistError("no module found".into()));
     }
@@ -364,17 +488,19 @@ pub fn parse_all(text: &str) -> Result<Design, NetlistError> {
         // instantiates itself) — fall back to the last, which is the usual emission order.
         .unwrap_or(mods.len() - 1);
 
-    // ⚠️ Recorded on every module regardless of which one it is: the escaping is a fact about
-    // the FILE's tokens, and a consumer writing OpenDB needs it for any name it creates.
-    for m in &mut mods {
-        m.modules = names.clone();
-        m.escaped_names = escaped_vals.clone();
+    // ⛔ ONCE, on the top. Both describe the FILE, and a copy on every module is a list of n
+    // names times n modules: tens of gigabytes on a netlist of tens of thousands of modules.
+    let mut by_name = std::collections::HashMap::with_capacity(names.len());
+    for (k, nm) in names.iter().enumerate() {
+        by_name.entry(nm.clone()).or_insert(k);
     }
-    Ok(Design { modules: mods, top })
+    mods[top].modules = names;
+    mods[top].escaped_names = escaped_vals;
+    Ok(Design { modules: mods, top, by_name })
 }
 
 /// Parse ONE `module … endmodule`, returning it and the index just past `endmodule`.
-fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
+fn parse_module(t: &[&str], from: usize) -> (Netlist, usize) {
     let n = t.len();
     let mut nl = Netlist::default();
     // names declared as a one-bit VECTOR (`wire [0:0] x`), and the single index they carry
@@ -390,7 +516,7 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
     if i < n && t[i] == "module" {
         i += 1;
         if i < n {
-            nl.module = t[i].clone();
+            nl.module = t[i].to_string();
             i += 1;
         }
         // THE HEADER MAY BE WHERE THE PORTS ARE DECLARED. Verilog-2001 ANSI style puts the
@@ -408,7 +534,7 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
             let mut depth = 1;
             let (mut dir, mut range): (Option<&str>, Option<(i64, i64)>) = (None, None);
             while i < n && depth > 0 {
-                match t[i].as_str() {
+                match t[i] {
                     "(" => depth += 1,
                     ")" => {
                         depth -= 1;
@@ -426,7 +552,7 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
                     "wire" | "reg" | "logic" | "signed" => {}
                     "," => {}
                     "[" => {
-                        let spec = t.get(i + 1).cloned().unwrap_or_default();
+                        let spec = t.get(i + 1).copied().unwrap_or_default();
                         range = spec.split_once(':').and_then(|(h, l)| {
                             Some((h.trim().parse::<i64>().ok()?, l.trim().parse::<i64>().ok()?))
                         });
@@ -472,13 +598,13 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
         let mut names = Vec::new();
         let mut range: Option<(i64, i64)> = None;
         while *i < n && t[*i] != ";" {
-            match t[*i].as_str() {
+            match t[*i] {
                 "," => {}
                 "[" => {
                     *i += 1;
                     let mut spec = String::new();
                     while *i < n && t[*i] != "]" {
-                        spec.push_str(&t[*i]);
+                        spec.push_str(t[*i]);
                         *i += 1;
                     }
                     range = spec.split_once(':').and_then(|(h, l)| {
@@ -501,7 +627,7 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
     };
 
     while i < n {
-        match t[i].as_str() {
+        match t[i] {
             "endmodule" => {
                 i += 1;
                 break;
@@ -566,7 +692,7 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
                 let mut single: Option<String> = None;
                 let mut range: Option<(i64, i64)> = None;
                 if i < n && t[i] == "[" {
-                    let spec = t.get(i + 1).cloned().unwrap_or_default();
+                    let spec = t.get(i + 1).copied().unwrap_or_default();
                     if let Some((a, b)) = spec.split_once(':') {
                         if a.trim() == b.trim() {
                             single = Some(a.trim().to_string());
@@ -582,12 +708,12 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
                     i += 1;
                 }
                 while i < n && t[i] != ";" {
-                    if is_ident(&t[i]) && !is_keyword(&t[i]) {
+                    if is_ident(t[i]) && !is_keyword(t[i]) {
                         if let Some(idx) = &single {
-                            one_bit_vec.insert(t[i].clone(), idx.clone());
+                            one_bit_vec.insert(t[i].to_string(), idx.clone());
                         }
                         if let Some(r) = range {
-                            decl_range.insert(t[i].clone(), r);
+                            decl_range.insert(t[i].to_string(), r);
                         }
                     }
                     i += 1;
@@ -622,22 +748,23 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
                             k += 1;
                         }
                         // `CELL #(…)` then INST `(` — keep the cell, skip the parameters
-                        if k + 1 < n && is_ident(&t[k]) && t[k + 1] == "(" {
+                        if k + 1 < n && is_ident(t[k]) && t[k + 1] == "(" {
                             head = k - 1; // so `head+1` is the instance name below
                         }
                     }
                 }
                 let cell_tok = i;
                 if head + 2 < n
-                    && is_ident(&t[cell_tok])
-                    && !is_keyword(&t[cell_tok])
-                    && !is_keyword(&t[head + 1])
+                    && is_ident(t[cell_tok])
+                    && !is_keyword(t[cell_tok])
+                    && !is_keyword(t[head + 1])
                     && t[head + 2] == "("
                 {
-                    let cell = t[cell_tok].clone();
-                    let name = t[head + 1].clone();
+                    let cell = t[cell_tok].to_string();
+                    let name = t[head + 1].to_string();
                     i = head + 3; // past CELL [#(...)] INST (
                     let mut conns = Vec::new();
+                    let mut ties = Vec::new();
                     let mut depth = 1;
                     // Named (`.PIN(net)`) and positional (`CELL u (a, b)`) forms are both legal
                     // and a netlist uses one or the other. Positional connections carry no pin
@@ -645,7 +772,7 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
                     // connectivity needs, so it is recorded with an empty pin and counted.
                     let named = (i..n).take_while(|&k| t[k] != ";").any(|k| t[k] == ".");
                     while i < n && depth > 0 {
-                        match t[i].as_str() {
+                        match t[i] {
                             "(" => {
                                 depth += 1;
                                 i += 1;
@@ -655,7 +782,7 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
                                 i += 1;
                             }
                             "." if named => {
-                                let pin = t.get(i + 1).cloned().unwrap_or_default();
+                                let pin = t.get(i + 1).copied().unwrap_or_default().to_string();
                                 // expect '(' at i+2 — the value may be a single net, a
                                 // bit-select, or a CONCATENATION on a bussed pin.
                                 let mut j = i + 3;
@@ -676,31 +803,34 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
                                 // synthesiser infers the port from the expression the same way,
                                 // which is why Yosys's JSON lists `data[0]`…`data[7]` where this
                                 // reader listed one.
-                                let bits: Vec<String> = nets
+                                // A CONSTANT is as many bits as its size says, so a concatenation that
+                                // holds one numbers its other members correctly; its bits are ties.
+                                let bits: Vec<Result<String, bool>> = nets
                                     .iter()
-                                    .flat_map(|net| expand_bits(net, &decl_range))
+                                    .flat_map(|net| -> Vec<Result<String, bool>> {
+                                        if is_const(net) {
+                                            const_bits(net).into_iter().map(Err).collect()
+                                        } else {
+                                            expand_bits(net, &decl_range).into_iter().map(Ok).collect()
+                                        }
+                                    })
                                     .collect();
-                                match bits.len() {
-                                    0 => {}
-                                    1 => {
-                                        if !is_const(&bits[0]) {
-                                            conns.push((pin, bits[0].clone()));
-                                        }
-                                    }
-                                    k => {
-                                        for (idx, net) in bits.iter().enumerate() {
-                                            if is_const(net) {
-                                                continue;
-                                            }
-                                            conns.push((format!("{pin}[{}]", k - 1 - idx), net.clone()));
-                                        }
+                                let k = bits.len();
+                                for (idx, bit) in bits.into_iter().enumerate() {
+                                    let p = if k == 1 { pin.clone() } else { format!("{pin}[{}]", k - 1 - idx) };
+                                    match bit {
+                                        Ok(net) => conns.push((p, net)),
+                                        Err(v) => ties.push((p, v)),
                                     }
                                 }
                                 i += 1;
                             }
                             _ if !named => {
-                                let tok = &t[i];
-                                if is_ident(tok) && !is_const(tok) {
+                                let tok = t[i];
+                                if is_const(tok) {
+                                    ties.extend(const_bits(tok).into_iter().map(|v| (String::new(), v)));
+                                    i += 1;
+                                } else if is_ident(tok) {
                                     let mut j = i;
                                     let nets = read_conn_value(t, &mut j);
                                     for net in nets {
@@ -717,7 +847,7 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
                             _ => i += 1,
                         }
                     }
-                    nl.insts.push(Inst { cell, name, conns });
+                    nl.insts.push(Inst { cell, name, conns, ties });
                     if i < n && t[i] == ";" {
                         i += 1;
                     }
@@ -796,7 +926,7 @@ fn parse_module(t: &[String], from: usize) -> (Netlist, usize) {
 /// `i` enters at the first token of the value and leaves just past it. A bit-select arrives
 /// from the tokenizer split into `count [ 7 ]` and is reassembled, so the name matches the
 /// bus-expanded port and the bit-nets other gates drive.
-fn read_conn_value(t: &[String], i: &mut usize) -> Vec<String> {
+fn read_conn_value(t: &[&str], i: &mut usize) -> Vec<String> {
     let n = t.len();
     let mut out = Vec::new();
     // A concatenation is `{ a , b[3] , c }`; the tokenizer keeps `{`/`}` inside a word, so it
@@ -806,7 +936,7 @@ fn read_conn_value(t: &[String], i: &mut usize) -> Vec<String> {
         if *i >= n {
             break;
         }
-        let tok = t[*i].as_str();
+        let tok = t[*i];
         if tok == ")" || tok == ";" {
             break;
         }
@@ -824,9 +954,9 @@ fn read_conn_value(t: &[String], i: &mut usize) -> Vec<String> {
         if !bare.is_empty() {
             let mut net = bare.to_string();
             // reassemble a bit-select that the tokenizer split
-            if t.get(*i + 1).map(|s| s.as_str()) == Some("[") {
+            if t.get(*i + 1).copied() == Some("[") {
                 if let (Some(idx), Some("]")) =
-                    (t.get(*i + 2), t.get(*i + 3).map(|s| s.as_str()))
+                    (t.get(*i + 2), t.get(*i + 3).copied())
                 {
                     net = format!("{net}[{idx}]");
                     *i += 3;
@@ -847,7 +977,7 @@ fn read_conn_value(t: &[String], i: &mut usize) -> Vec<String> {
 }
 
 /// The left- or right-hand side of an `assign`, as a single name (bit-selects reassembled).
-fn read_expr(t: &[String], i: &mut usize) -> String {
+fn read_expr(t: &[&str], i: &mut usize) -> String {
     let mut j = *i;
     let v = read_conn_value(t, &mut j);
     *i = j;
@@ -855,14 +985,76 @@ fn read_expr(t: &[String], i: &mut usize) -> String {
 }
 
 pub fn load(path: &str) -> Result<Netlist, NetlistError> {
-    let text = std::fs::read_to_string(path).map_err(|e| NetlistError(format!("{path}: {e}")))?;
-    parse(&text)
+    parse(&read_text(path)?)
 }
 
 /// [`load`], keeping every module — see [`Design`].
 pub fn load_all(path: &str) -> Result<Design, NetlistError> {
-    let text = std::fs::read_to_string(path).map_err(|e| NetlistError(format!("{path}: {e}")))?;
-    parse_all(&text)
+    parse_all(&read_text(path)?)
+}
+
+/// A netlist file's text: gunzipped when it is gzip (with the `gzip` feature), and read
+/// LOSSILY — a byte that is not UTF-8 becomes U+FFFD instead of failing the read.
+///
+/// ⛔ `read_to_string` refused both outright. Netlists are shipped gzipped, and a comment or a
+/// string written in a legacy code page (Windows-1252) is enough to make a whole file "not
+/// UTF-8" although every identifier in it is ASCII.
+pub fn read_text(path: &str) -> Result<String, NetlistError> {
+    let err = |e: String| NetlistError(format!("{path}: {e}"));
+    let bytes = std::fs::read(path).map_err(|e| err(e.to_string()))?;
+    let bytes = if bytes.starts_with(&[0x1f, 0x8b]) { gunzip(&bytes).map_err(err)? } else { bytes };
+    Ok(match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    })
+}
+
+/// Every member of a gzip file, concatenated (RFC 1952; `bgzip` and `cat a.gz b.gz` write more
+/// than one).
+#[cfg(feature = "gzip")]
+fn gunzip(mut data: &[u8]) -> Result<Vec<u8>, String> {
+    use miniz_oxide::inflate::stream::{inflate, InflateState};
+    use miniz_oxide::{DataFormat, MZFlush, MZStatus};
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 1 << 16];
+    while data.starts_with(&[0x1f, 0x8b]) {
+        let bad = || "malformed gzip header".to_string();
+        let flg = *data.get(3).ok_or_else(bad)?;
+        let mut p = 10usize;
+        if flg & 0x04 != 0 {
+            let x = data.get(p..p + 2).ok_or_else(bad)?;
+            p += 2 + u16::from_le_bytes([x[0], x[1]]) as usize;
+        }
+        for flag in [0x08, 0x10] {
+            if flg & flag != 0 {
+                p += data.get(p..).ok_or_else(bad)?.iter().position(|&c| c == 0).ok_or_else(bad)? + 1;
+            }
+        }
+        if flg & 0x02 != 0 {
+            p += 2;
+        }
+        let mut input = data.get(p..).ok_or_else(bad)?;
+        let mut st = InflateState::new_boxed(DataFormat::Raw);
+        loop {
+            let r = inflate(&mut st, input, &mut buf, MZFlush::None);
+            input = &input[r.bytes_consumed..];
+            out.extend_from_slice(&buf[..r.bytes_written]);
+            match r.status {
+                Ok(MZStatus::StreamEnd) => break,
+                Ok(_) if r.bytes_consumed > 0 || r.bytes_written > 0 => {}
+                Ok(_) => return Err("truncated gzip stream".into()),
+                Err(e) => return Err(format!("gzip: {e:?}")),
+            }
+        }
+        // the 8-byte trailer (CRC-32, size), then possibly another member
+        data = input.get(8..).unwrap_or(&[]);
+    }
+    Ok(out)
+}
+
+#[cfg(not(feature = "gzip"))]
+fn gunzip(_: &[u8]) -> Result<Vec<u8>, String> {
+    Err("gzip-compressed; build vyges-loom with the `gzip` feature to read it".into())
 }
 
 #[cfg(test)]
@@ -870,8 +1062,8 @@ mod tests {
     use super::*;
 
     /// Rule: a hierarchical netlist keeps EVERY module's contents; the top is the one nothing
-    /// instantiates, wherever it is declared. (Customer gap, 2026-10-16: `parse` returned the top
-    /// and dropped the rest, so nothing below it could be traced.)
+    /// instantiates, wherever it is declared. (`parse` returned the top and dropped the rest, so
+    /// nothing below it could be traced.)
     #[test]
     fn every_module_of_a_hierarchical_netlist_is_kept() {
         let src = r#"
@@ -898,6 +1090,88 @@ endmodule
         assert!(d.module("sky130_fd_sc_hd__inv_2").is_none(), "a library cell is a leaf, not a module");
         // `parse` still hands back the same top, unchanged.
         assert_eq!(parse(src).unwrap().module, "chip");
+        // The file-wide lists are on the top ONCE, not copied onto every module.
+        assert_eq!(d.module_names(), ["leaf", "mid", "chip"]);
+        assert_eq!(parse(src).unwrap().modules, ["leaf", "mid", "chip"]);
+        assert!(mid.modules.is_empty() && leaf.modules.is_empty());
+    }
+
+    /// Rule (the reference reader's): a constant is `size` bits, filled from its least
+    /// significant digit, missing digits 0, `x`/`z` as 0, unsized = one bit; its bits are ties,
+    /// and a concatenation counts a constant at its full width.
+    #[test]
+    fn constant_ties_are_recorded_bit_for_bit() {
+        let src = r#"
+module top (input [1:0] a, output y);
+  DLY  u0 (.E(1'b0), .S(1'b1), .A(a[0]), .Y(y));
+  MUX4 u1 (.D({a[1:0], 2'b10}), .S('b1), .T(4'hx), .U(3'd5));
+  INV  u2 (1'b1, y);
+endmodule
+"#;
+        let nl = parse(src).unwrap();
+        let ties = |k: usize| nl.insts[k].ties.iter().map(|(p, v)| (p.as_str(), *v)).collect::<Vec<_>>();
+        assert_eq!(ties(0), [("E", false), ("S", true)]);
+        assert_eq!(nl.insts[0].conns, [("A".to_string(), "a[0]".to_string()), ("Y".into(), "y".into())]);
+        assert_eq!(
+            nl.insts[1].conns,
+            [("D[3]".to_string(), "a[1]".to_string()), ("D[2]".into(), "a[0]".into())],
+            "the constant's two bits are D[1:0], so the bus takes D[3:2]"
+        );
+        assert_eq!(
+            ties(1),
+            [("D[1]", true), ("D[0]", false), ("S", true), ("T[3]", false), ("T[2]", false), ("T[1]", false), ("T[0]", false),
+             ("U[2]", true), ("U[1]", false), ("U[0]", true)]
+        );
+        assert_eq!(ties(2), [("", true)], "a positional constant, like a positional net, has no pin name");
+        assert_eq!(nl.insts[2].conns, [(String::new(), "y".to_string())]);
+    }
+
+    #[test]
+    fn const_bits_follow_the_reference() {
+        assert_eq!(const_bits("1'b1"), [true]);
+        assert_eq!(const_bits("4'b1_0"), [false, false, true, false], "missing digits are 0; `_` skipped");
+        assert_eq!(const_bits("2'hF"), [true, true], "truncated to its size");
+        assert_eq!(const_bits("'b1"), [true], "unsized is one bit");
+        assert_eq!(const_bits("2'bxz"), [false, false]);
+        assert_eq!(const_bits("2'sb11"), [false, false], "unknown base (here the sign) reads 0");
+    }
+
+    /// A non-UTF-8 byte (a Windows-1252 quote in a comment) no longer fails the whole read.
+    #[test]
+    fn a_file_that_is_not_utf8_is_read_lossily() {
+        let dir = std::env::temp_dir().join(format!("loom-nl-lossy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("n.v");
+        let mut bytes = b"// it\x92s a netlist\nmodule top (input a, output y);\n  INV u0 (.A(a), .Y(y));\nendmodule\n".to_vec();
+        bytes[5] = 0x92;
+        std::fs::write(&f, &bytes).unwrap();
+        let d = load_all(f.to_str().unwrap()).unwrap();
+        assert_eq!(d.top().insts.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A gzipped netlist — two members, as `cat a.gz b.gz` writes — reads as its text.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn a_gzipped_netlist_is_read() {
+        fn member(text: &[u8]) -> Vec<u8> {
+            let mut g = vec![0x1f, 0x8b, 8, 0x08, 0, 0, 0, 0, 0, 3];
+            g.extend_from_slice(b"n.v\0"); // FNAME
+            g.extend(miniz_oxide::deflate::compress_to_vec(text, 6));
+            g.extend_from_slice(&[0; 4]); // CRC-32 (not checked)
+            g.extend_from_slice(&(text.len() as u32).to_le_bytes());
+            g
+        }
+        let mut gz = member(b"module leaf (input a, output y);\n  INV u0 (.A(a), .Y(y));\nendmodule\n");
+        gz.extend(member(b"module top (input a, output y);\n  leaf l (.a(a), .y(y));\nendmodule\n"));
+        let dir = std::env::temp_dir().join(format!("loom-nl-gz-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("n.v.gz");
+        std::fs::write(&f, gz).unwrap();
+        let d = load_all(f.to_str().unwrap()).unwrap();
+        assert_eq!(d.module_names(), ["leaf", "top"]);
+        assert_eq!(d.top().module, "top");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

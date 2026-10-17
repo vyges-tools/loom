@@ -44,6 +44,11 @@ impl Inst {
     fn connections(&self) -> Vec<(String, String)> {
         self.inner.conns.clone()
     }
+    /// The `(pin, value)` constant ties (`.E(1'b0)` gives `("E", False)`).
+    #[getter]
+    fn ties(&self) -> Vec<(String, bool)> {
+        self.inner.ties.clone()
+    }
 
     fn __repr__(&self) -> String {
         format!(

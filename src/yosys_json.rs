@@ -111,15 +111,16 @@ pub fn parse(text: &str) -> Result<Netlist, NetlistError> {
     if let Some(cells) = module.get("cells").and_then(|c| c.as_object()) {
         for (cname, obj) in cells {
             let cell_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
-            let mut inst = Inst { cell: strip_esc(&cell_type), name: strip_esc(cname), conns: Vec::new() };
+            let mut inst = Inst { cell: strip_esc(&cell_type), name: strip_esc(cname), conns: Vec::new(), ..Default::default() };
             if let Some(conns) = obj.get("connections").and_then(|c| c.as_object()) {
                 for (pin, bits_v) in conns {
                     let bits = bits_v.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
                     for (idx, bit) in bits.iter().enumerate() {
                         let pin_name = expand(pin, idx, bits.len());
                         match bit {
-                            // constant bits ("0"/"1"/"x"/"z") are dropped
-                            json::Value::Str(_) => {}
+                            // constant bits ("0"/"1"/"x"/"z") are ties, not nets — read as the
+                            // Verilog reader reads them: `x`/`z` as 0 (see `Inst::ties`)
+                            json::Value::Str(v) => inst.ties.push((pin_name, v == "1")),
                             _ => {
                                 if let Some(id) = bit.as_int() {
                                     let net = name_of(id).unwrap_or_else(|| format!("$n{id}"));

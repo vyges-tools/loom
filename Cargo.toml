@@ -17,6 +17,8 @@ build = "build.rs"
 [features]
 default = []
 fst = ["dep:miniz_oxide"]
+# `netlist::load`/`load_all` read gzipped netlists (the same pure-Rust inflater).
+gzip = ["dep:miniz_oxide"]
 
 [dependencies]
 miniz_oxide = { version = "0.8", optional = true }
