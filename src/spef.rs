@@ -35,9 +35,8 @@
 //!
 //! **A coupling capacitor is written in BOTH nets' blocks.** This looks like redundancy and is
 //! not: a reader applies the capacitor to the net whose block it appears in, so listing it once
-//! leaves the other net believing it is uncoupled. It is what OpenRCX does. The READER dedupes
-//! by node pair — counting both listings would double every net's crosstalk — so the two halves
-//! of this are asymmetric on purpose.
+//! leaves the other net believing it is uncoupled. It is what OpenRCX does, and this reader reads
+//! it the same way — each listing credits only its own block's net, so nothing is deduped.
 //!
 //! **Numbers carry significant figures, not decimal places.** `{:.6}` is six places: it wrote
 //! every capacitance below 5e-7 as `0.000000`, deleting the capacitor in a file that still
@@ -54,7 +53,9 @@ use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Default)]
 pub struct NetRc {
-    pub cap_ff: f64,                  // total cap (grounded + coupling), from *D_NET
+    /// Total cap, grounded + coupling, as the caps SUM — the `*D_NET` total only for a net that
+    /// lists no caps (the reference ignores that total entirely).
+    pub cap_ff: f64,
     pub res_ohm: f64,                 // summed *RES (lumped fallback)
     pub coupling_ff: f64,             // total coupling cap (sum over neighbours)
     pub coupling: Vec<(String, f64)>, // per-aggressor coupling (net, Cc) for window-aware SI
@@ -96,7 +97,7 @@ pub struct PinConn {
 #[derive(Debug, Clone, Default)]
 pub struct Spef {
     pub nets: BTreeMap<String, NetRc>,
-    /// Lines inside a recognised section that this reader could not interpret.
+    /// Entries inside a recognised section that this reader could not interpret.
     ///
     /// **A parser that cannot fail cannot warn.** `parse` returns a `Spef` whatever it is given,
     /// so every gap it has ever had produced a quietly smaller answer rather than an error: a
@@ -104,6 +105,10 @@ pub struct Spef {
     /// This is the tell. Non-zero on a file you expect to be understood means the reader is
     /// behind the writer — check it before trusting the numbers, and see [`Spef::health`].
     pub skipped: usize,
+    /// Entries naming a node the file cannot resolve — an index with no name-map entry, or a
+    /// coupling cap neither of whose ends is on the net whose block lists it. The reference
+    /// warns and drops each; so does this reader, and counts them.
+    pub unresolved: usize,
     /// The file carried **corner triplets** (`min:typ:max`) and this reader took the first
     /// field of each. Single-corner by construction; a caller that needs a specific corner
     /// must not read it from here.
@@ -125,7 +130,10 @@ impl Spef {
             notes.push("no nets were parsed".to_string());
         }
         if self.skipped > 0 {
-            notes.push(format!("{} line(s) in known sections not understood", self.skipped));
+            notes.push(format!("{} entr(ies) in known sections not understood", self.skipped));
+        }
+        if self.unresolved > 0 {
+            notes.push(format!("{} entr(ies) naming a node that resolves to nothing — dropped", self.unresolved));
         }
         if self.triplets {
             notes.push("corner triplets present — the first (min) field was taken".to_string());
@@ -175,31 +183,141 @@ impl std::error::Error for SpefError {}
 
 /// Resolve a node reference to REAL NAMES: `*3:Y` -> `g1:Y`, `*1` -> `n1`, `*1:2` -> `n1:2`.
 ///
-/// A node reference is a name-map index (or a literal name) followed by an optional `:<suffix>`
-/// naming a pin or an internal node number; only the head is mapped. Keeping the raw index made
-/// every node meaningless to every consumer — `3:Y` says nothing about which instance that is —
-/// and it broke our own writer, which cannot tell the node `3:Y` from a net someone NAMED
-/// `3:Y`. It interned it as a name, so the RC network we wrote no longer joined the pins in
-/// `*CONN`: a driver attached to nothing, in a file that still parsed. That is what a
-/// read-write-read cycle over the whole structure catches and a field-by-field round trip does
-/// not, because nobody thinks to assert on node identity.
+/// A node reference is a name-map index (or a literal name) followed by an optional
+/// `<delimiter><suffix>` naming a pin or an internal node number; only the head is mapped.
+/// Keeping the raw index made every node meaningless to every consumer — `3:Y` says nothing about
+/// which instance that is — and it broke our own writer, which cannot tell the node `3:Y` from a
+/// net someone NAMED `3:Y`. That is what a read-write-read cycle over the whole structure catches
+/// and a field-by-field round trip does not, because nobody thinks to assert on node identity.
 ///
-/// The suffix delimiter is `:`, the format's default and the only one this writer emits.
-fn node_tok(t: &str, names: &BTreeMap<usize, String>) -> String {
-    let head = |h: &str| -> String {
+/// The head and suffix split at the LAST declared delimiter, as the reference splits them, and
+/// the node is written back with `:`, the only delimiter our writer emits. `None` for an index
+/// the name map does not hold: the reference resolves it to nothing and drops the entry.
+fn node_tok(t: &str, names: &BTreeMap<usize, String>, delim: char) -> Option<String> {
+    let head = |h: &str| -> Option<String> {
         match h.strip_prefix('*') {
-            Some(body) => body
-                .parse::<usize>()
-                .ok()
-                .and_then(|i| names.get(&i).cloned())
-                .unwrap_or_else(|| body.to_string()),
-            None => h.to_string(),
+            Some(body) => match body.parse::<usize>() {
+                Ok(i) => names.get(&i).cloned(),
+                Err(_) => Some(body.to_string()),
+            },
+            None => Some(h.to_string()),
         }
     };
-    match t.split_once(':') {
-        Some((h, suf)) => format!("{}:{suf}", head(h)),
+    match t.rsplit_once(delim) {
+        Some((h, suf)) => Some(format!("{}:{suf}", head(h)?)),
         None => head(t),
     }
+}
+
+/// A SPEF identifier — a `*NAME_MAP` index (`*17`) or a **literal name**. `None` for an index the
+/// map does not hold.
+///
+/// The map is OPTIONAL in IEEE 1481 and extractors do write names directly; resolving only the
+/// mapped form discarded the whole file. The leading `*` is the discriminator the format itself
+/// uses — do NOT infer it from whether the body parses as a number: a literal net may
+/// legitimately be named `123`.
+fn resolve(tok: &str, names: &BTreeMap<usize, String>) -> Option<String> {
+    match tok.strip_prefix('*') {
+        Some(body) => match body.parse::<usize>() {
+            Ok(i) => names.get(&i).cloned(),
+            Err(_) => Some(body.to_string()),
+        },
+        None => Some(unescape(tok)),
+    }
+}
+
+/// An instance pin `<inst><delim><pin>` -> (instance name, pin), split at the LAST delimiter.
+fn pin_of(tok: &str, names: &BTreeMap<usize, String>, delim: char) -> Option<(String, String)> {
+    let (ids, pin) = tok.rsplit_once(delim)?;
+    Some((resolve(ids, names)?, pin.to_string()))
+}
+
+/// A two-node cap awaiting resolution: (block serial, block net, node a, node b, fF).
+type PendingCc = (usize, String, Option<String>, Option<String>, f64);
+
+/// Where the reader is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sect {
+    None,
+    Header,
+    NameMap,
+    /// a section whose entries are not needed (`*PORTS`, `*POWER_NETS`, `*DEFINE`, …)
+    Ignore,
+    Conn,
+    Cap,
+    Res,
+    Induc,
+    /// a net between `*D_NET` and `*CONN`
+    Net,
+    /// a block that is not read at all (`*R_NET`, `*D_PNET`, `*R_PNET`, an unresolved net)
+    Skip,
+}
+
+/// The token as a SPEF keyword, upper-cased, when it is one. Keywords are matched without case —
+/// an extension: the reference's lexer is case-sensitive and rejects a lower-case file.
+fn keyword(t: &str) -> Option<&'static str> {
+    const KW: [&str; 32] = [
+        "*SPEF", "*DESIGN", "*DATE", "*VENDOR", "*PROGRAM", "*VERSION", "*DESIGN_FLOW", "*DIVIDER",
+        "*DELIMITER", "*BUS_DELIMITER", "*T_UNIT", "*C_UNIT", "*R_UNIT", "*L_UNIT", "*NAME_MAP",
+        "*POWER_NETS", "*GROUND_NETS", "*PORTS", "*PHYSICAL_PORTS", "*DEFINE", "*PDEFINE", "*D_NET",
+        "*R_NET", "*D_PNET", "*R_PNET", "*CONN", "*CAP", "*RES", "*INDUC", "*END", "*VARIATION_PARAMETERS",
+        "*POWER_DEF",
+    ];
+    if !t.starts_with('*') {
+        return None;
+    }
+    KW.iter().copied().find(|k| k.eq_ignore_ascii_case(t))
+}
+
+/// The file's tokens: whitespace-separated, with `//` and `/* */` comments removed, a quoted
+/// string kept whole, and a backslash escaping the next character (so `a\ b` is one name).
+fn tokens(text: &str) -> Vec<&str> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+        } else if c == b'/' && b.get(i + 1) == Some(&b'/') {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                i += 1;
+            }
+            i = (i + 2).min(b.len());
+        } else if c == b'"' {
+            let s0 = i;
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                i += if b[i] == b'\\' { 2 } else { 1 };
+            }
+            i = (i + 1).min(b.len());
+            out.push(&text[s0..i]);
+        } else {
+            let s0 = i;
+            while i < b.len() && !b[i].is_ascii_whitespace() {
+                i += if b[i] == b'\\' { 2 } else { 1 };
+            }
+            i = i.min(b.len());
+            out.push(&text[s0..i]);
+        }
+    }
+    out
+}
+
+/// A value in this reader's units (fF, Ω), with the reference's PRECISION: the first field of a
+/// `min:typ:max` triplet, scaled, then narrowed to `f32` — its lexer stores `(float)atof(text)`.
+///
+/// ⚠️ For a file in fF and Ω (what OpenRCX writes) this is the reference's `float` exactly. For
+/// one in pF or kΩ it narrows AFTER scaling, where the reference narrows before: an ulp apart.
+/// Narrowing in the file's unit instead would put each value on that unit's `f32` grid, and the
+/// writer — which writes fF and Ω — would stop being a fixed point on its own output.
+fn read_scaled(t: &str, scale: f64) -> Option<f64> {
+    parse_val(t).map(|v| (v * scale) as f32 as f64)
 }
 
 /// A SPEF value may be a single number or a **corner triplet** `min:typ:max`, written whenever
@@ -272,16 +390,6 @@ fn spread_xtalk<'a>(
         }
     } else {
         *cap.entry(driver).or_default() += xtalk_cap_ff;
-    }
-}
-
-/// Drop a `//` line comment, which is legal anywhere in a SPEF line. Left in place it becomes
-/// extra tokens, and an entry's field count is how this format distinguishes a grounded cap from
-/// a coupling one — so a trailing comment turns a ground cap into an unparseable coupling cap.
-fn strip_comment(line: &str) -> &str {
-    match line.find("//") {
-        Some(i) => &line[..i],
-        None => line,
     }
 }
 
@@ -656,330 +764,335 @@ impl NetRc {
 }
 
 impl Spef {
+    /// Read a SPEF file — as the reference reader reads it, rule for rule, except where a comment
+    /// says otherwise.
+    ///
+    /// 🔑 **A TOKEN STREAM, not lines.** The format is free-form: an extractor may put a whole
+    /// `*CAP` section on one line, or a statement across several. Read line by line, a net whose
+    /// header and pins shared a line lost its pins, and two caps on one line lost the second.
     pub fn parse(text: &str) -> Spef {
-        // unit scaling -> our internal fF / Ω (default 1.0 = already fF/Ω)
+        let toks = tokens(text);
+        let n = toks.len();
+        // The reader's own state. `cur` is the net whose block we are in: (name, serial, rc).
         let mut c_scale = 1.0f64;
         let mut r_scale = 1.0f64;
-        let cap_unit = |u: Option<&&str>| match u.map(|s| s.to_ascii_uppercase()).as_deref() {
-            Some("FF") => 1.0,
-            Some("PF") => 1000.0,
-            Some("NF") => 1.0e6,
-            _ => 1.0,
-        };
-        let res_unit = |u: Option<&&str>| match u.map(|s| s.to_ascii_uppercase()).as_deref() {
-            Some("OHM") => 1.0,
-            Some("KOHM") => 1000.0,
-            Some("MOHM") => 1.0e6,
-            _ => 1.0,
-        };
+        let mut delim = ':';
         let mut names: BTreeMap<usize, String> = BTreeMap::new();
         let mut nets: BTreeMap<String, NetRc> = BTreeMap::new();
+        // the block that won for each net — see `Duplicate *D_NET` below
+        let mut winner: BTreeMap<String, usize> = BTreeMap::new();
+        let mut cur: Option<(String, usize, NetRc)> = None;
+        let mut serial = 0usize;
+        let mut sect = Sect::None;
+        // A node's net, from the entries that tie it to one — see `owner_of`.
+        let mut conn_owner: BTreeMap<String, String> = BTreeMap::new();
+        let mut weak_owner: BTreeMap<String, String> = BTreeMap::new();
+        // (block serial, block net, node a, node b, fF) — resolved once every block is read.
+        let mut pending_cc: Vec<PendingCc> = Vec::new();
+        let (mut skipped, mut unresolved, mut reduced, mut pnets) = (0usize, 0usize, 0usize, 0usize);
+        let mut triplets = false;
+
+        let finish = |cur: &mut Option<(String, usize, NetRc)>,
+                      nets: &mut BTreeMap<String, NetRc>,
+                      winner: &mut BTreeMap<String, usize>| {
+            if let Some((name, ser, rc)) = cur.take() {
+                // Duplicate `*D_NET`: the LAST block replaces the net entirely, as the reference
+                // deletes the earlier network and builds a new one.
+                winner.insert(name.clone(), ser);
+                nets.insert(name, rc);
+            }
+        };
+
+        let mut i = 0;
+        while i < n {
+            let t = toks[i];
+            let kw = keyword(t);
+            // Inside a block this reader does not model, only the block's end (or, leniently, the
+            // start of another block) matters: its `*CONN`/`*CAP`/`*RC` must not be read as a
+            // signal net's. A power net's coupling leaked into the signal nets it touched.
+            if sect == Sect::Skip && !matches!(kw, Some("*END" | "*D_NET" | "*R_NET" | "*D_PNET" | "*R_PNET")) {
+                i += 1;
+                continue;
+            }
+            if let Some(kw) = kw {
+                i += 1;
+                match kw {
+                    "*C_UNIT" | "*R_UNIT" | "*T_UNIT" | "*L_UNIT" => {
+                        let scale = toks.get(i).and_then(|v| parse_val(v)).unwrap_or(1.0) as f32 as f64;
+                        let unit = toks.get(i + 1).map(|u| u.to_ascii_uppercase()).unwrap_or_default();
+                        // NF and MOHM are not SPEF units; the reference warns and keeps a scale of
+                        // 1 — reading the values as farads and ohms. Scaling them is kept here as
+                        // the only answer that is not wrong by orders of magnitude.
+                        match kw {
+                            "*C_UNIT" => c_scale = scale * match unit.as_str() { "PF" => 1e3, "NF" => 1e6, _ => 1.0 },
+                            "*R_UNIT" => r_scale = scale * match unit.as_str() { "KOHM" => 1e3, "MOHM" => 1e6, _ => 1.0 },
+                            _ => {}
+                        }
+                        i += 2;
+                    }
+                    // The pin delimiter is DECLARED, and a node splits at its LAST occurrence.
+                    "*DELIMITER" => {
+                        if let Some(c) = toks.get(i).and_then(|d| d.chars().next()) {
+                            delim = c;
+                        }
+                        i += 1;
+                    }
+                    "*NAME_MAP" => sect = Sect::NameMap,
+                    // These sections END the name map. Read as more of it, an indexed port entry
+                    // `*13 I *C 0 0` renamed index 13 to "I". Their entries are not needed here.
+                    "*POWER_NETS" | "*GROUND_NETS" | "*PORTS" | "*PHYSICAL_PORTS" | "*DEFINE" | "*PDEFINE" => {
+                        sect = Sect::Ignore
+                    }
+                    "*D_NET" => {
+                        finish(&mut cur, &mut nets, &mut winner);
+                        serial += 1;
+                        let idtok = toks.get(i).copied().unwrap_or("");
+                        let total = toks.get(i + 1).copied().unwrap_or("");
+                        triplets |= is_triplet(total);
+                        i += 2;
+                        match (resolve(idtok, &names), node_tok(idtok, &names, delim)) {
+                            (Some(name), Some(net_node)) => {
+                                let stated = read_scaled(total, c_scale).unwrap_or(0.0);
+                                weak_owner.insert(net_node.clone(), name.clone());
+                                let rc = NetRc { cap_ff: stated, net_node, ..Default::default() };
+                                cur = Some((name, serial, rc));
+                                sect = Sect::Net;
+                            }
+                            // An index the name map does not hold names nothing: the reference
+                            // warns and skips the net.
+                            _ => {
+                                unresolved += 1;
+                                sect = Sect::Skip;
+                            }
+                        }
+                    }
+                    // Reduced nets are not modelled (see `reduced`); power nets by design.
+                    "*R_NET" | "*D_PNET" | "*R_PNET" => {
+                        finish(&mut cur, &mut nets, &mut winner);
+                        if kw == "*R_NET" { reduced += 1 } else { pnets += 1 }
+                        sect = Sect::Skip;
+                    }
+                    "*CONN" => sect = Sect::Conn,
+                    "*CAP" => sect = Sect::Cap,
+                    "*RES" => sect = Sect::Res,
+                    // Inductors are read and discarded, as the reference does. Unrecognised, each
+                    // one was taken for a RESISTOR and closed a loop the Elmore walk refused.
+                    "*INDUC" => sect = Sect::Induc,
+                    "*END" => {
+                        finish(&mut cur, &mut nets, &mut winner);
+                        sect = Sect::None;
+                    }
+                    // the header's other fields: what follows is not needed
+                    _ => sect = Sect::Header,
+                }
+                continue;
+            }
+            // ---- an entry of the current section, starting at token `i` ----
+            match sect {
+                Sect::NameMap => {
+                    match (t.strip_prefix('*').and_then(|d| d.parse::<usize>().ok()), toks.get(i + 1)) {
+                        (Some(id), Some(name)) => {
+                            // a quoted name means its contents
+                            let name = name.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(name);
+                            names.insert(id, unescape(name));
+                            i += 2;
+                        }
+                        _ => {
+                            skipped += 1;
+                            i += 1;
+                        }
+                    }
+                }
+                Sect::Conn => {
+                    let up = t.to_ascii_uppercase();
+                    if up != "*P" && up != "*I" && up != "*N" {
+                        skipped += 1;
+                        i += 1;
+                        continue;
+                    }
+                    let node = toks.get(i + 1).copied().unwrap_or("");
+                    i += 2;
+                    // `*N <node> *C x y` gives an internal node's coordinates: nothing to keep
+                    let dir = if up == "*N" {
+                        None
+                    } else {
+                        match toks.get(i).copied() {
+                            Some(d @ ("I" | "O" | "B")) => {
+                                i += 1;
+                                Some(d)
+                            }
+                            _ => None,
+                        }
+                    };
+                    // the connection's attributes: `*C x y`, `*L cap`, `*S r1 r2`, `*D cell`
+                    let mut load = 0.0;
+                    while let Some(a) = toks.get(i) {
+                        match a.to_ascii_uppercase().as_str() {
+                            "*C" | "*S" => i += 3,
+                            "*L" => {
+                                load = toks.get(i + 1).and_then(|v| read_scaled(v, c_scale)).unwrap_or(0.0);
+                                i += 2;
+                            }
+                            "*D" => i += 2,
+                            _ => break,
+                        }
+                    }
+                    if up == "*N" {
+                        continue;
+                    }
+                    let is_port = up == "*P";
+                    let (Some(node_id), true) = (node_tok(node, &names, delim), cur.is_some()) else {
+                        unresolved += 1;
+                        continue;
+                    };
+                    // `*P <port>` names a top-level port, whose node is the port itself and not
+                    // `<inst>:<pin>`, so it never matched the instance form.
+                    let hookup = if is_port {
+                        resolve(node, &names).map(|p| (String::new(), p))
+                    } else {
+                        pin_of(node, &names, delim)
+                    };
+                    let Some((inst, pin)) = hookup else {
+                        unresolved += 1;
+                        continue;
+                    };
+                    let dir = match dir {
+                        Some("O") => crate::lef::PinDir::Output,
+                        Some("B") => crate::lef::PinDir::Inout,
+                        Some("I") => crate::lef::PinDir::Input,
+                        _ => crate::lef::PinDir::Unknown,
+                    };
+                    conn_owner.insert(node_id.clone(), cur.as_ref().map(|c| c.0.clone()).unwrap_or_default());
+                    let Some((_, _, rc)) = cur.as_mut() else { continue };
+                    // `pins` is instance hookup, which is what a netlist join asks for; a port has
+                    // no instance to name there.
+                    if !is_port {
+                        rc.pins.push((inst.clone(), pin.clone(), node_id.clone()));
+                    }
+                    rc.conns.push(PinConn { inst, pin, node: node_id, dir, cap_ff: load, is_port });
+                }
+                Sect::Cap | Sect::Res | Sect::Induc => {
+                    // `<id> <node> <value>` (grounded cap), `<id> <node> <node> <value>`
+                    if !t.bytes().all(|c| c.is_ascii_digit()) {
+                        skipped += 1;
+                        i += 1;
+                        continue;
+                    }
+                    let a = toks.get(i + 1).copied().unwrap_or("");
+                    let b = toks.get(i + 2).copied().unwrap_or("");
+                    let grounded = sect == Sect::Cap && parse_val(b).is_some();
+                    let vt = if grounded { b } else { toks.get(i + 3).copied().unwrap_or("") };
+                    i += if grounded { 3 } else { 4 };
+                    let scale = if sect == Sect::Cap { c_scale } else { r_scale };
+                    let Some(v) = read_scaled(vt, scale) else {
+                        skipped += 1;
+                        continue;
+                    };
+                    triplets |= is_triplet(vt);
+                    let Some((name, ser, rc)) = cur.as_mut() else { continue };
+                    let na = node_tok(a, &names, delim);
+                    match sect {
+                        Sect::Induc => {}
+                        Sect::Res => {
+                            let nb = node_tok(b, &names, delim);
+                            let (Some(na), Some(nb)) = (na, nb) else {
+                                unresolved += 1;
+                                continue;
+                            };
+                            let r = v;
+                            weak_owner.insert(na.clone(), name.clone());
+                            weak_owner.insert(nb.clone(), name.clone());
+                            rc.res_ohm += r;
+                            rc.res.push((na, nb, r));
+                        }
+                        _ if grounded => {
+                            let Some(na) = na else {
+                                unresolved += 1;
+                                continue;
+                            };
+                            weak_owner.insert(na.clone(), name.clone());
+                            rc.ground.push((na, v));
+                        }
+                        // A two-node cap: which end is LOCAL is only known once every block has
+                        // said which nodes it owns, so it is resolved after the loop.
+                        _ => pending_cc.push((*ser, name.clone(), na, node_tok(b, &names, delim), v)),
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+        finish(&mut cur, &mut nets, &mut winner);
+
+        // ── a node's net ─────────────────────────────────────────────────────────────────────
+        //
+        // The reference asks its NETLIST; this reader has the file. In order of strength: the net
+        // whose `*CONN` lists the pin; `<net>:<number>`, an internal node of a net the file
+        // names (the reference's own rule for that form); the net whose grounded caps and
+        // resistors mention the node; a bare name that IS a net.
+        let owner_of = |node: &str| -> Option<String> {
+            if let Some(o) = conn_owner.get(node) {
+                return Some(o.clone());
+            }
+            if let Some((head, suf)) = node.rsplit_once(':') {
+                let head = unescape(head);
+                if suf.bytes().all(|c| c.is_ascii_digit()) && nets.contains_key(&head) {
+                    return Some(head);
+                }
+            }
+            if let Some(o) = weak_owner.get(node) {
+                return Some(o.clone());
+            }
+            let bare = unescape(node);
+            (!node.contains(':') && nets.contains_key(&bare)).then_some(bare)
+        };
+
+        // ── the coupling caps ─────────────────────────────────────────────────────────────────
+        //
+        // 🔑 **A listing credits only the net whose block it is in**, at whichever of its two
+        // nodes lie on that net — the reference's rule, and the reason nothing is deduped.
+        // OpenRCX lists every cap in BOTH nets' blocks, so each net is credited once from its own
+        // block; a file that lists a cap once loads only that net, exactly as the reference
+        // reads it. A cap with both ends on the block's net is not crosstalk: it is grounded at
+        // BOTH ends, counting twice. A cap that is not positive is dropped.
         let mut coupling: BTreeMap<String, f64> = BTreeMap::new();
         let mut coupling_list: BTreeMap<(String, String), f64> = BTreeMap::new();
         #[allow(clippy::type_complexity)]
-        let mut coupling_nodes: BTreeMap<String, Vec<(String, String, String, f64)>> =
-            BTreeMap::new();
-        let mut cur: Option<(String, String, NetRc)> = None; // (name, net_node_token, rc)
-        let mut sect = ""; // "", "namemap", "conn", "cap", "res"
-        // Node token -> owning net. A coupling entry names one node on this net and one on a
-        // net defined elsewhere in the file, so the far end can only be resolved at the end.
-        let mut owner: BTreeMap<String, String> = BTreeMap::new();
-        // (node a, node b, fF), in file order — resolved to nets and deduped after the loop.
-        let mut pending_cc: Vec<(String, String, f64)> = Vec::new();
-        let mut skipped = 0usize;
-        let mut triplets = false;
-        let mut reduced = 0usize;
-        let mut pnets = 0usize;
-
-        // Record that `node` sits on the net whose block we are inside.
-        let claim = |cur: &Option<(String, String, NetRc)>,
-                     owner: &mut BTreeMap<String, String>,
-                     node: &str| {
-            if let Some((name, _, _)) = cur.as_ref() {
-                owner.insert(node.to_string(), name.clone());
-            }
-        };
-        let finish = |cur: &mut Option<(String, String, NetRc)>,
-                      nets: &mut BTreeMap<String, NetRc>| {
-            if let Some((name, _, rc)) = cur.take() {
-                if !name.is_empty() {
-                    nets.insert(name, rc);
-                }
-            }
-        };
-        // A SPEF identifier is either a `*NAME_MAP` index (`*17`) or a **literal name**. The
-        // map is OPTIONAL in IEEE 1481 and extractors do write names directly, so resolving
-        // only the mapped form does not degrade — it discards the whole file: every net ends
-        // up keyed by the empty string, every `*CONN` pin is dropped, and the caller gets the
-        // no-parasitics answer back with no error and no warning.
-        //
-        // The leading `*` is the discriminator the format itself uses. Do NOT infer it from
-        // whether the body parses as a number: a literal net may legitimately be named `123`.
-        let resolve = |tok: &str, names: &BTreeMap<usize, String>| -> String {
-            match tok.strip_prefix('*') {
-                // an index with no map entry falls back to its own text rather than vanishing
-                Some(body) => body
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|i| names.get(&i).cloned())
-                    .unwrap_or_else(|| body.to_string()),
-                None => unescape(tok),
-            }
-        };
-        // resolve a pin token "iid:pin" -> (instance name, pin)
-        let pin_of = |tok: &str, names: &BTreeMap<usize, String>| -> Option<(String, String)> {
-            let (ids, pin) = tok.split_once(':')?;
-            Some((resolve(ids, names), pin.to_string()))
-        };
-
-        for raw in text.lines() {
-            // Keywords are case-insensitive in the SPEF grammar, and a `//` comment is legal
-            // anywhere. A reader that assumes upper case and ignores comments does not fail on a
-            // file that uses either — it returns an EMPTY design, or an entry short of a field.
-            let t = strip_comment(raw).trim();
-            let kw = {
-                let head = t.split_whitespace().next().unwrap_or("");
-                head.to_ascii_uppercase()
-            };
-            if kw == "*C_UNIT" {
-                let p: Vec<&str> = t.split_whitespace().collect();
-                c_scale = p.get(1).and_then(|s| s.parse::<f64>().ok()).unwrap_or(1.0) * cap_unit(p.get(2));
+        let mut coupling_nodes: BTreeMap<String, Vec<(String, String, String, f64)>> = BTreeMap::new();
+        let mut ground_extra: Vec<(String, String, f64)> = Vec::new();
+        for (ser, net, a, b, v) in pending_cc {
+            // a block a later `*D_NET` for the same net replaced
+            if winner.get(&net) != Some(&ser) || v <= 0.0 {
                 continue;
             }
-            if kw == "*R_UNIT" {
-                let p: Vec<&str> = t.split_whitespace().collect();
-                r_scale = p.get(1).and_then(|s| s.parse::<f64>().ok()).unwrap_or(1.0) * res_unit(p.get(2));
-                continue;
-            }
-            if kw == "*NAME_MAP" {
-                sect = "namemap";
-                continue;
-            }
-            // Net-section variants we do not model. Recognised explicitly so the reader can
-            // say WHICH thing it skipped: a file of reduced (pi-model) nets otherwise reads as
-            // an empty design, and "no nets" does not tell you the format was the reason.
-            if kw == "*R_NET" {
-                finish(&mut cur, &mut nets);
-                sect = "";
-                reduced += 1;
-                continue;
-            }
-            if kw == "*D_PNET" || kw == "*R_PNET" {
-                finish(&mut cur, &mut nets);
-                sect = "";
-                pnets += 1;
-                continue;
-            }
-            if kw == "*D_NET" {
-                sect = "";
-                finish(&mut cur, &mut nets);
-                let toks: Vec<&str> = t.split_whitespace().collect();
-                let idtok = toks.get(1).copied().unwrap_or("");
-                triplets |= toks.get(2).is_some_and(|s| is_triplet(s));
-                let cap = toks.get(2).and_then(|s| parse_val(s)).unwrap_or(0.0) * c_scale;
-                let name = resolve(idtok, &names);
-                let net_node = node_tok(idtok, &names);
-                owner.insert(net_node.clone(), name.clone());
-                cur = Some((
-                    name,
-                    net_node.clone(),
-                    NetRc { cap_ff: cap, net_node, ..Default::default() },
-                ));
-                continue;
-            }
-            match kw.as_str() {
-                "*CONN" => {
-                    sect = "conn";
-                    continue;
+            let on = |x: &Option<String>| x.as_deref().and_then(owner_of).as_deref() == Some(net.as_str());
+            let (la, lb) = (on(&a), on(&b));
+            match (la, lb) {
+                (true, true) => {
+                    ground_extra.push((net.clone(), a.clone().unwrap_or_default(), v));
+                    ground_extra.push((net.clone(), b.clone().unwrap_or_default(), v));
                 }
-                "*CAP" => {
-                    sect = "cap";
-                    continue;
+                (true, false) | (false, true) => {
+                    let (local, far) = if la { (a, b) } else { (b, a) };
+                    let (local, far) = (local.unwrap_or_default(), far.unwrap_or_default());
+                    // The aggressor is the far node's net; failing that, the net it is named after.
+                    let agg = owner_of(&far).unwrap_or_else(|| {
+                        unescape(far.rsplit_once(':').map(|(h, _)| h).unwrap_or(&far))
+                    });
+                    *coupling.entry(net.clone()).or_default() += v;
+                    // One entry per AGGRESSOR NET, not per node pair: two nets routed alongside
+                    // each other couple at several node pairs, and a window-aware SI pass wants
+                    // one Cc per aggressor to switch against.
+                    *coupling_list.entry((net.clone(), agg.clone())).or_default() += v;
+                    coupling_nodes.entry(net).or_default().push((agg, local, far, v));
                 }
-                "*RES" => {
-                    sect = "res";
-                    continue;
-                }
-                "*END" => {
-                    sect = "";
-                    finish(&mut cur, &mut nets);
-                    continue;
-                }
-                _ => {}
-            }
-            let toks: Vec<&str> = t.split_whitespace().collect();
-            match sect {
-                "namemap" if t.starts_with('*') => {
-                    if let (Some(idtok), Some(name)) = (toks.first(), toks.get(1)) {
-                        if let Ok(id) = idtok.trim_start_matches('*').parse::<usize>() {
-                            names.insert(id, unescape(name));
-                        }
-                    }
-                }
-                "conn"
-                    if toks
-                        .first()
-                        .is_some_and(|t| t.eq_ignore_ascii_case("*I") || t.eq_ignore_ascii_case("*P")) =>
-                {
-                    if let Some(node) = toks.get(1) {
-                        // `*P <port> <dir>` names a top-level port, whose node is the port
-                        // itself and not `<inst>:<pin>`, so it never matched the instance form.
-                        let is_port = toks
-                            .first()
-                            .is_some_and(|t| t.eq_ignore_ascii_case("*P"));
-                        let hookup = if is_port {
-                            Some((String::new(), resolve(node, &names)))
-                        } else {
-                            pin_of(node, &names)
-                        };
-                        if let Some((inst, pin)) = hookup {
-                            let dir = match toks.get(2).copied() {
-                                Some("O") => crate::lef::PinDir::Output,
-                                Some("B") => crate::lef::PinDir::Inout,
-                                Some("I") => crate::lef::PinDir::Input,
-                                _ => crate::lef::PinDir::Unknown,
-                            };
-                            // optional `*L <cap>` load capacitance
-                            let cap_ff = toks
-                                .iter()
-                                .position(|t| t.eq_ignore_ascii_case("*L"))
-                                .and_then(|i| toks.get(i + 1))
-                                .and_then(|s| parse_val(s))
-                                .map(|c| c * c_scale)
-                                .unwrap_or(0.0);
-                            claim(&cur, &mut owner, &node_tok(node, &names));
-                            if let Some((_, _, rc)) = cur.as_mut() {
-                                // `pins` is instance hookup, which is what a netlist join asks
-                                // for; a port has no instance to name there.
-                                if !is_port {
-                                    rc.pins.push((
-                                        inst.clone(),
-                                        pin.clone(),
-                                        node_tok(node, &names),
-                                    ));
-                                }
-                                rc.conns.push(PinConn {
-                                    inst,
-                                    pin,
-                                    node: node_tok(node, &names),
-                                    dir,
-                                    cap_ff,
-                                    is_port,
-                                });
-                            }
-                        }
-                    }
-                }
-                "res" => {
-                    // `<idx> *a *b <ohm>`
-                    if toks.len() < 4 || parse_val(toks[3]).is_none() {
-                        skipped += 1;
-                    }
-                    if toks.len() >= 4 {
-                        triplets |= is_triplet(toks[3]);
-                        if let Some(r) = parse_val(toks[3]) {
-                            let r = r * r_scale;
-                            let (na, nb) = (node_tok(toks[1], &names), node_tok(toks[2], &names));
-                            claim(&cur, &mut owner, &na);
-                            claim(&cur, &mut owner, &nb);
-                            if let Some((_, _, rc)) = cur.as_mut() {
-                                rc.res_ohm += r;
-                                rc.res.push((na, nb, r));
-                            }
-                        }
-                    }
-                }
-                "cap" => {
-                    let understood = (toks.len() >= 4 && parse_val(toks[3]).is_some())
-                        || (toks.len() == 3 && parse_val(toks[2]).is_some());
-                    if !understood {
-                        skipped += 1;
-                    }
-                    if toks.len() >= 4 {
-                        // Two-node coupling cap `<idx> <A> <B> <ff>`. Both ends are usually
-                        // NODE tokens (`*262:A`), whose owning net is only known once the
-                        // whole file has been read, so these are resolved after the loop.
-                        triplets |= is_triplet(toks[3]);
-                        if let Some(v) = parse_val(toks[3]) {
-                            // NOT claimed for the net whose block this is. The two nodes are
-                            // written in the SAME order in both nets' blocks, so the first one
-                            // is not reliably the local end — claiming it reassigns the other
-                            // net's node to this one and the coupling then resolves to a single
-                            // net and is discarded as intra-net. Ownership comes from the
-                            // grounded caps and resistors, and from the fallback in `net_of`.
-                            pending_cc.push((
-                                node_tok(toks[1], &names),
-                                node_tok(toks[2], &names),
-                                v * c_scale,
-                            ));
-                        }
-                    } else if toks.len() >= 3 {
-                        // grounded cap `<idx> *node <ff>`
-                        triplets |= is_triplet(toks[2]);
-                        if let Some(v) = parse_val(toks[2]) {
-                            let node = node_tok(toks[1], &names);
-                            claim(&cur, &mut owner, &node);
-                            if let Some((_, _, rc)) = cur.as_mut() {
-                                rc.ground.push((node, v * c_scale));
-                            }
-                        }
-                    }
-                }
-                _ => {}
+                // neither end on this net: the reference attaches it nowhere
+                (false, false) => unresolved += 1,
             }
         }
-        finish(&mut cur, &mut nets);
-
-        // ── resolve the coupling caps ────────────────────────────────────────────────────
-        //
-        // ONE physical cap, up to TWO listings. A coupling cap belongs to two nets and SPEF
-        // lets it appear in either block; OpenRCX writes it in BOTH, at full value, so each
-        // net's block stands alone (`extSpef::writeSrcCouplingCaps` + `writeTgtCouplingCaps`).
-        // Crediting every listing therefore doubles every net's crosstalk load. Deduping by
-        // the NODE pair is correct for either convention: written once, it is counted once;
-        // written twice, the second listing is the same cap and is dropped.
-        //
-        // Both ends are resolved through the node->net map built above, because an endpoint is
-        // normally an instance-pin or internal node (`*262:A`), not a net name. Reading only
-        // the bare-net form silently discarded most of the coupling in a real SPEF.
-        let net_of = |tok: &str| -> Option<String> {
-            if let Some(n) = owner.get(tok) {
-                return Some(n.clone());
+        for (net, node, v) in ground_extra {
+            if let Some(rc) = nets.get_mut(&net) {
+                rc.ground.push((node, v));
             }
-            // FALL BACK TO WHAT THE NODE IS NAMED AFTER. Nodes read as `<owner>:<suffix>`, so a
-            // node the far net never mentions anywhere else — the only place it appears is this
-            // coupling entry — still says which net it belongs to. Requiring an exact match in
-            // the ownership map dropped exactly those, and they are not exotic: a net whose
-            // only parasitic IS the coupling capacitor has no other line to claim a node from.
-            if let Some((head, _)) = tok.split_once(':') {
-                if nets.contains_key(head) || owner.values().any(|n| n == head) {
-                    return Some(head.to_string());
-                }
-            }
-            // A bare identifier that named no node is the net itself.
-            (!tok.contains(':')).then(|| resolve(tok, &names))
-        };
-        let mut seen: std::collections::BTreeSet<(String, String)> = Default::default();
-        for (a, b, v) in pending_cc {
-            let key = if a <= b { (a.clone(), b.clone()) } else { (b.clone(), a.clone()) };
-            if !seen.insert(key) {
-                continue; // the same cap, listed again in the other net's block
-            }
-            let (Some(na), Some(nb)) = (net_of(&a), net_of(&b)) else {
-                continue;
-            };
-            if na == nb {
-                continue; // intra-net cap, not crosstalk
-            }
-            *coupling.entry(na.clone()).or_default() += v;
-            *coupling.entry(nb.clone()).or_default() += v;
-            // One entry per AGGRESSOR NET, not per node pair: two nets routed alongside each
-            // other for a while couple at several distinct node pairs, and a window-aware SI
-            // pass wants one Cc per aggressor to switch against.
-            *coupling_list.entry((na.clone(), nb.clone())).or_default() += v;
-            *coupling_list.entry((nb.clone(), na.clone())).or_default() += v;
-            coupling_nodes.entry(na.clone()).or_default().push((nb.clone(), a.clone(), b.clone(), v));
-            coupling_nodes.entry(nb).or_default().push((na, b, a, v));
         }
 
         for (name, rc) in nets.iter_mut() {
@@ -995,8 +1108,15 @@ impl Spef {
                 .take_while(|((n, _), _)| n == name)
                 .map(|((_, other), v)| (other.clone(), *v))
                 .collect();
+            // ⛔ The wire load is what the caps SUM to; the reference ignores the `*D_NET` total.
+            // The total is used only for a net that lists no caps at all — where the sum is zero
+            // and the total is the only number the file gives.
+            let summed: f64 = rc.ground.iter().map(|(_, c)| c).sum::<f64>() + rc.coupling_ff;
+            if !rc.ground.is_empty() || rc.coupling_ff != 0.0 {
+                rc.cap_ff = summed;
+            }
         }
-        Spef { nets, skipped, triplets, reduced, pnets }
+        Spef { nets, skipped, unresolved, triplets, reduced, pnets }
     }
 
     pub fn load(path: &str) -> Result<Spef, SpefError> {
@@ -1434,13 +1554,11 @@ mod writer_tests {
         assert_eq!(s.nets.get("neta").unwrap().coupling, vec![("netb".to_string(), 2.0)]);
     }
 
-    /// The other convention: each cap listed ONCE, in one net's block. Both are legal and both
-    /// come out of OpenRCX — its `couplingFlow` output lists every cap twice, its pattern-
-    /// extraction output lists each once. A reader that "corrects" by halving is right on one
-    /// and wrong on the other; deduping by node pair is right on both, which is why the two
-    /// cases below must agree.
+    /// Rule (the reference reader's): a coupling listing credits ONLY the net whose block lists
+    /// it. Listed once, the cap loads that net and not the other; listed in both blocks, each net
+    /// is credited once, from its own block.
     #[test]
-    fn a_coupling_cap_listed_once_is_read_the_same_way() {
+    fn a_coupling_cap_listed_once_loads_only_the_net_that_lists_it() {
         let head = "\
 *SPEF \"IEEE 1481-1999\"
 *DESIGN \"blk\"
@@ -1475,10 +1593,10 @@ mod writer_tests {
 ";
         let once = Spef::parse(&format!("{head}*END\n"));
         let twice = Spef::parse(&format!("{head}2 *3:A *4:Y 2\n*END\n"));
-        for s in [&once, &twice] {
-            assert_eq!(s.nets.get("neta").unwrap().coupling_ff, 2.0);
-            assert_eq!(s.nets.get("netb").unwrap().coupling_ff, 2.0);
-        }
+        assert_eq!(once.nets["neta"].coupling_ff, 2.0);
+        assert_eq!(once.nets["netb"].coupling_ff, 0.0, "netb's block does not list it");
+        assert_eq!(twice.nets["neta"].coupling_ff, 2.0);
+        assert_eq!(twice.nets["netb"].coupling_ff, 2.0);
     }
 
     /// Coupling endpoints are normally NODE tokens — an instance pin or an internal node,
@@ -1576,9 +1694,10 @@ mod writer_tests {
         assert_eq!(s.nets.get("netb").unwrap().coupling, vec![("neta".to_string(), 3.0)]);
     }
 
-    /// Two nodes on the SAME net are an intra-net cap, not crosstalk.
+    /// Rule (the reference reader's): two nodes on the SAME net are not crosstalk — the cap is
+    /// grounded at BOTH ends, so it counts twice.
     #[test]
-    fn a_cap_between_two_nodes_of_one_net_is_not_coupling() {
+    fn a_cap_between_two_nodes_of_one_net_is_grounded_at_both() {
         let text = "\
 *SPEF \"IEEE 1481-1999\"
 *DESIGN \"blk\"
@@ -1606,7 +1725,10 @@ mod writer_tests {
 *END
 ";
         let s = Spef::parse(text);
-        assert_eq!(s.nets.get("neta").unwrap().coupling_ff, 0.0);
+        let rc = &s.nets["neta"];
+        assert_eq!(rc.coupling_ff, 0.0);
+        assert_eq!(rc.ground.iter().map(|(_, c)| c).sum::<f64>(), 12.0, "8, then 2 at each end");
+        assert_eq!(rc.cap_ff, 12.0);
     }
 
     #[test]
@@ -1823,5 +1945,113 @@ mod rename_tests {
         let mut sp = spef_with("net2007", "other");
         assert_eq!(sp.rename_to_design(&nl), 0);
         assert!(sp.nets.contains_key("net2007"));
+    }
+}
+
+/// Each rule here is the reference reader's, found by running both readers on the same file.
+#[cfg(test)]
+mod reference_rule_tests {
+    use super::*;
+
+    const HEAD: &str = "*SPEF \"IEEE 1481-1998\"\n*DESIGN \"t\"\n*DATE \"d\"\n*VENDOR \"v\"\n*PROGRAM \"p\"\n\
+                        *VERSION \"1\"\n*DESIGN_FLOW \"x\"\n*DIVIDER /\n*DELIMITER :\n*BUS_DELIMITER [ ]\n\
+                        *T_UNIT 1 NS\n*C_UNIT 1 FF\n*R_UNIT 1 OHM\n*L_UNIT 1 HENRY\n";
+    const BODY: &str = "*NAME_MAP\n*1 n1\n*2 u1\n*3 u2\n\
+                        *D_NET *1 4.0\n*CONN\n*I *2:Y O\n*I *3:A I\n\
+                        *CAP\n1 *1:1 2.0\n2 *3:A 2.0\n*RES\n1 *2:Y *1:1 10\n2 *1:1 *3:A 20\n*END\n";
+
+    fn n1(text: &str) -> NetRc {
+        Spef::parse(text).nets.remove("n1").expect("n1")
+    }
+
+    /// The format is free-form: a block on one line reads as it does one statement per line,
+    /// and a `/* */` comment is not data.
+    #[test]
+    fn a_token_stream_not_lines() {
+        let lines = n1(&format!("{HEAD}{BODY}"));
+        let one = n1(&format!(
+            "{HEAD}*NAME_MAP *1 n1 *2 u1 *3 u2 /* *4 ghost */ *D_NET *1 4.0 *CONN *I *2:Y O *I *3:A I \
+             *CAP 1 *1:1 2.0 2 *3:A 2.0 *RES 1 *2:Y *1:1 10 2 *1:1 *3:A 20 *END"
+        ));
+        assert_eq!((one.pins.len(), one.ground.len(), one.res.len()), (2, 2, 2));
+        assert_eq!(one.cap_ff, lines.cap_ff);
+        assert!(one.elmore("u1:Y", 0.0, &BTreeMap::new()).is_some());
+    }
+
+    /// The pin delimiter is the one the header declares, and a node splits at its LAST one.
+    #[test]
+    fn the_declared_delimiter_is_honoured() {
+        let s = n1(&format!("{HEAD}{BODY}").replace("*DELIMITER :", "*DELIMITER |").replace("*2:Y", "*2|Y").replace("*3:A", "*3|A"));
+        assert_eq!(s.pins, [("u1".into(), "Y".into(), "u1:Y".into()), ("u2".into(), "A".into(), "u2:A".into())]);
+        assert!(s.elmore("u1:Y", 0.0, &BTreeMap::new()).is_some());
+    }
+
+    /// `*PORTS` ends the name map: an indexed port entry is not a name.
+    #[test]
+    fn an_indexed_port_entry_does_not_rename_the_map() {
+        let s = Spef::parse(&format!("{HEAD}{BODY}").replace("*D_NET", "*PORTS\n*1 I *C 0 0\n*D_NET"));
+        assert!(s.nets.contains_key("n1"), "{:?}", s.nets.keys().collect::<Vec<_>>());
+    }
+
+    /// Inductors are read and discarded — not taken for resistors.
+    #[test]
+    fn an_inductor_is_not_a_resistor() {
+        let s = n1(&format!("{HEAD}{BODY}").replace("*END", "*INDUC\n1 *3:A *2:Y 1.0\n*END"));
+        assert_eq!(s.res.len(), 2);
+        assert!(s.elmore("u1:Y", 0.0, &BTreeMap::new()).is_some());
+    }
+
+    /// Nothing inside a power-net block reaches a signal net.
+    #[test]
+    fn a_power_net_block_is_not_read() {
+        let s = n1(&format!("{HEAD}{BODY}*D_PNET VPWR 9\n*CAP\n1 VPWR:1 *1:1 1.5\n*END\n"));
+        assert_eq!(s.coupling_ff, 0.0);
+    }
+
+    /// An index the name map does not hold resolves to nothing, and its entry is dropped.
+    #[test]
+    fn an_unmapped_index_is_dropped() {
+        let sp = Spef::parse(&format!("{HEAD}{BODY}").replace("2 *3:A 2.0", "2 *3:A 2.0\n3 *99:1 0.6"));
+        assert_eq!(sp.nets["n1"].cap_ff, 4.0);
+        assert_eq!(sp.unresolved, 1);
+    }
+
+    /// The wire load is what the caps sum to; the `*D_NET` total is not used.
+    #[test]
+    fn the_wire_load_is_the_sum_of_the_caps() {
+        let s = n1(&format!("{HEAD}{BODY}").replace("*D_NET *1 4.0", "*D_NET *1 9.0"));
+        assert_eq!(s.cap_ff, 4.0);
+    }
+
+    /// A duplicate `*D_NET` replaces the earlier block entirely — its coupling too.
+    #[test]
+    fn a_duplicate_net_block_replaces_the_first_one_whole() {
+        let two = format!("{HEAD}{BODY}").replace("*NAME_MAP\n", "*NAME_MAP\n*4 n2\n*5 u3\n")
+            + "*D_NET *4 1.0\n*CONN\n*I *5:A I\n*CAP\n1 *5:A 1.0\n2 *5:A *1:1 0.5\n*END\n"
+            + "*D_NET *4 1.0\n*CONN\n*I *5:A I\n*CAP\n1 *5:A 1.0\n*END\n";
+        let s = Spef::parse(&two);
+        assert_eq!(s.nets["n2"].coupling_ff, 0.0);
+    }
+
+    /// A coupling cap with one end off the file (its net has no block) still loads the local
+    /// end; one that is not positive loads nothing.
+    #[test]
+    fn coupling_to_an_unseen_net_loads_the_local_end_and_a_nonpositive_cap_nothing() {
+        let s = n1(&format!("{HEAD}{BODY}").replace("2 *3:A 2.0", "2 *3:A 2.0\n3 *1:1 n9:1 0.8\n4 *1:1 n9:2 -0.3"));
+        assert_eq!(s.coupling, [("n9".to_string(), 0.8f32 as f64)]);
+    }
+
+    /// A value carries the reference's `float` precision: `(float)atof(text)` for a file in fF.
+    #[test]
+    fn a_value_is_narrowed_to_f32_as_the_reference_reads_it() {
+        let s = n1(&format!("{HEAD}{BODY}").replace("2 *3:A 2.0", "2 *3:A 0.1"));
+        assert_eq!(s.ground[1].1, 0.1f32 as f64);
+        assert_ne!(s.ground[1].1, 0.1);
+    }
+
+    /// A quoted name-map entry means its contents.
+    #[test]
+    fn a_quoted_name_map_entry_is_unquoted() {
+        assert!(Spef::parse(&format!("{HEAD}{BODY}").replace("*1 n1", "*1 \"n1\"")).nets.contains_key("n1"));
     }
 }

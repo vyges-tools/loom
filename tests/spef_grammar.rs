@@ -34,7 +34,8 @@ fn corner_triplets_are_read_not_dropped() {
         "1 OHM",
     );
     let n = s.nets.get("neta").expect("net parses");
-    assert_eq!(n.cap_ff, 10.0, "*D_NET total");
+    // the wire load is what the caps sum to; the reference ignores the `*D_NET` total (10)
+    assert_eq!(n.cap_ff, 8.0, "summed caps");
     assert_eq!(n.res_ohm, 20.0, "*RES");
     assert_eq!(n.ground.len(), 1, "grounded *CAP");
     assert_eq!(n.ground[0].1, 8.0);
@@ -54,7 +55,7 @@ fn keywords_are_case_insensitive() {
         "1 OHM",
     );
     let n = s.nets.get("neta").expect("a lower-case file is still a file");
-    assert_eq!(n.cap_ff, 10.0);
+    assert_eq!(n.cap_ff, 8.0, "the caps' sum, not the stated total");
     assert_eq!(n.ground.len(), 1);
 }
 
@@ -91,7 +92,7 @@ fn escaping_round_trips() {
     );
     let back = Spef::parse(&text);
     assert!(back.nets.contains_key("u_a.q[0]"));
-    assert_eq!(back.nets["u_a.q[0]"].cap_ff, 10.0);
+    assert_eq!(back.nets["u_a.q[0]"].cap_ff, 8.0);
 }
 
 /// **Comments.** `//` is legal anywhere. Left in place its tokens change an entry's field
@@ -113,7 +114,7 @@ fn line_comments_are_stripped() {
 #[test]
 fn units_scale() {
     let pf = one_net("*NAME_MAP\n*1 n\n\n*D_NET *1 0.01\n*CAP\n1 *1 0.008\n*END\n", "1 PF", "1 OHM");
-    assert_eq!(pf.nets["n"].cap_ff, 10.0, "PF -> fF");
+    assert_eq!(pf.nets["n"].cap_ff, 8.0, "PF -> fF");
     let ko = one_net(
         "*NAME_MAP\n*1 n\n*2 m\n\n*D_NET *1 1\n*RES\n1 *1 *2 0.02\n*END\n",
         "1 FF",
@@ -126,15 +127,16 @@ fn units_scale() {
 #[test]
 fn a_file_without_a_name_map_parses() {
     let s = one_net("*D_NET neta 10\n*CAP\n1 neta 8\n*END\n", "1 FF", "1 OHM");
-    assert_eq!(s.nets["neta"].cap_ff, 10.0);
+    assert_eq!(s.nets["neta"].cap_ff, 8.0);
 }
 
 /// Scientific notation is a number.
 #[test]
 fn scientific_notation_parses() {
     let s = one_net("*NAME_MAP\n*1 n\n\n*D_NET *1 1.0e-2\n*CAP\n1 *1 8.5e-3\n*END\n", "1 FF", "1 OHM");
-    assert!((s.nets["n"].cap_ff - 0.01).abs() < 1e-12);
-    assert!((s.nets["n"].ground[0].1 - 0.0085).abs() < 1e-12);
+    // read at the reference's float precision
+    assert_eq!(s.nets["n"].ground[0].1, 8.5e-3f32 as f64);
+    assert_eq!(s.nets["n"].cap_ff, 8.5e-3f32 as f64);
 }
 
 /// **The tell.** A parser that cannot fail must at least count what it did not understand,
@@ -188,7 +190,7 @@ fn power_net_blocks_are_skipped_cleanly() {
     assert_eq!(s.pnets, 1);
     assert_eq!(s.nets.len(), 1, "only the signal net");
     let n = s.nets.get("neta").expect("the signal net after a power block");
-    assert_eq!(n.cap_ff, 10.0);
+    assert_eq!(n.cap_ff, 8.0);
     assert_eq!(n.ground.len(), 1, "must not inherit the power block's entries");
     assert_eq!(n.ground[0].1, 8.0);
 }
