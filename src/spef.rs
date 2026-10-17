@@ -737,6 +737,21 @@ impl NetRc {
         for (node, c) in &self.ground {
             *cap.entry(node.as_str()).or_default() += c;
         }
+        // Each coupling capacitor grounded ON ITS OWN NODE: the reference's reader makes the
+        // two-node capacitor `incrCap(node, cap * couplingCapFactor())` on this net's node unless
+        // coupling is kept (`SpefReader::makeCapacitor`). Spread over the wire in proportion to its
+        // ground cap instead, the totals agree and the Pi does not: on one clock net Rpi came out
+        // 363 Ω against the reference's 456. Only a caller's extra beyond that (a Miller term) is
+        // spread.
+        let at_nodes: f64 = self.coupling_nodes.iter().map(|(_, _, _, c)| *c).sum();
+        let xtalk_cap_ff = if !self.coupling_nodes.is_empty() && xtalk_cap_ff >= at_nodes * (1.0 - 1e-9) {
+            for (_, own, _, c) in &self.coupling_nodes {
+                *cap.entry(own.as_str()).or_default() += c;
+            }
+            xtalk_cap_ff - at_nodes
+        } else {
+            xtalk_cap_ff
+        };
         spread_xtalk(&mut cap, &self.ground, driver, xtalk_cap_ff);
         for (a, b, _) in &self.res {
             cap.entry(a.as_str()).or_default();
