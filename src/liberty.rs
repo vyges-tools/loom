@@ -1383,14 +1383,15 @@ fn pin_caps(own: &str, dir: Dir, default_cap: [f64; 3]) -> PinCaps {
     }
 }
 
-/// One arc per (from bit, to bit), as the reference's reader builds them
-/// (`LibertyReader::makeTimingArcs`): `related_pin` and `related_bus_pins` are lists of names,
+/// One arc per (from bit, to bit), as the reference's reader builds them: `related_pin` and
+/// `related_bus_pins` are lists of names,
 /// split on spaces and tabs, each name a pin, a bus or a bus range. Per timing group and to-pin,
 /// the `related_pin` names in order, then the `related_bus_pins` names; per name its bits:
 ///   * to a plain pin (or a bus bit's own timing group): one arc from each bit (one/bus -> one);
 ///   * to a bus, from the BUS-level group: from one pin, an arc to every bit; from a bus,
 ///     `related_pin` pairs the bits one to one — when the sizes differ the LEADING bits of the
 ///     larger side are dropped — and `related_bus_pins` takes the cross product.
+///
 /// A name the cell does not declare makes no arc (the reference warns, port not found), and
 /// neither does a delay group with no related pin at all (warning 1243).
 fn expand_arcs(pins: &mut BTreeMap<String, Pin>, buses: &[(String, Vec<String>)], bus_bits: &BTreeMap<String, (usize, usize, usize)>) {
@@ -2872,7 +2873,7 @@ mod related_pin_lists {
         p.arcs.iter().map(|a| a.related_pin.as_str()).collect()
     }
 
-    /// Reference rule (makeTimingArcs): `related_pin` is a list split on spaces and tabs, one arc
+    /// Reference rule: `related_pin` is a list split on spaces and tabs, one arc
     /// set per name in order; a group with no related pin makes none (warning 1243). Checked on
     /// this library: the reference's `report_lib_cell` lists exactly these arcs for AO and MEM.
     /// ⚠️ A name the cell lacks: the reference warns (1294, port not found) and then CRASHES (its
