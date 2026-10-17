@@ -180,11 +180,42 @@ impl RecvCap {
     }
 }
 
+/// A pin's capacitance per output edge and per analysis (min/max), in library units — the
+/// reference's four values.
+///
+/// `capacitance` sets all four; `rise_capacitance` / `fall_capacitance` override their edge;
+/// `rise_capacitance_range (min, max)` / `fall_…` override min and max apart; and whatever is
+/// still unset is the library's `default_{input,output,inout}_pin_cap` for the pin's direction.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PinCaps {
+    pub rise_min: f64,
+    pub rise_max: f64,
+    pub fall_min: f64,
+    pub fall_max: f64,
+}
+
+impl PinCaps {
+    /// The capacitance for one edge (`rising`) in a late (`max`) or early analysis.
+    pub fn get(&self, rising: bool, max: bool) -> f64 {
+        match (rising, max) {
+            (true, true) => self.rise_max,
+            (true, false) => self.rise_min,
+            (false, true) => self.fall_max,
+            (false, false) => self.fall_min,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Pin {
     pub name: String,
     pub direction: Dir,
-    pub capacitance: f64, // input capacitance in library units (timing/NLDM load axis)
+    /// Input capacitance in library units (timing/NLDM load axis): the stated `capacitance`,
+    /// else the largest of [`Pin::caps`] — one figure for a consumer that does not time per edge.
+    /// ⛔ It was 0 for a pin that states only `rise_`/`fall_capacitance`, or nothing at all.
+    pub capacitance: f64,
+    /// Per edge and analysis — see [`PinCaps`]. What the reference times with.
+    pub caps: PinCaps,
     pub cap_f: f64,       // same capacitance in Farads (power: net-load summation)
     pub recv: Option<RecvCap>, // CCS receiver model (input pins); None -> use `capacitance`
     pub clock: bool,      // `clock : true` — the cell's clock pin
@@ -969,9 +1000,10 @@ fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
         Some("inout") => Dir::Inout,
         _ => Dir::Other,
     };
+    let caps = pin_caps(&own, direction, ctx.default_cap);
     let capacitance = simple_attr(&own, "capacitance")
         .and_then(|s| lnum(&s))
-        .unwrap_or(0.0);
+        .unwrap_or_else(|| caps.rise_max.max(caps.fall_max));
     let cap_f = capacitance * cap_unit_f;
     // CCS receiver capacitance group (input pins): the Miller-aware two-segment load.
     // Skipped for NLDM-only parses (consumers fall back to lumped Ceff).
@@ -1033,6 +1065,7 @@ fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
         name,
         direction,
         capacitance,
+        caps,
         cap_f,
         recv,
         clock,
@@ -1104,6 +1137,8 @@ struct Ctx<'a> {
     cap_f: f64,
     skip_ccs: bool,
     templates: &'a Templates,
+    /// `default_input_pin_cap`, `default_output_pin_cap`, `default_inout_pin_cap`
+    default_cap: [f64; 3],
 }
 
 /// Every `*_template` group directly in the library (`lu_table_template`, `power_lut_template`,
@@ -1308,6 +1343,41 @@ fn bit_range(from: i64, to: i64) -> Box<dyn Iterator<Item = i64>> {
 
 /// A member pin: the group's attributes (a `bus` or `bundle`) with what an inner `pin` group
 /// states over them. The inner group's timing is ADDED to the group's, which applies to every bit.
+/// A pin's [`PinCaps`] from its own attributes, by the reference's rule.
+fn pin_caps(own: &str, dir: Dir, default_cap: [f64; 3]) -> PinCaps {
+    let num = |k: &str| simple_attr(own, k).and_then(|v| lnum(&v));
+    let range = |k: &str| {
+        next_paren_after(own, k)
+            .map(|v| floats(&v.replace('"', "")))
+            .filter(|v| v.len() == 2)
+            .map(|v| (v[0], v[1]))
+    };
+    let base = num("capacitance");
+    let edge = |rf: &str| {
+        let (mut lo, mut hi) = (base, base);
+        if let Some(c) = num(&format!("{rf}_capacitance")) {
+            (lo, hi) = (Some(c), Some(c));
+        }
+        if let Some((a, b)) = range(&format!("{rf}_capacitance_range")) {
+            (lo, hi) = (Some(a), Some(b));
+        }
+        (lo, hi)
+    };
+    let dflt = match dir {
+        Dir::In => default_cap[0],
+        Dir::Out => default_cap[1],
+        Dir::Inout => default_cap[2],
+        Dir::Other => 0.0,
+    };
+    let ((rl, rh), (fl, fh)) = (edge("rise"), edge("fall"));
+    PinCaps {
+        rise_min: rl.unwrap_or(dflt),
+        rise_max: rh.unwrap_or(dflt),
+        fall_min: fl.unwrap_or(dflt),
+        fall_max: fh.unwrap_or(dflt),
+    }
+}
+
 fn merged_pin(name: &str, group: &Pin, inner: Option<(&Pin, &str)>) -> Pin {
     let mut p = group.clone();
     p.name = name.to_string();
@@ -1315,8 +1385,14 @@ fn merged_pin(name: &str, group: &Pin, inner: Option<(&Pin, &str)>) -> Pin {
         if ip.direction != Dir::Other {
             p.direction = ip.direction;
         }
-        if simple_attr(ibody, "capacitance").is_some() {
+        // a pin group that states any capacitance of its own states all of it
+        let own = own_attrs(ibody);
+        if ["capacitance", "rise_capacitance", "fall_capacitance", "rise_capacitance_range", "fall_capacitance_range"]
+            .iter()
+            .any(|k| simple_attr(&own, k).is_some() || next_paren_after(&own, k).is_some())
+        {
             p.capacitance = ip.capacitance;
+            p.caps = ip.caps;
             p.cap_f = ip.cap_f;
         }
         if ip.recv.is_some() {
@@ -1356,8 +1432,9 @@ fn parse_cell(
     skip_ccs: bool,
     types: &BTreeMap<String, (i64, i64)>,
     templates: &Templates,
+    default_cap: [f64; 3],
 ) -> Cell {
-    let ctx = Ctx { cap_f: units.cap_f, skip_ccs, templates };
+    let ctx = Ctx { cap_f: units.cap_f, skip_ccs, templates, default_cap };
     let mut pins = BTreeMap::new();
     let mut scan_pins = BTreeMap::new();
     let (own, spans) = level(body);
@@ -1587,12 +1664,14 @@ impl Lib {
         let thresholds = Thresholds::from_lib(&lib_own);
         let types = bus_types(text);
         let tpls = templates(lib_body, &lib_spans);
+        let dcap = |k: &str| simple_attr(&lib_own, k).and_then(|v| lnum(&v)).unwrap_or(0.0);
+        let default_cap = [dcap("default_input_pin_cap"), dcap("default_output_pin_cap"), dcap("default_inout_pin_cap")];
         let mut cells = BTreeMap::new();
         for g in lib_spans.iter().filter(|g| g.kw == "cell") {
             let cname = g.args.clone();
             cells.insert(
                 cname.clone(),
-                parse_cell(cname, &lib_body[g.body.clone()], &units, opts.skip_ccs, &types, &tpls),
+                parse_cell(cname, &lib_body[g.body.clone()], &units, opts.skip_ccs, &types, &tpls, default_cap),
             );
         }
         if cells.is_empty() {
@@ -2646,5 +2725,40 @@ mod timing_type_tests {
         let e: Vec<OutEdges> = a.iter().map(|x| x.out_edges).collect();
         assert_eq!(e, [OutEdges::Rise, OutEdges::Fall, OutEdges::Both, OutEdges::Fall]);
         assert!(OutEdges::Rise.drives(true) && !OutEdges::Rise.drives(false));
+    }
+}
+
+/// A pin's capacitance per edge — the reference's rule (`LibertyReader::readCapacitance`).
+#[cfg(test)]
+mod pin_cap_tests {
+    use super::*;
+
+    fn pin(lib_attrs: &str, pin_attrs: &str, dir: &str) -> Pin {
+        Lib::parse(&format!(
+            "library (l) {{ {lib_attrs} cell (C) {{ pin (P) {{ direction : {dir}; {pin_attrs} }} }} }}"
+        ))
+        .unwrap()
+        .cell("C")
+        .unwrap()
+        .pins["P"]
+        .clone()
+    }
+
+    #[test]
+    fn rise_and_fall_override_capacitance_and_a_range_splits_min_from_max() {
+        let p = pin("", "capacitance : 2; rise_capacitance : 3; fall_capacitance_range (1, 4);", "input");
+        assert_eq!(p.caps, PinCaps { rise_min: 3.0, rise_max: 3.0, fall_min: 1.0, fall_max: 4.0 });
+        assert_eq!(p.capacitance, 2.0, "the stated figure");
+    }
+
+    /// A pin that states no capacitance takes the library default for its direction, and its
+    /// single figure is no longer zero.
+    #[test]
+    fn an_unstated_capacitance_is_the_library_default() {
+        let lib = "default_input_pin_cap : 0.5; default_output_pin_cap : 0.25;";
+        assert_eq!(pin(lib, "", "input").caps.get(true, true), 0.5);
+        assert_eq!(pin(lib, "", "output").capacitance, 0.25);
+        let only_rise = pin("", "rise_capacitance : 3; fall_capacitance : 2;", "input");
+        assert_eq!(only_rise.capacitance, 3.0, "the largest, not zero");
     }
 }

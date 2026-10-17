@@ -50,6 +50,9 @@ const HANDLED: &[&str] = &[
     // Read since tables are read by their template (2026-10-16): a template's variables say what
     // each axis is, and its indices stand in for a table's own.
     "lu_table_template", "power_lut_template", "output_current_template",
+    // Read since pin capacitance is read per edge (2026-10-16), with the library's defaults.
+    "rise_capacitance", "fall_capacitance", "rise_capacitance_range", "fall_capacitance_range",
+    "default_input_pin_cap", "default_output_pin_cap", "default_inout_pin_cap",
 ];
 
 /// A library exercising everything this reader claims to read.

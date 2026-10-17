@@ -15,11 +15,12 @@
 //! in-process cache) mean a changed library is a different entry — never a stale read.
 
 use crate::ccs::{CcsArc, CcsWaveform};
-use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, OutEdges, Pin, RecvCap, Table};
+use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, OutEdges, Pin, PinCaps, RecvCap, Table};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLC8"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLC9"; // Vyges Liberty Cache — bump the trailing digit on any format change
+                                 // VLC9: Pin gained `caps` (rise/fall x min/max, library defaults).
                                  // VLC8: Arc gained `out_edges` (combinational_rise/_fall build one edge).
                                  // VLC7: Cell gained `clock_gating` + `scan_pins` (test_cell signal_type).
                                  // VLC5: Cell gained `async_reset_pins` (the `ff` group's clear/preset pins), for RDC.
@@ -296,6 +297,10 @@ fn enc_pin(w: &mut W, p: &Pin) {
     for a in &p.arcs {
         enc_arc(w, a);
     }
+    // after the arcs, where `dec_pin` reads them
+    for c in [p.caps.rise_min, p.caps.rise_max, p.caps.fall_min, p.caps.fall_max] {
+        w.f64(c);
+    }
 }
 fn dec_pin(r: &mut R) -> Option<Pin> {
     let name = r.s()?;
@@ -338,10 +343,12 @@ fn dec_pin(r: &mut R) -> Option<Pin> {
     for _ in 0..na {
         arcs.push(dec_arc(r)?);
     }
+    let caps = PinCaps { rise_min: r.f64()?, rise_max: r.f64()?, fall_min: r.f64()?, fall_max: r.f64()? };
     Some(Pin {
         name,
         direction,
         capacitance,
+        caps,
         cap_f,
         recv,
         clock,
