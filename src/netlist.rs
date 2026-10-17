@@ -141,141 +141,226 @@ impl std::fmt::Display for NetlistError {
 }
 impl std::error::Error for NetlistError {}
 
-/// The tokens of a netlist, ONE AT A TIME, each a slice of the text, with the values that
-/// arrived as ESCAPED identifiers collected on the side.
-/// ⚠️ The token VALUE is canonical either way; the set only records where a backslash was.
+/// A netlist's tokens, read from a STREAM one at a time — the reference's design: its flex
+/// scanner reads through `igzstream` and hands the parser one token at a time, so neither the
+/// file nor its token list is ever held whole.
 ///
-/// ⛔ **Tokens BORROW from the text, and are not all held at once.** An owned `String` per token
-/// for the whole file, plus two cleaned copies of it, put the peak at many times the file size
-/// before parsing began. Every delimiter is ASCII, so a token is a slice of the source; comments
-/// are skipped in the same pass; and [`parse_all`] holds one module's tokens at a time.
-struct Tokens<'a> {
-    text: &'a str,
-    it: std::str::CharIndices<'a>,
-    /// a punctuation token found while closing the token before it
-    queued: Option<&'a str>,
-    /// inside an escaped identifier
+/// ⛔ **Nothing here holds the file.** A chip-scale netlist runs to many gigabytes; reading it
+/// into a `String` first put the whole of it in memory before a token was produced, and an owned
+/// token per word plus two cleaned copies put the peak at several times that. The lexer keeps
+/// its state — comment, escape, a `/` waiting for the byte after it — across buffer refills, and
+/// [`parse_reader`] writes one module's tokens into a reused arena and parses it there.
+///
+/// Bytes, not characters: every delimiter is ASCII, and whitespace is ASCII whitespace, as the
+/// reference's lexer has it. A token that is not UTF-8 (a Windows-1252 byte) is read lossily.
+struct Lexer<R: std::io::BufRead> {
+    r: R,
+    /// where the token being read starts in the arena — tokens are written there directly
+    start: Option<usize>,
+    /// the open token is an escaped identifier
     escaped: bool,
+    /// a `/` seen, its meaning decided by the byte after it
+    slash: bool,
+    mode: Mode,
+    /// a punctuation token found while closing the token before it
+    pending: Option<u8>,
+    /// Values that arrived as ESCAPED identifiers. ⚠️ The token VALUE is canonical either way;
+    /// the set only records where a backslash was.
     escaped_vals: std::collections::BTreeSet<String>,
 }
 
-impl<'a> Tokens<'a> {
-    fn new(text: &'a str) -> Self {
-        Tokens { text, it: text.char_indices(), queued: None, escaped: false, escaped_vals: Default::default() }
-    }
-
-    /// Close the token open since `start`, if any, at byte `at`.
-    fn cut(&mut self, start: &mut Option<usize>, at: usize) -> Option<&'a str> {
-        let tok = start.take().filter(|&s0| s0 < at).map(|s0| &self.text[s0..at]);
-        if let (Some(t), true) = (tok, self.escaped) {
-            self.escaped_vals.insert(t.to_string());
-        }
-        self.escaped = false;
-        tok
-    }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Normal,
+    LineComment,
+    /// inside `/* */`; `true` when the last byte was `*`
+    BlockComment(bool),
 }
 
-impl<'a> Iterator for Tokens<'a> {
-    type Item = &'a str;
+/// Bytes that end a run of an ordinary token: ASCII whitespace, `/` (a comment may start),
+/// `\\` and the punctuation the parser reads as tokens of their own.
+const STOP: [bool; 256] = stop_table(false);
+/// The same inside an escaped identifier, which only whitespace (or a comment) ends.
+const STOP_ESCAPED: [bool; 256] = stop_table(true);
 
-    fn next(&mut self) -> Option<&'a str> {
-        if let Some(q) = self.queued.take() {
-            return Some(q);
+const fn stop_table(escaped: bool) -> [bool; 256] {
+    let mut t = [false; 256];
+    let mut i = 0;
+    while i < 256 {
+        let b = i as u8;
+        t[i] = b.is_ascii_whitespace()
+            || b == b'/'
+            || (!escaped && matches!(b, b'\\' | b'(' | b')' | b';' | b',' | b'.' | b'[' | b']' | b'='));
+        i += 1;
+    }
+    t
+}
+
+/// Close the token open since `start` in `arena`: the range it occupies, or `None` when no
+/// token was open.
+fn flush_tok(
+    start: &mut Option<usize>,
+    escaped: &mut bool,
+    vals: &mut std::collections::BTreeSet<String>,
+    arena: &[u8],
+) -> Option<std::ops::Range<usize>> {
+    let was_escaped = std::mem::replace(escaped, false);
+    let s0 = start.take()?;
+    if was_escaped {
+        vals.insert(String::from_utf8_lossy(&arena[s0..]).into_owned());
+    }
+    Some(s0..arena.len())
+}
+
+/// Append `b` to the open token in `arena`, opening one if none is.
+fn push_tok(start: &mut Option<usize>, arena: &mut Vec<u8>, b: &[u8]) {
+    if start.is_none() {
+        *start = Some(arena.len());
+    }
+    arena.extend_from_slice(b);
+}
+
+impl<R: std::io::BufRead> Lexer<R> {
+    fn new(r: R) -> Self {
+        Lexer {
+            r,
+            start: None,
+            escaped: false,
+            slash: false,
+            mode: Mode::Normal,
+            pending: None,
+            escaped_vals: Default::default(),
         }
-        let b = self.text.as_bytes();
-        let mut start: Option<usize> = None;
-        while let Some((i, ch)) = self.it.next() {
-            // Comments — BOTH forms — end whatever token is open, escaped or not.
-            //
-            // `/* ... */` spans lines and is where tools park disabled code. Left in, its contents
-            // tokenize like anything else, and `/* INV bogus (.A(a)); */` becomes a real instance in
-            // the netlist: connectivity invented out of a comment, which no downstream tool can tell
-            // from the real thing. An unterminated one runs to the end of the file.
-            if ch == '/' && b.get(i + 1) == Some(&b'/') {
-                let tok = self.cut(&mut start, i);
-                for (_, c) in self.it.by_ref() {
-                    if c == '\n' {
-                        break;
-                    }
-                }
-                if tok.is_some() {
-                    return tok;
-                }
-                continue;
+    }
+
+    /// The next token, written to the end of `arena`; its range there, or `None` at the end.
+    fn next_into(&mut self, arena: &mut Vec<u8>) -> std::io::Result<Option<std::ops::Range<usize>>> {
+        loop {
+            if let Some(p) = self.pending.take() {
+                let s0 = arena.len();
+                arena.push(p);
+                return Ok(Some(s0..s0 + 1));
             }
-            if ch == '/' && b.get(i + 1) == Some(&b'*') {
-                let tok = self.cut(&mut start, i);
-                self.it.next();
-                let mut prev = '\0';
-                for (_, c) in self.it.by_ref() {
-                    if prev == '*' && c == '/' {
-                        break;
-                    }
-                    prev = c;
+            let buf = self.r.fill_buf()?;
+            if buf.is_empty() {
+                // the end: a `/` still waiting is an ordinary byte, and an open token closes
+                if std::mem::take(&mut self.slash) && self.mode == Mode::Normal {
+                    push_tok(&mut self.start, arena, b"/");
                 }
-                if tok.is_some() {
-                    return tok;
-                }
-                continue;
+                return Ok(flush_tok(&mut self.start, &mut self.escaped, &mut self.escaped_vals, arena));
             }
-            // A Verilog *escaped identifier* starts with `\` and runs until the next whitespace,
-            // which terminates it (and is not part of the name). Punctuation inside it —
-            // `\clkbuf_0_gpio_in[0]`, `\ANTENNA_u_cpu.foo[1]` — is part of the name, so it must NOT
-            // be split on `[`/`]`/`.`; otherwise the real instance is missed and the leftover
-            // `0 ] (` fragment mis-parses as a bogus cell.
-            //
-            // THE BACKSLASH IS NOT PART OF THE NAME EITHER. Per the LRM an escaped identifier
-            // denotes the same identifier as the equivalent simple one — `\foo ` IS `foo` — so it is
-            // dropped here, exactly as the terminating whitespace is. Keeping it is not cosmetic:
-            // every other file in the flow spells the name without it. A SPEF says
-            // `u_adapter.req_addr_q[0]` and a DEF says `u_adapter\.req_addr_q\[0\]`, both of which
-            // resolve to the same characters, and a netlist net called `\u_adapter.req_addr_q[0]`
-            // matches neither. On a real block that was 767 of 14238 nets, and 4527 coupling
-            // aggressor references that a timer looked up, failed to find, and dropped without a
-            // word — silently removing crosstalk from the analysis.
-            if self.escaped {
-                if ch.is_whitespace() {
-                    if let Some(tok) = self.cut(&mut start, i) {
-                        return Some(tok);
-                    }
-                } else if start.is_none() {
-                    start = Some(i);
-                }
-                continue;
-            }
-            match ch {
-                '\\' => {
-                    let tok = self.cut(&mut start, i);
-                    self.escaped = true;
-                    if tok.is_some() {
-                        return tok;
+            let (mut used, mut out) = (0usize, None);
+            while used < buf.len() {
+                // ⚡ whitespace between tokens is skipped in one go, and a run of ordinary token
+                // bytes is copied in one go
+                if self.mode == Mode::Normal && !self.slash && !self.escaped && self.start.is_none() {
+                    let ws = buf[used..].iter().take_while(|b| b.is_ascii_whitespace()).count();
+                    if ws > 0 {
+                        used += ws;
+                        continue;
                     }
                 }
-                '(' | ')' | ';' | ',' | '.' | '[' | ']' | '=' => {
-                    let punct = &self.text[i..i + 1];
-                    return match self.cut(&mut start, i) {
-                        Some(tok) => {
-                            self.queued = Some(punct);
-                            Some(tok)
+                if self.mode == Mode::Normal && !self.slash {
+                    // inside an escaped identifier only whitespace (and a comment) ends it
+                    let stop = if self.escaped { STOP_ESCAPED } else { STOP };
+                    let run = buf[used..].iter().take_while(|&&b| !stop[b as usize]).count();
+                    if run > 0 {
+                        push_tok(&mut self.start, arena, &buf[used..used + run]);
+                        used += run;
+                        continue;
+                    }
+                }
+                let c = buf[used];
+                used += 1;
+                // Comments — BOTH forms — end whatever token is open, escaped or not.
+                //
+                // `/* ... */` spans lines and is where tools park disabled code. Left in, its contents
+                // tokenize like anything else, and `/* INV bogus (.A(a)); */` becomes a real instance in
+                // the netlist: connectivity invented out of a comment, which no downstream tool can tell
+                // from the real thing. An unterminated one runs to the end of the file.
+                match self.mode {
+                    Mode::LineComment => {
+                        if c == b'\n' {
+                            self.mode = Mode::Normal;
                         }
-                        None => Some(punct),
-                    };
-                }
-                c if c.is_whitespace() => {
-                    if let Some(tok) = self.cut(&mut start, i) {
-                        return Some(tok);
+                        continue;
                     }
-                }
-                _ => {
-                    if start.is_none() {
-                        start = Some(i);
+                    Mode::BlockComment(star) => {
+                        self.mode = if star && c == b'/' { Mode::Normal } else { Mode::BlockComment(c == b'*') };
+                        continue;
                     }
+                    Mode::Normal => {}
+                }
+                if std::mem::take(&mut self.slash) {
+                    if c == b'/' || c == b'*' {
+                        self.mode = if c == b'/' { Mode::LineComment } else { Mode::BlockComment(false) };
+                        out = flush_tok(&mut self.start, &mut self.escaped, &mut self.escaped_vals, arena);
+                        if out.is_some() {
+                            break;
+                        }
+                        continue;
+                    }
+                    push_tok(&mut self.start, arena, b"/");
+                }
+                if c == b'/' {
+                    self.slash = true;
+                    continue;
+                }
+                // A Verilog *escaped identifier* starts with `\` and runs until the next whitespace,
+                // which terminates it (and is not part of the name). Punctuation inside it —
+                // `\clkbuf_0_gpio_in[0]`, `\ANTENNA_u_cpu.foo[1]` — is part of the name, so it must NOT
+                // be split on `[`/`]`/`.`; otherwise the real instance is missed and the leftover
+                // `0 ] (` fragment mis-parses as a bogus cell.
+                //
+                // THE BACKSLASH IS NOT PART OF THE NAME EITHER. Per the LRM an escaped identifier
+                // denotes the same identifier as the equivalent simple one — `\foo ` IS `foo` — so it is
+                // dropped here, exactly as the terminating whitespace is. Keeping it is not cosmetic:
+                // every other file in the flow spells the name without it. A SPEF says
+                // `u_adapter.req_addr_q[0]` and a DEF says `u_adapter\.req_addr_q\[0\]`, both of which
+                // resolve to the same characters, and a netlist net called `\u_adapter.req_addr_q[0]`
+                // matches neither. On a real block that was 767 of 14238 nets, and 4527 coupling
+                // aggressor references that a timer looked up, failed to find, and dropped without a
+                // word — silently removing crosstalk from the analysis.
+                if self.escaped {
+                    if c.is_ascii_whitespace() {
+                        out = flush_tok(&mut self.start, &mut self.escaped, &mut self.escaped_vals, arena);
+                        if out.is_some() {
+                            break;
+                        }
+                    } else {
+                        push_tok(&mut self.start, arena, &[c]);
+                    }
+                    continue;
+                }
+                match c {
+                    b'\\' => {
+                        out = flush_tok(&mut self.start, &mut self.escaped, &mut self.escaped_vals, arena);
+                        self.escaped = true;
+                    }
+                    b'(' | b')' | b';' | b',' | b'.' | b'[' | b']' | b'=' => {
+                        out = flush_tok(&mut self.start, &mut self.escaped, &mut self.escaped_vals, arena);
+                        if out.is_some() {
+                            self.pending = Some(c);
+                        } else {
+                            let s0 = arena.len();
+                            arena.push(c);
+                            out = Some(s0..s0 + 1);
+                        }
+                    }
+                    c if c.is_ascii_whitespace() => {
+                        out = flush_tok(&mut self.start, &mut self.escaped, &mut self.escaped_vals, arena)
+                    }
+                    _ => push_tok(&mut self.start, arena, &[c]),
+                }
+                if out.is_some() {
+                    break;
                 }
             }
+            self.r.consume(used);
+            if out.is_some() {
+                return Ok(out);
+            }
         }
-        // the last token — an escaped identifier at end of input has no whitespace to close it
-        let end = self.text.len();
-        self.cut(&mut start, end)
     }
 }
 
@@ -451,25 +536,55 @@ pub fn parse(text: &str) -> Result<Netlist, NetlistError> {
 
 /// Every module in the file, and which one is the top.
 pub fn parse_all(text: &str) -> Result<Design, NetlistError> {
-    let mut toks = Tokens::new(text);
+    parse_reader(text.as_bytes())
+}
+
+/// [`parse_all`] from a STREAM — the file is never held whole; see [`Lexer`].
+pub fn parse_reader<R: std::io::BufRead>(r: R) -> Result<Design, NetlistError> {
+    let io = |e: std::io::Error| NetlistError(e.to_string());
+    let mut lx = Lexer::new(r);
     let mut mods: Vec<Netlist> = Vec::new();
-    // ONE module's tokens at a time, `module` through `endmodule`; the buffer is reused, so the
-    // peak is the largest module rather than the file.
-    let mut t: Vec<&str> = Vec::new();
+    // ONE module's tokens at a time, `module` through `endmodule`, in an arena that is reused:
+    // the peak is the largest module, not the file.
+    let mut arena: Vec<u8> = Vec::new();
+    let mut spans: Vec<std::ops::Range<usize>> = Vec::new();
     // EVERY module, not just the first. A hierarchical netlist that lists its leaves before its
     // top otherwise hands back a leaf as the design.
-    while let Some(m) = toks.by_ref().find(|&x| x == "module") {
-        t.clear();
-        t.push(m);
-        for tok in toks.by_ref() {
-            t.push(tok);
-            if tok == "endmodule" {
+    loop {
+        arena.clear();
+        spans.clear();
+        let mut found = false;
+        while let Some(t) = lx.next_into(&mut arena).map_err(io)? {
+            if &arena[t.clone()] == b"module" {
+                spans.push(t);
+                found = true;
+                break;
+            }
+            arena.clear();
+        }
+        if !found {
+            break;
+        }
+        while let Some(t) = lx.next_into(&mut arena).map_err(io)? {
+            let end = &arena[t.clone()] == b"endmodule";
+            spans.push(t);
+            if end {
                 break;
             }
         }
-        mods.push(parse_module(&t, 0).0);
+        // UTF-8 is checked once per module; a module that is not (a Windows-1252 byte) is read
+        // lossily, token by token.
+        let lossy: Vec<String>;
+        let toks: Vec<&str> = match std::str::from_utf8(&arena) {
+            Ok(text) => spans.iter().map(|t| &text[t.clone()]).collect(),
+            Err(_) => {
+                lossy = spans.iter().map(|t| String::from_utf8_lossy(&arena[t.clone()]).into_owned()).collect();
+                lossy.iter().map(String::as_str).collect()
+            }
+        };
+        mods.push(parse_module(&toks, 0).0);
     }
-    let escaped_vals = std::mem::take(&mut toks.escaped_vals);
+    let escaped_vals = std::mem::take(&mut lx.escaped_vals);
     if mods.is_empty() {
         return Err(NetlistError("no module found".into()));
     }
@@ -985,76 +1100,143 @@ fn read_expr(t: &[&str], i: &mut usize) -> String {
 }
 
 pub fn load(path: &str) -> Result<Netlist, NetlistError> {
-    parse(&read_text(path)?)
+    let mut d = load_all(path)?;
+    Ok(d.modules.swap_remove(d.top))
 }
 
-/// [`load`], keeping every module — see [`Design`].
+/// [`load`], keeping every module — see [`Design`]. STREAMED: read through a buffer, and
+/// inflated as it is read when it is gzip (with the `gzip` feature), as the reference reads
+/// through `igzstream`. A byte that is not UTF-8 is read lossily.
 pub fn load_all(path: &str) -> Result<Design, NetlistError> {
-    parse_all(&read_text(path)?)
+    let err = |e: String| NetlistError(format!("{path}: {e}"));
+    parse_reader(open(path).map_err(|e| err(e.to_string()))?).map_err(|e| err(e.0))
 }
 
-/// A netlist file's text: gunzipped when it is gzip (with the `gzip` feature), and read
-/// LOSSILY — a byte that is not UTF-8 becomes U+FFFD instead of failing the read.
+/// A netlist file as a buffered byte stream, inflated on the fly when it is gzip.
+fn open(path: &str) -> std::io::Result<Box<dyn std::io::BufRead>> {
+    use std::io::BufRead;
+    let mut f = std::io::BufReader::with_capacity(1 << 16, std::fs::File::open(path)?);
+    if f.fill_buf()?.starts_with(&[0x1f, 0x8b]) {
+        return gz_stream(f);
+    }
+    Ok(Box::new(f))
+}
+
+/// A netlist file's whole text, inflated and read LOSSILY — for a caller that wants the text.
+/// The readers here do not; they stream.
 ///
 /// ⛔ `read_to_string` refused both outright. Netlists are shipped gzipped, and a comment or a
 /// string written in a legacy code page (Windows-1252) is enough to make a whole file "not
 /// UTF-8" although every identifier in it is ASCII.
 pub fn read_text(path: &str) -> Result<String, NetlistError> {
-    let err = |e: String| NetlistError(format!("{path}: {e}"));
-    let bytes = std::fs::read(path).map_err(|e| err(e.to_string()))?;
-    let bytes = if bytes.starts_with(&[0x1f, 0x8b]) { gunzip(&bytes).map_err(err)? } else { bytes };
+    let err = |e: std::io::Error| NetlistError(format!("{path}: {e}"));
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut open(path).map_err(err)?, &mut bytes).map_err(err)?;
     Ok(match String::from_utf8(bytes) {
         Ok(s) => s,
         Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
     })
 }
 
-/// Every member of a gzip file, concatenated (RFC 1952; `bgzip` and `cat a.gz b.gz` write more
-/// than one).
 #[cfg(feature = "gzip")]
-fn gunzip(mut data: &[u8]) -> Result<Vec<u8>, String> {
-    use miniz_oxide::inflate::stream::{inflate, InflateState};
-    use miniz_oxide::{DataFormat, MZFlush, MZStatus};
-    let mut out = Vec::new();
-    let mut buf = vec![0u8; 1 << 16];
-    while data.starts_with(&[0x1f, 0x8b]) {
-        let bad = || "malformed gzip header".to_string();
-        let flg = *data.get(3).ok_or_else(bad)?;
-        let mut p = 10usize;
-        if flg & 0x04 != 0 {
-            let x = data.get(p..p + 2).ok_or_else(bad)?;
-            p += 2 + u16::from_le_bytes([x[0], x[1]]) as usize;
-        }
-        for flag in [0x08, 0x10] {
-            if flg & flag != 0 {
-                p += data.get(p..).ok_or_else(bad)?.iter().position(|&c| c == 0).ok_or_else(bad)? + 1;
-            }
-        }
-        if flg & 0x02 != 0 {
-            p += 2;
-        }
-        let mut input = data.get(p..).ok_or_else(bad)?;
-        let mut st = InflateState::new_boxed(DataFormat::Raw);
-        loop {
-            let r = inflate(&mut st, input, &mut buf, MZFlush::None);
-            input = &input[r.bytes_consumed..];
-            out.extend_from_slice(&buf[..r.bytes_written]);
-            match r.status {
-                Ok(MZStatus::StreamEnd) => break,
-                Ok(_) if r.bytes_consumed > 0 || r.bytes_written > 0 => {}
-                Ok(_) => return Err("truncated gzip stream".into()),
-                Err(e) => return Err(format!("gzip: {e:?}")),
-            }
-        }
-        // the 8-byte trailer (CRC-32, size), then possibly another member
-        data = input.get(8..).unwrap_or(&[]);
-    }
-    Ok(out)
+fn gz_stream<R: std::io::BufRead + 'static>(r: R) -> std::io::Result<Box<dyn std::io::BufRead>> {
+    Ok(Box::new(std::io::BufReader::with_capacity(1 << 16, GzReader::new(r))))
 }
 
 #[cfg(not(feature = "gzip"))]
-fn gunzip(_: &[u8]) -> Result<Vec<u8>, String> {
-    Err("gzip-compressed; build vyges-loom with the `gzip` feature to read it".into())
+fn gz_stream<R: std::io::BufRead + 'static>(_: R) -> std::io::Result<Box<dyn std::io::BufRead>> {
+    Err(std::io::Error::other("gzip-compressed; build vyges-loom with the `gzip` feature to read it"))
+}
+
+/// A gzip stream inflated as it is read: every member, concatenated (RFC 1952; `bgzip` and
+/// `cat a.gz b.gz` write more than one). The inflater's state is all that is held.
+#[cfg(feature = "gzip")]
+struct GzReader<R: std::io::BufRead> {
+    r: R,
+    st: Box<miniz_oxide::inflate::stream::InflateState>,
+    state: Gz,
+}
+
+#[cfg(feature = "gzip")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Gz {
+    Header,
+    Body,
+    Done,
+}
+
+#[cfg(feature = "gzip")]
+impl<R: std::io::BufRead> GzReader<R> {
+    fn new(r: R) -> Self {
+        let st = miniz_oxide::inflate::stream::InflateState::new_boxed(miniz_oxide::DataFormat::Raw);
+        GzReader { r, st, state: Gz::Header }
+    }
+
+    /// Exactly `n` bytes from the stream, or an error at its end.
+    fn take(&mut self, n: usize) -> std::io::Result<Vec<u8>> {
+        let mut v = vec![0u8; n];
+        std::io::Read::read_exact(&mut self.r, &mut v)?;
+        Ok(v)
+    }
+
+    /// One member's header; `false` at a clean end of the file (or trailing non-gzip bytes).
+    fn header(&mut self) -> std::io::Result<bool> {
+        if !self.r.fill_buf()?.starts_with(&[0x1f, 0x8b]) {
+            return Ok(false);
+        }
+        let h = self.take(10)?;
+        let flg = h[3];
+        if flg & 0x04 != 0 {
+            let x = self.take(2)?;
+            self.take(u16::from_le_bytes([x[0], x[1]]) as usize)?;
+        }
+        for flag in [0x08, 0x10] {
+            if flg & flag != 0 {
+                let mut z = Vec::new();
+                std::io::BufRead::read_until(&mut self.r, 0, &mut z)?;
+            }
+        }
+        if flg & 0x02 != 0 {
+            self.take(2)?;
+        }
+        self.st.reset(miniz_oxide::DataFormat::Raw);
+        Ok(true)
+    }
+}
+
+#[cfg(feature = "gzip")]
+impl<R: std::io::BufRead> std::io::Read for GzReader<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        use miniz_oxide::{MZFlush, MZStatus};
+        let bad = |m: String| std::io::Error::new(std::io::ErrorKind::InvalidData, m);
+        loop {
+            match self.state {
+                Gz::Done => return Ok(0),
+                Gz::Header => self.state = if self.header()? { Gz::Body } else { Gz::Done },
+                Gz::Body => {
+                    let input = self.r.fill_buf()?;
+                    let eof = input.is_empty();
+                    let res = miniz_oxide::inflate::stream::inflate(&mut self.st, input, out, MZFlush::None);
+                    self.r.consume(res.bytes_consumed);
+                    match res.status {
+                        Ok(MZStatus::StreamEnd) => {
+                            self.take(8)?; // CRC-32 and size; then perhaps another member
+                            self.state = Gz::Header;
+                        }
+                        Ok(_) => {}
+                        Err(miniz_oxide::MZError::Buf) if !eof => {}
+                        Err(e) => return Err(bad(format!("gzip: {e:?}"))),
+                    }
+                    if res.bytes_written > 0 {
+                        return Ok(res.bytes_written);
+                    }
+                    if eof && res.bytes_consumed == 0 && self.state == Gz::Body {
+                        return Err(bad("truncated gzip stream".into()));
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1136,6 +1318,29 @@ endmodule
         assert_eq!(const_bits("2'sb11"), [false, false], "unknown base (here the sign) reads 0");
     }
 
+    /// The reader STREAMS: fed a few bytes at a time, so that every lexer state — a `/` waiting
+    /// for its next byte, a comment, an escaped identifier, a token — is cut by a buffer refill,
+    /// it reads exactly what a whole-text read does.
+    #[test]
+    fn a_streamed_read_is_the_whole_read() {
+        let src = "// head\nmodule leaf (input a, output y); /* INV ghost (.A(a)); */\n\
+                   INV \\u0.x[1] (.A(a), .Y(y)); // tail\nendmodule\n\
+                   module top (input a, output [1:0] y); wire w/*c*/; leaf l (.a(a), .y(w));\n\
+                   BUF b (.A({w, 1'b1}), .X(y)); endmodule/";
+        let whole = parse_all(src).unwrap();
+        let key = |d: &Design| {
+            d.modules.iter().map(|m| format!("{}|{:?}|{:?}|{:?}", m.module, m.inputs, m.outputs,
+                m.insts.iter().map(|i| (&i.cell, &i.name, &i.conns, &i.ties)).collect::<Vec<_>>())).collect::<Vec<_>>()
+        };
+        assert_eq!(whole.module_names(), ["leaf", "top"]);
+        assert!(whole.escaped_names().contains("u0.x[1]"));
+        for cap in [1, 2, 3, 7] {
+            let d = parse_reader(std::io::BufReader::with_capacity(cap, src.as_bytes())).unwrap();
+            assert_eq!(key(&d), key(&whole), "buffer of {cap} byte(s)");
+            assert_eq!(d.escaped_names(), whole.escaped_names());
+        }
+    }
+
     /// A non-UTF-8 byte (a Windows-1252 quote in a comment) no longer fails the whole read.
     #[test]
     fn a_file_that_is_not_utf8_is_read_lossily() {
@@ -1147,6 +1352,11 @@ endmodule
         std::fs::write(&f, &bytes).unwrap();
         let d = load_all(f.to_str().unwrap()).unwrap();
         assert_eq!(d.top().insts.len(), 1);
+        // and inside a NAME, the byte becomes U+FFFD and the rest of the module still reads
+        let named = b"module top (input a, output y);\n  INV u\x920 (.A(a), .Y(y));\nendmodule\n";
+        let d = parse_reader(&named[..]).unwrap();
+        assert_eq!(d.top().insts[0].name, "u\u{FFFD}0");
+        assert_eq!(d.top().insts[0].conns.len(), 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 
