@@ -619,39 +619,71 @@ fn idents_in(expr: &str) -> Vec<String> {
     out
 }
 
+/// `key : value ;` stated at `body`'s OWN level — not inside a nested group — and the LAST such
+/// statement where there are several, as the reference's parser keeps it (a later simple
+/// attribute replaces an earlier one).
+///
+/// ⛔ It used to return the FIRST textual match anywhere in `body`, nested groups included: an
+/// attribute of an inner group could answer for the outer one, and a repeated attribute took its
+/// first value where the reference takes its last. Quoted strings are skipped, so a key inside a
+/// value is not a match.
+///
+/// ⚠️ It scans the whole of `body`. A hot path reads its attributes from [`own_attrs`], computed
+/// once, rather than from a body that carries large tables.
 fn simple_attr(body: &str, key: &str) -> Option<String> {
-    // matches `key : value ;`
     let b = body.as_bytes();
-    let mut p = 0;
-    loop {
-        let hit = body[p..].find(key)? + p;
-        let before_ok = hit == 0 || !is_ident(b[hit - 1]);
-        let mut q = hit + key.len();
-        while q < b.len() && b[q].is_ascii_whitespace() {
-            q += 1;
-        }
-        if before_ok && q < b.len() && b[q] == b':' {
-            // A simple attribute ends at `;` OR at the end of the line, whichever comes first.
-            //
-            // Liberty asks for the semicolon and real libraries do not always write one: asap7
-            // states `area : 0.20412` with no terminator on 37 cells. Scanning to the next `;`
-            // then swallows everything up to some later attribute, the value fails to parse,
-            // and the cell silently reports an area of ZERO — which ranks it first among
-            // interchangeable cells. Nothing errors; the number is simply gone.
-            //
-            // A value genuinely continued onto the next line is rare but legal, so an empty
-            // first line falls back to the semicolon rather than returning nothing.
-            let semi = body[q..].find(';').map(|i| i + q).unwrap_or(body.len());
-            let nl = body[q..].find('\n').map(|i| i + q).unwrap_or(body.len());
-            let end = semi.min(nl);
-            let v = body[q + 1..end].trim().trim_matches('"').trim();
-            if !v.is_empty() {
-                return Some(v.to_string());
+    let k = key.as_bytes();
+    let (mut i, mut depth, mut quoted) = (0usize, 0i32, false);
+    let mut found = None;
+    while i < b.len() {
+        let c = b[i];
+        if quoted {
+            match c {
+                b'\\' => i += 1,
+                b'"' => quoted = false,
+                _ => {}
             }
-            return Some(body[q + 1..semi].trim().trim_matches('"').to_string());
+            i += 1;
+            continue;
         }
-        p = hit + key.len();
+        match c {
+            b'"' => quoted = true,
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            _ if depth == 0 && b[i..].starts_with(k) && (i == 0 || !is_ident(b[i - 1])) => {
+                let mut q = i + k.len();
+                while q < b.len() && b[q].is_ascii_whitespace() {
+                    q += 1;
+                }
+                if q < b.len() && b[q] == b':' {
+                    found = Some(attr_value(body, q));
+                }
+                i = q;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
     }
+    found
+}
+
+/// The value of a simple attribute whose `:` is at `colon`.
+///
+/// It ends at `;` OR at the end of the line, whichever comes first. Liberty asks for the
+/// semicolon and real libraries do not always write one: asap7 states `area : 0.20412` with no
+/// terminator on 37 cells. Scanning to the next `;` then swallows everything up to some later
+/// attribute, the value fails to parse, and the cell silently reports an area of ZERO — which
+/// ranks it first among interchangeable cells. A value genuinely continued onto the next line is
+/// rare but legal, so an empty first line falls back to the semicolon.
+fn attr_value(body: &str, colon: usize) -> String {
+    let semi = body[colon..].find(';').map(|i| i + colon).unwrap_or(body.len());
+    let nl = body[colon..].find('\n').map(|i| i + colon).unwrap_or(body.len());
+    let v = body[colon + 1..semi.min(nl)].trim().trim_matches('"').trim();
+    if !v.is_empty() {
+        return v.to_string();
+    }
+    body[colon + 1..semi].trim().trim_matches('"').to_string()
 }
 
 /// A number as the reference's Liberty lexer reads it: `strtof`, straight to `float` — ONE
@@ -786,7 +818,7 @@ fn next_paren_after(s: &str, kw: &str) -> Option<String> {
     }
 }
 
-fn parse_arc(timing_body: &str, skip_ccs: bool) -> Arc {
+fn parse_arc(timing_body: &str, own: &str, skip_ccs: bool) -> Arc {
     let tbl = |name: &str| {
         next_block(timing_body, 0, name)
             .map(|(_, body, _)| parse_table(&body))
@@ -795,14 +827,14 @@ fn parse_arc(timing_body: &str, skip_ccs: bool) -> Arc {
     // `rising_edge` / `falling_edge` name the launching clock edge. Anything else is a
     // combinational arc; the checks (setup_*/hold_*/recovery_*/removal_*) never reach
     // here — the caller routes them into the constraint vectors before this point.
-    let clk_edge = match simple_attr(timing_body, "timing_type").as_deref() {
+    let clk_edge = match simple_attr(own, "timing_type").as_deref() {
         Some("rising_edge") => Some(ClkEdge::Rise),
         Some("falling_edge") => Some(ClkEdge::Fall),
         _ => None,
     };
     Arc {
-        related_pin: simple_attr(timing_body, "related_pin").unwrap_or_default(),
-        sense: simple_attr(timing_body, "timing_sense").unwrap_or_else(|| "non_unate".into()),
+        related_pin: simple_attr(own, "related_pin").unwrap_or_default(),
+        sense: simple_attr(own, "timing_sense").unwrap_or_else(|| "non_unate".into()),
         clk_edge,
         cell_rise: tbl("cell_rise"),
         cell_fall: tbl("cell_fall"),
@@ -885,13 +917,14 @@ fn parse_constraint(timing_body: &str) -> Constraint {
 }
 
 fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
-    let direction = match simple_attr(body, "direction").as_deref() {
+    let own = own_attrs(body);
+    let direction = match simple_attr(&own, "direction").as_deref() {
         Some("input") => Dir::In,
         Some("output") => Dir::Out,
         Some("inout") => Dir::Inout,
         _ => Dir::Other,
     };
-    let capacitance = simple_attr(body, "capacitance")
+    let capacitance = simple_attr(&own, "capacitance")
         .and_then(|s| lnum(&s))
         .unwrap_or(0.0);
     let cap_f = capacitance * cap_unit_f;
@@ -914,10 +947,10 @@ fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
             }
         })
     };
-    let clock = simple_attr(body, "clock").as_deref() == Some("true");
+    let clock = simple_attr(&own, "clock").as_deref() == Some("true");
     // Liberty puts `function` on the OUTPUT pin, not the cell. It is what makes two cells
     // comparable: a resize must not change what a gate computes.
-    let function = simple_attr(body, "function").filter(|f| !f.is_empty());
+    let function = simple_attr(&own, "function").filter(|f| !f.is_empty());
     let mut arcs = Vec::new();
     let mut setup: Vec<Constraint> = Vec::new();
     let mut hold: Vec<Constraint> = Vec::new();
@@ -925,7 +958,8 @@ fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
     let mut removal: Vec<Constraint> = Vec::new();
     let mut at = 0;
     while let Some((_, tbody, after)) = next_block(body, at, "timing") {
-        match simple_attr(&tbody, "timing_type").as_deref() {
+        let town = own_attrs(&tbody);
+        match simple_attr(&town, "timing_type").as_deref() {
             Some(tt) if tt.starts_with("setup") => setup.push(parse_constraint(&tbody)),
             Some(tt) if tt.starts_with("hold") => hold.push(parse_constraint(&tbody)),
             // recovery/removal are CHECKS on the async set/reset pin, with their own
@@ -940,7 +974,7 @@ fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
                 if tt.starts_with("clear")
                     || tt.starts_with("preset")
                     || tt.contains("pulse_width") => {}
-            _ => arcs.push(parse_arc(&tbody, skip_ccs)), // delay arc (incl. rising_edge CK->Q)
+            _ => arcs.push(parse_arc(&tbody, &town, skip_ccs)), // delay arc (incl. rising_edge CK->Q)
         }
         at = after;
     }
@@ -994,15 +1028,18 @@ fn top_group_spans(body: &str) -> Vec<GroupSpan> {
             b'{' => {
                 let end = matching(b, i).min(b.len());
                 let raw = &body[stmt..i];
-                let lead = raw.len() - raw.trim_start().len();
-                let head = raw.trim();
-                if let Some(open) = head.find('(') {
-                    let kw = head[..open].trim().to_string();
-                    let args = head[open + 1..].trim_end().trim_end_matches(')').trim().trim_matches('"');
+                if let Some(open) = raw.find('(') {
+                    // The keyword is the identifier just before `(`. Not everything since the last
+                    // `;`: an attribute written without one (`area : 3.5` then `pg_pin (VDD) {`)
+                    // would become part of the group's head, and be removed with the group.
+                    let before = raw[..open].trim_end();
+                    let kw_at = before.rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |k| k + 1);
+                    let kw = before[kw_at..].to_string();
+                    let args = raw[open + 1..].trim_end().trim_end_matches(')').trim().trim_matches('"');
                     out.push(GroupSpan {
                         kw,
                         args: args.to_string(),
-                        whole: stmt + lead..(end + 1).min(b.len()),
+                        whole: stmt + kw_at..(end + 1).min(b.len()),
                         body: i + 1..end,
                     });
                 }
@@ -1199,7 +1236,8 @@ fn parse_cell(
     // SEQUENTIAL: an `ff`/`latch` group (or a bank of them), a `statetable` — synchronizer cells
     // model their state that way and have no `ff` at all — or a clock pin on a cell that is not a
     // clock gate. ⛔ Read at the cell's own level: a `test_cell`'s `ff` describes scan mode.
-    let clock_gating = simple_attr(&own_attrs(body), "clock_gating_integrated_cell").filter(|v| !v.is_empty());
+    let own = own_attrs(body);
+    let clock_gating = simple_attr(&own, "clock_gating_integrated_cell").filter(|v| !v.is_empty());
     let is_seq = groups
         .iter()
         .any(|(k, _, _)| matches!(k.as_str(), "ff" | "latch" | "ff_bank" | "latch_bank" | "statetable"))
@@ -1227,7 +1265,7 @@ fn parse_cell(
     // INSTEAD — asap7 has 222 of them and no per-cell attribute — and reading only the scalar
     // reports those cells as leaking exactly nothing, which is not a number anyone would query.
     let leakage_w =
-        match simple_attr(body, "cell_leakage_power").and_then(|s| lnum(&s)) {
+        match simple_attr(&own, "cell_leakage_power").and_then(|s| lnum(&s)) {
             Some(v) => v * units.leak_w,
             None => state_leakage(body) * units.leak_w,
         };
@@ -1237,8 +1275,8 @@ fn parse_cell(
     } else {
         (ivals.iter().sum::<f64>() / ivals.len() as f64) * units.energy_j
     };
-    let cell_footprint = simple_attr(body, "cell_footprint").filter(|f| !f.is_empty());
-    let area = simple_attr(body, "area")
+    let cell_footprint = simple_attr(&own, "cell_footprint").filter(|f| !f.is_empty());
+    let area = simple_attr(&own, "area")
         .and_then(|s| lnum(&s))
         .unwrap_or(0.0);
     Cell {
@@ -1340,9 +1378,16 @@ impl Lib {
         } else {
             text
         };
-        let units = Units::from_lib(text);
-        let voltage = lib_voltage(text).unwrap_or(1.8);
-        let thresholds = Thresholds::from_lib(text);
+        // The library's own attributes, once: they sit one level down, inside `library () { }`,
+        // and are read many times.
+        let lib_own = top_group_spans(text)
+            .into_iter()
+            .find(|g| g.kw == "library")
+            .map(|g| own_attrs(&text[g.body]))
+            .unwrap_or_else(|| own_attrs(text));
+        let units = Units::from_lib(&lib_own);
+        let voltage = lib_voltage(&lib_own, text).unwrap_or(1.8);
+        let thresholds = Thresholds::from_lib(&lib_own);
         let types = bus_types(text);
         let mut cells = BTreeMap::new();
         let mut at = 0;
@@ -1620,9 +1665,10 @@ fn cap_load_unit(lib_body: &str) -> Option<f64> {
     Some(scale * base)
 }
 
-/// nom_voltage, else an operating_conditions `voltage :`, else None.
-fn lib_voltage(text: &str) -> Option<f64> {
-    if let Some(v) = simple_attr(text, "nom_voltage").and_then(|s| lnum(&s)) {
+/// nom_voltage, else an operating_conditions `voltage :`, else None. `own` is the library's own
+/// attributes; `text` the file, for its groups.
+fn lib_voltage(own: &str, text: &str) -> Option<f64> {
+    if let Some(v) = simple_attr(own, "nom_voltage").and_then(|s| lnum(&s)) {
         return Some(v);
     }
     let mut at = 0;
@@ -2253,6 +2299,16 @@ mod lexer_tests {
         let t = &l.cell("INV").unwrap().pins["Y"].arcs[0].cell_rise;
         assert_eq!(t.index_1, [0.01f32 as f64, 0.02f32 as f64]);
         assert_eq!(t.values[0], [0.1f32 as f64, 0.2f32 as f64]);
+    }
+
+    /// A simple attribute is the LAST one stated at the group's own level; an inner group's
+    /// attribute of the same name does not answer for it.
+    #[test]
+    fn the_last_attribute_at_its_own_level_wins() {
+        let lib = LIB.replace("area : 2.0;", "area : 2.0; area : 3.0; leakage_power () { area : 9.0; value : 1; }");
+        assert_eq!(Lib::parse(&lib).unwrap().cell("INV").unwrap().area, 3.0);
+        let nested_only = LIB.replace("area : 2.0;", "leakage_power () { area : 9.0; value : 1; }");
+        assert_eq!(Lib::parse(&nested_only).unwrap().cell("INV").unwrap().area, 0.0);
     }
 
     /// A number is `strtof`: one rounding, straight to f32.
