@@ -1448,6 +1448,48 @@ fn expand_arcs(pins: &mut BTreeMap<String, Pin>, buses: &[(String, Vec<String>)]
     }
 }
 
+/// A register or latch timing group that states no `timing_type` (or says `combinational`), on an
+/// output whose function is one sequential's output (`IQ`): as the reference builds it, from a
+/// pin in the CLOCK expression (`clocked_on`, a latch's `enable`) of positive or negative sense
+/// it is a `rising_edge` arc — negative too, as the reference has it; from a pin in `clear` or
+/// `preset` it is that async effect arc, which is not a delay arc here. Otherwise it stays
+/// combinational (a latch's D->Q among them).
+fn sequential_arcs(pins: &mut BTreeMap<String, Pin>, seqs: &[(String, String, String)]) {
+    use crate::liberty_func::{Func, Sense};
+    if seqs.is_empty() {
+        return;
+    }
+    let names: std::collections::BTreeSet<String> = pins.keys().cloned().collect();
+    let expr = |body: &str, key: &str| simple_attr(body, key).and_then(|e| Func::parse_in(&e, |p| names.contains(p)));
+    for pin in pins.values_mut() {
+        let Some(Func::Port(out)) = pin.function.as_deref().and_then(|f| Func::parse_in(f, |_| true)) else { continue };
+        let Some((kw, _, body)) = seqs.iter().find(|(_, args, _)| args.split(',').any(|a| a.trim().trim_matches('"') == out)) else {
+            continue;
+        };
+        let clock = expr(body, if kw == "ff" { "clocked_on" } else { "enable" });
+        let (clear, preset) = (expr(body, "clear"), expr(body, "preset"));
+        pin.arcs.retain_mut(|a| {
+            if a.clk_edge.is_some() || !matches!(a.kind.as_str(), "" | "combinational") {
+                return true;
+            }
+            let from = a.related_pin.as_str();
+            match &clock {
+                Some(c) if c.has_port(from) => {
+                    if matches!(c.port_timing_sense(from), Sense::Positive | Sense::Negative) {
+                        a.clk_edge = Some(ClkEdge::Rise);
+                        a.kind = "rising_edge".into();
+                        if a.sense.is_empty() {
+                            a.sense = "non_unate".into();
+                        }
+                    }
+                    true
+                }
+                _ => !(clear.as_ref().is_some_and(|e| e.has_port(from)) || preset.as_ref().is_some_and(|e| e.has_port(from))),
+            }
+        });
+    }
+}
+
 /// The sense of every arc whose group states no `timing_sense`, as the reference builds the arcs:
 ///   * a combinational arc: the output pin's `function`, when it names the related pin; else, on a
 ///     three-state pin whose enable names it, non-unate;
@@ -1619,6 +1661,12 @@ fn parse_cell(
         }
     }
     expand_arcs(&mut pins, &buses, &bus_bits);
+    let seqs: Vec<(String, String, String)> = groups
+        .iter()
+        .filter(|(k, _, _)| k == "ff" || k == "latch")
+        .map(|(k, a, b)| (k.clone(), a.clone(), b.to_string()))
+        .collect();
+    sequential_arcs(&mut pins, &seqs);
     derive_senses(&mut pins);
     let ff = groups
         .iter()
@@ -3007,5 +3055,43 @@ mod derived_sense {
         assert_eq!(sense("TBUF", "A"), "negative_unate");
         assert_eq!(sense("TBUF", "EN"), "non_unate");
         assert_eq!(sense("ODD", "A"), "non_unate");
+    }
+}
+
+#[cfg(test)]
+mod sequential_without_timing_type {
+    use super::*;
+
+    /// Reference rule (checked on this library with `report_lib_cell`): a flop's timing group with
+    /// no `timing_type` is a clock-to-Q arc from the RISING clock edge — on DFFN too, whose
+    /// `clocked_on` is `!CLKN` (the reference's own quirk, reproduced) — and one from the `clear`
+    /// pin is a set/clear arc, which is not a delay arc here.
+    #[test]
+    fn a_flop_group_without_timing_type_is_clock_to_q() {
+        let l = Lib::parse(r#"library(s) {
+  delay_model : table_lookup;
+  time_unit : "1ns"; capacitive_load_unit (1, pf); voltage_unit : "1V"; current_unit : "1mA";
+  cell (DFF) { ff (IQ, IQN) { next_state : "D"; clocked_on : "CLK"; }
+    pin(CLK) { direction : input; clock : true; capacitance : 0.001; }
+    pin(D) { direction : input; capacitance : 0.001; }
+    pin(Q) { direction : output; function : "IQ"; timing () { related_pin : "CLK"; cell_rise (scalar) { values("0.1"); } cell_fall (scalar) { values("0.1"); } rise_transition (scalar) { values("0.1"); } fall_transition (scalar) { values("0.1"); } } } }
+  cell (DFFN) { ff (IQ, IQN) { next_state : "D"; clocked_on : "!CLKN"; }
+    pin(CLKN) { direction : input; clock : true; capacitance : 0.001; }
+    pin(D) { direction : input; capacitance : 0.001; }
+    pin(Q) { direction : output; function : "IQ"; timing () { related_pin : "CLKN"; cell_rise (scalar) { values("0.1"); } cell_fall (scalar) { values("0.1"); } rise_transition (scalar) { values("0.1"); } fall_transition (scalar) { values("0.1"); } } } }
+  cell (DFFR) { ff (IQ, IQN) { next_state : "D"; clocked_on : "CLK"; clear : "!RESET_B"; }
+    pin(CLK) { direction : input; clock : true; capacitance : 0.001; }
+    pin(D) { direction : input; capacitance : 0.001; }
+    pin(RESET_B) { direction : input; capacitance : 0.001; }
+    pin(Q) { direction : output; function : "IQ";
+      timing () { related_pin : "CLK"; cell_rise (scalar) { values("0.1"); } cell_fall (scalar) { values("0.1"); } rise_transition (scalar) { values("0.1"); } fall_transition (scalar) { values("0.1"); } }
+      timing () { related_pin : "RESET_B"; cell_rise (scalar) { values("0.1"); } cell_fall (scalar) { values("0.1"); } rise_transition (scalar) { values("0.1"); } fall_transition (scalar) { values("0.1"); } } } }
+}
+"#).unwrap();
+        for (c, ck) in [("DFF", "CLK"), ("DFFN", "CLKN"), ("DFFR", "CLK")] {
+            let q = &l.cells[c].pins["Q"];
+            assert_eq!(q.arcs.len(), 1, "{c}: only the clock arc is a delay arc");
+            assert_eq!((q.arcs[0].related_pin.as_str(), q.arcs[0].clk_edge), (ck, Some(ClkEdge::Rise)), "{c}");
+        }
     }
 }
