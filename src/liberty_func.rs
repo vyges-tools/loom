@@ -257,7 +257,7 @@ mod tests {
         assert_eq!(p("\"A|B\""), Func::Or(port("A"), port("B")));
     }
 
-    /// The reference's `portTimingSense`, case by case.
+    /// The reference's timing-sense rule, case by case.
     #[test]
     fn port_timing_sense_follows_the_reference() {
         assert_eq!(sense("A", "A"), Sense::Positive);

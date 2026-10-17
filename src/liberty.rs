@@ -99,7 +99,7 @@ pub struct Arc {
 /// A setup or hold constraint: rise/fall tables indexed by
 /// (index_1 = related/clock transition, index_2 = constrained/data transition).
 /// Evaluated by bilinear interpolation at the operating slews (like delay arcs),
-/// not collapsed to a table-max — matching OpenSTA.
+/// not collapsed to a table-max — as the reference does.
 #[derive(Debug, Clone, Default)]
 pub struct Constraint {
     pub rise: Table,
@@ -1054,7 +1054,7 @@ fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
             // setup/hold. They are not max-delay data arcs.
             Some(tt) if tt.starts_with("recovery") => recovery.push(parse_constraint(tbody, &tspans, ctx)),
             Some(tt) if tt.starts_with("removal") => removal.push(parse_constraint(tbody, &tspans, ctx)),
-            // DELAY arcs, by the reference's own list (`LibertyBuilder::makeTimingArcs`); a
+            // DELAY arcs, by the reference's own list; a
             // missing `timing_type` is combinational.
             None
             | Some(
@@ -2736,8 +2736,7 @@ mod lexer_tests {
     }
 }
 
-/// A table's axes are what its TEMPLATE says — each rule here the reference's (`TableModel.cc`,
-/// `LibertyReader::readTableModel`).
+/// A table's axes are what its TEMPLATE says — each rule here the reference's.
 #[cfg(test)]
 mod table_axis_tests {
     use super::*;
@@ -2849,7 +2848,7 @@ mod timing_type_tests {
     }
 }
 
-/// A pin's capacitance per edge — the reference's rule (`LibertyReader::readCapacitance`).
+/// A pin's capacitance per edge — the reference's rule.
 #[cfg(test)]
 mod pin_cap_tests {
     use super::*;
