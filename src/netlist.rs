@@ -164,9 +164,6 @@ struct Lexer<R: std::io::BufRead> {
     mode: Mode,
     /// a punctuation token found while closing the token before it
     pending: Option<u8>,
-    /// Values that arrived as ESCAPED identifiers. ⚠️ The token VALUE is canonical either way;
-    /// the set only records where a backslash was.
-    escaped_vals: std::collections::BTreeSet<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -196,20 +193,15 @@ const fn stop_table(escaped: bool) -> [bool; 256] {
     t
 }
 
-/// Close the token open since `start` in `arena`: the range it occupies, or `None` when no
-/// token was open.
-fn flush_tok(
-    start: &mut Option<usize>,
-    escaped: &mut bool,
-    vals: &mut std::collections::BTreeSet<String>,
-    arena: &[u8],
-) -> Option<std::ops::Range<usize>> {
+/// A token's place in the arena, and whether it arrived as an ESCAPED identifier. ⚠️ The token
+/// VALUE is canonical either way; the flag only records where a backslash was.
+type Tok = (std::ops::Range<usize>, bool);
+
+/// Close the token open since `start` in `arena`, or `None` when no token was open.
+fn flush_tok(start: &mut Option<usize>, escaped: &mut bool, arena: &[u8]) -> Option<Tok> {
     let was_escaped = std::mem::replace(escaped, false);
     let s0 = start.take()?;
-    if was_escaped {
-        vals.insert(String::from_utf8_lossy(&arena[s0..]).into_owned());
-    }
-    Some(s0..arena.len())
+    Some((s0..arena.len(), was_escaped))
 }
 
 /// Append `b` to the open token in `arena`, opening one if none is.
@@ -229,17 +221,16 @@ impl<R: std::io::BufRead> Lexer<R> {
             slash: false,
             mode: Mode::Normal,
             pending: None,
-            escaped_vals: Default::default(),
         }
     }
 
     /// The next token, written to the end of `arena`; its range there, or `None` at the end.
-    fn next_into(&mut self, arena: &mut Vec<u8>) -> std::io::Result<Option<std::ops::Range<usize>>> {
+    fn next_into(&mut self, arena: &mut Vec<u8>) -> std::io::Result<Option<Tok>> {
         loop {
             if let Some(p) = self.pending.take() {
                 let s0 = arena.len();
                 arena.push(p);
-                return Ok(Some(s0..s0 + 1));
+                return Ok(Some((s0..s0 + 1, false)));
             }
             let buf = self.r.fill_buf()?;
             if buf.is_empty() {
@@ -247,7 +238,7 @@ impl<R: std::io::BufRead> Lexer<R> {
                 if std::mem::take(&mut self.slash) && self.mode == Mode::Normal {
                     push_tok(&mut self.start, arena, b"/");
                 }
-                return Ok(flush_tok(&mut self.start, &mut self.escaped, &mut self.escaped_vals, arena));
+                return Ok(flush_tok(&mut self.start, &mut self.escaped, arena));
             }
             let (mut used, mut out) = (0usize, None);
             while used < buf.len() {
@@ -294,7 +285,7 @@ impl<R: std::io::BufRead> Lexer<R> {
                 if std::mem::take(&mut self.slash) {
                     if c == b'/' || c == b'*' {
                         self.mode = if c == b'/' { Mode::LineComment } else { Mode::BlockComment(false) };
-                        out = flush_tok(&mut self.start, &mut self.escaped, &mut self.escaped_vals, arena);
+                        out = flush_tok(&mut self.start, &mut self.escaped, arena);
                         if out.is_some() {
                             break;
                         }
@@ -323,7 +314,7 @@ impl<R: std::io::BufRead> Lexer<R> {
                 // word — silently removing crosstalk from the analysis.
                 if self.escaped {
                     if c.is_ascii_whitespace() {
-                        out = flush_tok(&mut self.start, &mut self.escaped, &mut self.escaped_vals, arena);
+                        out = flush_tok(&mut self.start, &mut self.escaped, arena);
                         if out.is_some() {
                             break;
                         }
@@ -334,21 +325,21 @@ impl<R: std::io::BufRead> Lexer<R> {
                 }
                 match c {
                     b'\\' => {
-                        out = flush_tok(&mut self.start, &mut self.escaped, &mut self.escaped_vals, arena);
+                        out = flush_tok(&mut self.start, &mut self.escaped, arena);
                         self.escaped = true;
                     }
                     b'(' | b')' | b';' | b',' | b'.' | b'[' | b']' | b'=' => {
-                        out = flush_tok(&mut self.start, &mut self.escaped, &mut self.escaped_vals, arena);
+                        out = flush_tok(&mut self.start, &mut self.escaped, arena);
                         if out.is_some() {
                             self.pending = Some(c);
                         } else {
                             let s0 = arena.len();
                             arena.push(c);
-                            out = Some(s0..s0 + 1);
+                            out = Some((s0..s0 + 1, false));
                         }
                     }
                     c if c.is_ascii_whitespace() => {
-                        out = flush_tok(&mut self.start, &mut self.escaped, &mut self.escaped_vals, arena)
+                        out = flush_tok(&mut self.start, &mut self.escaped, arena)
                     }
                     _ => push_tok(&mut self.start, arena, &[c]),
                 }
@@ -489,6 +480,245 @@ fn is_ident(t: &str) -> bool {
     matches!(t.chars().next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '\\')
 }
 
+/// A name in a [`StrPool`]: four bytes, compared and hashed as an integer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Sym(u32);
+
+impl Sym {
+    /// The symbol's index in its pool.
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Every distinct name of a design, stored ONCE: one text buffer, an end offset per name, and an
+/// open-addressing index over them — about 16 bytes plus the text per distinct name.
+///
+/// ⛔ **Why.** The owned [`Netlist`] keeps a `String` for every cell name, instance name, pin and
+/// net of every instance — about 460 bytes an instance, measured, nearly all of it repeats of the
+/// same few cell and pin names and allocator overhead. A chip-scale netlist does not fit that way.
+#[derive(Debug, Clone, Default)]
+pub struct StrPool {
+    text: String,
+    ends: Vec<u64>,
+    /// open addressing, linear probing; `EMPTY` is a free slot; at most half full
+    table: Vec<u32>,
+}
+
+const EMPTY: u32 = u32::MAX;
+
+/// FxHash over the bytes, eight at a time, with a final mix: fast, and good enough for an index.
+fn fx_hash(s: &str) -> u64 {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    let b = s.as_bytes();
+    let mut h: u64 = b.len() as u64;
+    let (words, rest) = b.as_chunks::<8>();
+    for w in words {
+        h = (h.rotate_left(5) ^ u64::from_le_bytes(*w)).wrapping_mul(K);
+    }
+    for &c in rest {
+        h = (h.rotate_left(5) ^ c as u64).wrapping_mul(K);
+    }
+    // ⛔ Mixed before use: the index takes the LOW bits, and a multiply leaves them weak — short
+    // names that differ in one byte (`w[3]`, `w[5]`) clustered into long probe chains.
+    h ^= h >> 31;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^ (h >> 29)
+}
+
+impl StrPool {
+    /// The number of distinct names.
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    /// The text of `s`.
+    pub fn get(&self, s: Sym) -> &str {
+        let i = s.index();
+        let a = if i == 0 { 0 } else { self.ends[i - 1] as usize };
+        &self.text[a..self.ends[i] as usize]
+    }
+
+    /// The symbol for `s`, if the pool holds it.
+    pub fn find(&self, s: &str) -> Option<Sym> {
+        if self.table.is_empty() {
+            return None;
+        }
+        let mask = self.table.len() - 1;
+        let mut h = fx_hash(s) as usize & mask;
+        loop {
+            match self.table[h] {
+                EMPTY => return None,
+                e if self.get(Sym(e)) == s => return Some(Sym(e)),
+                _ => h = (h + 1) & mask,
+            }
+        }
+    }
+
+    /// The symbol for `s`, adding it if new.
+    pub fn intern(&mut self, s: &str) -> Sym {
+        if self.ends.len() * 2 >= self.table.len() {
+            self.grow();
+        }
+        let mask = self.table.len() - 1;
+        let mut h = fx_hash(s) as usize & mask;
+        loop {
+            match self.table[h] {
+                EMPTY => break,
+                e if self.get(Sym(e)) == s => return Sym(e),
+                _ => h = (h + 1) & mask,
+            }
+        }
+        let id = u32::try_from(self.ends.len()).ok().filter(|&id| id != EMPTY).expect("more than 4 billion distinct names");
+        self.text.push_str(s);
+        self.ends.push(self.text.len() as u64);
+        self.table[h] = id;
+        Sym(id)
+    }
+
+    fn grow(&mut self) {
+        let cap = (self.table.len() * 2).max(1024);
+        self.table = vec![EMPTY; cap];
+        let mask = cap - 1;
+        for id in 0..self.ends.len() as u32 {
+            let mut h = fx_hash(self.get(Sym(id))) as usize & mask;
+            while self.table[h] != EMPTY {
+                h = (h + 1) & mask;
+            }
+            self.table[h] = id;
+        }
+    }
+}
+
+/// One instance of a [`CompactModule`]: its cell and name, and where its connections and ties
+/// lie in the module's tables. 20 bytes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CompactInst {
+    pub cell: Sym,
+    pub name: Sym,
+    conns: (u32, u32),
+    ties: (u32, u32),
+}
+
+/// A module with every name a [`Sym`] and every instance's connections in ONE table — the
+/// chip-scale form of [`Netlist`], with the same content. Read it through
+/// [`CompactModule::conns`] / [`CompactModule::ties`] and the design's [`StrPool`].
+#[derive(Debug, Clone, Default)]
+pub struct CompactModule {
+    pub name: Sym,
+    pub inputs: Vec<Sym>,
+    pub outputs: Vec<Sym>,
+    pub inouts: Vec<Sym>,
+    pub insts: Vec<CompactInst>,
+    /// `(pin, net)` of every instance, in instance order — see [`Inst::conns`]
+    conn_table: Vec<(Sym, Sym)>,
+    /// `(pin, value)` of every instance — see [`Inst::ties`]
+    tie_table: Vec<(Sym, bool)>,
+    pub aliases: Vec<(Sym, Sym)>,
+    /// written name -> canonical name — see [`Netlist::canonical`]
+    pub canonical: Vec<(Sym, Sym)>,
+    pub behavioural: usize,
+    pub positional: usize,
+}
+
+impl CompactModule {
+    /// `inst`'s `(pin, net)` connections — see [`Inst::conns`].
+    pub fn conns(&self, inst: &CompactInst) -> &[(Sym, Sym)] {
+        &self.conn_table[inst.conns.0 as usize..inst.conns.1 as usize]
+    }
+
+    /// `inst`'s constant ties — see [`Inst::ties`].
+    pub fn ties(&self, inst: &CompactInst) -> &[(Sym, bool)] {
+        &self.tie_table[inst.ties.0 as usize..inst.ties.1 as usize]
+    }
+
+    /// The owned form. `modules` / `escaped_names` are the DESIGN's, and are left empty here.
+    pub fn to_netlist(&self, pool: &StrPool) -> Netlist {
+        let st = |s: &Sym| pool.get(*s).to_string();
+        Netlist {
+            module: st(&self.name),
+            inputs: self.inputs.iter().map(st).collect(),
+            outputs: self.outputs.iter().map(st).collect(),
+            inouts: self.inouts.iter().map(st).collect(),
+            insts: self
+                .insts
+                .iter()
+                .map(|x| Inst {
+                    cell: st(&x.cell),
+                    name: st(&x.name),
+                    conns: self.conns(x).iter().map(|(p, n)| (st(p), st(n))).collect(),
+                    ties: self.ties(x).iter().map(|(p, v)| (st(p), *v)).collect(),
+                })
+                .collect(),
+            aliases: self.aliases.iter().map(|(a, b)| (st(a), st(b))).collect(),
+            canonical: self.canonical.iter().map(|(a, b)| (st(a), st(b))).collect(),
+            behavioural: self.behavioural,
+            positional: self.positional,
+            ..Default::default()
+        }
+    }
+}
+
+/// Every module of a file in the compact form — what [`Design`] is made from.
+#[derive(Debug, Clone, Default)]
+pub struct CompactDesign {
+    /// every name the design uses, once
+    pub pool: StrPool,
+    /// in DECLARATION order
+    pub modules: Vec<CompactModule>,
+    /// index of the module no other module instantiates
+    pub top: usize,
+    /// one bit per name: arrived as an escaped identifier — see [`Netlist::escaped_names`]
+    escaped: Vec<u64>,
+    by_name: std::collections::HashMap<Sym, usize>,
+}
+
+impl CompactDesign {
+    pub fn top(&self) -> &CompactModule {
+        &self.modules[self.top]
+    }
+
+    /// The module DEFINED under `name`, if the file defines it (the first, if twice).
+    pub fn module(&self, name: &str) -> Option<&CompactModule> {
+        let s = self.pool.find(name)?;
+        self.by_name.get(&s).map(|&i| &self.modules[i])
+    }
+
+    /// The text of a name.
+    pub fn str(&self, s: Sym) -> &str {
+        self.pool.get(s)
+    }
+
+    /// Did `s` arrive as an escaped identifier (`\foo[0] `)? See [`Netlist::escaped_names`].
+    pub fn is_escaped(&self, s: Sym) -> bool {
+        self.escaped.get(s.index() / 64).is_some_and(|w| w >> (s.index() % 64) & 1 == 1)
+    }
+
+    /// Every name that arrived as an escaped identifier, in pool order.
+    pub fn escaped_names(&self) -> impl Iterator<Item = Sym> + '_ {
+        (0..self.pool.len() as u32).map(Sym).filter(|s| self.is_escaped(*s))
+    }
+
+    /// The owned form of every module.
+    pub fn to_design(&self) -> Design {
+        let mut modules: Vec<Netlist> = self.modules.iter().map(|m| m.to_netlist(&self.pool)).collect();
+        let names: Vec<String> = self.modules.iter().map(|m| self.pool.get(m.name).to_string()).collect();
+        let mut by_name = std::collections::HashMap::with_capacity(names.len());
+        for (k, nm) in names.iter().enumerate() {
+            by_name.entry(nm.clone()).or_insert(k);
+        }
+        if let Some(t) = modules.get_mut(self.top) {
+            t.modules = names;
+            t.escaped_names = self.escaped_names().map(|s| self.pool.get(s).to_string()).collect();
+        }
+        Design { modules, top: self.top, by_name }
+    }
+}
+
 /// EVERY module a file defines, with the top marked.
 ///
 /// ⛔ **`parse` returns only the top**, and on a hierarchical netlist that is not the design:
@@ -541,11 +771,35 @@ pub fn parse_all(text: &str) -> Result<Design, NetlistError> {
 
 /// [`parse_all`] from a STREAM — the file is never held whole; see [`Lexer`].
 pub fn parse_reader<R: std::io::BufRead>(r: R) -> Result<Design, NetlistError> {
+    Ok(parse_compact_reader(r)?.to_design())
+}
+
+/// Every module of a file in the COMPACT form — see [`CompactDesign`]. For a chip-scale netlist.
+pub fn parse_compact(text: &str) -> Result<CompactDesign, NetlistError> {
+    parse_compact_reader(text.as_bytes())
+}
+
+/// Record that a token arrived escaped: one bit per name in the pool, not a string per name —
+/// on a netlist whose every name is escaped, a set of strings was most of the memory.
+fn mark_escaped(pool: &mut StrPool, bits: &mut Vec<u64>, tok: &[u8]) {
+    let s = pool.intern(&String::from_utf8_lossy(tok));
+    let (w, b) = (s.index() / 64, s.index() % 64);
+    if bits.len() <= w {
+        bits.resize(w + 1, 0);
+    }
+    bits[w] |= 1 << b;
+}
+
+/// [`parse_compact`] from a STREAM: neither the file nor an owned copy of any module is held,
+/// only the compact design.
+pub fn parse_compact_reader<R: std::io::BufRead>(r: R) -> Result<CompactDesign, NetlistError> {
     let io = |e: std::io::Error| NetlistError(e.to_string());
     let mut lx = Lexer::new(r);
-    let mut mods: Vec<Netlist> = Vec::new();
-    // ONE module's tokens at a time, `module` through `endmodule`, in an arena that is reused:
-    // the peak is the largest module, not the file.
+    let mut pool = StrPool::default();
+    let mut escaped = Vec::new();
+    let mut mods: Vec<CompactModule> = Vec::new();
+    // ONE STATEMENT's tokens at a time — to its `;` at depth 0, or `endmodule` — in an arena
+    // that is reused: the peak is the longest statement, not the module or the file.
     let mut arena: Vec<u8> = Vec::new();
     let mut spans: Vec<std::ops::Range<usize>> = Vec::new();
     // EVERY module, not just the first. A hierarchical netlist that lists its leaves before its
@@ -554,7 +808,10 @@ pub fn parse_reader<R: std::io::BufRead>(r: R) -> Result<Design, NetlistError> {
         arena.clear();
         spans.clear();
         let mut found = false;
-        while let Some(t) = lx.next_into(&mut arena).map_err(io)? {
+        while let Some((t, esc)) = lx.next_into(&mut arena).map_err(io)? {
+            if esc {
+                mark_escaped(&mut pool, &mut escaped, &arena[t.clone()]);
+            }
             if &arena[t.clone()] == b"module" {
                 spans.push(t);
                 found = true;
@@ -565,475 +822,510 @@ pub fn parse_reader<R: std::io::BufRead>(r: R) -> Result<Design, NetlistError> {
         if !found {
             break;
         }
-        while let Some(t) = lx.next_into(&mut arena).map_err(io)? {
-            let end = &arena[t.clone()] == b"endmodule";
-            spans.push(t);
+        let mut reader = ModuleReader::default();
+        let mut depth = 0i32;
+        loop {
+            let next = lx.next_into(&mut arena).map_err(io)?;
+            let (done, end) = match next {
+                None => (true, true),
+                Some((t, esc)) => {
+                    if esc {
+                        mark_escaped(&mut pool, &mut escaped, &arena[t.clone()]);
+                    }
+                    let w = &arena[t.clone()];
+                    let end = w == b"endmodule";
+                    match w {
+                        b"(" => depth += 1,
+                        b")" => depth -= 1,
+                        _ => {}
+                    }
+                    let done = end || (w == b";" && depth <= 0);
+                    spans.push(t);
+                    (done, end)
+                }
+            };
+            if done && !spans.is_empty() {
+                // UTF-8 is checked once per statement; one that is not (a Windows-1252 byte) is
+                // read lossily, token by token.
+                let lossy: Vec<String>;
+                let toks: Vec<&str> = match std::str::from_utf8(&arena) {
+                    Ok(text) => spans.iter().map(|t| &text[t.clone()]).collect(),
+                    Err(_) => {
+                        lossy = spans.iter().map(|t| String::from_utf8_lossy(&arena[t.clone()]).into_owned()).collect();
+                        lossy.iter().map(String::as_str).collect()
+                    }
+                };
+                reader.statement(&toks, &mut pool);
+                arena.clear();
+                spans.clear();
+                depth = 0;
+            }
             if end {
                 break;
             }
         }
-        // UTF-8 is checked once per module; a module that is not (a Windows-1252 byte) is read
-        // lossily, token by token.
-        let lossy: Vec<String>;
-        let toks: Vec<&str> = match std::str::from_utf8(&arena) {
-            Ok(text) => spans.iter().map(|t| &text[t.clone()]).collect(),
-            Err(_) => {
-                lossy = spans.iter().map(|t| String::from_utf8_lossy(&arena[t.clone()]).into_owned()).collect();
-                lossy.iter().map(String::as_str).collect()
-            }
-        };
-        mods.push(parse_module(&toks, 0).0);
+        mods.push(reader.finish(&mut pool));
     }
-    let escaped_vals = std::mem::take(&mut lx.escaped_vals);
     if mods.is_empty() {
         return Err(NetlistError("no module found".into()));
     }
 
     // TOP is the module no other module instantiates. That is the definition, and it does not
     // depend on declaration order — which is the only thing position could have told us.
-    let names: Vec<String> = mods.iter().map(|m| m.module.clone()).collect();
-    let instantiated: std::collections::BTreeSet<&str> = mods
+    let instantiated: std::collections::HashSet<Sym> = mods.iter().flat_map(|m| m.insts.iter().map(|x| x.cell)).collect();
+    let top = mods
         .iter()
-        .flat_map(|m| m.insts.iter().map(|x| x.cell.as_str()))
-        .collect();
-    let top = names
-        .iter()
-        .position(|nm| !instantiated.contains(nm.as_str()))
+        .position(|m| !instantiated.contains(&m.name))
         // Every module instantiated by another (mutual recursion, or a single module that
         // instantiates itself) — fall back to the last, which is the usual emission order.
         .unwrap_or(mods.len() - 1);
 
     // ⛔ ONCE, on the top. Both describe the FILE, and a copy on every module is a list of n
     // names times n modules: tens of gigabytes on a netlist of tens of thousands of modules.
-    let mut by_name = std::collections::HashMap::with_capacity(names.len());
-    for (k, nm) in names.iter().enumerate() {
-        by_name.entry(nm.clone()).or_insert(k);
+    // (the owned form keeps these on the top only — see `CompactDesign::to_design`)
+    let mut by_name = std::collections::HashMap::with_capacity(mods.len());
+    for (k, m) in mods.iter().enumerate() {
+        by_name.entry(m.name).or_insert(k);
     }
-    mods[top].modules = names;
-    mods[top].escaped_names = escaped_vals;
-    Ok(Design { modules: mods, top, by_name })
+    Ok(CompactDesign { pool, modules: mods, top, escaped, by_name })
 }
 
-/// Parse ONE `module … endmodule`, returning it and the index just past `endmodule`.
-fn parse_module(t: &[&str], from: usize) -> (Netlist, usize) {
-    let n = t.len();
-    let mut nl = Netlist::default();
+/// One module, read ONE STATEMENT at a time — as the reference's parser consumes it: what
+/// carries from one statement to the next is the module itself and its declarations (which
+/// ranges, which one-bit vectors), never the tokens.
+///
+/// ⛔ Held whole, a flat module of a million and a half instances was some thirty million
+/// tokens — a range and a slice each, about a gigabyte that existed only to be parsed.
+#[derive(Default)]
+struct ModuleReader {
+    nl: CompactModule,
     // names declared as a one-bit VECTOR (`wire [0:0] x`), and the single index they carry
-    let mut one_bit_vec: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
+    one_bit_vec: std::collections::BTreeMap<String, String>,
     // every declared signal's range, so a connection naming a whole bus can be expanded the way
     // a synthesiser expands it
-    let mut decl_range: std::collections::BTreeMap<String, (i64, i64)> =
-        std::collections::BTreeMap::new();
-    let mut i = from;
+    decl_range: std::collections::BTreeMap<String, (i64, i64)>,
+    /// the header has been read: only the FIRST statement is `module NAME ( … ) ;`
+    started: bool,
+}
 
-    // module NAME ( ... ) ;  — keep name, skip the header port list
-    if i < n && t[i] == "module" {
-        i += 1;
-        if i < n {
-            nl.module = t[i].to_string();
+impl ModuleReader {
+    /// One statement: the tokens up to and including its `;` (or `endmodule`); the first one is
+    /// the header, `module NAME ( … ) ;`.
+    fn statement(&mut self, t: &[&str], pool: &mut StrPool) {
+        let n = t.len();
+        let first = !std::mem::replace(&mut self.started, true);
+        let nl = &mut self.nl;
+        let one_bit_vec = &mut self.one_bit_vec;
+        let decl_range = &mut self.decl_range;
+        let mut i = 0;
+
+        // module NAME ( ... ) ;  — keep name, skip the header port list
+        if first && i < n && t[i] == "module" {
             i += 1;
-        }
-        // THE HEADER MAY BE WHERE THE PORTS ARE DECLARED. Verilog-2001 ANSI style puts the
-        // direction, type and range inline — `module m (input wire [7:0] ui_in, output ...)` —
-        // and a module written that way has no separate `input`/`output` statements at all.
-        // Skipping the header then yields a design with ZERO ports: every join that asks whether
-        // a net is a port fails, and the port-alias canonicalisation below is inert. It is not a
-        // corner case — it is how modern Verilog is written, and how every TinyTapeout project
-        // is written.
-        //
-        // Both styles are read: an ANSI header declares its ports here, and a non-ANSI header
-        // just lists names that the `input`/`output` statements below will declare properly.
-        if i < n && t[i] == "(" {
-            i += 1;
-            let mut depth = 1;
-            let (mut dir, mut range): (Option<&str>, Option<(i64, i64)>) = (None, None);
-            while i < n && depth > 0 {
-                match t[i] {
-                    "(" => depth += 1,
-                    ")" => {
-                        depth -= 1;
-                        if depth == 0 {
-                            i += 1;
-                            break;
+            if i < n {
+                nl.name = pool.intern(t[i]);
+                i += 1;
+            }
+            // THE HEADER MAY BE WHERE THE PORTS ARE DECLARED. Verilog-2001 ANSI style puts the
+            // direction, type and range inline — `module m (input wire [7:0] ui_in, output ...)` —
+            // and a module written that way has no separate `input`/`output` statements at all.
+            // Skipping the header then yields a design with ZERO ports: every join that asks whether
+            // a net is a port fails, and the port-alias canonicalisation below is inert. It is not a
+            // corner case — it is how modern Verilog is written, and how every TinyTapeout project
+            // is written.
+            //
+            // Both styles are read: an ANSI header declares its ports here, and a non-ANSI header
+            // just lists names that the `input`/`output` statements below will declare properly.
+            if i < n && t[i] == "(" {
+                i += 1;
+                let mut depth = 1;
+                let (mut dir, mut range): (Option<&str>, Option<(i64, i64)>) = (None, None);
+                while i < n && depth > 0 {
+                    match t[i] {
+                        "(" => depth += 1,
+                        ")" => {
+                            depth -= 1;
+                            if depth == 0 {
+                                i += 1;
+                                break;
+                            }
                         }
+                        // a direction keyword starts a new ANSI declaration; the range and direction
+                        // then apply to every name until the next one
+                        d @ ("input" | "output" | "inout") => {
+                            dir = Some(d);
+                            range = None;
+                        }
+                        "wire" | "reg" | "logic" | "signed" => {}
+                        "," => {}
+                        "[" => {
+                            let spec = t.get(i + 1).copied().unwrap_or_default();
+                            range = spec.split_once(':').and_then(|(h, l)| {
+                                Some((h.trim().parse::<i64>().ok()?, l.trim().parse::<i64>().ok()?))
+                            });
+                            while i < n && t[i] != "]" {
+                                i += 1;
+                            }
+                        }
+                        tok if is_ident(tok) && !is_keyword(tok) => {
+                            if let Some(d) = dir {
+                                let names: Vec<String> = match range {
+                                    Some((h, l)) => {
+                                        let (hi, lo) = if h >= l { (h, l) } else { (l, h) };
+                                        decl_range.insert(tok.to_string(), (hi, lo));
+                                        (lo..=hi).rev().map(|b| format!("{tok}[{b}]")).collect()
+                                    }
+                                    None => vec![tok.to_string()],
+                                };
+                                let names = names.iter().map(|x| pool.intern(x));
+                                match d {
+                                    "input" => nl.inputs.extend(names),
+                                    "output" => nl.outputs.extend(names),
+                                    // ⚠️ Recorded, not folded into inputs: see `Netlist::inouts`.
+                                    "inout" => nl.inouts.extend(names),
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {}
                     }
-                    // a direction keyword starts a new ANSI declaration; the range and direction
-                    // then apply to every name until the next one
-                    d @ ("input" | "output" | "inout") => {
-                        dir = Some(d);
-                        range = None;
-                    }
-                    "wire" | "reg" | "logic" | "signed" => {}
+                    i += 1;
+                }
+            }
+            if i < n && t[i] == ";" {
+                i += 1;
+            }
+        }
+
+        // Read a declaration's net names, **expanding bus ranges**: `output [7:0] count`
+        // yields count[7]..count[0] as individual ports, so each bit matches the
+        // bit-nets the gates drive (and SDC `set_output_delay [get_ports count[3]]`
+        // resolves). A range stays in effect for every name in the same declaration
+        // (`output [3:0] a, b;` -> a and b both expand). Scalars (no range) pass through.
+        let read_names = |i: &mut usize| -> Vec<String> {
+            let mut names = Vec::new();
+            let mut range: Option<(i64, i64)> = None;
+            while *i < n && t[*i] != ";" {
+                match t[*i] {
                     "," => {}
                     "[" => {
-                        let spec = t.get(i + 1).copied().unwrap_or_default();
+                        *i += 1;
+                        let mut spec = String::new();
+                        while *i < n && t[*i] != "]" {
+                            spec.push_str(t[*i]);
+                            *i += 1;
+                        }
                         range = spec.split_once(':').and_then(|(h, l)| {
                             Some((h.trim().parse::<i64>().ok()?, l.trim().parse::<i64>().ok()?))
                         });
+                    }
+                    tok => match range {
+                        Some((h, l)) => {
+                            let (hi, lo) = if h >= l { (h, l) } else { (l, h) };
+                            for b in (lo..=hi).rev() {
+                                names.push(format!("{tok}[{b}]"));
+                            }
+                        }
+                        None => names.push(tok.to_string()),
+                    },
+                }
+                *i += 1;
+            }
+            names
+        };
+
+        while i < n {
+            match t[i] {
+                "endmodule" => break,
+                // The names come back already expanded to bits, so the declared range is recovered
+                // from them — `expand_bits` needs it when an instance below connects the whole bus.
+                "input" => {
+                    i += 1;
+                    let names = read_names(&mut i);
+                    note_ranges(&names, decl_range);
+                    nl.inputs.extend(names.iter().map(|x| pool.intern(x)));
+                }
+                "output" => {
+                    i += 1;
+                    let names = read_names(&mut i);
+                    note_ranges(&names, decl_range);
+                    nl.outputs.extend(names.iter().map(|x| pool.intern(x)));
+                }
+                // `assign lhs = rhs ;` is not decoration: it is two names for the same net, and
+                // tools emit it for port aliases and constant ties. Skipping it leaves the lhs
+                // with no driver.
+                "assign" => {
+                    i += 1;
+                    let lhs = read_expr(t, &mut i);
+                    if i < n && t[i] == "=" {
+                        i += 1;
+                    }
+                    let rhs = read_expr(t, &mut i);
+                    if !lhs.is_empty() && !rhs.is_empty() {
+                        nl.aliases.push((pool.intern(&lhs), pool.intern(&rhs)));
+                    }
+                    while i < n && t[i] != ";" {
+                        i += 1;
+                    }
+                }
+                // Structural-only: these are not parsed, and their presence means the file is not
+                // a gate-level netlist. Counted rather than ignored, so the caller is told.
+                "always" | "always_ff" | "always_comb" | "always_latch" | "initial" | "function"
+                | "task" | "generate" => {
+                    nl.behavioural += 1;
+                    i += 1;
+                }
+                // A DECLARATION CARRIES THE WIDTH, and a one-bit VECTOR is named without an index.
+                // `wire [0:0] clk;` and `wire clk;` are the same net to every consumer — Yosys's own
+                // JSON represents them identically, `bits: [n]`, with nothing to tell them apart —
+                // but Verilog source may write the connection either way. Left as written, one front
+                // end says `clk[0]` and the other says `clk`, and the two describe the same design
+                // differently. The declaration is the only place the answer exists, so it is read
+                // rather than skipped.
+                // ⛔ `inout` used to sit in the group below and was read as a plain wire, so its
+                // names never reached any port list. It carries a range like the others, so the range
+                // handling is shared — only the destination differs.
+                "inout" => {
+                    i += 1;
+                    let names = read_names(&mut i);
+                    note_ranges(&names, decl_range);
+                    nl.inouts.extend(names.iter().map(|x| pool.intern(x)));
+                }
+                "wire" | "reg" | "parameter" | "localparam" | "supply0" | "supply1" => {
+                    i += 1;
+                    // an optional `[ msb:lsb ]` range, then the names it applies to
+                    let mut single: Option<String> = None;
+                    let mut range: Option<(i64, i64)> = None;
+                    if i < n && t[i] == "[" {
+                        let spec = t.get(i + 1).copied().unwrap_or_default();
+                        if let Some((a, b)) = spec.split_once(':') {
+                            if a.trim() == b.trim() {
+                                single = Some(a.trim().to_string());
+                            }
+                            range = match (a.trim().parse::<i64>(), b.trim().parse::<i64>()) {
+                                (Ok(x), Ok(y)) => Some((x, y)),
+                                _ => None,
+                            };
+                        }
                         while i < n && t[i] != "]" {
                             i += 1;
                         }
-                    }
-                    tok if is_ident(tok) && !is_keyword(tok) => {
-                        if let Some(d) = dir {
-                            let names: Vec<String> = match range {
-                                Some((h, l)) => {
-                                    let (hi, lo) = if h >= l { (h, l) } else { (l, h) };
-                                    decl_range.insert(tok.to_string(), (hi, lo));
-                                    (lo..=hi).rev().map(|b| format!("{tok}[{b}]")).collect()
-                                }
-                                None => vec![tok.to_string()],
-                            };
-                            match d {
-                                "input" => nl.inputs.extend(names),
-                                "output" => nl.outputs.extend(names),
-                                // ⚠️ Recorded, not folded into inputs: see `Netlist::inouts`.
-                                "inout" => nl.inouts.extend(names),
-                                _ => {}
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                i += 1;
-            }
-        }
-        if i < n && t[i] == ";" {
-            i += 1;
-        }
-    }
-
-    // Read a declaration's net names, **expanding bus ranges**: `output [7:0] count`
-    // yields count[7]..count[0] as individual ports, so each bit matches the
-    // bit-nets the gates drive (and SDC `set_output_delay [get_ports count[3]]`
-    // resolves). A range stays in effect for every name in the same declaration
-    // (`output [3:0] a, b;` -> a and b both expand). Scalars (no range) pass through.
-    let read_names = |i: &mut usize| -> Vec<String> {
-        let mut names = Vec::new();
-        let mut range: Option<(i64, i64)> = None;
-        while *i < n && t[*i] != ";" {
-            match t[*i] {
-                "," => {}
-                "[" => {
-                    *i += 1;
-                    let mut spec = String::new();
-                    while *i < n && t[*i] != "]" {
-                        spec.push_str(t[*i]);
-                        *i += 1;
-                    }
-                    range = spec.split_once(':').and_then(|(h, l)| {
-                        Some((h.trim().parse::<i64>().ok()?, l.trim().parse::<i64>().ok()?))
-                    });
-                }
-                tok => match range {
-                    Some((h, l)) => {
-                        let (hi, lo) = if h >= l { (h, l) } else { (l, h) };
-                        for b in (lo..=hi).rev() {
-                            names.push(format!("{tok}[{b}]"));
-                        }
-                    }
-                    None => names.push(tok.to_string()),
-                },
-            }
-            *i += 1;
-        }
-        names
-    };
-
-    while i < n {
-        match t[i] {
-            "endmodule" => {
-                i += 1;
-                break;
-            }
-            // The names come back already expanded to bits, so the declared range is recovered
-            // from them — `expand_bits` needs it when an instance below connects the whole bus.
-            "input" => {
-                i += 1;
-                let names = read_names(&mut i);
-                note_ranges(&names, &mut decl_range);
-                nl.inputs.extend(names);
-            }
-            "output" => {
-                i += 1;
-                let names = read_names(&mut i);
-                note_ranges(&names, &mut decl_range);
-                nl.outputs.extend(names);
-            }
-            // `assign lhs = rhs ;` is not decoration: it is two names for the same net, and
-            // tools emit it for port aliases and constant ties. Skipping it leaves the lhs
-            // with no driver.
-            "assign" => {
-                i += 1;
-                let lhs = read_expr(t, &mut i);
-                if i < n && t[i] == "=" {
-                    i += 1;
-                }
-                let rhs = read_expr(t, &mut i);
-                if !lhs.is_empty() && !rhs.is_empty() {
-                    nl.aliases.push((lhs, rhs));
-                }
-                while i < n && t[i] != ";" {
-                    i += 1;
-                }
-            }
-            // Structural-only: these are not parsed, and their presence means the file is not
-            // a gate-level netlist. Counted rather than ignored, so the caller is told.
-            "always" | "always_ff" | "always_comb" | "always_latch" | "initial" | "function"
-            | "task" | "generate" => {
-                nl.behavioural += 1;
-                i += 1;
-            }
-            // A DECLARATION CARRIES THE WIDTH, and a one-bit VECTOR is named without an index.
-            // `wire [0:0] clk;` and `wire clk;` are the same net to every consumer — Yosys's own
-            // JSON represents them identically, `bits: [n]`, with nothing to tell them apart —
-            // but Verilog source may write the connection either way. Left as written, one front
-            // end says `clk[0]` and the other says `clk`, and the two describe the same design
-            // differently. The declaration is the only place the answer exists, so it is read
-            // rather than skipped.
-            // ⛔ `inout` used to sit in the group below and was read as a plain wire, so its
-            // names never reached any port list. It carries a range like the others, so the range
-            // handling is shared — only the destination differs.
-            "inout" => {
-                i += 1;
-                let names = read_names(&mut i);
-                note_ranges(&names, &mut decl_range);
-                nl.inouts.extend(names);
-            }
-            "wire" | "reg" | "parameter" | "localparam" | "supply0" | "supply1" => {
-                i += 1;
-                // an optional `[ msb:lsb ]` range, then the names it applies to
-                let mut single: Option<String> = None;
-                let mut range: Option<(i64, i64)> = None;
-                if i < n && t[i] == "[" {
-                    let spec = t.get(i + 1).copied().unwrap_or_default();
-                    if let Some((a, b)) = spec.split_once(':') {
-                        if a.trim() == b.trim() {
-                            single = Some(a.trim().to_string());
-                        }
-                        range = match (a.trim().parse::<i64>(), b.trim().parse::<i64>()) {
-                            (Ok(x), Ok(y)) => Some((x, y)),
-                            _ => None,
-                        };
-                    }
-                    while i < n && t[i] != "]" {
                         i += 1;
                     }
-                    i += 1;
-                }
-                while i < n && t[i] != ";" {
-                    if is_ident(t[i]) && !is_keyword(t[i]) {
-                        if let Some(idx) = &single {
-                            one_bit_vec.insert(t[i].to_string(), idx.clone());
-                        }
-                        if let Some(r) = range {
-                            decl_range.insert(t[i].to_string(), r);
-                        }
-                    }
-                    i += 1;
-                }
-            }
-            ";" | ")" | "(" | "," | "." | "=" | "[" | "]" => i += 1,
-            _ => {
-                // candidate instance:  CELL  INST  ( .pin(net), ... ) ;
-                // the cell must be a real identifier — a stray numeric token before
-                // `(` is never a cell (defensive net around tokenizer edge cases).
-                // A PARAMETER OVERRIDE sits between the cell and the instance name:
-                // `ALU #(.MODE("AND")) u1 (.A(a), …)`. Yosys emits them, and so does any
-                // parameterised macro. Read without allowing for it, `#` became the instance
-                // NAME, the parameter list became its connections, and the instance's real
-                // connections were never seen — a whole gate, silently replaced by its own
-                // parameters.
-                let mut head = i;
-                if head + 1 < n && t[head + 1] == "#" {
-                    let mut k = head + 2;
-                    if k < n && t[k] == "(" {
-                        let mut d = 0;
-                        while k < n {
-                            if t[k] == "(" {
-                                d += 1;
-                            } else if t[k] == ")" {
-                                d -= 1;
-                                if d == 0 {
-                                    k += 1;
-                                    break;
-                                }
+                    while i < n && t[i] != ";" {
+                        if is_ident(t[i]) && !is_keyword(t[i]) {
+                            if let Some(idx) = &single {
+                                one_bit_vec.insert(t[i].to_string(), idx.clone());
                             }
-                            k += 1;
+                            if let Some(r) = range {
+                                decl_range.insert(t[i].to_string(), r);
+                            }
                         }
-                        // `CELL #(…)` then INST `(` — keep the cell, skip the parameters
-                        if k + 1 < n && is_ident(t[k]) && t[k + 1] == "(" {
-                            head = k - 1; // so `head+1` is the instance name below
-                        }
+                        i += 1;
                     }
                 }
-                let cell_tok = i;
-                if head + 2 < n
-                    && is_ident(t[cell_tok])
-                    && !is_keyword(t[cell_tok])
-                    && !is_keyword(t[head + 1])
-                    && t[head + 2] == "("
-                {
-                    let cell = t[cell_tok].to_string();
-                    let name = t[head + 1].to_string();
-                    i = head + 3; // past CELL [#(...)] INST (
-                    let mut conns = Vec::new();
-                    let mut ties = Vec::new();
-                    let mut depth = 1;
-                    // Named (`.PIN(net)`) and positional (`CELL u (a, b)`) forms are both legal
-                    // and a netlist uses one or the other. Positional connections carry no pin
-                    // name — that lives in the cell's LEF/Liberty — but the NET is what
-                    // connectivity needs, so it is recorded with an empty pin and counted.
-                    let named = (i..n).take_while(|&k| t[k] != ";").any(|k| t[k] == ".");
-                    while i < n && depth > 0 {
-                        match t[i] {
-                            "(" => {
-                                depth += 1;
-                                i += 1;
-                            }
-                            ")" => {
-                                depth -= 1;
-                                i += 1;
-                            }
-                            "." if named => {
-                                let pin = t.get(i + 1).copied().unwrap_or_default().to_string();
-                                // expect '(' at i+2 — the value may be a single net, a
-                                // bit-select, or a CONCATENATION on a bussed pin.
-                                let mut j = i + 3;
-                                let nets = read_conn_value(t, &mut j);
-                                // ONE RULE FOR EVERY CONNECTION SHAPE: flatten what is
-                                // connected to a list of BITS, most significant first, then name
-                                // the pin's bits from it. Verilog concatenation is MSB-first and
-                                // that is how a bussed pin is named in Liberty, so the same
-                                // numbering serves a concatenation, a whole bus, a part-select
-                                // and any mixture.
-                                //
-                                // Doing it per MEMBER instead — `{uio_out[4:0], uo_out[4:0]}`
-                                // becoming P[1] and P[0] — is wrong the moment a member is wider
-                                // than one bit, which is most of the time. And a whole bus
-                                // (`.data(ui_in)`) has to expand at all: the port's width is
-                                // unknowable when the module is a black box, but the
-                                // CONNECTION's is not, because the signal is declared here. A
-                                // synthesiser infers the port from the expression the same way,
-                                // which is why Yosys's JSON lists `data[0]`…`data[7]` where this
-                                // reader listed one.
-                                // A CONSTANT is as many bits as its size says, so a concatenation that
-                                // holds one numbers its other members correctly; its bits are ties.
-                                let bits: Vec<Result<String, bool>> = nets
-                                    .iter()
-                                    .flat_map(|net| -> Vec<Result<String, bool>> {
-                                        if is_const(net) {
-                                            const_bits(net).into_iter().map(Err).collect()
-                                        } else {
-                                            expand_bits(net, &decl_range).into_iter().map(Ok).collect()
-                                        }
-                                    })
-                                    .collect();
-                                let k = bits.len();
-                                for (idx, bit) in bits.into_iter().enumerate() {
-                                    let p = if k == 1 { pin.clone() } else { format!("{pin}[{}]", k - 1 - idx) };
-                                    match bit {
-                                        Ok(net) => conns.push((p, net)),
-                                        Err(v) => ties.push((p, v)),
+                ";" | ")" | "(" | "," | "." | "=" | "[" | "]" => i += 1,
+                _ => {
+                    // candidate instance:  CELL  INST  ( .pin(net), ... ) ;
+                    // the cell must be a real identifier — a stray numeric token before
+                    // `(` is never a cell (defensive net around tokenizer edge cases).
+                    // A PARAMETER OVERRIDE sits between the cell and the instance name:
+                    // `ALU #(.MODE("AND")) u1 (.A(a), …)`. Yosys emits them, and so does any
+                    // parameterised macro. Read without allowing for it, `#` became the instance
+                    // NAME, the parameter list became its connections, and the instance's real
+                    // connections were never seen — a whole gate, silently replaced by its own
+                    // parameters.
+                    let mut head = i;
+                    if head + 1 < n && t[head + 1] == "#" {
+                        let mut k = head + 2;
+                        if k < n && t[k] == "(" {
+                            let mut d = 0;
+                            while k < n {
+                                if t[k] == "(" {
+                                    d += 1;
+                                } else if t[k] == ")" {
+                                    d -= 1;
+                                    if d == 0 {
+                                        k += 1;
+                                        break;
                                     }
                                 }
-                                i += 1;
+                                k += 1;
                             }
-                            _ if !named => {
-                                let tok = t[i];
-                                if is_const(tok) {
-                                    ties.extend(const_bits(tok).into_iter().map(|v| (String::new(), v)));
+                            // `CELL #(…)` then INST `(` — keep the cell, skip the parameters
+                            if k + 1 < n && is_ident(t[k]) && t[k + 1] == "(" {
+                                head = k - 1; // so `head+1` is the instance name below
+                            }
+                        }
+                    }
+                    let cell_tok = i;
+                    if head + 2 < n
+                        && is_ident(t[cell_tok])
+                        && !is_keyword(t[cell_tok])
+                        && !is_keyword(t[head + 1])
+                        && t[head + 2] == "("
+                    {
+                        let cell = pool.intern(t[cell_tok]);
+                        let name = pool.intern(t[head + 1]);
+                        i = head + 3; // past CELL [#(...)] INST (
+                        // written straight into the module's tables
+                        let (c0, t0) = (nl.conn_table.len() as u32, nl.tie_table.len() as u32);
+                        let mut depth = 1;
+                        // Named (`.PIN(net)`) and positional (`CELL u (a, b)`) forms are both legal
+                        // and a netlist uses one or the other. Positional connections carry no pin
+                        // name — that lives in the cell's LEF/Liberty — but the NET is what
+                        // connectivity needs, so it is recorded with an empty pin and counted.
+                        let named = (i..n).take_while(|&k| t[k] != ";").any(|k| t[k] == ".");
+                        while i < n && depth > 0 {
+                            match t[i] {
+                                "(" => {
+                                    depth += 1;
                                     i += 1;
-                                } else if is_ident(tok) {
-                                    let mut j = i;
+                                }
+                                ")" => {
+                                    depth -= 1;
+                                    i += 1;
+                                }
+                                "." if named => {
+                                    let pin = t.get(i + 1).copied().unwrap_or_default().to_string();
+                                    // expect '(' at i+2 — the value may be a single net, a
+                                    // bit-select, or a CONCATENATION on a bussed pin.
+                                    let mut j = i + 3;
                                     let nets = read_conn_value(t, &mut j);
-                                    for net in nets {
-                                        if !is_const(&net) {
-                                            conns.push((String::new(), net));
-                                            nl.positional += 1;
+                                    // ONE RULE FOR EVERY CONNECTION SHAPE: flatten what is
+                                    // connected to a list of BITS, most significant first, then name
+                                    // the pin's bits from it. Verilog concatenation is MSB-first and
+                                    // that is how a bussed pin is named in Liberty, so the same
+                                    // numbering serves a concatenation, a whole bus, a part-select
+                                    // and any mixture.
+                                    //
+                                    // Doing it per MEMBER instead — `{uio_out[4:0], uo_out[4:0]}`
+                                    // becoming P[1] and P[0] — is wrong the moment a member is wider
+                                    // than one bit, which is most of the time. And a whole bus
+                                    // (`.data(ui_in)`) has to expand at all: the port's width is
+                                    // unknowable when the module is a black box, but the
+                                    // CONNECTION's is not, because the signal is declared here. A
+                                    // synthesiser infers the port from the expression the same way,
+                                    // which is why Yosys's JSON lists `data[0]`…`data[7]` where this
+                                    // reader listed one.
+                                    // A CONSTANT is as many bits as its size says, so a concatenation that
+                                    // holds one numbers its other members correctly; its bits are ties.
+                                    let bits: Vec<Result<String, bool>> = nets
+                                        .iter()
+                                        .flat_map(|net| -> Vec<Result<String, bool>> {
+                                            if is_const(net) {
+                                                const_bits(net).into_iter().map(Err).collect()
+                                            } else {
+                                                expand_bits(net, decl_range).into_iter().map(Ok).collect()
+                                            }
+                                        })
+                                        .collect();
+                                    let k = bits.len();
+                                    for (idx, bit) in bits.into_iter().enumerate() {
+                                        let p = if k == 1 { pin.clone() } else { format!("{pin}[{}]", k - 1 - idx) };
+                                        let p = pool.intern(&p);
+                                        match bit {
+                                            Ok(net) => nl.conn_table.push((p, pool.intern(&net))),
+                                            Err(v) => nl.tie_table.push((p, v)),
                                         }
                                     }
-                                    i = j;
-                                } else {
                                     i += 1;
                                 }
+                                _ if !named => {
+                                    let tok = t[i];
+                                    if is_const(tok) {
+                                        let none = pool.intern("");
+                                        nl.tie_table.extend(const_bits(tok).into_iter().map(|v| (none, v)));
+                                        i += 1;
+                                    } else if is_ident(tok) {
+                                        let mut j = i;
+                                        let nets = read_conn_value(t, &mut j);
+                                        for net in nets {
+                                            if !is_const(&net) {
+                                                let none = pool.intern("");
+                                                nl.conn_table.push((none, pool.intern(&net)));
+                                                nl.positional += 1;
+                                            }
+                                        }
+                                        i = j;
+                                    } else {
+                                        i += 1;
+                                    }
+                                }
+                                _ => i += 1,
                             }
-                            _ => i += 1,
                         }
-                    }
-                    nl.insts.push(Inst { cell, name, conns, ties });
-                    if i < n && t[i] == ";" {
+                        let (c1, t1) = (nl.conn_table.len() as u32, nl.tie_table.len() as u32);
+                        nl.insts.push(CompactInst { cell, name, conns: (c0, c1), ties: (t0, t1) });
+                        if i < n && t[i] == ";" {
+                            i += 1;
+                        }
+                    } else {
                         i += 1;
                     }
-                } else {
-                    i += 1;
                 }
             }
         }
-    }
-    // ---- canonicalise the net names, so both front ends describe one design ------------------
-    //
-    // Two normalisations, each because the same net is legitimately written more than one way
-    // and every consumer joins by NAME:
-    //
-    //   * `x[0]` where `x` is a one-bit vector is just `x`. Yosys's JSON cannot say otherwise —
-    //     it represents `wire [0:0] x` and `wire x` identically — so the bare form is the only
-    //     one both front ends can agree on.
-    //
-    //   * a net tied to a PORT by `assign port = net;` is that port. Both names are the net's,
-    //     and the port's is the one the DEF, the SPEF and the SDC all use, so it is the one that
-    //     joins. Yosys resolves this for us by merging both names onto one bit id and reporting
-    //     the port; reading the Verilog literally reported the local wire, and the two front
-    //     ends then disagreed about a net on five of fifteen real designs.
-    let ports: std::collections::BTreeSet<&str> =
-        nl.inputs.iter().chain(nl.outputs.iter()).map(String::as_str).collect();
-    let mut to_port: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
-    for (lhs, rhs) in &nl.aliases {
-        match (ports.contains(lhs.as_str()), ports.contains(rhs.as_str())) {
-            (true, false) => to_port.insert(rhs.as_str(), lhs.as_str()),
-            (false, true) => to_port.insert(lhs.as_str(), rhs.as_str()),
-            // NEITHER IS A PORT — `assign rom0_data[2] = addr[3];` between two internal nets.
-            // Still one net with two names, so the two front ends must still agree on which, and
-            // there is no port to prefer. The driver is: `assign a = b` makes `b` the source and
-            // `a` a name for it, which is also the one a synthesiser keeps when it merges them.
-            (false, false) => to_port.insert(lhs.as_str(), rhs.as_str()),
-            _ => None,
-        };
-    }
-    let canon = |net: &str| -> String {
-        if let Some(p) = to_port.get(net) {
-            return p.to_string();
-        }
-        if let Some((base, rest)) = net.split_once('[') {
-            if let Some(idx) = rest.strip_suffix(']') {
-                if one_bit_vec.get(base).map(String::as_str) == Some(idx) {
-                    return base.to_string();
-                }
-            }
-        }
-        net.to_string()
-    };
-    let renames: Vec<(usize, usize, String)> = nl
-        .insts
-        .iter()
-        .enumerate()
-        .flat_map(|(ii, inst)| {
-            inst.conns.iter().enumerate().filter_map(move |(ci, (_, net))| {
-                let c = canon(net);
-                (c != *net).then_some((ii, ci, c))
-            })
-        })
-        .collect();
-    for (ii, ci, c) in renames {
-        nl.insts[ii].conns[ci].1 = c;
-    }
-    // ⚠️ Recorded even when nothing was renamed, so a consumer never has to ask whether the map
-    // is populated — an empty map and "no renaming happened" are the same statement.
-    nl.canonical =
-        to_port.iter().map(|(from, to)| (from.to_string(), to.to_string())).collect();
 
-    (nl, i)
+    }
+
+    /// The module, its net names canonicalised now that every `assign` has been read.
+    fn finish(self, pool: &mut StrPool) -> CompactModule {
+        let mut nl = self.nl;
+        let one_bit_vec = self.one_bit_vec;
+        // ---- canonicalise the net names, so both front ends describe one design ------------------
+        //
+        // Two normalisations, each because the same net is legitimately written more than one way
+        // and every consumer joins by NAME:
+        //
+        //   * `x[0]` where `x` is a one-bit vector is just `x`. Yosys's JSON cannot say otherwise —
+        //     it represents `wire [0:0] x` and `wire x` identically — so the bare form is the only
+        //     one both front ends can agree on.
+        //
+        //   * a net tied to a PORT by `assign port = net;` is that port. Both names are the net's,
+        //     and the port's is the one the DEF, the SPEF and the SDC all use, so it is the one that
+        //     joins. Yosys resolves this for us by merging both names onto one bit id and reporting
+        //     the port; reading the Verilog literally reported the local wire, and the two front
+        //     ends then disagreed about a net on five of fifteen real designs.
+        let ports: std::collections::BTreeSet<Sym> = nl.inputs.iter().chain(nl.outputs.iter()).copied().collect();
+        let mut to_port: std::collections::BTreeMap<Sym, Sym> = std::collections::BTreeMap::new();
+        for &(lhs, rhs) in &nl.aliases {
+            match (ports.contains(&lhs), ports.contains(&rhs)) {
+                (true, false) => to_port.insert(rhs, lhs),
+                (false, true) => to_port.insert(lhs, rhs),
+                // NEITHER IS A PORT — `assign rom0_data[2] = addr[3];` between two internal nets.
+                // Still one net with two names, so the two front ends must still agree on which, and
+                // there is no port to prefer. The driver is: `assign a = b` makes `b` the source and
+                // `a` a name for it, which is also the one a synthesiser keeps when it merges them.
+                (false, false) => to_port.insert(lhs, rhs),
+                _ => None,
+            };
+        }
+        for k in 0..nl.conn_table.len() {
+            let net = nl.conn_table[k].1;
+            if let Some(&p) = to_port.get(&net) {
+                nl.conn_table[k].1 = p;
+                continue;
+            }
+            let text = pool.get(net);
+            if let Some((base, rest)) = text.split_once('[') {
+                if let Some(idx) = rest.strip_suffix(']') {
+                    if one_bit_vec.get(base).map(String::as_str) == Some(idx) {
+                        let base = base.to_string();
+                        nl.conn_table[k].1 = pool.intern(&base);
+                    }
+                }
+            }
+        }
+        // ⚠️ Recorded even when nothing was renamed, so a consumer never has to ask whether the map
+        // is populated — an empty map and "no renaming happened" are the same statement. Ordered by
+        // the WRITTEN name, as the owned map is.
+        let mut canonical: Vec<(Sym, Sym)> = to_port.into_iter().collect();
+        canonical.sort_by(|a, b| pool.get(a.0).cmp(pool.get(b.0)));
+        nl.canonical = canonical;
+
+    nl
+    }
 }
 
 /// One connection value: a net, a bit-select, or the members of a concatenation.
@@ -1108,8 +1400,13 @@ pub fn load(path: &str) -> Result<Netlist, NetlistError> {
 /// inflated as it is read when it is gzip (with the `gzip` feature), as the reference reads
 /// through `igzstream`. A byte that is not UTF-8 is read lossily.
 pub fn load_all(path: &str) -> Result<Design, NetlistError> {
+    Ok(load_compact(path)?.to_design())
+}
+
+/// [`load_all`] in the COMPACT form — see [`CompactDesign`]. Streamed, as [`load_all`] is.
+pub fn load_compact(path: &str) -> Result<CompactDesign, NetlistError> {
     let err = |e: String| NetlistError(format!("{path}: {e}"));
-    parse_reader(open(path).map_err(|e| err(e.to_string()))?).map_err(|e| err(e.0))
+    parse_compact_reader(open(path).map_err(|e| err(e.to_string()))?).map_err(|e| err(e.0))
 }
 
 /// A netlist file as a buffered byte stream, inflated on the fly when it is gzip.
@@ -1500,5 +1797,57 @@ mod escaped_identifier_tests {
                         BUF u1 (.A(a), .X(\\u_sub.n1 ));\nendmodule\n")
             .unwrap();
         assert!(nl.escaped_names.contains("u_sub.n1"), "{:?}", nl.escaped_names);
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+
+    /// A name is stored once and found again; the index survives growing past many resizes.
+    #[test]
+    fn the_pool_stores_each_name_once() {
+        let mut p = StrPool::default();
+        let a = p.intern("clk");
+        assert_eq!(p.intern("clk"), a);
+        let e = p.intern("");
+        assert_eq!(p.get(e), "");
+        let syms: Vec<Sym> = (0..50_000).map(|k| p.intern(&format!("n{k}"))).collect();
+        assert_eq!(p.len(), 50_002);
+        for (k, s) in syms.iter().enumerate().step_by(997) {
+            assert_eq!(p.get(*s), format!("n{k}"));
+            assert_eq!(p.find(&format!("n{k}")), Some(*s));
+        }
+        assert_eq!(p.find("absent"), None);
+        assert_eq!(p.get(a), "clk");
+    }
+
+    /// The compact form holds exactly what the owned one does — the owned one is made from it,
+    /// so what is checked here is the compact accessors.
+    #[test]
+    fn the_compact_form_reads_like_the_owned_one() {
+        let src = "module leaf (input a, output y); INV u0 (.A(a), .Y(y)); endmodule\n\
+                   module top (input a, output [1:0] y); wire w; assign y[0] = w; \
+                   leaf l (.a(a), .y(w)); BUF b (.A({w, 1'b1}), .X(y[1])); endmodule";
+        let c = parse_compact(src).unwrap();
+        let d = c.to_design();
+        assert_eq!(c.str(c.top().name), "top");
+        let leaf = c.module("leaf").expect("leaf");
+        assert_eq!(c.str(leaf.insts[0].cell), "INV");
+        for (cm, nm) in c.modules.iter().zip(&d.modules) {
+            assert_eq!(cm.insts.len(), nm.insts.len());
+            for (ci, ni) in cm.insts.iter().zip(&nm.insts) {
+                assert_eq!(c.str(ci.name), ni.name);
+                let conns: Vec<(String, String)> =
+                    cm.conns(ci).iter().map(|(p, n)| (c.str(*p).to_string(), c.str(*n).to_string())).collect();
+                assert_eq!(conns, ni.conns);
+                let ties: Vec<(String, bool)> = cm.ties(ci).iter().map(|(p, v)| (c.str(*p).to_string(), *v)).collect();
+                assert_eq!(ties, ni.ties);
+            }
+        }
+        let b = &c.top().insts[1];
+        assert_eq!(c.top().ties(b), [(c.pool.find("A[0]").unwrap(), true)]);
+        // the alias renamed `w` to the port it drives, in the compact form as in the owned one
+        assert_eq!(d.top().canonical.get("w").map(String::as_str), Some("y[0]"));
     }
 }
