@@ -47,6 +47,9 @@ const HANDLED: &[&str] = &[
     // or make pins. `test_cell` is NOT here on purpose — it must never perturb what we read.
     "statetable", "ff_bank", "latch_bank", "clock_gating_integrated_cell", "bus", "bundle",
     "members", "bus_type", "type", "bit_from", "bit_to",
+    // Read since tables are read by their template (2026-10-16): a template's variables say what
+    // each axis is, and its indices stand in for a table's own.
+    "lu_table_template", "power_lut_template", "output_current_template",
 ];
 
 /// A library exercising everything this reader claims to read.

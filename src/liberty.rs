@@ -847,8 +847,8 @@ fn next_paren_after(s: &str, kw: &str) -> Option<String> {
     }
 }
 
-fn parse_arc(timing_body: &str, own: &str, spans: &[GroupSpan], skip_ccs: bool) -> Arc {
-    let tbl = |name: &str| span_table(timing_body, spans, name);
+fn parse_arc(timing_body: &str, own: &str, spans: &[GroupSpan], ctx: &Ctx) -> Arc {
+    let tbl = |name: &str| span_table(timing_body, spans, name, ctx, Axes::SlewLoad);
     // `rising_edge` / `falling_edge` name the launching clock edge. Anything else is a
     // combinational arc; the checks (setup_*/hold_*/recovery_*/removal_*) never reach
     // here — the caller routes them into the constraint vectors before this point.
@@ -867,7 +867,7 @@ fn parse_arc(timing_body: &str, own: &str, spans: &[GroupSpan], skip_ccs: bool) 
         fall_transition: tbl("fall_transition"),
         // CCS output_current waveforms — skipped (empty) for NLDM-only parses.
         ccs_declared: spans.iter().any(|g| g.kw == "output_current_rise" || g.kw == "output_current_fall"),
-        ccs: if skip_ccs {
+        ccs: if ctx.skip_ccs {
             crate::ccs::CcsArc::default()
         } else {
             parse_ccs(timing_body)
@@ -917,14 +917,15 @@ fn parse_ccs_set(timing_body: &str, group: &str) -> Vec<crate::ccs::CcsWaveform>
 }
 
 /// Parse a setup/hold constraint group's rise/fall tables.
-fn parse_constraint(timing_body: &str, spans: &[GroupSpan]) -> Constraint {
+fn parse_constraint(timing_body: &str, spans: &[GroupSpan], ctx: &Ctx) -> Constraint {
     Constraint {
-        rise: span_table(timing_body, spans, "rise_constraint"),
-        fall: span_table(timing_body, spans, "fall_constraint"),
+        rise: span_table(timing_body, spans, "rise_constraint", ctx, Axes::RelatedConstrained),
+        fall: span_table(timing_body, spans, "fall_constraint", ctx, Axes::RelatedConstrained),
     }
 }
 
-fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
+fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
+    let (cap_unit_f, skip_ccs) = (ctx.cap_f, ctx.skip_ccs);
     let (own, pin_groups) = level(body);
     let direction = match simple_attr(&own, "direction").as_deref() {
         Some("input") => Dir::In,
@@ -944,7 +945,7 @@ fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
         pin_groups.iter().find(|g| g.kw == "receiver_capacitance").map(|g| {
             let rbody = &body[g.body.clone()];
             let (_, rspans) = level(rbody);
-            let tbl = |name: &str| span_table(rbody, &rspans, name);
+            let tbl = |name: &str| span_table(rbody, &rspans, name, ctx, Axes::SlewLoad);
             RecvCap {
                 c1_rise: tbl("receiver_capacitance1_rise"),
                 c2_rise: tbl("receiver_capacitance2_rise"),
@@ -966,13 +967,13 @@ fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
         let tbody = &body[g.body.clone()];
         let (town, tspans) = level(tbody);
         match simple_attr(&town, "timing_type").as_deref() {
-            Some(tt) if tt.starts_with("setup") => setup.push(parse_constraint(tbody, &tspans)),
-            Some(tt) if tt.starts_with("hold") => hold.push(parse_constraint(tbody, &tspans)),
+            Some(tt) if tt.starts_with("setup") => setup.push(parse_constraint(tbody, &tspans, ctx)),
+            Some(tt) if tt.starts_with("hold") => hold.push(parse_constraint(tbody, &tspans, ctx)),
             // recovery/removal are CHECKS on the async set/reset pin, with their own
             // tables — kept, and applied by the timer as the async counterparts of
             // setup/hold. They are not max-delay data arcs.
-            Some(tt) if tt.starts_with("recovery") => recovery.push(parse_constraint(tbody, &tspans)),
-            Some(tt) if tt.starts_with("removal") => removal.push(parse_constraint(tbody, &tspans)),
+            Some(tt) if tt.starts_with("recovery") => recovery.push(parse_constraint(tbody, &tspans, ctx)),
+            Some(tt) if tt.starts_with("removal") => removal.push(parse_constraint(tbody, &tspans, ctx)),
             // clear/preset are async *effect* arcs (dfrtp RESET_B->Q), not launch paths —
             // propagating data through them would invent a path that cannot exist.
             // min_pulse_width is a check we do not implement yet.
@@ -980,7 +981,7 @@ fn parse_pin(name: String, body: &str, cap_unit_f: f64, skip_ccs: bool) -> Pin {
                 if tt.starts_with("clear")
                     || tt.starts_with("preset")
                     || tt.contains("pulse_width") => {}
-            _ => arcs.push(parse_arc(tbody, &town, &tspans, skip_ccs)), // delay arc (incl. rising_edge CK->Q)
+            _ => arcs.push(parse_arc(tbody, &town, &tspans, ctx)), // delay arc (incl. rising_edge CK->Q)
         }
     }
     Pin {
@@ -1024,9 +1025,113 @@ fn level(body: &str) -> (String, Vec<GroupSpan>) {
     (own, spans)
 }
 
-/// The first group named `kw` among `spans` of `body`, as a parsed table.
-fn span_table(body: &str, spans: &[GroupSpan], kw: &str) -> Table {
-    spans.iter().find(|g| g.kw == kw).map(|g| parse_table(&body[g.body.clone()])).unwrap_or_default()
+/// The first group named `kw` among `spans` of `body`, as a parsed table, its axes in this
+/// reader's order for `kind` (see [`orient`]).
+fn span_table(body: &str, spans: &[GroupSpan], kw: &str, ctx: &Ctx, kind: Axes) -> Table {
+    spans
+        .iter()
+        .find(|g| g.kw == kw)
+        .map(|g| orient(parse_table(&body[g.body.clone()]), ctx.templates.get(g.args.as_str()), kind))
+        .unwrap_or_default()
+}
+
+/// What a table's two axes mean to its consumer — the order [`Table::lookup`] takes them in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Axes {
+    /// (input slew, output load) — delay, transition, sigma, receiver capacitance
+    SlewLoad,
+    /// (related pin slew, constrained pin slew) — setup, hold, recovery, removal
+    RelatedConstrained,
+}
+
+/// A `*_template` group: its axis variables and default indices.
+#[derive(Clone, Debug, Default)]
+struct Template {
+    vars: [String; 2],
+    index: [Vec<f64>; 2],
+}
+
+/// The library's table templates, by name.
+type Templates = BTreeMap<String, Template>;
+
+/// Everything a cell's reading needs from its library.
+struct Ctx<'a> {
+    cap_f: f64,
+    skip_ccs: bool,
+    templates: &'a Templates,
+}
+
+/// Every `*_template` group directly in the library (`lu_table_template`, `power_lut_template`,
+/// `ocv_table_template`, …). Names are unique across them in practice; the first wins.
+fn templates(lib_body: &str, spans: &[GroupSpan]) -> Templates {
+    let mut out = Templates::new();
+    for g in spans.iter().filter(|g| g.kw.ends_with("_template")) {
+        let body = &lib_body[g.body.clone()];
+        let own = own_attrs(body);
+        let var = |k: &str| simple_attr(&own, k).unwrap_or_default();
+        let idx = |k: &str| next_paren_after(&own, k).map(|v| floats(&v.replace('"', ""))).unwrap_or_default();
+        out.entry(g.args.clone()).or_insert(Template {
+            vars: [var("variable_1"), var("variable_2")],
+            index: [idx("index_1"), idx("index_2")],
+        });
+    }
+    out
+}
+
+/// Which of `kind`'s two axes a template variable is: `Some(0)` first, `Some(1)` second.
+fn axis_role(var: &str, kind: Axes) -> Option<usize> {
+    match (kind, var) {
+        (Axes::SlewLoad, "input_net_transition" | "input_transition_time") => Some(0),
+        (Axes::SlewLoad, "total_output_net_capacitance") => Some(1),
+        (Axes::RelatedConstrained, "related_pin_transition") => Some(0),
+        (Axes::RelatedConstrained, "constrained_pin_transition") => Some(1),
+        _ => None,
+    }
+}
+
+/// A table as written, put in `kind`'s axis order using its template — the reference's rule.
+///
+/// ⛔ **The axes are what the TEMPLATE says, not where they sit.** The reference maps each axis by
+/// its template's `variable_N` (`input_net_transition`, `constrained_pin_transition`, …). This
+/// reader took `index_1` as the clock slew of every constraint: right for sky130 hd, whose
+/// templates put the related pin first, and wrong for asap7, gf180, IHP and sky130 hs, which put
+/// the constrained pin first — a setup check read at swapped slews, 0.28 ps where the reference
+/// gives 21.9. Delay templates that put the load first (memory macros) had the same fault.
+///
+/// Also the reference's: an index the table does not state is the template's, and a table with
+/// ONE axis is one-dimensional — given here a single-point second axis, so the lookup
+/// interpolates along the axis it has instead of returning its first value.
+fn orient(mut t: Table, tpl: Option<&Template>, kind: Axes) -> Table {
+    let Some(tpl) = tpl else { return t };
+    if t.index_1.is_empty() {
+        t.index_1 = tpl.index[0].clone();
+    }
+    if t.index_2.is_empty() {
+        t.index_2 = tpl.index[1].clone();
+    }
+    let (r1, r2) = (axis_role(&tpl.vars[0], kind), axis_role(&tpl.vars[1], kind));
+    // one axis means one VARIABLE; a template that declares none says nothing about its axes
+    let one_d = !tpl.vars[0].is_empty() && tpl.vars[1].is_empty();
+    if one_d {
+        // values is a single row along axis 1
+        let row = t.values.first().cloned().unwrap_or_default();
+        let axis = std::mem::take(&mut t.index_1);
+        if row.len() != axis.len() {
+            return Table { index_1: axis, index_2: Vec::new(), values: t.values };
+        }
+        return match r1 {
+            Some(1) => Table { index_1: vec![0.0], index_2: axis, values: vec![row] },
+            _ => Table { index_1: axis, index_2: vec![0.0], values: row.into_iter().map(|v| vec![v]).collect() },
+        };
+    }
+    if r1 == Some(1) && r2 == Some(0) {
+        let (n, m) = (t.index_1.len(), t.index_2.len());
+        if t.values.len() == n && t.values.iter().all(|r| r.len() == m) {
+            let values = (0..m).map(|j| (0..n).map(|i| t.values[i][j]).collect()).collect();
+            return Table { index_1: std::mem::take(&mut t.index_2), index_2: std::mem::take(&mut t.index_1), values };
+        }
+    }
+    t
 }
 
 struct GroupSpan {
@@ -1205,7 +1310,9 @@ fn parse_cell(
     units: &Units,
     skip_ccs: bool,
     types: &BTreeMap<String, (i64, i64)>,
+    templates: &Templates,
 ) -> Cell {
+    let ctx = Ctx { cap_f: units.cap_f, skip_ccs, templates };
     let mut pins = BTreeMap::new();
     let mut scan_pins = BTreeMap::new();
     let (own, spans) = level(body);
@@ -1220,7 +1327,7 @@ fn parse_cell(
         match kw.as_str() {
             "pin" => {
                 for pname in args.split(',').map(|n| n.trim().trim_matches('"')).filter(|n| !n.is_empty()) {
-                    pins.insert(pname.to_string(), parse_pin(pname.to_string(), gbody, units.cap_f, skip_ccs));
+                    pins.insert(pname.to_string(), parse_pin(pname.to_string(), gbody, &ctx));
                 }
             }
             // ⛔ A bus's direction and capacitance are on the BUS, and a bus need not repeat them
@@ -1228,7 +1335,7 @@ fn parse_cell(
             // direction at all. A bus is its bits `name[i]`, bit_from to
             // bit_to; the bus's attributes reach every bit; a pin group inside states its own.
             "bus" | "bundle" => {
-                let own = parse_pin(args.clone(), &without_groups(gbody, "pin"), units.cap_f, skip_ccs);
+                let own = parse_pin(args.clone(), &without_groups(gbody, "pin"), &ctx);
                 let members: Vec<String> = if kw == "bus" {
                     match simple_attr(gbody, "bus_type").and_then(|t| types.get(&t).copied()) {
                         Some((from, to)) => bit_range(from, to).map(|k| format!("{args}[{k}]")).collect(),
@@ -1246,7 +1353,7 @@ fn parse_cell(
                     if ikw != "pin" {
                         continue;
                     }
-                    let ip = parse_pin(iargs.clone(), ibody, units.cap_f, skip_ccs);
+                    let ip = parse_pin(iargs.clone(), ibody, &ctx);
                     for bit in named_bits(&iargs, args, &members) {
                         let base = pins.get(&bit).cloned().unwrap_or_else(|| merged_pin(&bit, &own, None));
                         pins.insert(bit.clone(), merged_pin(&bit, &base, Some((&ip, ibody))));
@@ -1422,25 +1529,26 @@ impl Lib {
 
     /// [`Lib::parse_opts`] on text [`lex_clean`] has already seen.
     fn parse_lexed(text: &str, opts: LibOpts) -> Result<Lib, LibError> {
-        // The library's own attributes, once: they sit one level down, inside `library () { }`,
-        // and are read many times.
-        let lib_own = top_group_spans(text)
+        // The library group, read once at its own level: its attributes, its templates, its
+        // cells. A file with no `library` group is read as if its body were one.
+        let lib_body = top_group_spans(text)
             .into_iter()
             .find(|g| g.kw == "library")
-            .map(|g| own_attrs(&text[g.body]))
-            .unwrap_or_else(|| own_attrs(text));
+            .map(|g| &text[g.body])
+            .unwrap_or(text);
+        let (lib_own, lib_spans) = level(lib_body);
         let units = Units::from_lib(&lib_own);
         let voltage = lib_voltage(&lib_own, text).unwrap_or(1.8);
         let thresholds = Thresholds::from_lib(&lib_own);
         let types = bus_types(text);
+        let tpls = templates(lib_body, &lib_spans);
         let mut cells = BTreeMap::new();
-        let mut at = 0;
-        while let Some((cname, cbody, after)) = next_block(text, at, "cell") {
+        for g in lib_spans.iter().filter(|g| g.kw == "cell") {
+            let cname = g.args.clone();
             cells.insert(
                 cname.clone(),
-                parse_cell(cname, &cbody, &units, opts.skip_ccs, &types),
+                parse_cell(cname, &lib_body[g.body.clone()], &units, opts.skip_ccs, &types, &tpls),
             );
-            at = after;
         }
         if cells.is_empty() {
             return Err(LibError("no cells found".into()));
@@ -2380,5 +2488,80 @@ mod lexer_tests {
         lex_clean(&mut b);
         assert_eq!(b.len(), LIB.len());
         assert_eq!(b.iter().filter(|&&c| c == b'\n').count() + 2, LIB.matches('\n').count());
+    }
+}
+
+/// A table's axes are what its TEMPLATE says — each rule here the reference's (`TableModel.cc`,
+/// `LibertyReader::readTableModel`).
+#[cfg(test)]
+mod table_axis_tests {
+    use super::*;
+
+    fn lib(templates: &str, cell: &str) -> Lib {
+        Lib::parse(&format!("library (l) {{\n capacitive_load_unit (1, pf);\n{templates}\n cell (C) {{\n{cell}\n }}\n}}\n")).unwrap()
+    }
+
+    const TPL: &str = "
+      lu_table_template (rc) { variable_1 : related_pin_transition; variable_2 : constrained_pin_transition;
+        index_1 (\"1, 2\"); index_2 (\"10, 20\"); }
+      lu_table_template (cr) { variable_1 : constrained_pin_transition; variable_2 : related_pin_transition;
+        index_1 (\"10, 20\"); index_2 (\"1, 2\"); }
+      lu_table_template (sl) { variable_1 : input_net_transition; variable_2 : total_output_net_capacitance;
+        index_1 (\"1, 2\"); index_2 (\"10, 20\"); }
+      lu_table_template (ls) { variable_1 : total_output_net_capacitance; variable_2 : input_net_transition;
+        index_1 (\"10, 20\"); index_2 (\"1, 2\"); }
+      lu_table_template (load1) { variable_1 : total_output_net_capacitance; index_1 (\"10, 20\"); }";
+
+    fn setup(tpl: &str, values: &str) -> Constraint {
+        let l = lib(TPL, &format!(
+            "pin (CK) {{ direction : input; clock : true; }}
+             pin (D) {{ direction : input; timing () {{ related_pin : CK; timing_type : setup_rising;
+               rise_constraint ({tpl}) {{ values ({values}); }} fall_constraint ({tpl}) {{ values ({values}); }} }} }}"
+        ));
+        l.cell("C").unwrap().pins["D"].setup[0].clone()
+    }
+
+    /// The same check written related-first and constrained-first reads the same — at
+    /// (related slew, constrained slew), whichever order the file uses.
+    #[test]
+    fn a_constraint_is_read_by_its_template_variables() {
+        // value = related*100 + constrained, so the axes cannot be confused
+        let rc = setup("rc", "\"110, 120\", \"210, 220\"");
+        let cr = setup("cr", "\"110, 210\", \"120, 220\"");
+        for c in [&rc, &cr] {
+            assert_eq!(c.eval_edge(true, 1.0, 20.0), 120.0);
+            assert_eq!(c.eval_edge(true, 2.0, 10.0), 210.0);
+        }
+    }
+
+    fn delay(tpl: &str, values: &str, inline: &str) -> Table {
+        let l = lib(TPL, &format!(
+            "pin (A) {{ direction : input; }}
+             pin (Y) {{ direction : output; function : \"!A\"; timing () {{ related_pin : A;
+               cell_rise ({tpl}) {{ {inline} values ({values}); }} }} }}"
+        ));
+        l.cell("C").unwrap().pins["Y"].arcs[0].cell_rise.clone()
+    }
+
+    /// A delay template that puts the load first is read at (slew, load) all the same, and a
+    /// table that states no index takes the template's.
+    #[test]
+    fn a_load_first_delay_table_and_a_template_only_index() {
+        let sl = delay("sl", "\"110, 120\", \"210, 220\"", "");
+        let ls = delay("ls", "\"110, 210\", \"120, 220\"", "");
+        for t in [&sl, &ls] {
+            assert_eq!(t.index_1, [1.0, 2.0]);
+            assert_eq!(t.lookup(1.0, 20.0), 120.0);
+            assert_eq!(t.lookup(2.0, 15.0), 215.0, "interpolated, not a constant");
+        }
+    }
+
+    /// A one-axis table interpolates along its axis.
+    #[test]
+    fn a_one_dimensional_table_is_not_a_constant() {
+        let t = delay("load1", "\"1, 2\"", "");
+        assert_eq!(t.lookup(0.5, 10.0), 1.0);
+        assert_eq!(t.lookup(0.5, 15.0), 1.5);
+        assert_eq!(t.lookup(9.0, 20.0), 2.0, "slew does not matter");
     }
 }
