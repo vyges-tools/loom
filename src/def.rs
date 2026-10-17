@@ -727,23 +727,31 @@ fn parse_pins(toks: &[&str]) -> Vec<DefPin> {
     let mut origin = (0i64, 0i64);
     let mut orient = "N".to_string();
 
+    // One PORT's rectangles, placed by that port's own placement. ⛔ Each `+ PORT` carries ITS
+    // OWN `PLACED`/`FIXED` — a pad pin entered from several sides is several ports — and one
+    // placement per pin put every port's rectangles at the last port's location.
+    let place = |p: &mut DefPin, rel: &mut Vec<(String, i64, i64, i64, i64)>, origin: &mut (i64, i64), orient: &mut String| {
+        for (layer, x1, y1, x2, y2) in rel.drain(..) {
+            let (ax1, ay1) = orient_pt(x1, y1, orient);
+            let (ax2, ay2) = orient_pt(x2, y2, orient);
+            p.shapes.push((
+                layer,
+                ax1.min(ax2) + origin.0,
+                ay1.min(ay2) + origin.1,
+                ax1.max(ax2) + origin.0,
+                ay1.max(ay2) + origin.1,
+            ));
+        }
+        *origin = (0, 0);
+        *orient = "N".to_string();
+    };
     let flush = |cur: &mut Option<DefPin>,
                  rel: &mut Vec<(String, i64, i64, i64, i64)>,
                  origin: &mut (i64, i64),
                  orient: &mut String,
                  out: &mut Vec<DefPin>| {
         if let Some(mut p) = cur.take() {
-            for (layer, x1, y1, x2, y2) in rel.drain(..) {
-                let (ax1, ay1) = orient_pt(x1, y1, orient);
-                let (ax2, ay2) = orient_pt(x2, y2, orient);
-                p.shapes.push((
-                    layer,
-                    ax1.min(ax2) + origin.0,
-                    ay1.min(ay2) + origin.1,
-                    ax1.max(ax2) + origin.0,
-                    ay1.max(ay2) + origin.1,
-                ));
-            }
+            place(&mut p, rel, origin, orient);
             out.push(p);
         }
         rel.clear();
@@ -778,23 +786,28 @@ fn parse_pins(toks: &[&str]) -> Vec<DefPin> {
                 }
                 i += 2;
             }
-            // + LAYER <l> ( x1 y1 ) ( x2 y2 )
-            //   tokens:   i+1  i+2 i+3 i+4 i+5 i+6 i+7 i+8 i+9
-            //             <l>   (   x1  y1   )   (   x2  y2   )
-            "LAYER" if cur.is_some() && i + 9 < end => {
+            // a new port: the previous one's rectangles take the previous one's placement
+            "PORT" if cur.is_some() => {
+                place(cur.as_mut().unwrap(), &mut rel, &mut origin, &mut orient);
+                i += 1;
+            }
+            // + LAYER <l> [MASK n] [SPACING s | DESIGNRULEWIDTH w] ( x1 y1 ) ( x2 y2 ) — the
+            // options sit between the layer and its rectangle, so the rectangle is found by
+            // looking for it, not at a fixed offset (which dropped every such shape)
+            "LAYER" if cur.is_some() && i + 1 < end => {
                 let layer = toks[i + 1].to_string();
-                let c = [
-                    num(toks[i + 3]),
-                    num(toks[i + 4]),
-                    num(toks[i + 7]),
-                    num(toks[i + 8]),
-                ];
-                if toks[i + 2] == "(" && toks[i + 6] == "(" {
-                    if let [Some(x1), Some(y1), Some(x2), Some(y2)] = c {
+                let mut k = i + 2;
+                while k < end && toks[k] != "(" && toks[k] != "+" && toks[k] != ";" {
+                    k += 1;
+                }
+                if k + 7 < end && toks[k] == "(" && toks[k + 4] == "(" {
+                    if let [Some(x1), Some(y1), Some(x2), Some(y2)] = [num(toks[k + 1]), num(toks[k + 2]), num(toks[k + 5]), num(toks[k + 6])] {
                         rel.push((layer, x1, y1, x2, y2));
                     }
+                    i = k + 8;
+                } else {
+                    i = k;
                 }
-                i += 10;
             }
             // + PLACED|FIXED|COVER ( x y ) <orient>
             "PLACED" | "FIXED" | "COVER" if cur.is_some() && i + 5 < end => {
@@ -873,13 +886,38 @@ fn parse_vias(toks: &[&str]) -> BTreeMap<String, ViaDef> {
     out
 }
 
+/// The SPECIALNETS section, as the reference reads its wiring.
+///
+/// `ROUTED`, `FIXED`, `COVER` and `SHIELD <net>` all start a path (`<layer> <width>` then points
+/// and vias), as does `NEW`; any OTHER `+` attribute (`SOURCE`, `USE`, `WEIGHT`, `PROPERTY`, …)
+/// ends the wiring — its words are not vias. A path starts afresh: no segment joins it to the
+/// previous path's last point. `+ RECT <layer> ( ) ( )` is a box, not a route; a via followed by
+/// `DO n BY m STEP dx dy` is an array of n×m vias. Layer and width do not carry from one net to
+/// the next.
 fn parse_specialnets(body: &[&str]) -> Vec<NetGeom> {
     let mut nets: Vec<NetGeom> = Vec::new();
     let mut cur: Option<NetGeom> = None;
     let mut layer = String::new();
     let mut width = 0.0f64;
     let mut last: Option<(i64, i64)> = None;
+    let mut wiring = false;
     let mut i = 0;
+    let int = |t: Option<&&str>| t.and_then(|v| v.parse::<i64>().ok());
+    // `( x y )` at `k` (each coordinate may be `*`, the previous one), and the index past it
+    let point = |k: usize, prev: (i64, i64)| -> Option<((i64, i64), usize)> {
+        if body.get(k) != Some(&"(") {
+            return None;
+        }
+        let xr = *body.get(k + 1)?;
+        let yr = *body.get(k + 2)?;
+        let mut j = k + 1;
+        while j < body.len() && body[j] != ")" {
+            j += 1;
+        }
+        let x = if xr == "*" { prev.0 } else { xr.parse().ok()? };
+        let y = if yr == "*" { prev.1 } else { yr.parse().ok()? };
+        Some(((x, y), j + 1))
+    };
     while i < body.len() {
         let t = body[i];
         match t {
@@ -888,93 +926,134 @@ fn parse_specialnets(body: &[&str]) -> Vec<NetGeom> {
                     nets.push(n);
                 }
                 let name = unescape(body.get(i + 1).copied().unwrap_or(""));
-                cur = Some(NetGeom {
-                    name,
-                    ..Default::default()
-                });
-                last = None;
+                cur = Some(NetGeom { name, ..Default::default() });
+                (last, wiring, layer, width) = (None, false, String::new(), 0.0);
                 i += 2;
             }
             ";" => {
-                last = None;
+                (last, wiring) = (None, false);
                 i += 1;
             }
-            "USE" => {
-                if body.get(i + 1) == Some(&"POWER") {
-                    if let Some(n) = cur.as_mut() {
-                        n.use_power = true;
+            "+" => {
+                let kw = body.get(i + 1).copied().unwrap_or("");
+                match kw {
+                    // `<status> <layer> <width>`; ⛔ a bare `+ FIXED ;` is legal and has no path —
+                    // reading on past its `;` swallowed the next net's header
+                    "ROUTED" | "FIXED" | "COVER" | "SHIELD" => {
+                        let at = if kw == "SHIELD" { i + 3 } else { i + 2 };
+                        let word = |k: usize| body.get(k).copied().filter(|w| !matches!(*w, ";" | "+" | "-" | "("));
+                        match (word(at), body.get(at + 1).and_then(|w| w.parse::<f64>().ok())) {
+                            (Some(l), Some(w)) => {
+                                (layer, width) = (l.to_string(), w);
+                                (last, wiring) = (None, true);
+                                i = at + 2;
+                            }
+                            _ => {
+                                wiring = false;
+                                i += 2;
+                            }
+                        }
+                    }
+                    // a path's own options, between its width and its points: the wiring goes on
+                    "SHAPE" | "STYLE" | "MASK" if wiring => i += 3,
+                    "USE" => {
+                        if body.get(i + 2) == Some(&"POWER") {
+                            if let Some(n) = cur.as_mut() {
+                                n.use_power = true;
+                            }
+                        }
+                        wiring = false;
+                        i += 3;
+                    }
+                    // + RECT <layer> [MASK n] ( x1 y1 ) ( x2 y2 ): a box, stored as a flush wire
+                    // along its long side with the short side as its width
+                    "RECT" => {
+                        let l = body.get(i + 2).copied().unwrap_or("").to_string();
+                        let mut k = i + 3;
+                        while k < body.len() && body[k] != "(" && body[k] != "+" && body[k] != ";" {
+                            k += 1;
+                        }
+                        if let (Some(((x1, y1), k2)), true) = (point(k, (0, 0)), k < body.len()) {
+                            if let Some(((x2, y2), k3)) = point(k2, (x1, y1)) {
+                                let (lx, hx, ly, hy) = (x1.min(x2), x1.max(x2), y1.min(y2), y1.max(y2));
+                                if let Some(n) = cur.as_mut() {
+                                    let seg = if hx - lx >= hy - ly {
+                                        let cy = (ly + hy) / 2;
+                                        Seg { layer: l, width_dbu: (hy - ly) as f64, x1: lx, y1: cy, x2: hx, y2: cy }
+                                    } else {
+                                        let cx = (lx + hx) / 2;
+                                        Seg { layer: l, width_dbu: (hx - lx) as f64, x1: cx, y1: ly, x2: cx, y2: hy }
+                                    };
+                                    n.segs.push(seg);
+                                }
+                                k = k3;
+                            }
+                        }
+                        wiring = false;
+                        i = k;
+                    }
+                    _ => {
+                        // any other attribute ends the wiring; its words are not vias
+                        wiring = false;
+                        i += 2;
                     }
                 }
-                i += 2;
             }
-            "ROUTED" | "NEW" => {
+            "NEW" if wiring => {
                 layer = body.get(i + 1).copied().unwrap_or("").to_string();
                 width = body.get(i + 2).and_then(|w| w.parse().ok()).unwrap_or(0.0);
                 last = None;
                 i += 3;
             }
-            "(" => {
-                let xr = body.get(i + 1).copied().unwrap_or("0");
-                let yr = body.get(i + 2).copied().unwrap_or("0");
-                let prev = last.unwrap_or((0, 0));
-                let px_ok = xr == "*" || xr.parse::<i64>().is_ok();
-                let py_ok = yr == "*" || yr.parse::<i64>().is_ok();
-                let mut j = i + 1;
-                while j < body.len() && body[j] != ")" {
-                    j += 1;
-                }
-                let next_i = j + 1;
-                if !px_ok || !py_ok {
-                    i = next_i;
-                    continue;
-                }
-                let x = if xr == "*" {
-                    prev.0
-                } else {
-                    xr.parse().unwrap_or(0)
-                };
-                let y = if yr == "*" {
-                    prev.1
-                } else {
-                    yr.parse().unwrap_or(0)
-                };
-                i = next_i;
-                if let Some(n) = cur.as_mut() {
-                    if !layer.is_empty() {
-                        n.points.push((layer.clone(), x, y));
-                    }
-                    if let Some((px, py)) = last {
-                        if px != x || py != y {
-                            n.segs.push(Seg {
-                                layer: layer.clone(),
-                                width_dbu: width,
-                                x1: px,
-                                y1: py,
-                                x2: x,
-                                y2: y,
-                            });
+            "(" if wiring => {
+                match point(i, last.unwrap_or((0, 0))) {
+                    Some(((x, y), next)) => {
+                        if let Some(n) = cur.as_mut() {
+                            if !layer.is_empty() {
+                                n.points.push((layer.clone(), x, y));
+                            }
+                            if let Some((px, py)) = last {
+                                if px != x || py != y {
+                                    n.segs.push(Seg { layer: layer.clone(), width_dbu: width, x1: px, y1: py, x2: x, y2: y });
+                                }
+                            }
                         }
+                        last = Some((x, y));
+                        i = next;
+                    }
+                    None => {
+                        while i < body.len() && body[i] != ")" {
+                            i += 1;
+                        }
+                        i += 1;
                     }
                 }
-                last = Some((x, y));
             }
-            "+" => i += 1,
-            other => {
-                if other
-                    .chars()
-                    .next()
-                    .map(|c| c.is_ascii_alphabetic())
-                    .unwrap_or(false)
-                {
+            // `MASK n`: the digit colours the next shape
+            "MASK" if wiring => i += 2,
+            other if wiring => {
+                let is_name = other.chars().next().is_some_and(|c| c.is_ascii_alphabetic());
+                if is_name && !is_qualifier(other) && !is_orient(other) {
                     if let (Some(n), Some(p)) = (cur.as_mut(), last) {
-                        if !is_qualifier(other) {
-                            n.vias.push(p);
-                            n.via_names.push((other.to_string(), p.0, p.1));
+                        // `<via> DO n BY m STEP dx dy` — an n×m array from the point
+                        let (cols, rows, dx, dy, skip) = if body.get(i + 1) == Some(&"DO") && body.get(i + 3) == Some(&"BY") && body.get(i + 5) == Some(&"STEP") {
+                            (int(body.get(i + 2)).unwrap_or(1), int(body.get(i + 4)).unwrap_or(1), int(body.get(i + 6)).unwrap_or(0), int(body.get(i + 7)).unwrap_or(0), 7)
+                        } else {
+                            (1, 1, 0, 0, 0)
+                        };
+                        for r in 0..rows.max(1) {
+                            for c in 0..cols.max(1) {
+                                let q = (p.0 + c * dx, p.1 + r * dy);
+                                n.vias.push(q);
+                                n.via_names.push((other.to_string(), q.0, q.1));
+                            }
                         }
+                        i += skip;
                     }
                 }
                 i += 1;
             }
+            _ => i += 1,
         }
     }
     if let Some(n) = cur.take() {
@@ -1432,5 +1511,55 @@ mod reference_rule_tests {
         let d = Def::parse("NETS 1 ;\n- n1 ( u1 A )\n  + ROUTED met1 ( 0 0 ) ( 100 0 ) ;\nEND NETS\n").unwrap();
         assert_eq!(d.units_per_um, 100.0);
         assert!((d.nets[0].segments[0].len_um() - 1.0).abs() < 1e-9);
+    }
+}
+
+/// Pins and special wiring as the reference reads them (`definPin`, `definSNet`).
+#[cfg(test)]
+mod special_rule_tests {
+    use super::*;
+
+    /// Each `+ PORT` has its own placement; options before a rectangle do not drop it.
+    #[test]
+    fn each_port_is_placed_by_its_own_placement() {
+        let def = "UNITS DISTANCE MICRONS 1000 ;\nPINS 1 ;\n- VDD + NET VDD + SPECIAL + DIRECTION INOUT + USE POWER\n\
+                   + PORT + LAYER met5 ( -100 -100 ) ( 100 100 ) + FIXED ( 1000 1000 ) N\n\
+                   + PORT + LAYER met5 MASK 1 ( -100 -100 ) ( 100 100 ) + FIXED ( 9000 9000 ) N ;\nEND PINS\n";
+        let d = Def::parse(def).unwrap();
+        let shapes: Vec<(i64, i64)> = d.pins[0].shapes.iter().map(|s| (s.1, s.2)).collect();
+        assert_eq!(shapes, [(900, 900), (8900, 8900)]);
+    }
+
+    fn snet(body: &str) -> NetGeom {
+        let def = format!("UNITS DISTANCE MICRONS 1000 ;\nSPECIALNETS 2 ;\n- VDD ( * VDD ) + USE POWER\n{body} ;\n- VSS ( * VSS ) + USE GROUND + COVER met4 300 ( 0 0 ) ( 0 500 ) ;\nEND SPECIALNETS\n");
+        Def::parse(&def).unwrap().power_nets.into_iter().find(|n| n.name == "VDD").unwrap()
+    }
+
+    /// FIXED wiring is wiring; a later path does not join the last one; trailing attributes and
+    /// a box are not vias or routes.
+    #[test]
+    fn special_wiring_paths_boxes_and_attributes() {
+        let n = snet("  + ROUTED met1 480 ( 0 0 ) ( 1000 0 )\n  + FIXED met2 300 ( 5000 5000 ) ( 5000 6000 )\n  + RECT met3 ( 0 0 ) ( 2000 100 )\n  + SOURCE NETLIST + WEIGHT 2");
+        assert!(n.vias.is_empty(), "{:?}", n.via_names);
+        let segs: Vec<(&str, f64, i64, i64, i64, i64)> = n.segs.iter().map(|s| (s.layer.as_str(), s.width_dbu, s.x1, s.y1, s.x2, s.y2)).collect();
+        assert_eq!(segs, [("met1", 480.0, 0, 0, 1000, 0), ("met2", 300.0, 5000, 5000, 5000, 6000), ("met3", 100.0, 0, 50, 2000, 50)]);
+    }
+
+    /// A bare `+ FIXED ;` ends its net and nothing more: the next net is still read.
+    #[test]
+    fn a_bare_status_does_not_swallow_the_next_net() {
+        let def = "UNITS DISTANCE MICRONS 1000 ;\nSPECIALNETS 2 ;\n- A ( u1 S ) + USE SIGNAL\n  + FIXED ;\n- B ( u2 S ) + USE POWER + ROUTED met1 100 ( 0 0 ) ( 10 0 ) ;\nEND SPECIALNETS\n";
+        let d = Def::parse(def).unwrap();
+        assert_eq!(d.power_nets.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(), ["A", "B"]);
+        assert_eq!(d.power_nets[1].segs.len(), 1);
+    }
+
+    /// `<via> DO n BY m STEP dx dy` is an array of vias.
+    #[test]
+    fn a_via_array_is_every_via() {
+        let n = snet("  + ROUTED met1 480 ( 1000 2000 ) M1M2_PR DO 3 BY 2 STEP 300 400");
+        assert_eq!(n.vias.len(), 6);
+        assert!(n.vias.contains(&(1600, 2400)));
+        assert!(n.via_names.iter().all(|v| v.0 == "M1M2_PR"));
     }
 }
