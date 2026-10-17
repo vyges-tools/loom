@@ -740,9 +740,27 @@ fn lex_clean(b: &mut [u8]) {
     }
 }
 
-/// Does the text need [`lex_clean`]? Cheap, so a clean file is not copied.
+/// Would [`lex_clean`] change anything? The same walk, read-only, stopping at the first change —
+/// so a file with nothing to clean is not copied. (A backslash-newline OUTSIDE a string is common
+/// in CCS tables and is left alone by both.)
 fn needs_lex_clean(text: &str) -> bool {
-    text.contains("/*") || text.contains("\\\n") || text.contains("\\\r")
+    let b = text.as_bytes();
+    let (mut i, mut quoted) = (0, false);
+    while i < b.len() {
+        match b[i] {
+            b'"' => quoted = !quoted,
+            b'\\' if quoted => {
+                if matches!(b.get(i + 1), Some(b'\n' | b'\r')) {
+                    return true;
+                }
+                i += 1;
+            }
+            b'/' if !quoted && b.get(i + 1) == Some(&b'*') => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 fn floats(s: &str) -> Vec<f64> {
@@ -1355,16 +1373,18 @@ impl Lib {
 
     /// Like [`Lib::parse`] but honoring [`LibOpts`] (e.g. `skip_ccs` for NLDM-only).
     pub fn parse_opts(text: &str, opts: LibOpts) -> Result<Lib, LibError> {
-        let cleaned;
-        let text = if needs_lex_clean(text) {
-            let mut b = text.as_bytes().to_vec();
-            lex_clean(&mut b);
-            // only ASCII bytes were replaced, by ASCII, so the text is still UTF-8
-            cleaned = String::from_utf8(b).map_err(|e| LibError(e.to_string()))?;
-            cleaned.as_str()
-        } else {
-            text
-        };
+        if !needs_lex_clean(text) {
+            return Lib::parse_lexed(text, opts);
+        }
+        let mut b = text.as_bytes().to_vec();
+        lex_clean(&mut b);
+        // only ASCII bytes were replaced, by ASCII, so the text is still UTF-8
+        let cleaned = String::from_utf8(b).map_err(|e| LibError(e.to_string()))?;
+        Lib::parse_lexed(&cleaned, opts)
+    }
+
+    /// [`Lib::parse_opts`] on text [`lex_clean`] has already seen.
+    fn parse_lexed(text: &str, opts: LibOpts) -> Result<Lib, LibError> {
         // The library's own attributes, once: they sit one level down, inside `library () { }`,
         // and are read many times.
         let lib_own = top_group_spans(text)
@@ -1404,10 +1424,7 @@ impl Lib {
     /// on-disk cross-process (`VYGES_LIB_CACHE`, #37/#38) → parse.
     pub fn load_opts(path: &str, opts: LibOpts) -> Result<Lib, LibError> {
         let text = std::fs::read_to_string(path).map_err(|e| LibError(format!("{path}: {e}")))?;
-        // Cleaned IN PLACE: a large CCS library is not copied a second time.
-        let mut b = text.into_bytes();
-        lex_clean(&mut b);
-        let text = String::from_utf8(b).map_err(|e| LibError(format!("{path}: {e}")))?;
+        // keyed on the file as read: a cache hit costs no lexing at all
         let key = lib_cache_key(&text, opts);
         // 1) in-process cache
         if let Some(hit) = lib_cache().lock().ok().and_then(|m| m.get(&key).cloned()) {
@@ -1417,8 +1434,13 @@ impl Lib {
         if let Some(lib) = crate::libcache::disk_get(key) {
             return Ok(cache_store(key, lib));
         }
-        // 3) parse, then populate both the disk and in-process caches
-        let lib = Lib::parse_opts(&text, opts)?;
+        // 3) parse, then populate both the disk and in-process caches. Cleaned IN PLACE: a large
+        // CCS library is not copied a second time.
+        let mut b = text.into_bytes();
+        lex_clean(&mut b);
+        // only ASCII bytes were replaced, by ASCII, so the text is still UTF-8
+        let text = String::from_utf8(b).map_err(|e| LibError(format!("{path}: {e}")))?;
+        let lib = Lib::parse_lexed(&text, opts)?;
         crate::libcache::disk_put(key, &lib);
         Ok(cache_store(key, lib))
     }
