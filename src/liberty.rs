@@ -72,6 +72,8 @@ pub struct Arc {
     pub related_pin: String,
     /// `related_bus_pins` as read, until `expand_arcs` turns it into arcs (then empty).
     pub(crate) related_bus_pins: String,
+    /// The group's `timing_type` as read (empty when absent), for `derive_senses`.
+    pub(crate) kind: String,
     pub sense: String,
     /// The output edges this arc drives — see [`OutEdges`].
     pub out_edges: OutEdges,
@@ -239,6 +241,8 @@ pub struct Pin {
     /// table to an async pin is not an approximation, it is the wrong check.
     pub removal: Vec<Constraint>,
     pub arcs: Vec<Arc>, // delay arcs (e.g. CK->Q on a flop output)
+    /// `three_state` (the DISABLE expression), for `derive_senses`.
+    pub(crate) three_state: Option<String>,
 }
 
 impl Pin {
@@ -930,7 +934,9 @@ fn parse_arc(timing_body: &str, own: &str, spans: &[GroupSpan], ctx: &Ctx) -> Ar
     Arc {
         related_pin: simple_attr(own, "related_pin").unwrap_or_default(),
         related_bus_pins: simple_attr(own, "related_bus_pins").unwrap_or_default(),
-        sense: simple_attr(own, "timing_sense").unwrap_or_else(|| "non_unate".into()),
+        kind: tt.clone(),
+        // empty = not stated: `derive_senses` takes it from the pin's function, as the reference does
+        sense: simple_attr(own, "timing_sense").unwrap_or_default(),
         out_edges,
         clk_edge,
         cell_rise: tbl("cell_rise"),
@@ -1031,6 +1037,7 @@ fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
     // Liberty puts `function` on the OUTPUT pin, not the cell. It is what makes two cells
     // comparable: a resize must not change what a gate computes.
     let function = simple_attr(&own, "function").filter(|f| !f.is_empty());
+    let three_state = simple_attr(&own, "three_state").filter(|f| !f.is_empty());
     let mut arcs = Vec::new();
     let mut setup: Vec<Constraint> = Vec::new();
     let mut hold: Vec<Constraint> = Vec::new();
@@ -1075,6 +1082,7 @@ fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
         recv,
         clock,
         function,
+        three_state,
         setup,
         hold,
         recovery,
@@ -1440,6 +1448,46 @@ fn expand_arcs(pins: &mut BTreeMap<String, Pin>, buses: &[(String, Vec<String>)]
     }
 }
 
+/// The sense of every arc whose group states no `timing_sense`, as the reference builds the arcs:
+///   * a combinational arc: the output pin's `function`, when it names the related pin; else, on a
+///     three-state pin whose enable names it, non-unate;
+///   * a three-state enable/disable arc: the enable (the inverted `three_state` expression);
+///   * anything else, or no answer (a function naming a port the cell lacks parses to nothing):
+///     non-unate, which times both input edges, as the reference does for an unknown sense.
+fn derive_senses(pins: &mut BTreeMap<String, Pin>) {
+    use crate::liberty_func::{Func, Sense};
+    let names: std::collections::BTreeSet<String> = pins.keys().cloned().collect();
+    let is_port = |p: &str| names.contains(p);
+    for pin in pins.values_mut() {
+        if pin.arcs.iter().all(|a| !a.sense.is_empty()) {
+            continue;
+        }
+        let func = pin.function.as_deref().and_then(|f| Func::parse_in(f, is_port));
+        let enable = pin.three_state.as_deref().and_then(|f| Func::parse_in(f, is_port)).map(Func::invert);
+        for a in pin.arcs.iter_mut().filter(|a| a.sense.is_empty()) {
+            let from = a.related_pin.as_str();
+            let combinational = a.clk_edge.is_none() && matches!(a.kind.as_str(), "" | "combinational" | "combinational_rise" | "combinational_fall");
+            let sense = if combinational {
+                match (&func, &enable) {
+                    (Some(f), _) if f.has_port(from) => f.port_timing_sense(from),
+                    (_, Some(e)) if e.has_port(from) => Sense::NonUnate,
+                    _ => Sense::Unknown,
+                }
+            } else if a.kind.starts_with("three_state_") {
+                enable.as_ref().map_or(Sense::Unknown, |e| e.port_timing_sense(from))
+            } else {
+                Sense::Unknown
+            };
+            a.sense = match sense {
+                Sense::Positive => "positive_unate",
+                Sense::Negative => "negative_unate",
+                _ => "non_unate",
+            }
+            .to_string();
+        }
+    }
+}
+
 fn merged_pin(name: &str, group: &Pin, inner: Option<(&Pin, &str)>) -> Pin {
     let mut p = group.clone();
     p.name = name.to_string();
@@ -1463,6 +1511,9 @@ fn merged_pin(name: &str, group: &Pin, inner: Option<(&Pin, &str)>) -> Pin {
         p.clock |= ip.clock;
         if ip.function.is_some() {
             p.function = ip.function.clone();
+        }
+        if ip.three_state.is_some() {
+            p.three_state = ip.three_state.clone();
         }
         p.setup.extend(ip.setup.iter().cloned());
         p.hold.extend(ip.hold.iter().cloned());
@@ -1568,6 +1619,7 @@ fn parse_cell(
         }
     }
     expand_arcs(&mut pins, &buses, &bus_bits);
+    derive_senses(&mut pins);
     let ff = groups
         .iter()
         .find(|(k, _, _)| k == "ff" || k == "latch")
@@ -2902,5 +2954,59 @@ mod related_pin_lists {
         assert_eq!(from(&m.pins["Q[1]"]), vec!["CK", "D[1]", "S[1]", "S[1]", "S[0]"]);
         assert_eq!(from(&m.pins["Q[0]"]), vec!["CK", "D[0]", "S[0]", "S[1]", "S[0]"]);
         assert!(m.pins["Q[0]"].arcs.iter().all(|a| a.related_bus_pins.is_empty()));
+    }
+}
+
+#[cfg(test)]
+mod derived_sense {
+    use super::*;
+
+    /// Reference rule: a combinational group with no `timing_sense` takes it from the output's
+    /// function (`portTimingSense`); a three-state pin's enable pin, absent from the function, is
+    /// non-unate. Checked on this library: the reference times exactly these edges (`report_edges`:
+    /// AND2 A ^->^ v->v; NOR2 A ^->v v->^; MUX2 S all four, B ^->^ v->v; XOR2 A all four; TBUF A
+    /// ^->v v->^, EN all four).
+    /// ⚠️ ODD's function names a port the cell lacks: the reference warns (1130) and then CRASHES
+    /// reading it; here the expression is absent and the arc non-unate.
+    #[test]
+    fn a_missing_timing_sense_comes_from_the_function() {
+        let l = Lib::parse(r#"library(s) {
+  delay_model : table_lookup;
+  time_unit : "1ns"; capacitive_load_unit (1, pf); voltage_unit : "1V"; current_unit : "1mA";
+  cell (AND2) { pin(A) { direction : input; capacitance : 0.001; } pin(B) { direction : input; capacitance : 0.001; }
+    pin(Y) { direction : output; function : "A B";
+      timing () { related_pin : "A"; cell_rise (scalar) { values("0.1"); } cell_fall (scalar) { values("0.1"); } rise_transition (scalar) { values("0.1"); } fall_transition (scalar) { values("0.1"); } }
+      timing () { related_pin : "B"; cell_rise (scalar) { values("0.1"); } cell_fall (scalar) { values("0.1"); } rise_transition (scalar) { values("0.1"); } fall_transition (scalar) { values("0.1"); } } } }
+  cell (NOR2) { pin(A) { direction : input; capacitance : 0.001; } pin(B) { direction : input; capacitance : 0.001; }
+    pin(Y) { direction : output; function : "(A+B)'";
+      timing () { related_pin : "A"; cell_rise (scalar) { values("0.1"); } cell_fall (scalar) { values("0.1"); } rise_transition (scalar) { values("0.1"); } fall_transition (scalar) { values("0.1"); } } } }
+  cell (MUX2) { pin(S) { direction : input; capacitance : 0.001; } pin(A) { direction : input; capacitance : 0.001; } pin(B) { direction : input; capacitance : 0.001; }
+    pin(Y) { direction : output; function : "(A !S) | (B S)";
+      timing () { related_pin : "S"; cell_rise (scalar) { values("0.1"); } cell_fall (scalar) { values("0.1"); } rise_transition (scalar) { values("0.1"); } fall_transition (scalar) { values("0.1"); } }
+      timing () { related_pin : "B"; cell_rise (scalar) { values("0.1"); } cell_fall (scalar) { values("0.1"); } rise_transition (scalar) { values("0.1"); } fall_transition (scalar) { values("0.1"); } } } }
+  cell (XOR2) { pin(A) { direction : input; capacitance : 0.001; } pin(B) { direction : input; capacitance : 0.001; }
+    pin(Y) { direction : output; function : "A^B";
+      timing () { related_pin : "A"; cell_rise (scalar) { values("0.1"); } cell_fall (scalar) { values("0.1"); } rise_transition (scalar) { values("0.1"); } fall_transition (scalar) { values("0.1"); } } } }
+  cell (TBUF) { pin(A) { direction : input; capacitance : 0.001; } pin(EN) { direction : input; capacitance : 0.001; }
+    pin(Y) { direction : output; function : "!A"; three_state : "!EN";
+      timing () { related_pin : "A"; cell_rise (scalar) { values("0.1"); } cell_fall (scalar) { values("0.1"); } rise_transition (scalar) { values("0.1"); } fall_transition (scalar) { values("0.1"); } }
+      timing () { related_pin : "EN"; cell_rise (scalar) { values("0.1"); } cell_fall (scalar) { values("0.1"); } rise_transition (scalar) { values("0.1"); } fall_transition (scalar) { values("0.1"); } } } }
+  cell (ODD) { pin(A) { direction : input; capacitance : 0.001; }
+    pin(Y) { direction : output; function : "A & IQ";
+      timing () { related_pin : "A"; cell_rise (scalar) { values("0.1"); } cell_fall (scalar) { values("0.1"); } rise_transition (scalar) { values("0.1"); } fall_transition (scalar) { values("0.1"); } } } }
+}
+"#).unwrap();
+        let sense = |c: &str, from: &str| -> String {
+            l.cells[c].pins["Y"].arcs.iter().find(|a| a.related_pin == from).map(|a| a.sense.clone()).unwrap()
+        };
+        assert_eq!(sense("AND2", "A"), "positive_unate");
+        assert_eq!(sense("AND2", "B"), "positive_unate");
+        assert_eq!(sense("NOR2", "A"), "negative_unate");
+        assert_eq!(sense("MUX2", "S"), "non_unate");
+        assert_eq!(sense("MUX2", "B"), "positive_unate");
+        assert_eq!(sense("XOR2", "A"), "non_unate");
+        assert_eq!(sense("TBUF", "A"), "negative_unate");
+        assert_eq!(sense("TBUF", "EN"), "non_unate");
+        assert_eq!(sense("ODD", "A"), "non_unate");
     }
 }

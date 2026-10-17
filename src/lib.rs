@@ -26,6 +26,7 @@
 //! are the plug boundary; loom is where they are parsed once into shared state.
 
 pub mod liberty;
+mod liberty_func;
 /// CCS (Composite Current Source) data model — the waveform groups the Liberty
 /// reader populates (NLDM + CCS). The current-source delay *calculation* belongs
 /// to the timing engine (`vyges-sta-si`); loom holds + can evaluate the curves.

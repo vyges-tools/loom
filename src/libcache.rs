@@ -19,7 +19,8 @@ use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, OutEdges, Pin, Pi
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLCA"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLCB"; // Vyges Liberty Cache — bump the trailing digit on any format change
+                                 // VLCB: an arc with no timing_sense takes it from the pin's function.
                                  // VLCA: one arc per related BIT (a multi-pin / bus related_pin was one arc).
                                  // VLC9: Pin gained `caps` (rise/fall x min/max, library defaults).
                                  // VLC8: Arc gained `out_edges` (combinational_rise/_fall build one edge).
@@ -218,6 +219,7 @@ fn dec_arc(r: &mut R) -> Option<Arc> {
     Some(Arc {
         related_pin: r.s()?,
         related_bus_pins: String::new(),
+        kind: String::new(),
         sense: r.s()?,
         cell_rise: dec_table(r)?,
         cell_fall: dec_table(r)?,
@@ -355,6 +357,7 @@ fn dec_pin(r: &mut R) -> Option<Pin> {
         recv,
         clock,
         function,
+        three_state: None,
         setup,
         hold,
         recovery,
