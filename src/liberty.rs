@@ -40,10 +40,37 @@ pub enum ClkEdge {
     Fall,
 }
 
+/// Which OUTPUT edges a delay arc drives.
+///
+/// `combinational_rise` / `_fall` and `three_state_*_rise` / `_fall` build only the named edge,
+/// as the reference builds them; every other delay type builds both. ⛔ Without it a one-edge
+/// arc read as two, and the edge it does not have — its table empty — timed as ZERO delay: a
+/// clock gate's CLK->GCLK, among others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutEdges {
+    #[default]
+    Both,
+    Rise,
+    Fall,
+}
+
+impl OutEdges {
+    /// Does the arc drive the output edge `rising` (true) or falling (false)?
+    pub fn drives(self, rising: bool) -> bool {
+        match self {
+            OutEdges::Both => true,
+            OutEdges::Rise => rising,
+            OutEdges::Fall => !rising,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Arc {
     pub related_pin: String,
     pub sense: String,
+    /// The output edges this arc drives — see [`OutEdges`].
+    pub out_edges: OutEdges,
     /// `Some` only on a sequential (`rising_edge` / `falling_edge`) arc; `None` on a
     /// combinational one. See [`ClkEdge`].
     pub clk_edge: Option<ClkEdge>,
@@ -857,9 +884,18 @@ fn parse_arc(timing_body: &str, own: &str, spans: &[GroupSpan], ctx: &Ctx) -> Ar
         Some("falling_edge") => Some(ClkEdge::Fall),
         _ => None,
     };
+    let tt = simple_attr(own, "timing_type").unwrap_or_default();
+    let out_edges = if tt.ends_with("_rise") {
+        OutEdges::Rise
+    } else if tt.ends_with("_fall") {
+        OutEdges::Fall
+    } else {
+        OutEdges::Both
+    };
     Arc {
         related_pin: simple_attr(own, "related_pin").unwrap_or_default(),
         sense: simple_attr(own, "timing_sense").unwrap_or_else(|| "non_unate".into()),
+        out_edges,
         clk_edge,
         cell_rise: tbl("cell_rise"),
         cell_fall: tbl("cell_fall"),
@@ -974,14 +1010,23 @@ fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
             // setup/hold. They are not max-delay data arcs.
             Some(tt) if tt.starts_with("recovery") => recovery.push(parse_constraint(tbody, &tspans, ctx)),
             Some(tt) if tt.starts_with("removal") => removal.push(parse_constraint(tbody, &tspans, ctx)),
-            // clear/preset are async *effect* arcs (dfrtp RESET_B->Q), not launch paths —
-            // propagating data through them would invent a path that cannot exist.
-            // min_pulse_width is a check we do not implement yet.
-            Some(tt)
-                if tt.starts_with("clear")
-                    || tt.starts_with("preset")
-                    || tt.contains("pulse_width") => {}
-            _ => arcs.push(parse_arc(tbody, &town, &tspans, ctx)), // delay arc (incl. rising_edge CK->Q)
+            // DELAY arcs, by the reference's own list (`LibertyBuilder::makeTimingArcs`); a
+            // missing `timing_type` is combinational.
+            None
+            | Some(
+                "combinational" | "combinational_rise" | "combinational_fall" | "rising_edge"
+                | "falling_edge" | "three_state_enable" | "three_state_enable_rise"
+                | "three_state_enable_fall" | "three_state_disable" | "three_state_disable_rise"
+                | "three_state_disable_fall",
+            ) => arcs.push(parse_arc(tbody, &town, &tspans, ctx)),
+            // Everything else is NOT a delay arc, and read as one it was a zero-delay path that
+            // does not exist — onto an input pin, or a clock pin to itself:
+            //   * clear / preset are async EFFECT arcs (dfrtp RESET_B->Q); the reference builds
+            //     them as set/clear arcs its timer leaves off by default;
+            //   * skew, non_seq_setup/hold, min_pulse_width, minimum_period are checks this
+            //     reader does not model;
+            //   * nochange_*, retaining_time and unknown types the reference drops itself.
+            Some(_) => {}
         }
     }
     Pin {
@@ -2563,5 +2608,43 @@ mod table_axis_tests {
         assert_eq!(t.lookup(0.5, 10.0), 1.0);
         assert_eq!(t.lookup(0.5, 15.0), 1.5);
         assert_eq!(t.lookup(9.0, 20.0), 2.0, "slew does not matter");
+    }
+}
+
+/// Which timing groups are delay arcs, and which edges they drive — the reference's lists.
+#[cfg(test)]
+mod timing_type_tests {
+    use super::*;
+
+    fn arcs(types: &[&str]) -> Vec<Arc> {
+        let groups: String = types
+            .iter()
+            .map(|t| format!("timing () {{ related_pin : A; timing_type : {t}; cell_rise (scalar) {{ values (\"1\"); }} }}\n"))
+            .collect();
+        let l = Lib::parse(&format!(
+            "library (l) {{ cell (C) {{ pin (A) {{ direction : input; }} pin (Y) {{ direction : output; {groups} }} }} }}"
+        ))
+        .unwrap();
+        l.cell("C").unwrap().pins["Y"].arcs.clone()
+    }
+
+    /// Only the reference's delay types are delay arcs; checks loom does not model, and types
+    /// the reference drops, are not zero-delay paths.
+    #[test]
+    fn only_delay_types_make_delay_arcs() {
+        let kept = ["combinational", "rising_edge", "falling_edge", "three_state_enable", "three_state_disable_rise"];
+        let dropped = ["non_seq_setup_rising", "non_seq_hold_falling", "minimum_period", "min_pulse_width",
+                       "skew_rising", "nochange_high_high", "retaining_time", "clear", "preset", "bogus_type"];
+        assert_eq!(arcs(&kept).len(), kept.len());
+        assert!(arcs(&dropped).is_empty());
+    }
+
+    /// `combinational_rise` drives only the rising output edge, `_fall` only the falling one.
+    #[test]
+    fn a_one_edge_type_drives_one_edge() {
+        let a = arcs(&["combinational_rise", "combinational_fall", "combinational", "three_state_enable_fall"]);
+        let e: Vec<OutEdges> = a.iter().map(|x| x.out_edges).collect();
+        assert_eq!(e, [OutEdges::Rise, OutEdges::Fall, OutEdges::Both, OutEdges::Fall]);
+        assert!(OutEdges::Rise.drives(true) && !OutEdges::Rise.drives(false));
     }
 }

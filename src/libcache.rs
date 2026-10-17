@@ -15,11 +15,12 @@
 //! in-process cache) mean a changed library is a different entry — never a stale read.
 
 use crate::ccs::{CcsArc, CcsWaveform};
-use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, Pin, RecvCap, Table};
+use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, OutEdges, Pin, RecvCap, Table};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLC7"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLC8"; // Vyges Liberty Cache — bump the trailing digit on any format change
+                                 // VLC8: Arc gained `out_edges` (combinational_rise/_fall build one edge).
                                  // VLC7: Cell gained `clock_gating` + `scan_pins` (test_cell signal_type).
                                  // VLC5: Cell gained `async_reset_pins` (the `ff` group's clear/preset pins), for RDC.
                                  // VLC2: pin `function`, cell `cell_footprint` + `area`.
@@ -205,6 +206,11 @@ fn enc_arc(w: &mut W, a: &Arc) {
     });
     enc_table(w, &a.sigma_rise);
     enc_table(w, &a.sigma_fall);
+    w.u8(match a.out_edges {
+        OutEdges::Both => 0,
+        OutEdges::Rise => 1,
+        OutEdges::Fall => 2,
+    });
 }
 fn dec_arc(r: &mut R) -> Option<Arc> {
     Some(Arc {
@@ -223,6 +229,12 @@ fn dec_arc(r: &mut R) -> Option<Arc> {
         },
         sigma_rise: dec_table(r)?,
         sigma_fall: dec_table(r)?,
+        // read LAST, as it is written: a struct literal's fields are evaluated in written order
+        out_edges: match r.u8()? {
+            1 => OutEdges::Rise,
+            2 => OutEdges::Fall,
+            _ => OutEdges::Both,
+        },
     })
 }
 
