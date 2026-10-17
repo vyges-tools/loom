@@ -1038,6 +1038,31 @@ struct GroupSpan {
     body: std::ops::Range<usize>,
 }
 
+/// Where a group head's argument list opens: the `(` matching the LAST `)` before the brace.
+///
+/// ⛔ Not the first `(`. A statement written without its `;` runs into the group after it, and
+/// its value may hold parentheses of its own — `when : "((A | B) & C)"` then
+/// `rise_constraint ("t") {` (an IHP SRAM writes exactly this). Taking the first lost the
+/// table's keyword, and the table with it.
+fn args_open(head: &str) -> Option<usize> {
+    let b = head.as_bytes();
+    let close = head.trim_end().len().checked_sub(1).filter(|&k| b[k] == b')')?;
+    let mut depth = 0i32;
+    for k in (0..=close).rev() {
+        match b[k] {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(k);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// One linear pass over `body`: each depth-0 group with where it lies.
 fn top_group_spans(body: &str) -> Vec<GroupSpan> {
     let b = body.as_bytes();
@@ -1051,7 +1076,7 @@ fn top_group_spans(body: &str) -> Vec<GroupSpan> {
             b'{' => {
                 let end = matching(b, i).min(b.len());
                 let raw = &body[stmt..i];
-                if let Some(open) = raw.find('(') {
+                if let Some(open) = args_open(raw) {
                     // The keyword is the identifier just before `(`. Not everything since the last
                     // `;`: an attribute written without one (`area : 3.5` then `pg_pin (VDD) {`)
                     // would become part of the group's head, and be removed with the group.
@@ -2320,6 +2345,19 @@ mod lexer_tests {
         let t = &l.cell("INV").unwrap().pins["Y"].arcs[0].cell_rise;
         assert_eq!(t.index_1, [0.01f32 as f64, 0.02f32 as f64]);
         assert_eq!(t.values[0], [0.1f32 as f64, 0.2f32 as f64]);
+    }
+
+    /// A group whose head follows a semicolon-less attribute holding parentheses is still that
+    /// group (an IHP SRAM writes `when : "((A | B) & C)"` then `rise_constraint (t) {`).
+    #[test]
+    fn a_group_after_an_unterminated_attribute_with_parens_is_found() {
+        let lib = LIB.replace(
+            "timing () { related_pin : \"A\";",
+            "timing () { related_pin : \"A\"; when : \"((A | A) & A)\"\n sdf_cond : \"x\"\n",
+        );
+        assert_ne!(lib, LIB, "the fixture must change");
+        let l = Lib::parse(&lib).unwrap();
+        assert_eq!(l.cell("INV").unwrap().pins["Y"].arcs[0].cell_rise.index_1.len(), 2);
     }
 
     /// A simple attribute is the LAST one stated at the group's own level; an inner group's
