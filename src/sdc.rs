@@ -422,6 +422,10 @@ pub struct Sdc {
     /// Every `set_clock_latency`, per command (its value is also folded into
     /// [`Sdc::clock_latency`]); a consumer that does not model latency refuses any.
     pub clock_latencies: Vec<EnvCmd>,
+    /// Every `set_clock_transition`, per command (`-rise`/`-fall`/`-min`/`-max` in its flags):
+    /// an IDEAL clock's slew at its register clock pins. Still in [`Sdc::ignored`] for a consumer
+    /// that does not model it.
+    pub clock_transitions: Vec<EnvCmd>,
     /// Every `set_max_delay` / `set_min_delay`, in file order (still in [`Sdc::ignored`]).
     pub path_delays: Vec<PathDelayCmd>,
     /// Every `set_driving_cell`, as written (still in [`Sdc::ignored`] for a consumer that does
@@ -1903,6 +1907,10 @@ impl Sdc {
                     sdc.setup_uncertainty = fold(false);
                     sdc.hold_uncertainty = fold(true);
                 }
+                "set_clock_transition" => {
+                    sdc.clock_transitions.extend(env_cmd(&toks));
+                    sdc.ignored.push("set_clock_transition".to_string());
+                }
                 "set_clock_latency" => {
                     sdc.clock_latencies.extend(env_cmd(&toks));
                     if let Some(v) = toks.iter().skip(1).find_map(|t| {
@@ -2892,5 +2900,18 @@ mod object_queries {
         assert_eq!(s.unevaluated_queries.len(), 4, "{:?}", s.unevaluated_queries);
         assert!(s.unevaluated_queries[1].starts_with("set_false_path: [get_pins -of_obj"));
         assert!(s.health().unwrap().contains("needs the design"));
+    }
+}
+
+#[cfg(test)]
+mod clock_transition_kept {
+    use super::*;
+
+    #[test]
+    fn set_clock_transition_is_kept_per_command() {
+        let s = Sdc::parse("create_clock -name c -period 1 [get_ports clk]\nset_clock_transition -rise 0.04 [get_clocks c]\nset_clock_transition 0.05 [all_clocks]\n").unwrap();
+        assert_eq!(s.clock_transitions.len(), 2);
+        assert_eq!((s.clock_transitions[0].value, s.clock_transitions[0].flags.clone(), s.clock_transitions[0].objects.clone()), (0.04, vec!["-rise".to_string()], vec!["c".to_string()]));
+        assert!(s.ignored.iter().any(|c| c == "set_clock_transition"));
     }
 }
