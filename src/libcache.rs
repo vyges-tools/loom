@@ -19,7 +19,8 @@ use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, OutEdges, Pin, Pi
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLCD"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLCE"; // Vyges Liberty Cache — bump the trailing digit on any format change
+                                 // VLCE: Cell gained `dont_use`.
                                  // VLCC: bare-number table rows; tables padded to their axes.
                                  // VLCB: an arc with no timing_sense takes it from the pin's function.
                                  // VLCA: one arc per related BIT (a multi-pin / bus related_pin was one arc).
@@ -408,6 +409,7 @@ fn enc_cell(w: &mut W, c: &Cell) {
         w.s(k);
         w.s(v);
     }
+    w.u8(c.dont_use as u8);
 }
 fn dec_cell(r: &mut R) -> Option<Cell> {
     let name = r.s()?;
@@ -445,6 +447,7 @@ fn dec_cell(r: &mut R) -> Option<Cell> {
         let k = r.s()?;
         scan_pins.insert(k, r.s()?);
     }
+    let dont_use = r.u8()? != 0;
     Some(Cell {
         name,
         pins,
@@ -457,6 +460,7 @@ fn dec_cell(r: &mut R) -> Option<Cell> {
         async_reset_pins,
         clock_gating,
         scan_pins,
+        dont_use,
     })
 }
 

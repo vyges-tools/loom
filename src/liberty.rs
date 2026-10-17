@@ -313,6 +313,11 @@ pub struct Cell {
     /// 🔑 This is the ONLY thing read from a `test_cell`. Its pins repeat the real ones in scan
     /// mode and must never replace them (see `parse_cell`), but the roles exist nowhere else.
     pub scan_pins: BTreeMap<String, String>,
+    /// `dont_use : true` — the library withholds the cell from optimisation. Read as the
+    /// reference reads a cell boolean: exactly `true` or `false`, anything else leaves the
+    /// default (`false`). A design may still instantiate the cell; only a resize/insert move
+    /// may not choose it (see [`Lib::equivalence_class`]).
+    pub dont_use: bool,
 }
 
 impl Lib {
@@ -334,6 +339,10 @@ impl Lib {
     /// group rather than a pin function, so a structural match would be guessing — and guessing
     /// wrong about a flop swaps a design's state element.
     ///
+    /// A `dont_use` cell is never offered as a replacement — the reference's resizer skips it
+    /// in every candidate list — but `cell` itself stays in the ladder even when it is one, so
+    /// a caller can still see where it sits.
+    ///
     /// Returns an empty vec if `cell` is unknown, and a single-element vec (the cell itself) if
     /// nothing is interchangeable with it — including the common case of a timing-only library
     /// with no `function` and no `cell_footprint`, where equivalence is simply not knowable.
@@ -344,7 +353,7 @@ impl Lib {
         let mut out: Vec<&Cell> = self
             .cells
             .values()
-            .filter(|o| interchangeable(c, o))
+            .filter(|o| o.name == c.name || (!o.dont_use && interchangeable(c, o)))
             .collect();
         out.sort_by(|a, b| {
             a.area
@@ -1755,6 +1764,7 @@ fn parse_cell(
     let area = simple_attr(&own, "area")
         .and_then(|s| lnum(&s))
         .unwrap_or(0.0);
+    let dont_use = simple_attr(&own, "dont_use").as_deref() == Some("true");
     Cell {
         name,
         pins,
@@ -1767,6 +1777,7 @@ fn parse_cell(
         async_reset_pins,
         clock_gating,
         scan_pins,
+        dont_use,
     }
 }
 
@@ -3433,5 +3444,45 @@ mod unit_tests {
         let cap = first.cells["INV_a"].pins["A"].capacitance;
         first.merge(second);
         assert_eq!(first.cells["INV_a"].pins["A"].capacitance, cap);
+    }
+}
+
+#[cfg(test)]
+mod dont_use_cells {
+    use super::*;
+
+    const LIB: &str = r#"library (d) {
+  cell (INV_X1) { cell_footprint : "inv"; area : 1.0; dont_use : true;
+    pin (A) { direction : input; capacitance : 0.001; }
+    pin (Y) { direction : output; function : "!A"; } }
+  cell (INV_X2) { cell_footprint : "inv"; area : 2.0; dont_use : true;
+    pin (A) { direction : input; capacitance : 0.002; }
+    pin (Y) { direction : output; function : "!A"; } }
+  cell (INV_X4) { cell_footprint : "inv"; area : 4.0; dont_use : false;
+    pin (A) { direction : input; capacitance : 0.004; }
+    pin (Y) { direction : output; function : "!A"; } }
+  cell (INV_X8) { cell_footprint : "inv"; area : 8.0; dont_use : yes;
+    pin (A) { direction : input; capacitance : 0.008; }
+    pin (Y) { direction : output; function : "!A"; } }
+}"#;
+
+    /// Reference rule: a cell's `dont_use` is a boolean attribute — exactly `true` or `false`;
+    /// any other value is warned about and leaves the cell usable. The resizer then never offers
+    /// a dont_use cell as a swap or buffer candidate, while a design may still contain one.
+    #[test]
+    fn a_dont_use_cell_is_never_a_replacement_but_keeps_its_own_rung() {
+        let l = Lib::parse(LIB).unwrap();
+        assert!(l.cells["INV_X1"].dont_use && l.cells["INV_X2"].dont_use);
+        assert!(!l.cells["INV_X4"].dont_use, "`false` is usable");
+        assert!(!l.cells["INV_X8"].dont_use, "a non-boolean value leaves the default");
+        let class = |c: &str| l.equivalence_class(c).iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+        assert_eq!(class("INV_X1"), ["INV_X1", "INV_X4", "INV_X8"], "X2 is withheld; X1 keeps its rung");
+        assert_eq!(class("INV_X4"), ["INV_X4", "INV_X8"]);
+        let ups: Vec<_> = l.upsize_candidates("INV_X1").iter().map(|c| c.name.clone()).collect();
+        assert_eq!(ups, ["INV_X4", "INV_X8"]);
+        assert!(l.downsize_candidates("INV_X4").is_empty(), "X1 and X2 are both dont_use");
+        // the cache round-trips the flag
+        let back = crate::libcache::decode(&crate::libcache::encode(&l)).unwrap();
+        assert!(back.cells["INV_X2"].dont_use && !back.cells["INV_X4"].dont_use);
     }
 }
