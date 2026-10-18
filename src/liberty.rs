@@ -241,6 +241,11 @@ pub struct Pin {
     /// table to an async pin is not an approximation, it is the wrong check.
     pub removal: Vec<Constraint>,
     pub arcs: Vec<Arc>, // delay arcs (e.g. CK->Q on a flop output)
+    /// CHECK `timing_type`s on this pin that the reader does not model (`non_seq_setup_rising`,
+    /// `skew_*`, `min_pulse_width`, `minimum_period`), as written, once each. Not delay arcs and
+    /// not applied — kept so a timer can SAY a check the reference makes was left out, where
+    /// dropping them left a design checked only by them with an empty report.
+    pub unmodelled_checks: Vec<String>,
     /// `three_state` (the DISABLE expression), for `derive_senses`.
     pub(crate) three_state: Option<String>,
 }
@@ -1076,6 +1081,7 @@ fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
     let mut hold: Vec<Constraint> = Vec::new();
     let mut recovery: Vec<Constraint> = Vec::new();
     let mut removal: Vec<Constraint> = Vec::new();
+    let mut unmodelled_checks: Vec<String> = Vec::new();
     for g in pin_groups.iter().filter(|g| g.kw == "timing") {
         let tbody = &body[g.body.clone()];
         let (town, tspans) = level(tbody);
@@ -1103,7 +1109,12 @@ fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
             //   * skew, non_seq_setup/hold, min_pulse_width, minimum_period are checks this
             //     reader does not model;
             //   * nochange_*, retaining_time and unknown types the reference drops itself.
-            Some(_) => {}
+            Some(tt) => {
+                let check = ["non_seq_setup", "non_seq_hold", "skew_", "min_pulse_width", "minimum_period"].iter().any(|k| tt.starts_with(k));
+                if check && !unmodelled_checks.iter().any(|c| c == tt) {
+                    unmodelled_checks.push(tt.to_string());
+                }
+            }
         }
     }
     Pin {
@@ -1121,6 +1132,7 @@ fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
         recovery,
         removal,
         arcs,
+        unmodelled_checks,
     }
 }
 
@@ -2419,6 +2431,32 @@ fn internal_values(cell_body: &str) -> Vec<f64> {
         at = after;
     }
     out
+}
+
+/// A check the reader does not model is NAMED on its pin and never built as a delay arc: the
+/// reference times `non_seq_setup_rising` (a gate's select against its clock) as a check, and a
+/// design checked only by it reported nothing at all when the group was dropped silently.
+#[cfg(test)]
+mod unmodelled_check_tests {
+    use super::*;
+
+    #[test]
+    fn a_non_sequential_check_is_named_not_timed() {
+        let lib = Lib::parse(
+            r#"library (u) { cell (CKMUX) {
+  pin (CLK1) { direction : input; capacitance : 0.001; }
+  pin (CLKSEL) { direction : input; capacitance : 0.001;
+    timing () { related_pin : "CLK1"; timing_type : non_seq_setup_rising; rise_constraint (s) { values ("0.05"); } }
+    timing () { related_pin : "CLK1"; timing_type : non_seq_hold_rising; rise_constraint (s) { values ("0.02"); } } }
+  pin (CLKOUT) { direction : output; function : "CLK1"; } } }"#,
+        )
+        .unwrap();
+        let p = &lib.cell("CKMUX").unwrap().pins["CLKSEL"];
+        assert!(p.arcs.is_empty() && p.setup.is_empty() && p.hold.is_empty());
+        assert_eq!(p.unmodelled_checks, ["non_seq_setup_rising", "non_seq_hold_rising"]);
+        let back = crate::libcache::decode(&crate::libcache::encode(&lib)).unwrap();
+        assert_eq!(back.cell("CKMUX").unwrap().pins["CLKSEL"].unmodelled_checks, p.unmodelled_checks);
+    }
 }
 
 /// The reference reads a gzipped Liberty directly; so does `Lib::load` (with `gzip`).

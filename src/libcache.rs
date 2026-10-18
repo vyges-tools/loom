@@ -19,7 +19,8 @@ use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, OutEdges, Pin, Pi
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLCE"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLCF"; // Vyges Liberty Cache — bump the trailing digit on any format change
+                                 // VLCF: Pin gained `unmodelled_checks`.
                                  // VLCE: Cell gained `dont_use`.
                                  // VLCC: bare-number table rows; tables padded to their axes.
                                  // VLCB: an arc with no timing_sense takes it from the pin's function.
@@ -307,6 +308,10 @@ fn enc_pin(w: &mut W, p: &Pin) {
     for c in [p.caps.rise_min, p.caps.rise_max, p.caps.fall_min, p.caps.fall_max] {
         w.f64(c);
     }
+    w.u64(p.unmodelled_checks.len() as u64);
+    for c in &p.unmodelled_checks {
+        w.s(c);
+    }
 }
 fn dec_pin(r: &mut R) -> Option<Pin> {
     let name = r.s()?;
@@ -350,6 +355,10 @@ fn dec_pin(r: &mut R) -> Option<Pin> {
         arcs.push(dec_arc(r)?);
     }
     let caps = PinCaps { rise_min: r.f64()?, rise_max: r.f64()?, fall_min: r.f64()?, fall_max: r.f64()? };
+    let mut unmodelled_checks = Vec::new();
+    for _ in 0..r.u64()? {
+        unmodelled_checks.push(r.s()?);
+    }
     Some(Pin {
         name,
         direction,
@@ -365,6 +374,7 @@ fn dec_pin(r: &mut R) -> Option<Pin> {
         recovery,
         removal,
         arcs,
+        unmodelled_checks,
     })
 }
 
