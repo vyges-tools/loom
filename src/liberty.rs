@@ -241,10 +241,10 @@ pub struct Pin {
     /// table to an async pin is not an approximation, it is the wrong check.
     pub removal: Vec<Constraint>,
     pub arcs: Vec<Arc>, // delay arcs (e.g. CK->Q on a flop output)
-    /// CHECK `timing_type`s on this pin that the reader does not model (`non_seq_setup_rising`,
-    /// `skew_*`, `min_pulse_width`, `minimum_period`), as written, once each. Not delay arcs and
-    /// not applied — kept so a timer can SAY a check the reference makes was left out, where
-    /// dropping them left a design checked only by them with an empty report.
+    /// What the reader does not model on this pin, as written, once each: CHECK `timing_type`s
+    /// (`non_seq_setup_rising`, `skew_*`, `min_pulse_width`, `minimum_period`) and an arc's
+    /// `retaining_rise` / `retaining_fall` contamination tables. Not applied — kept so a timer can
+    /// SAY what the reference does that it left out, rather than drop it in silence.
     pub unmodelled_checks: Vec<String>,
     /// `three_state` (the DISABLE expression), for `derive_senses`.
     pub(crate) three_state: Option<String>,
@@ -1085,6 +1085,13 @@ fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
     for g in pin_groups.iter().filter(|g| g.kw == "timing") {
         let tbody = &body[g.body.clone()];
         let (town, tspans) = level(tbody);
+        // `retaining_rise/_fall` (+ `retain_*_slew`): the arc's contamination delay, which the
+        // reference times the MIN analysis with. Not read; named, so a timer can say so.
+        for (kw, _, _) in top_groups(tbody) {
+            if (kw == "retaining_rise" || kw == "retaining_fall") && !unmodelled_checks.contains(&kw) {
+                unmodelled_checks.push(kw);
+            }
+        }
         match simple_attr(&town, "timing_type").as_deref() {
             Some(tt) if tt.starts_with("setup") => setup.push(parse_constraint(tbody, &tspans, ctx)),
             Some(tt) if tt.starts_with("hold") => hold.push(parse_constraint(tbody, &tspans, ctx)),
@@ -2454,6 +2461,15 @@ mod unmodelled_check_tests {
         let p = &lib.cell("CKMUX").unwrap().pins["CLKSEL"];
         assert!(p.arcs.is_empty() && p.setup.is_empty() && p.hold.is_empty());
         assert_eq!(p.unmodelled_checks, ["non_seq_setup_rising", "non_seq_hold_rising"]);
+        let r = Lib::parse(
+            r#"library (r) { cell (B) { pin (A) { direction : input; capacitance : 0.001; }
+  pin (Y) { direction : output; function : "A";
+    timing () { related_pin : "A"; cell_rise (s) { values ("4.0"); } cell_fall (s) { values ("5.0"); }
+      rise_transition (s) { values ("0.4"); } fall_transition (s) { values ("0.5"); }
+      retaining_rise (s) { values ("1.0"); } retaining_fall (s) { values ("1.2"); } } } } }"#,
+        )
+        .unwrap();
+        assert_eq!(r.cell("B").unwrap().pins["Y"].unmodelled_checks, ["retaining_rise", "retaining_fall"]);
         let back = crate::libcache::decode(&crate::libcache::encode(&lib)).unwrap();
         assert_eq!(back.cell("CKMUX").unwrap().pins["CLKSEL"].unmodelled_checks, p.unmodelled_checks);
     }
