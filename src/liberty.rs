@@ -1956,7 +1956,10 @@ impl Lib {
     /// Cached content-addressed so the same lib parses once: in-process (#37) →
     /// on-disk cross-process (`VYGES_LIB_CACHE`, #37/#38) → parse.
     pub fn load_opts(path: &str, opts: LibOpts) -> Result<Lib, LibError> {
-        let text = std::fs::read_to_string(path).map_err(|e| LibError(format!("{path}: {e}")))?;
+        // Inflated when gzipped and read lossily, as the netlist reader does: the reference reads
+        // a `.lib.gz` directly (its own test libraries, and asap7's, ship that way), and a
+        // comment in a legacy code page must not make a whole library unreadable.
+        let text = crate::netlist::read_text(path).map_err(|e| LibError(e.0))?;
         let text = splice_includes(text);
         // keyed on the file as read (its includes spliced in): a cache hit costs no lexing at all
         let key = lib_cache_key(&text, opts);
@@ -2416,6 +2419,26 @@ fn internal_values(cell_body: &str) -> Vec<f64> {
         at = after;
     }
     out
+}
+
+/// The reference reads a gzipped Liberty directly; so does `Lib::load` (with `gzip`).
+#[cfg(all(test, feature = "gzip"))]
+mod gzip_tests {
+    use super::*;
+
+    #[test]
+    fn a_gzipped_library_loads_as_its_text() {
+        let text = "library (z) { cell (INV) { pin (A) { direction : input; capacitance : 0.002; } pin (Y) { direction : output; function : \"!A\"; } } }\n";
+        let mut g = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+        g.extend(miniz_oxide::deflate::compress_to_vec(text.as_bytes(), 6));
+        g.extend_from_slice(&[0; 4]);
+        g.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        let f = std::env::temp_dir().join(format!("loom-lib-gz-{}.lib.gz", std::process::id()));
+        std::fs::write(&f, g).unwrap();
+        let lib = Lib::load(f.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&f);
+        assert!((lib.cell("INV").unwrap().pins["A"].capacitance - 0.002).abs() < 1e-9);
+    }
 }
 
 #[cfg(test)]
