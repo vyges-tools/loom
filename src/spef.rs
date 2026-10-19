@@ -425,64 +425,93 @@ impl NetRc {
         // Same node capacitances the Pi reduction sees — one source, so the two walks
         // cannot drift apart.
         let mut cap = self.node_caps(driver, xtalk_cap_ff, pin_cap_ff)?;
-        // adjacency
-        let mut adj: HashMap<&str, Vec<(&str, f64)>> = HashMap::new();
-        for (a, b, r) in &self.res {
-            adj.entry(a).or_default().push((b, *r));
-            adj.entry(b).or_default().push((a, *r));
+        // Each node's resistors in file order, each resistor under both its ends, as the
+        // reference's parasitic network lists them.
+        let mut rmap: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (k, (a, b, _)) in self.res.iter().enumerate() {
+            rmap.entry(a).or_default().push(k);
+            rmap.entry(b).or_default().push(k);
             cap.entry(a.as_str()).or_default();
             cap.entry(b.as_str()).or_default();
         }
-        if !adj.contains_key(driver) {
+        if !rmap.contains_key(driver) {
             return None;
         }
-        // BFS tree from the driver; record parent + parent-edge R, in visit order
-        let mut parent: HashMap<&str, (&str, f64)> = HashMap::new();
-        let mut order: Vec<&str> = vec![driver];
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        seen.insert(driver);
-        let mut head = 0;
-        while head < order.len() {
-            let u = order[head];
-            head += 1;
-            for &(v, r) in adj.get(u).map(|x| x.as_slice()).unwrap_or(&[]) {
-                if !seen.insert(v) {
-                    if parent.get(u).map(|p| p.0) != Some(v) {
-                        return None; // a cycle reached an already-visited node -> not a tree
-                    }
+        let other = |k: usize, node: &str| -> &str {
+            let (a, b, _) = &self.res[k];
+            if a == node { b } else { a }
+        };
+        // `ReduceToPi::reducePiDfs`, the part the delays need: depth first from the driver, each
+        // node's DOWNSTREAM capacitance; a resistor back to a node on the current path is a loop
+        // and is never walked again. A resistor whose two ends are one node (an extractor's — and
+        // every placement estimate's driver — self-resistor) and the one just come over are
+        // skipped. The walk is the reference's spanning tree, in its order.
+        #[allow(clippy::too_many_arguments)]
+        fn down<'a>(
+            node: &'a str,
+            from: Option<usize>,
+            rmap: &HashMap<&'a str, Vec<usize>>,
+            cap: &HashMap<&'a str, f64>,
+            other: &dyn Fn(usize, &'a str) -> &'a str,
+            on_path: &mut std::collections::HashSet<&'a str>,
+            loops: &mut std::collections::HashSet<usize>,
+            dwn: &mut HashMap<&'a str, f64>,
+        ) -> f64 {
+            let mut d = cap.get(node).copied().unwrap_or(0.0);
+            on_path.insert(node);
+            for &k in rmap.get(node).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if loops.contains(&k) {
                     continue;
                 }
-                parent.insert(v, (u, r));
-                order.push(v);
+                let o = other(k, node);
+                if o != node && Some(k) != from {
+                    if on_path.contains(o) {
+                        loops.insert(k);
+                    } else {
+                        d += down(o, Some(k), rmap, cap, other, on_path, loops, dwn);
+                    }
+                }
             }
+            dwn.insert(node, d);
+            on_path.remove(node);
+            d
         }
-        // subtree caps: reverse BFS order accumulates child caps into parents
-        let mut sub: HashMap<&str, f64> = HashMap::new();
-        for &nd in &order {
-            *sub.entry(nd).or_default() += cap.get(nd).copied().unwrap_or(0.0);
+        // `ReduceToPiElmore::reduceElmoreDfs`: the second walk, each node's Elmore delay from its
+        // parent's and the resistor times the node's downstream capacitance.
+        #[allow(clippy::too_many_arguments)]
+        fn elm<'a>(
+            node: &'a str,
+            from: Option<usize>,
+            elmore: f64,
+            res: &[(String, String, f64)],
+            rmap: &HashMap<&'a str, Vec<usize>>,
+            other: &dyn Fn(usize, &'a str) -> &'a str,
+            dwn: &HashMap<&'a str, f64>,
+            loops: &std::collections::HashSet<usize>,
+            on_path: &mut std::collections::HashSet<&'a str>,
+            delay: &mut BTreeMap<String, f64>,
+        ) {
+            delay.insert(node.to_string(), elmore);
+            on_path.insert(node);
+            for &k in rmap.get(node).map(|v| v.as_slice()).unwrap_or(&[]) {
+                let o = other(k, node);
+                if Some(k) != from && !on_path.contains(o) && !loops.contains(&k) {
+                    // ⛔ TYPES, from the reference (see `cpp-to-rust-numeric-reference.md` §1):
+                    //   `double onode_elmore = elmore + r * downstreamCap(onode);`
+                    // where BOTH `Parasitics::value(ParasiticResistor*)` and
+                    // `ReduceToPi::downstreamCap` return **float**. So the per-step increment is
+                    // an f32 multiply — about 7 significant digits — and only the running sum is
+                    // double.
+                    let inc = (res[k].2 as f32 * dwn[o] as f32) as f64 * 1e-6; // R[Ω]·C[fF] -> ns
+                    elm(o, Some(k), elmore + inc, res, rmap, other, dwn, loops, on_path, delay);
+                }
+            }
+            on_path.remove(node);
         }
-        for &nd in order.iter().skip(1).rev() {
-            let (p, _) = parent[nd];
-            let add = sub[nd];
-            *sub.get_mut(p).unwrap() += add;
-        }
-        // delays: delay[child] = delay[parent] + R_edge * subtree_cap[child]
+        let (mut on_path, mut loops, mut dwn) = (std::collections::HashSet::new(), std::collections::HashSet::new(), HashMap::new());
+        down(driver, None, &rmap, &cap, &other, &mut on_path, &mut loops, &mut dwn);
         let mut delay: BTreeMap<String, f64> = BTreeMap::new();
-        delay.insert(driver.to_string(), 0.0);
-        for &nd in order.iter().skip(1) {
-            let (p, r) = parent[nd];
-            // ⛔ TYPES, from the reference (see `cpp-to-rust-numeric-reference.md` §1):
-            // `ReduceToPiElmore::reduceElmoreDfs` computes
-            //   `double onode_elmore = elmore + r * downstreamCap(onode);`
-            // where BOTH `Parasitics::value(ParasiticResistor*)` and
-            // `ReduceToPi::downstreamCap` return **float**. So the per-step increment is an
-            // f32 multiply — about 7 significant digits — and only the running sum is
-            // double. Computing the increment in f64 is MORE ACCURATE than the reference,
-            // which is a divergence here, not an improvement.
-            let inc = (r as f32 * sub[nd] as f32) as f64 * 1e-6; // R[Ω]·C[fF] -> ns
-            let d = delay[p] + inc;
-            delay.insert(nd.to_string(), d);
-        }
+        elm(driver, None, 0.0, &self.res, &rmap, &other, &dwn, &loops, &mut on_path, &mut delay);
         Some(delay)
     }
 
@@ -1925,6 +1954,29 @@ mod name_map_optional_tests {
 3 sig:1 u_snk:A 30.0
 *END
 "#;
+
+    /// The delays walk the network as the reference does (`reducePiDfs` then `reduceElmoreDfs`):
+    /// depth first from the driver, a resistor whose two ends are one node skipped, and a
+    /// resistor back to a node already on the path a loop, never walked. Every placement
+    /// estimate writes a self-resistor on its driver's node; refusing the network as "not a
+    /// tree" left every net of a placed design on the lumped fallback.
+    #[test]
+    fn a_self_resistor_and_a_loop_are_walked_as_the_reference_walks_them() {
+        let net = |extra: &str| {
+            Spef::parse(&LITERAL.replace("3 sig:1 u_snk:A 30.0\n", &format!("3 sig:1 u_snk:A 30.0\n{extra}")))
+        };
+        let delay = |s: &Spef| -> f64 {
+            let rc = &s.nets["sig"];
+            *rc.elmore("u_drv:Y", 0.0, &BTreeMap::new()).expect("a network to walk").get("u_snk:A").expect("sink reached")
+        };
+        let tree = delay(&net(""));
+        // R·C downstream, ohm·fF -> 1e-6 ns: 40·12.5 + 10·7.5 + 30·0 = 575 -> 5.75e-4
+        assert!((tree - 5.75e-4).abs() < 1e-12, "{tree}");
+        assert_eq!(delay(&net("4 sig:0 sig:0 1.0\n")), tree, "a self-resistor changes nothing");
+        // a second resistor from the driver to sig:1 closes a loop: the depth-first walk takes the
+        // file's first path (u_drv:Y -> sig:0 -> sig:1) and marks the closing resistor a loop
+        assert_eq!(delay(&net("4 u_drv:Y sig:1 5.0\n")), tree, "the loop resistor is not walked");
+    }
 
     #[test]
     fn a_literal_named_spef_does_not_parse_to_nothing() {
