@@ -19,7 +19,8 @@ use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, OutEdges, Pin, Pi
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLCF"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLCG"; // Vyges Liberty Cache — bump the trailing digit on any format change
+                                 // VLCG: Constraint gained `clk_edge` + `related_pin`.
                                  // VLCF: Pin gained `unmodelled_checks`.
                                  // VLCE: Cell gained `dont_use`.
                                  // VLCC: bare-number table rows; tables padded to their axes.
@@ -169,11 +170,20 @@ fn dec_ccs(r: &mut R) -> Option<CcsArc> {
 fn enc_constraint(w: &mut W, c: &Constraint) {
     enc_table(w, &c.rise);
     enc_table(w, &c.fall);
+    // The check's clock edge: dropped here, a negative-edge register would be checked at the
+    // rising edge again on every warm-cache run.
+    w.u8(match c.clk_edge {
+        ClkEdge::Rise => 0,
+        ClkEdge::Fall => 1,
+    });
+    w.s(&c.related_pin);
 }
 fn dec_constraint(r: &mut R) -> Option<Constraint> {
     Some(Constraint {
         rise: dec_table(r)?,
         fall: dec_table(r)?,
+        clk_edge: if r.u8()? == 1 { ClkEdge::Fall } else { ClkEdge::Rise },
+        related_pin: r.s()?,
     })
 }
 
@@ -709,6 +719,33 @@ library (seqdemo) {
         assert_eq!(edge(&back, "DFF", "Q"), Some(ClkEdge::Rise));
         assert_eq!(edge(&back, "DFFN", "Q"), Some(ClkEdge::Fall));
         assert_eq!(edge(&back, "BUF", "X"), None);
+    }
+
+    /// A CHECK's clock edge and related pin survive the cache, as an arc's edge does: a
+    /// negative-edge register read back as rising would be checked half a period wrong, and
+    /// only on a warm cache.
+    #[test]
+    fn a_checks_clock_edge_and_related_pin_survive_the_cache() {
+        const NEG: &str = r#"
+library (neg) {
+  capacitive_load_unit (1, pf);
+  cell (DFFN) {
+    pin (CLK) { direction : input; clock : true; capacitance : 0.001; }
+    pin (D) {
+      direction : input; capacitance : 0.001;
+      timing () { related_pin : "CLK"; timing_type : setup_falling; rise_constraint (s) { values ("0.05"); } }
+      timing () { related_pin : "CLK"; timing_type : hold_falling; rise_constraint (s) { values ("0.02"); } }
+    }
+  }
+}
+"#;
+        let lib = Lib::parse(NEG).unwrap();
+        let back = decode(&encode(&lib)).expect("decode");
+        for l in [&lib, &back] {
+            let d = &l.cells["DFFN"].pins["D"];
+            assert_eq!((d.setup[0].clk_edge, d.setup[0].related_pin.as_str()), (ClkEdge::Fall, "CLK"));
+            assert_eq!((d.hold[0].clk_edge, d.hold[0].related_pin.as_str()), (ClkEdge::Fall, "CLK"));
+        }
     }
 
     #[test]

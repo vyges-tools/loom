@@ -34,8 +34,12 @@ pub struct Table {
 /// `non_unate` and every input edge appears to drive every output edge. A flop's CK->Q may
 /// be launched by ONE clock edge; letting the other launch it is how a min-delay pass ends
 /// up carrying the FALLING edge of the clock into the data path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// A timing CHECK names its clock edge the same way (`setup_rising` / `hold_falling` …): see
+/// [`Constraint::clk_edge`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ClkEdge {
+    #[default]
     Rise,
     Fall,
 }
@@ -104,6 +108,15 @@ pub struct Arc {
 pub struct Constraint {
     pub rise: Table,
     pub fall: Table,
+    /// The clock edge the check is made at: `Rise` for `setup_rising` / `hold_rising` /
+    /// `recovery_rising` / `removal_rising`, `Fall` for the `_falling` forms. The reference
+    /// builds the check arc from that edge of the related pin, and its cycle accounting
+    /// pairs the launching edge with THIS one — a negative-edge register is captured half a
+    /// period from a rising launch.
+    pub clk_edge: ClkEdge,
+    /// The pin the check is made against (`related_pin`), as written: a cell with two clock
+    /// pins (a dual-port SRAM) checks each data pin against its own.
+    pub related_pin: String,
 }
 
 impl Constraint {
@@ -1033,10 +1046,12 @@ fn parse_ccs_set(timing_body: &str, group: &str) -> Vec<crate::ccs::CcsWaveform>
 }
 
 /// Parse a setup/hold constraint group's rise/fall tables.
-fn parse_constraint(timing_body: &str, spans: &[GroupSpan], ctx: &Ctx) -> Constraint {
+fn parse_constraint(timing_body: &str, spans: &[GroupSpan], ctx: &Ctx, own: &str, timing_type: &str) -> Constraint {
     Constraint {
         rise: span_table(timing_body, spans, "rise_constraint", ctx, Axes::RelatedConstrained),
         fall: span_table(timing_body, spans, "fall_constraint", ctx, Axes::RelatedConstrained),
+        clk_edge: if timing_type.ends_with("_falling") { ClkEdge::Fall } else { ClkEdge::Rise },
+        related_pin: simple_attr(own, "related_pin").unwrap_or_default(),
     }
 }
 
@@ -1093,13 +1108,13 @@ fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
             }
         }
         match simple_attr(&town, "timing_type").as_deref() {
-            Some(tt) if tt.starts_with("setup") => setup.push(parse_constraint(tbody, &tspans, ctx)),
-            Some(tt) if tt.starts_with("hold") => hold.push(parse_constraint(tbody, &tspans, ctx)),
+            Some(tt) if tt.starts_with("setup") => setup.push(parse_constraint(tbody, &tspans, ctx, &town, tt)),
+            Some(tt) if tt.starts_with("hold") => hold.push(parse_constraint(tbody, &tspans, ctx, &town, tt)),
             // recovery/removal are CHECKS on the async set/reset pin, with their own
             // tables — kept, and applied by the timer as the async counterparts of
             // setup/hold. They are not max-delay data arcs.
-            Some(tt) if tt.starts_with("recovery") => recovery.push(parse_constraint(tbody, &tspans, ctx)),
-            Some(tt) if tt.starts_with("removal") => removal.push(parse_constraint(tbody, &tspans, ctx)),
+            Some(tt) if tt.starts_with("recovery") => recovery.push(parse_constraint(tbody, &tspans, ctx, &town, tt)),
+            Some(tt) if tt.starts_with("removal") => removal.push(parse_constraint(tbody, &tspans, ctx, &town, tt)),
             // DELAY arcs, by the reference's own list; a
             // missing `timing_type` is combinational.
             None
@@ -3136,6 +3151,25 @@ mod table_axis_tests {
                rise_constraint ({tpl}) {{ values ({values}); }} fall_constraint ({tpl}) {{ values ({values}); }} }} }}"
         ));
         l.cell("C").unwrap().pins["D"].setup[0].clone()
+    }
+
+    /// A check keeps the clock edge its `timing_type` names and the pin it is related to. The
+    /// reference builds each check arc from that edge of `related_pin`; a dual-port SRAM checks
+    /// `addr1` against `clk1`, not the cell's first clock pin.
+    #[test]
+    fn a_check_keeps_its_clock_edge_and_related_pin() {
+        let l = lib(TPL, "pin (clk0) { direction : input; clock : true; }
+             pin (clk1) { direction : input; clock : true; }
+             pin (a0) { direction : input; timing () { related_pin : \"clk0\"; timing_type : setup_rising;
+               rise_constraint (rc) { values (\"1, 2\", \"3, 4\"); } } }
+             pin (a1) { direction : input; timing () { related_pin : \"clk1\"; timing_type : setup_falling;
+               rise_constraint (rc) { values (\"1, 2\", \"3, 4\"); } }
+               timing () { related_pin : \"clk1\"; timing_type : removal_falling;
+               rise_constraint (rc) { values (\"1, 2\", \"3, 4\"); } } }");
+        let c = l.cell("C").unwrap();
+        assert_eq!((c.pins["a0"].setup[0].clk_edge, c.pins["a0"].setup[0].related_pin.as_str()), (ClkEdge::Rise, "clk0"));
+        assert_eq!((c.pins["a1"].setup[0].clk_edge, c.pins["a1"].setup[0].related_pin.as_str()), (ClkEdge::Fall, "clk1"));
+        assert_eq!(c.pins["a1"].removal[0].clk_edge, ClkEdge::Fall);
     }
 
     /// The same check written related-first and constrained-first reads the same — at
