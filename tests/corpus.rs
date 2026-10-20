@@ -479,6 +479,7 @@ fn the_fst_reader_agrees_with_the_vcd_reader_on_every_pair() {
     announce("VCD/FST pairs", &pairs);
     let mut bad = Vec::new();
     let mut aborted = Vec::new();
+    let mut short = Vec::new();
     for v in &pairs {
         let f = v.with_extension("fst");
         let (Ok(a), Ok(b)) = (Vcd::load(v.to_str().unwrap()), Fst::load(f.to_str().unwrap())) else {
@@ -496,8 +497,16 @@ fn the_fst_reader_agrees_with_the_vcd_reader_on_every_pair() {
         if (a.sim_time_s - b.sim_time_s).abs() > 1e-15 * a.sim_time_s.max(1.0) {
             bad.push(format!("{}: sim time vcd {:e} fst {:e}", show(v), a.sim_time_s, b.sim_time_s));
         }
+        let filled = buses_given_a_lone_one(v);
+        if !filled.is_empty() {
+            short.push(format!("{} ({})", show(v), filled.len()));
+        }
+        let is_filled = |path: &str| filled.iter().any(|bus| path.starts_with(bus.as_str()));
         let mut shown = 0;
         for (path, n) in &a.idx.toggles {
+            if is_filled(path) {
+                continue;
+            }
             let m = b.idx.toggles.get(path).copied();
             if m != Some(*n) {
                 bad.push(format!("{}: {path} vcd={n} fst={m:?}", show(v)));
@@ -510,7 +519,7 @@ fn the_fst_reader_agrees_with_the_vcd_reader_on_every_pair() {
         // A net that never toggles gets no entry from either reader, but they can disagree
         // about WHICH those are — so compare on the union, treating a missing key as zero.
         for (path, m) in &b.idx.toggles {
-            if !a.idx.toggles.contains_key(path) && *m > 0.0 {
+            if !a.idx.toggles.contains_key(path) && *m > 0.0 && !is_filled(path) {
                 bad.push(format!("{}: {path} vcd=absent fst={m}", show(v)));
                 break;
             }
@@ -519,7 +528,57 @@ fn the_fst_reader_agrees_with_the_vcd_reader_on_every_pair() {
     if !aborted.is_empty() {
         println!("  {} aborted dump(s) skipped: {}", aborted.len(), aborted.join(", "));
     }
+    if !short.is_empty() {
+        println!("  {} file(s) with buses given a lone `1`, those buses skipped", short.len());
+    }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// The `<scope>.<name>[` prefixes of the multi-bit vars a VCD gives a one-character `1`.
+///
+/// The reference fills every bit from a lone character, so the VCD reader counts `b1` on a
+/// 4-bit bus as `1111`; a converter stores the VCD standard's `0001` in the FST. The two files
+/// then hold different bits, and the readers cannot agree on that bus -- each is right about
+/// its own file (`counts_known_by_construction_are_reproduced_exactly` holds both to number).
+#[cfg(feature = "fst")]
+fn buses_given_a_lone_one(vcd: &std::path::Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(vcd) else { return Vec::new() };
+    let mut scopes: Vec<&str> = Vec::new();
+    let mut buses: std::collections::HashMap<&str, Vec<String>> = Default::default();
+    let mut filled = std::collections::BTreeSet::new();
+    let mut words = text.split_ascii_whitespace();
+    while let Some(w) = words.next() {
+        match w {
+            "$scope" => {
+                words.next();
+                scopes.extend(words.next());
+            }
+            "$upscope" => {
+                scopes.pop();
+            }
+            "$var" => {
+                let (_, Some(width), Some(code), Some(name)) =
+                    (words.next(), words.next(), words.next(), words.next())
+                else {
+                    break;
+                };
+                if width.parse::<u32>().is_ok_and(|n| n > 1) {
+                    let leaf = name.trim_start_matches('\\').split('[').next().unwrap_or(name);
+                    let mut path: Vec<&str> =
+                        scopes.iter().map(|s| s.trim_start_matches('\\')).collect();
+                    path.push(leaf);
+                    buses.entry(code).or_default().push(format!("{}[", path.join(".")));
+                }
+            }
+            "b1" | "B1" => {
+                if let Some(names) = words.next().and_then(|code| buses.get(code)) {
+                    filled.extend(names.iter().cloned());
+                }
+            }
+            _ => {}
+        }
+    }
+    filled.into_iter().collect()
 }
 
 /// **Toggle counts known BY CONSTRUCTION.**
@@ -527,8 +586,9 @@ fn the_fst_reader_agrees_with_the_vcd_reader_on_every_pair() {
 /// A generator writes VCDs and, because it decides every value change itself, records the
 /// expected count as arithmetic rather than by asking any tool. Both readers must reproduce it
 /// exactly. Where a `.fst` sits alongside (produced by GTKWave's `vcd2fst`), the binary reader
-/// is held to the same number — so the chain is: our arithmetic, an external converter, and two
-/// independently written parsers, all agreeing or the test fails.
+/// is held to `.fst-expected`, the same arithmetic over the bits the converter stores (a lone
+/// `b1` at full width, not filled) — so the chain is: our arithmetic, an external converter, and
+/// two independently written parsers, all agreeing or the test fails.
 ///
 /// This is the one check here that can be made arbitrarily exhaustive: generate more files.
 /// The generator deliberately emits x/z excursions and `$dumpoff` windows, which is where four
@@ -539,6 +599,14 @@ fn the_fst_reader_agrees_with_the_vcd_reader_on_every_pair() {
 /// for f in /tmp/vcdgen/*.vcd; do vcd2fst "$f" "${f%.vcd}.fst"; done
 /// VYGES_CORPUS=/tmp/vcdgen cargo test --features fst --test corpus counts_known
 /// ```
+/// `net<TAB>count` lines, as `tools/gen_vcd.py` writes them.
+fn parse_expected(txt: &str) -> std::collections::BTreeMap<&str, f64> {
+    txt.lines()
+        .filter_map(|l| l.split_once('\t'))
+        .filter_map(|(k, v)| v.trim().parse().ok().map(|n| (k, n)))
+        .collect()
+}
+
 #[test]
 fn counts_known_by_construction_are_reproduced_exactly() {
     let files: Vec<PathBuf> = corpus(&[".vcd"])
@@ -549,11 +617,7 @@ fn counts_known_by_construction_are_reproduced_exactly() {
     let mut bad = Vec::new();
     for f in &files {
         let Ok(exp_txt) = std::fs::read_to_string(f.with_extension("expected")) else { continue };
-        let expected: std::collections::BTreeMap<&str, f64> = exp_txt
-            .lines()
-            .filter_map(|l| l.split_once('\t'))
-            .filter_map(|(k, v)| v.trim().parse().ok().map(|n| (k, n)))
-            .collect();
+        let expected = parse_expected(&exp_txt);
         let Ok(v) = Vcd::load(f.to_str().unwrap()) else {
             bad.push(format!("{}: vcd would not load", show(f)));
             continue;
@@ -576,7 +640,13 @@ fn counts_known_by_construction_are_reproduced_exactly() {
                 match vyges_loom::fst::Fst::load(fp.to_str().unwrap()) {
                     Err(e) => bad.push(format!("{}: fst would not load: {e}", show(f))),
                     Ok(b) => {
-                        for (net, want) in &expected {
+                        // A converter stores a short bus value at full width, extended as the
+                        // VCD standard says, so the FST is held to `.fst-expected` when the
+                        // generator wrote one (a lone `b1` fills under the reference's VCD rule;
+                        // the FST holds `0..01`).
+                        let fst_txt = std::fs::read_to_string(f.with_extension("fst-expected")).ok();
+                        let fst_expected = fst_txt.as_deref().map(parse_expected);
+                        for (net, want) in fst_expected.as_ref().unwrap_or(&expected) {
                             let got = b.idx.toggles.get(*net).copied().unwrap_or(0.0);
                             if got != *want {
                                 bad.push(format!("{}: FST {net} want {want} got {got}", show(f)));

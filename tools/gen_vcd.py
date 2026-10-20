@@ -41,10 +41,14 @@ def gen(seed, path):
     # what the reader last SAW: scalars upper-cased, vector bits raw
     cur = {n: None for n, _ in scal}
     vcur = {n: [None] * w for n, _, w in vecs}
+    # the same, for the bits an FST converted from this file holds
+    fexp = dict(exp)
+    fcur = {n: [None] * w for n, _, w in vecs}
 
     def see_s(n, v):
         v = v.upper()
         exp[f"top.{n}"] += weight(cur[n], v)
+        fexp[f"top.{n}"] += weight(cur[n], v)
         cur[n] = v
 
     def see_v(n, w, written):
@@ -53,6 +57,10 @@ def gen(seed, path):
             # bit i of a [w-1:0] vector is named [w-1-i]
             exp[f"top.{n}[{w-1-i}]"] += weight(vcur[n][i], b)
             vcur[n][i] = b
+        pad = written[0] if written[0] in "xzXZ" else "0"
+        for i, b in enumerate(pad * (w - len(written)) + written):
+            fexp[f"top.{n}[{w-1-i}]"] += weight(fcur[n][i], b)
+            fcur[n][i] = b
 
     lines.append("#0")
     lines.append("$dumpvars")
@@ -129,6 +137,9 @@ def gen(seed, path):
     with open(path + ".expected", "w") as fh:
         for k in sorted(exp):
             fh.write(f"{k}\t{exp[k]:g}\n")
+    with open(path + ".fst-expected", "w") as fh:
+        for k in sorted(fexp):
+            fh.write(f"{k}\t{fexp[k]:g}\n")
 
 if __name__ == "__main__":
     out = sys.argv[1]
