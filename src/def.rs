@@ -634,9 +634,10 @@ fn parse_signal(
                 // there and tie distant parts of it together, which is a loop in the
                 // extracted RC. Skip the keyword AND its group.
                 //
-                // The patch's own area is not modelled; it is a via-landing enlargement,
-                // typically a few tenths of a micron square. Dropping it understates that
-                // net's capacitance slightly. Drawing a wire across the die does much worse.
+                // The patch itself is dropped, as the reference's extraction drops it: its RC
+                // network is built from the wire's paths, which hide patches, and a patch's shape
+                // has no RC segment to charge — a routed design extracted with and without its
+                // patches gives the same parasitics there, net for net.
                 "RECT" => {
                     i += 1;
                     if t.get(i).map(String::as_str) == Some("(") {
