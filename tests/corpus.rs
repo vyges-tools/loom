@@ -443,8 +443,8 @@ fn activity_partitions_across_windows() {
         };
         // compare on the FULL hierarchical path, so leaf-name ambiguity plays no part
         for (path, n) in &whole.idx.toggles {
-            let split = a.idx.toggles.get(path).copied().unwrap_or(0)
-                + b.idx.toggles.get(path).copied().unwrap_or(0);
+            let split = a.idx.toggles.get(path).copied().unwrap_or(0.0)
+                + b.idx.toggles.get(path).copied().unwrap_or(0.0);
             if *n != split {
                 bad.push(format!("{}: {path} whole={n} halves={split}", show(f)));
                 break;
@@ -510,7 +510,7 @@ fn the_fst_reader_agrees_with_the_vcd_reader_on_every_pair() {
         // A net that never toggles gets no entry from either reader, but they can disagree
         // about WHICH those are — so compare on the union, treating a missing key as zero.
         for (path, m) in &b.idx.toggles {
-            if !a.idx.toggles.contains_key(path) && *m > 0 {
+            if !a.idx.toggles.contains_key(path) && *m > 0.0 {
                 bad.push(format!("{}: {path} vcd=absent fst={m}", show(v)));
                 break;
             }
@@ -549,7 +549,7 @@ fn counts_known_by_construction_are_reproduced_exactly() {
     let mut bad = Vec::new();
     for f in &files {
         let Ok(exp_txt) = std::fs::read_to_string(f.with_extension("expected")) else { continue };
-        let expected: std::collections::BTreeMap<&str, u64> = exp_txt
+        let expected: std::collections::BTreeMap<&str, f64> = exp_txt
             .lines()
             .filter_map(|l| l.split_once('\t'))
             .filter_map(|(k, v)| v.trim().parse().ok().map(|n| (k, n)))
@@ -559,7 +559,7 @@ fn counts_known_by_construction_are_reproduced_exactly() {
             continue;
         };
         for (net, want) in &expected {
-            let got = v.idx.toggles.get(*net).copied().unwrap_or(0);
+            let got = v.idx.toggles.get(*net).copied().unwrap_or(0.0);
             if got != *want {
                 bad.push(format!("{}: VCD {net} want {want} got {got}", show(f)));
             }
@@ -577,7 +577,7 @@ fn counts_known_by_construction_are_reproduced_exactly() {
                     Err(e) => bad.push(format!("{}: fst would not load: {e}", show(f))),
                     Ok(b) => {
                         for (net, want) in &expected {
-                            let got = b.idx.toggles.get(*net).copied().unwrap_or(0);
+                            let got = b.idx.toggles.get(*net).copied().unwrap_or(0.0);
                             if got != *want {
                                 bad.push(format!("{}: FST {net} want {want} got {got}", show(f)));
                             }

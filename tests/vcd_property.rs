@@ -5,10 +5,12 @@
 //! no PDK, no external tool — so it runs on every `cargo test`, which is where a reader that
 //! decides how much power a design burns ought to be checked.
 //!
-//! The generator decides every value change itself, so the expected count is arithmetic. It
+//! The generator decides every value change itself, so the expected count is arithmetic — the
+//! reference's (`VcdCount::incrCounts`): every change counts one, a half when either side is
+//! `X`/`Z` (a scalar upper-cased first, a bus bit compared raw, so a bus `x` weighs one). It
 //! deliberately produces the cases that cost us four defects: `x`/`z` excursions, `$dumpoff`
-//! windows, vectors whose leading zeros are dropped, and one identifier code shared by two
-//! names.
+//! windows (an x-flood and its restore are changes like any other), vectors whose leading zeros
+//! are dropped, and one identifier code shared by two names.
 
 use std::collections::BTreeMap;
 
@@ -38,7 +40,18 @@ impl Rng {
 /// One generated dump plus the counts it must produce.
 struct Case {
     text: String,
-    expect: BTreeMap<String, u64>,
+    expect: BTreeMap<String, f64>,
+}
+
+/// The reference's weight of a change (see the module comment).
+fn weight(prev: char, cur: char) -> f64 {
+    if prev == cur {
+        0.0
+    } else if matches!(prev, 'X' | 'Z') || matches!(cur, 'X' | 'Z') {
+        0.5
+    } else {
+        1.0
+    }
 }
 
 fn generate(seed: u64) -> Case {
@@ -69,18 +82,21 @@ fn generate(seed: u64) -> Case {
         vecs.push((format!("v{i}"), c));
     }
 
-    let mut expect: BTreeMap<String, u64> = BTreeMap::new();
+    let mut expect: BTreeMap<String, f64> = BTreeMap::new();
+    // What the reader last saw: scalars upper-cased, vector bits raw and full width.
+    let mut cur_s: BTreeMap<String, char> = BTreeMap::new();
+    let mut cur_v: BTreeMap<String, Vec<char>> = BTreeMap::new();
     let mut last: BTreeMap<String, char> = BTreeMap::new();
     let mut vlast: BTreeMap<String, Vec<char>> = BTreeMap::new();
     for (n, _) in &scal {
-        expect.insert(format!("top.{n}"), 0);
+        expect.insert(format!("top.{n}"), 0.0);
     }
     if aliased {
-        expect.insert("top.s0_alias".into(), 0);
+        expect.insert("top.s0_alias".into(), 0.0);
     }
     for (n, _) in &vecs {
         for b in 0..vw {
-            expect.insert(format!("top.{n}[{b}]"), 0);
+            expect.insert(format!("top.{n}[{b}]"), 0.0);
         }
     }
 
@@ -89,13 +105,34 @@ fn generate(seed: u64) -> Case {
         let v = if r.chance(50) { '0' } else { '1' };
         body.push_str(&format!("{v}{c}\n"));
         last.insert(n.clone(), v);
+        cur_s.insert(n.clone(), v);
     }
     for (n, c) in &vecs {
         let bits: Vec<char> = (0..vw).map(|_| if r.chance(50) { '0' } else { '1' }).collect();
         body.push_str(&format!("b{} {c}\n", bits.iter().collect::<String>()));
+        cur_v.insert(n.clone(), bits.clone());
         vlast.insert(n.clone(), bits);
     }
     body.push_str("$end\n");
+
+    // A scalar written as `v`: weigh it against what the reader last saw.
+    let see_s = |expect: &mut BTreeMap<String, f64>, cur_s: &mut BTreeMap<String, char>, n: &str, v: char| {
+        let v = v.to_ascii_uppercase();
+        let w = weight(cur_s[n], v);
+        *expect.get_mut(&format!("top.{n}")).unwrap() += w;
+        if aliased && n == "s0" {
+            *expect.get_mut("top.s0_alias").unwrap() += w;
+        }
+        cur_s.insert(n.to_string(), v);
+    };
+    // A vector written as full-width `bits` (a one-character value fills every bit).
+    let see_v = |expect: &mut BTreeMap<String, f64>, cur_v: &mut BTreeMap<String, Vec<char>>, n: &str, bits: &[char]| {
+        for (i, b) in bits.iter().enumerate() {
+            // bit i of a [vw-1:0] vector is named [vw-1-i]
+            *expect.get_mut(&format!("top.{n}[{}]", vw - 1 - i)).unwrap() += weight(cur_v[n][i], *b);
+        }
+        cur_v.insert(n.to_string(), bits.to_vec());
+    };
 
     let mut t = 0u64;
     let mut dumping = true;
@@ -106,11 +143,13 @@ fn generate(seed: u64) -> Case {
             // a $dumpoff x-flood and its $dumpon restore are not activity
             if dumping {
                 body.push_str("$dumpoff\n");
-                for (_, c) in &scal {
+                for (n, c) in &scal {
                     body.push_str(&format!("x{c}\n"));
+                    see_s(&mut expect, &mut cur_s, n, 'x');
                 }
-                for (_, c) in &vecs {
+                for (n, c) in &vecs {
                     body.push_str(&format!("bx {c}\n"));
+                    see_v(&mut expect, &mut cur_v, n, &vec!['x'; vw]);
                 }
                 body.push_str("$end\n");
                 dumping = false;
@@ -118,9 +157,11 @@ fn generate(seed: u64) -> Case {
                 body.push_str("$dumpon\n");
                 for (n, c) in &scal {
                     body.push_str(&format!("{}{c}\n", last[n]));
+                    see_s(&mut expect, &mut cur_s, n, last[n]);
                 }
                 for (n, c) in &vecs {
                     body.push_str(&format!("b{} {c}\n", vlast[n].iter().collect::<String>()));
+                    see_v(&mut expect, &mut cur_v, n, &vlast[n]);
                 }
                 body.push_str("$end\n");
                 dumping = true;
@@ -146,14 +187,9 @@ fn generate(seed: u64) -> Case {
                 }
             };
             if v == '0' || v == '1' {
-                if last.get(n).is_some_and(|p| *p != v) {
-                    *expect.get_mut(&format!("top.{n}")).unwrap() += 1;
-                    if aliased && n == "s0" {
-                        *expect.get_mut("top.s0_alias").unwrap() += 1;
-                    }
-                }
                 last.insert(n.clone(), v);
             }
+            see_s(&mut expect, &mut cur_s, n, v);
             body.push_str(&format!("{v}{c}\n"));
         }
         for (n, c) in &vecs {
@@ -174,22 +210,23 @@ fn generate(seed: u64) -> Case {
                 })
                 .collect();
             for (i, b) in bits.iter().enumerate() {
-                if *b != '0' && *b != '1' {
-                    continue;
+                if *b == '0' || *b == '1' {
+                    vlast.get_mut(n).unwrap()[i] = *b;
                 }
-                let prev = vlast[n][i];
-                if (prev == '0' || prev == '1') && prev != *b {
-                    // bit i of a [vw-1:0] vector is named [vw-1-i]
-                    *expect.get_mut(&format!("top.{n}[{}]", vw - 1 - i)).unwrap() += 1;
-                }
-                vlast.get_mut(n).unwrap()[i] = *b;
             }
-            // VCD drops leading ZEROS, but a reader extends with the leading character when it
-            // is x or z — so a leading 0 must be kept when the next character is not 0 or 1.
+            // VCD drops leading ZEROS (a leading 0 kept before an x/z, which the standard would
+            // extend). The reference spreads what was WRITTEN: a one-character value fills
+            // every bit — so `b1` on a wide bus reads as all ones — and a longer one pads with 0.
             let mut sv: String = bits.iter().collect();
             while sv.len() > 1 && sv.starts_with('0') && matches!(sv.as_bytes()[1], b'0' | b'1') {
                 sv.remove(0);
             }
+            let read: Vec<char> = if sv.len() == 1 {
+                vec![sv.chars().next().unwrap(); vw]
+            } else {
+                std::iter::repeat_n('0', vw - sv.len()).chain(sv.chars()).collect()
+            };
+            see_v(&mut expect, &mut cur_v, n, &read);
             body.push_str(&format!("b{sv} {c}\n"));
         }
     }
@@ -220,7 +257,7 @@ fn generated_dumps_are_counted_exactly() {
             }
         };
         for (net, want) in &case.expect {
-            let got = v.idx.toggles.get(net).copied().unwrap_or(0);
+            let got = v.idx.toggles.get(net).copied().unwrap_or(0.0);
             if got != *want {
                 failures.push(format!("seed {seed}: {net} want {want} got {got}"));
             }
@@ -260,8 +297,8 @@ fn generated_dumps_partition_across_windows() {
             continue;
         };
         for (path, n) in &whole.idx.toggles {
-            let split = a.idx.toggles.get(path).copied().unwrap_or(0)
-                + b.idx.toggles.get(path).copied().unwrap_or(0);
+            let split = a.idx.toggles.get(path).copied().unwrap_or(0.0)
+                + b.idx.toggles.get(path).copied().unwrap_or(0.0);
             if *n != split {
                 failures.push(format!("seed {seed}: {path} whole={n} halves={split}"));
             }

@@ -14,8 +14,8 @@ fn vcd(decls: &str, body: &str) -> String {
     )
 }
 
-fn toggles(v: &Vcd, net: &str) -> u64 {
-    v.idx.resolve(net).unwrap_or(0)
+fn toggles(v: &Vcd, net: &str) -> f64 {
+    v.idx.resolve(net).unwrap_or(0.0)
 }
 
 #[test]
@@ -25,34 +25,36 @@ fn a_clean_dump_counts_transitions_not_values() {
         "#0\n0!\n#10\n1!\n#20\n0!\n#30\n1!\n#40\n",
     ))
     .unwrap();
-    assert_eq!(toggles(&v, "clk"), 3, "the initial value is not a transition");
+    assert_eq!(toggles(&v, "clk"), 3.0, "the initial value is not a transition");
     assert!((v.sim_time_s - 40e-9).abs() < 1e-18);
 }
 
-/// **`x` and `z` are not levels.** They are the absence of one, so they neither count as a
-/// transition nor replace what was known. Counting them inflated activity — and therefore
-/// dynamic power — on every net that is ever undriven or uninitialised.
+/// **A change to or from `x`/`z` weighs a half** (reference `VcdCount::incrCounts`; a scalar
+/// value is upper-cased first). Every change counts, so an excursion through an unknown and
+/// back is one transition, not none.
 #[test]
-fn unknown_values_do_not_count_as_transitions() {
-    // the net really did change, once, through an unknown
+fn unknown_values_weigh_a_half() {
     let through = Vcd::parse(&vcd("$var wire 1 ! n $end\n", "#0\n0!\n#10\nx!\n#20\nz!\n#30\n1!\n")).unwrap();
-    assert_eq!(toggles(&through, "n"), 1, "0 -> x -> z -> 1 is ONE toggle");
+    assert_eq!(toggles(&through, "n"), 1.5, "0 -> x -> z -> 1: three halves");
 
-    // and here it did not change at all
     let back = Vcd::parse(&vcd("$var wire 1 ! n $end\n", "#0\n0!\n#10\nx!\n#20\n0!\n")).unwrap();
-    assert_eq!(toggles(&back, "n"), 0, "0 -> x -> 0 is no toggle");
+    assert_eq!(toggles(&back, "n"), 1.0, "0 -> x -> 0: two halves");
+
+    // an initial x settling is a half too: the first value is never a change, the next one is
+    let settle = Vcd::parse(&vcd("$var wire 1 ! n $end\n", "#0\nx!\n#10\n0!\n#20\n")).unwrap();
+    assert_eq!(toggles(&settle, "n"), 0.5);
 }
 
-/// **`$dumpoff` writes `x` over every signal.** That is a statement about the dumper, not the
-/// circuit, and counting it charged every net in the design for transitions it never made.
+/// **`$dumpoff` writes `x` over every signal**, and the reference reads those values like any
+/// other: the x-flood and the `$dumpon` restore each weigh a half.
 #[test]
-fn a_dumpoff_window_contributes_no_activity() {
+fn a_dumpoff_window_is_read_as_values() {
     let v = Vcd::parse(&vcd(
         "$var wire 1 ! clk $end\n",
         "#0\n$dumpvars\n0!\n$end\n#10\n$dumpoff\nx!\n$end\n#20\n$dumpon\n0!\n$end\n#30\n1!\n",
     ))
     .unwrap();
-    assert_eq!(toggles(&v, "clk"), 1, "only the real 0->1 at #30");
+    assert_eq!(toggles(&v, "clk"), 2.0, "0 -> x and x -> 0 a half each, the 0 -> 1 at #30 one");
 }
 
 /// **One identifier code may name several signals.** A net and its port alias share a code, and
@@ -65,8 +67,8 @@ fn an_aliased_identifier_credits_every_name() {
         "#0\n0!\n#10\n1!\n#20\n0!\n",
     ))
     .unwrap();
-    assert_eq!(toggles(&v, "clk"), 2);
-    assert_eq!(toggles(&v, "clk_alias"), 2, "both names are the same signal");
+    assert_eq!(toggles(&v, "clk"), 2.0);
+    assert_eq!(toggles(&v, "clk_alias"), 2.0, "both names are the same signal");
 }
 
 /// **A `$comment` body contains anything at all**, including things shaped exactly like a
@@ -78,7 +80,7 @@ fn a_comment_body_is_not_activity() {
         "$comment\n#999\n1!\n0!\n1!\n$end\n#0\n0!\n#10\n1!\n",
     ))
     .unwrap();
-    assert_eq!(toggles(&v, "clk"), 1);
+    assert_eq!(toggles(&v, "clk"), 1.0);
     assert!((v.sim_time_s - 10e-9).abs() < 1e-18, "and #999 is not the end of the sim");
 }
 
@@ -87,7 +89,7 @@ fn a_comment_body_is_not_activity() {
 #[test]
 fn a_real_signal_counts_changes_not_dumps() {
     let v = Vcd::parse(&vcd("$var real 64 ! v $end\n", "#0\nr1.5 !\n#10\nr2.5 !\n#20\nr2.5 !\n")).unwrap();
-    assert_eq!(toggles(&v, "v"), 1, "one change; the dump and the repeat are not");
+    assert_eq!(toggles(&v, "v"), 1.0, "one change; the dump and the repeat are not");
 }
 
 /// **VCD drops leading zeros on vector values**: `b1` on a 4-bit net is `0001`. Comparing the
@@ -99,21 +101,25 @@ fn vector_values_are_left_padded_before_comparison() {
         "#0\nb0000 \"\n#10\nb1 \"\n#20\nb1111 \"\n",
     ))
     .unwrap();
-    assert_eq!(toggles(&v, "d[0]"), 1, "0 -> 1 -> 1");
-    assert_eq!(toggles(&v, "d[3]"), 1, "0 -> 0 -> 1");
-    assert_eq!(toggles(&v, "d[1]"), 1);
+    assert_eq!(toggles(&v, "d[0]"), 1.0, "0 -> 1 -> 1");
+    assert_eq!(toggles(&v, "d[3]"), 1.0, "0 -> 0 -> 1");
+    assert_eq!(toggles(&v, "d[1]"), 1.0);
 }
 
-/// Per bit, an unknown behaves exactly as it does on a scalar.
+/// A BUS bit is compared RAW (the reference upper-cases scalar values, not bus bits): a bus `x`
+/// is not `X`, so `0 -> x -> 1` on a bus bit is two full changes, and `X` is the half.
+/// A one-character bus value fills every bit — `b1` on a wide bus reads as all ones.
 #[test]
-fn unknown_bits_in_a_vector_do_not_count() {
+fn bus_bits_are_weighed_raw_and_a_single_character_fills() {
     let v = Vcd::parse(&vcd(
         "$var wire 2 \" d [1:0] $end\n",
-        "#0\nb00 \"\n#10\nbx0 \"\n#20\nb10 \"\n",
+        "#0\nb00 \"\n#10\nbx0 \"\n#20\nb10 \"\n#30\nbX0 \"\n#40\n",
     ))
     .unwrap();
-    assert_eq!(toggles(&v, "d[1]"), 1, "0 -> x -> 1 is one toggle");
-    assert_eq!(toggles(&v, "d[0]"), 0);
+    assert_eq!(toggles(&v, "d[1]"), 2.5, "0 -> x and x -> 1 one each, 1 -> X a half");
+    assert_eq!(toggles(&v, "d[0]"), 0.0);
+    let f = Vcd::parse(&vcd("$var wire 4 \" d [3:0] $end\n", "#0\nb0 \"\n#10\nb1 \"\n#20\n")).unwrap();
+    assert_eq!(toggles(&f, "d[3]"), 1.0, "b1 fills every bit");
 }
 
 /// **The windowing invariant.** Activity over the whole dump must equal the activity of its
@@ -162,9 +168,9 @@ fn saif_names_are_unescaped_to_match_the_netlist() {
          (u\\.a (T0 500) (T1 500) (TC 4))\n   (plain (T0 500) (T1 500) (TC 2))\n  )\n )\n",
     ))
     .expect("valid SAIF");
-    assert_eq!(s.idx.toggles.get("top.i[0]"), Some(&40), "{:?}", s.idx.toggles.keys().collect::<Vec<_>>());
-    assert_eq!(s.idx.toggles.get("top.u.a"), Some(&4));
-    assert_eq!(s.idx.toggles.get("top.plain"), Some(&2), "an unescaped name is untouched");
+    assert_eq!(s.idx.toggles.get("top.i[0]"), Some(&40.0), "{:?}", s.idx.toggles.keys().collect::<Vec<_>>());
+    assert_eq!(s.idx.toggles.get("top.u.a"), Some(&4.0));
+    assert_eq!(s.idx.toggles.get("top.plain"), Some(&2.0), "an unescaped name is untouched");
 }
 
 /// Nested `INSTANCE` groups build the hierarchical path, and every level's nets are kept.
@@ -176,9 +182,9 @@ fn saif_hierarchy_builds_full_paths() {
          (INSTANCE ff0\n    (NET (CK (T0 500) (T1 500) (TC 10)))\n   )\n  )\n )\n",
     ))
     .expect("valid SAIF");
-    assert_eq!(s.idx.toggles.get("top.a"), Some(&2));
-    assert_eq!(s.idx.toggles.get("top.dut.b"), Some(&6));
-    assert_eq!(s.idx.toggles.get("top.dut.ff0.CK"), Some(&10));
+    assert_eq!(s.idx.toggles.get("top.a"), Some(&2.0));
+    assert_eq!(s.idx.toggles.get("top.dut.b"), Some(&6.0));
+    assert_eq!(s.idx.toggles.get("top.dut.ff0.CK"), Some(&10.0));
 }
 
 /// `TC` is a count and `DURATION` a span; the rate is the one divided by the other, in the
@@ -241,38 +247,33 @@ fn the_text_and_binary_readers_agree_on_the_same_simulation() {
     assert!(disagree.is_empty(), "{}", disagree.join("\n"));
 }
 
-/// IEEE 1164 nine-state levels, counted the same by both readers.
+/// IEEE 1164 nine-state values, read as the reference reads them, and the same by both readers.
 ///
-/// `H` and `L` are the weak 1 and weak 0 and a transition to one is a real transition. `U`, `W`,
-/// `X`, `Z` and `-` are the absence of one: they count nothing and leave the last known value in
-/// place. A VHDL dump (nvc, GHDL) is written entirely in these, and the two readers used to
-/// disagree on every one — the VCD reader dropped `H`/`L` scalar changes on the floor, the FST
-/// reader counted `U` and `W` as if they were levels.
-///
-/// The counts below are derived by hand from the fixture, not from either reader.
+/// A scalar: only `0 1 X U Z` are values (upper-cased); `H`, `L`, `W` and `-` are not read at all.
+/// A bus bit: every character is a value, compared raw. A change weighs one, a half when either
+/// side is `X`/`Z`. The counts below are derived by hand from the fixture, not from either reader.
 #[test]
-fn nine_state_levels_count_as_weak_ones_and_zeros() {
+fn nine_state_values_are_read_as_the_reference_reads_them() {
     let v = vyges_loom::vcd::Vcd::load(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/ninestate.vcd"
     ))
     .expect("ninestate.vcd");
-    let got = |n: &str| v.idx.toggles.get(n).copied().unwrap_or(0);
+    let got = |n: &str| v.idx.toggles.get(n).copied().unwrap_or(0.0);
 
-    assert_eq!(got("top.clk"), 4, "0,1,0,1,0");
-    // U -> H -> L -> W -> H: the U seeds nothing, the W is skipped without becoming the
-    // baseline, so H->L and the L->H across it are the only two transitions.
-    assert_eq!(got("top.weak"), 2);
+    assert_eq!(got("top.clk"), 4.0, "0,1,0,1,0");
+    // U -> H -> L -> W -> H: after the U nothing is a value the reference reads
+    assert_eq!(got("top.weak"), 0.0);
     // UUUU -> HLZ0 -> LH1X -> 0011 -> ZZZZ, per bit, MSB first
-    assert_eq!(got("top.bus[3]"), 1);
-    assert_eq!(got("top.bus[2]"), 2);
-    assert_eq!(got("top.bus[1]"), 0);
-    assert_eq!(got("top.bus[0]"), 1);
+    assert_eq!(got("top.bus[3]"), 3.5, "U H L 0 Z");
+    assert_eq!(got("top.bus[2]"), 3.5, "U L H 0 Z");
+    assert_eq!(got("top.bus[1]"), 1.5, "U Z 1 1 Z");
+    assert_eq!(got("top.bus[0]"), 2.5, "U 0 X 1 Z");
     // a real is one net, not 64: 1.0 -> 2.5 -> 2.5 -> 3.5 -> 3.5
-    assert_eq!(got("top.freq"), 2);
+    assert_eq!(got("top.freq"), 2.0);
     assert!(!v.idx.toggles.keys().any(|k| k.starts_with("top.freq[")), "reals are not bit-expanded");
     // a string carries no switching activity
-    assert_eq!(got("top.label"), 0);
+    assert_eq!(got("top.label"), 0.0);
 }
 
 /// **A vector dumped one bit at a time keeps its indices.** ModelSim, Quartus and others do not
@@ -299,13 +300,13 @@ fn a_vector_dumped_one_bit_per_var_keeps_its_indices() {
          #20\n0)\n1*\n",
     )
     .expect("vcd");
-    let got = |n: &str| v.idx.toggles.get(n).copied().unwrap_or(0);
-    assert_eq!(got("tb.r[2]"), 2, "0 -> 1 -> 0");
-    assert_eq!(got("tb.r[1]"), 1);
-    assert_eq!(got("tb.r[0]"), 1);
+    let got = |n: &str| v.idx.toggles.get(n).copied().unwrap_or(0.0);
+    assert_eq!(got("tb.r[2]"), 2.0, "0 -> 1.0 -> 0.0");
+    assert_eq!(got("tb.r[1]"), 1.0);
+    assert_eq!(got("tb.r[0]"), 1.0);
     assert!(!v.idx.toggles.contains_key("tb.r"), "the bits must not merge onto one net");
     // [0:0] is a range, not a bit-select: the signal is `w`
-    assert_eq!(got("tb.w"), 1);
+    assert_eq!(got("tb.w"), 1.0);
     assert!(!v.idx.toggles.contains_key("tb.w[0]"));
 }
 
@@ -324,11 +325,11 @@ fn an_aliased_vector_identifier_credits_every_name() {
          #10\nb0011 !\n",
     )
     .expect("vcd");
-    let got = |n: &str| v.idx.toggles.get(n).copied().unwrap_or(0);
+    let got = |n: &str| v.idx.toggles.get(n).copied().unwrap_or(0.0);
     for scope in ["a", "b"] {
-        assert_eq!(got(&format!("{scope}.bus[0]")), 1, "{scope}");
-        assert_eq!(got(&format!("{scope}.bus[1]")), 1, "{scope}");
-        assert_eq!(got(&format!("{scope}.bus[3]")), 0, "{scope}");
+        assert_eq!(got(&format!("{scope}.bus[0]")), 1.0, "{scope}");
+        assert_eq!(got(&format!("{scope}.bus[1]")), 1.0, "{scope}");
+        assert_eq!(got(&format!("{scope}.bus[3]")), 0.0, "{scope}");
     }
 }
 
@@ -351,9 +352,9 @@ fn an_unnamed_scope_contributes_no_path_component() {
          #10\n1!\n1\"\n",
     )
     .expect("vcd");
-    let got = |n: &str| v.idx.toggles.get(n).copied().unwrap_or(0);
-    assert_eq!(got("top.clk"), 1);
-    assert_eq!(got("other.rst"), 1, "the empty scope must not swallow its sibling");
+    let got = |n: &str| v.idx.toggles.get(n).copied().unwrap_or(0.0);
+    assert_eq!(got("top.clk"), 1.0);
+    assert_eq!(got("other.rst"), 1.0, "the empty scope must not swallow its sibling");
     assert!(
         !v.idx.toggles.keys().any(|k| k.starts_with("$end") || k.starts_with('.')),
         "no stray root component: {:?}",
@@ -378,7 +379,7 @@ fn a_one_bit_signal_dumped_as_a_vector_still_counts() {
     )
     .expect("vcd");
     // the two spellings share one baseline: 0 -> 1 -> 0 -> 1
-    assert_eq!(v.idx.toggles.get("tb.en").copied().unwrap_or(0), 3);
+    assert_eq!(v.idx.toggles.get("tb.en").copied().unwrap_or(0.0), 3.0);
 }
 
 /// **A fractional timestamp still advances the clock.** IEEE 1364 says `#` carries a whole
@@ -399,7 +400,7 @@ fn a_fractional_timestamp_still_advances_the_clock() {
     )
     .expect("vcd");
     assert!((v.sim_time_s - 15.0e-9).abs() < 1e-18, "dump length: {:e}", v.sim_time_s);
-    assert_eq!(v.idx.toggles.get("tb.clk").copied().unwrap_or(0), 3);
+    assert_eq!(v.idx.toggles.get("tb.clk").copied().unwrap_or(0.0), 3.0);
     // and the window boundaries land where the fractional times say they do
     let w = vyges_loom::vcd::Vcd::parse_windowed(
         "$timescale 1ns $end\n\
@@ -413,8 +414,8 @@ fn a_fractional_timestamp_still_advances_the_clock() {
     )
     .expect("vcd");
     assert_eq!(
-        w.idx.toggles.get("tb.clk").copied().unwrap_or(0),
-        2,
+        w.idx.toggles.get("tb.clk").copied().unwrap_or(0.0),
+        2.0,
         "the change at 3.2 ns is before the window, the two after it are inside"
     );
 }

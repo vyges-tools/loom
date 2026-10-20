@@ -264,10 +264,10 @@ fn every_net_of_the_netlist_is_findable_in_the_activity_dump() {
 
     // And the join carries the right numbers, not merely a name that resolves: d[3] is dumped
     // one bit per $var, q[3:0] as a whole vector, and both are read per bit.
-    assert_eq!(v.idx.resolve("d[3]"), Some(2), "dumped bit by bit: 0 -> 1 -> 0");
+    assert_eq!(v.idx.resolve("d[3]"), Some(2.0), "dumped bit by bit: 0 -> 1.0 -> 0.0");
     // dumped whole: b0000 -> b1011 -> b0100, so bit 2 moves once and the rest move twice
-    assert_eq!(v.idx.resolve("q[3]"), Some(2));
-    assert_eq!(v.idx.resolve("q[2]"), Some(1));
-    assert_eq!(v.idx.resolve("q[1]"), Some(2));
-    assert_eq!(v.idx.resolve("q[0]"), Some(2));
+    assert_eq!(v.idx.resolve("q[3]"), Some(2.0));
+    assert_eq!(v.idx.resolve("q[2]"), Some(1.0));
+    assert_eq!(v.idx.resolve("q[1]"), Some(2.0));
+    assert_eq!(v.idx.resolve("q[0]"), Some(2.0));
 }

@@ -58,7 +58,7 @@ impl Saif {
     /// zero-duration run). Resolution is scope-aware — see [`crate::names::NetIndex`].
     pub fn toggle_rate(&self, net: &str) -> f64 {
         match self.idx.resolve(net) {
-            Some(n) if self.sim_time_s > 0.0 => n as f64 / self.sim_time_s,
+            Some(n) if self.sim_time_s > 0.0 => n / self.sim_time_s,
             _ => 0.0,
         }
     }
@@ -107,7 +107,7 @@ impl Saif {
             // identical from the outside.
             let full = unescape_saif(&full);
             idx.declare(&full);
-            idx.add_toggles(&full, tc);
+            idx.add_toggles(&full, tc as f64);
             if span > max_span_units {
                 max_span_units = span;
             }
@@ -356,11 +356,11 @@ mod tests {
     fn parses_counts_and_rates() {
         let s = Saif::parse(SAIF).unwrap();
         assert!((s.sim_time_s - 50.0e-9).abs() < 1e-18);
-        assert_eq!(*s.idx.toggles.get("top.clk").unwrap(), 10);
-        assert_eq!(*s.idx.toggles.get("top.n1").unwrap(), 4);
-        assert_eq!(*s.idx.toggles.get("top.q").unwrap(), 2);
+        assert_eq!(*s.idx.toggles.get("top.clk").unwrap(), 10.0);
+        assert_eq!(*s.idx.toggles.get("top.n1").unwrap(), 4.0);
+        assert_eq!(*s.idx.toggles.get("top.q").unwrap(), 2.0);
         // nested INSTANCE/NET nets keep their full path
-        assert_eq!(*s.idx.toggles.get("top.sub.deep").unwrap(), 6);
+        assert_eq!(*s.idx.toggles.get("top.sub.deep").unwrap(), 6.0);
         // TC / DURATION: n1 = 4 / 50ns = 8e7 (leaf resolves, unique)
         assert!((s.toggle_rate("n1") - 8.0e7).abs() < 1.0);
         assert!((s.toggle_rate("q") - 4.0e7).abs() < 1.0);
@@ -379,8 +379,8 @@ mod tests {
     #[test]
     fn scope_aware_resolution() {
         let s = Saif::parse(SAIF_HIER).unwrap();
-        assert_eq!(*s.idx.toggles.get("top.clk").unwrap(), 10);
-        assert_eq!(*s.idx.toggles.get("top.dut.clk").unwrap(), 4);
+        assert_eq!(*s.idx.toggles.get("top.clk").unwrap(), 10.0);
+        assert_eq!(*s.idx.toggles.get("top.dut.clk").unwrap(), 4.0);
         assert_eq!(s.collisions(), 1);
         // bare `clk` collides -> unresolved, no silent last-write-wins
         assert_eq!(s.toggle_rate("clk"), 0.0);

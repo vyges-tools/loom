@@ -46,7 +46,7 @@ use std::collections::HashMap;
 
 use crate::lz4;
 use crate::names::NetIndex;
-use crate::vcd::{build_sig, join_scope, level, Sig};
+use crate::vcd::{build_sig, change_weight, join_scope, scalar_value, Sig};
 
 #[derive(Debug, Clone, Default)]
 pub struct Fst {
@@ -67,7 +67,7 @@ impl Fst {
     /// Transitions / second for a netlist net (scope-aware; 0 if unresolved).
     pub fn toggle_rate(&self, net: &str) -> f64 {
         match self.idx.resolve(net) {
-            Some(n) if self.sim_time_s > 0.0 => n as f64 / self.sim_time_s,
+            Some(n) if self.sim_time_s > 0.0 => n / self.sim_time_s,
             _ => 0.0,
         }
     }
@@ -139,8 +139,10 @@ impl Fst {
         // Rate denominator: the full dump, or the window duration when windowed (so a
         // windowed FST rate is defined the same way as a windowed VCD rate).
         let end_s = end_time as f64 * timescale_s;
+        // The whole dump is measured from its start time, as the reference measures a VCD.
+        let start_s = (be_u64(hdr, 0)? as f64 * timescale_s).min(end_s);
         let sim_time_s = match window {
-            None => end_s,
+            None => end_s - start_s,
             Some((f, t)) => {
                 let eff_from = f.clamp(0.0, end_s);
                 let eff_to = t.unwrap_or(end_s).clamp(eff_from, end_s);
@@ -156,9 +158,9 @@ impl Fst {
         // chain_counts[handle] = toggle counts. Scalars: Vec of len 1 (the net's count).
         // Vectors: Vec of per-bit counts (MSB..LSB, matching build_sig's bit order).
         let n_handles = handles.iter().map(|h| h.handle + 1).max().unwrap_or(0);
-        let mut chain_counts: Vec<Vec<u64>> = vec![Vec::new(); n_handles];
-        for payload in &vcdata {
-            decode_vc_block(payload, &handles, window, timescale_s, &mut chain_counts)?;
+        let mut chain_counts: Vec<Vec<f64>> = vec![Vec::new(); n_handles];
+        for (k, payload) in vcdata.iter().enumerate() {
+            decode_vc_block(payload, &handles, window, timescale_s, k == 0, &mut chain_counts)?;
         }
 
         // ---- attribute counts to nets ----------------------------------------------
@@ -171,14 +173,14 @@ impl Fst {
             match sig {
                 Sig::Scalar(full) => {
                     if let Some(&c) = counts.first() {
-                        if c > 0 {
+                        if c > 0.0 {
                             idx.add_toggles(&full, c);
                         }
                     }
                 }
                 Sig::Vector { bits } => {
                     for (bit, &c) in bits.iter().zip(counts.iter()) {
-                        if c > 0 {
+                        if c > 0.0 {
                             idx.add_toggles(bit, c);
                         }
                     }
@@ -306,7 +308,8 @@ fn decode_vc_block(
     handles: &[HierVar],
     window: Option<(f64, Option<f64>)>,
     timescale_s: f64,
-    chain_counts: &mut [Vec<u64>],
+    first_block: bool,
+    chain_counts: &mut [Vec<f64>],
 ) -> Result<(), FstError> {
     if p.len() < 24 {
         return Err(FstError("short vc block".into()));
@@ -390,7 +393,7 @@ fn decode_vc_block(
         let off = match chains[target] {
             Chain::Data(off) => off,
             Chain::None => {
-                merge_counts(&mut chain_counts[h], &[0]);
+                merge_counts(&mut chain_counts[h], &[0.0]);
                 continue;
             }
             Chain::Alias(_) => {
@@ -408,6 +411,7 @@ fn decode_vc_block(
             win_from,
             win_to,
             timescale_s,
+            first_block,
         )?;
         merge_counts(&mut chain_counts[h], &counts);
     }
@@ -552,12 +556,18 @@ fn decode_chain(
     win_from: f64,
     win_to: Option<f64>,
     timescale_s: f64,
-) -> Result<Vec<u64>, FstError> {
+    first_block: bool,
+) -> Result<Vec<f64>, FstError> {
+    // THE DUMP'S FIRST VALUES. A dump with no `$dumpvars` writes each signal's first value as a
+    // change at its first time, and an FST writer turns that into an all-`x` frame followed by a
+    // change at time index 0. In the VCD those values are the signal's first — no change, as
+    // the reference reads them — so in the first block a record at time index 0 only sets it.
+    let sets_first = |ti: usize| first_block && ti == 0;
     if seg.is_empty() {
         return Ok(if is_real || width <= 1 {
-            vec![0]
+            vec![0.0]
         } else {
-            vec![0; width]
+            vec![0.0; width]
         });
     }
     let (unclen, o) = uvarint(seg, 0)?;
@@ -595,7 +605,7 @@ fn decode_chain(
         let mut prev: Option<[u8; 8]> = initial
             .and_then(|v| <[u8; 8]>::try_from(v).ok())
             .filter(|b| !f64::from_le_bytes(*b).is_nan());
-        let mut count: u64 = 0;
+        let mut count: f64 = 0.0;
         while p < data.len() {
             let (v, np) = uvarint(&data, p)?;
             p = np;
@@ -607,21 +617,19 @@ fn decode_chain(
             bytes[..take].copy_from_slice(&data[p..p + take]);
             p += take;
             time_index += (v >> 1) as usize;
-            if prev.map(|q| q != bytes).unwrap_or(false) && in_window(time_index) {
-                count += 1;
+            if prev.map(|q| q != bytes).unwrap_or(false) && in_window(time_index) && !sets_first(time_index) {
+                count += 1.0;
             }
             prev = Some(bytes);
         }
         Ok(vec![count])
     } else if width <= 1 {
-        // 1-bit: one varint per change; value transitions counted vs previous.
-        // Seeded from the frame, so the FIRST change is a change and not the baseline.
-        // Seeded from the frame, so the FIRST change record is a change and not the baseline.
-        // An unknown initial value seeds nothing, exactly as an unknown change counts nothing.
+        // 1-bit: one varint per change, weighed as the VCD reader weighs a scalar change
+        // (`scalar_value`, `change_weight`). The frame is the signal's first value.
         let mut prev: Option<char> = initial
             .and_then(|v| v.first())
-            .and_then(|&b| level(b as char));
-        let mut count: u64 = 0;
+            .and_then(|&b| scalar_value(b as char));
+        let mut count: f64 = 0.0;
         while p < data.len() {
             let (v, np) = uvarint(&data, p)?;
             p = np;
@@ -631,14 +639,11 @@ fn decode_chain(
                 (xz_char((v >> 1) & 7), (v >> 4) as usize)
             };
             time_index += td;
-            // Same rule as the VCD reader: `x`/`z` is not a level. It counts no transition and
-            // does not become the baseline — otherwise a signal whose FRAME value is `x`
-            // (undriven at time zero, which is most of them) charges one extra toggle the
-            // moment it is first driven.
-            let Some(val) = level(val) else { continue };
-            let changed = prev.map(|c| c != val).unwrap_or(false);
-            if changed && in_window(time_index) {
-                count += 1;
+            let Some(val) = scalar_value(val) else { continue }; // not a value the reference reads
+            if let Some(was) = prev {
+                if in_window(time_index) && !sets_first(time_index) {
+                    count += change_weight(was, val);
+                }
             }
             prev = Some(val);
         }
@@ -646,12 +651,10 @@ fn decode_chain(
     } else {
         // multi-bit: varint(tdelta<<1 | has_xz) then packed BE bytes (has_xz=0) or ASCII.
         let nbytes = width.div_ceil(8);
-        let mut prev: Option<Vec<char>> = initial.filter(|v| v.len() == width).map(|v| {
-            v.iter()
-                .map(|&b| (b as char).to_ascii_lowercase())
-                .collect()
-        });
-        let mut counts = vec![0u64; width];
+        // Bits are weighed on their RAW characters, as the VCD reader weighs a bus bit.
+        let mut prev: Option<Vec<char>> =
+            initial.filter(|v| v.len() == width).map(|v| v.iter().map(|&b| b as char).collect());
+        let mut counts = vec![0.0f64; width];
         while p < data.len() {
             let (hdr, np) = uvarint(&data, p)?;
             p = np;
@@ -695,40 +698,21 @@ fn decode_chain(
                 bitv
             };
             if let Some(prev) = &prev {
-                if in_window(time_index) {
+                if in_window(time_index) && !sets_first(time_index) {
                     for (i, (a, b)) in cur.iter().zip(prev).enumerate() {
-                        // per bit, an unknown is not a level — see the 1-bit path
-                        let (Some(a), Some(b)) = (level(*a), level(*b)) else {
-                            continue;
-                        };
-                        if a != b {
-                            counts[i] += 1;
-                        }
+                        counts[i] += change_weight(*b, *a);
                     }
                 }
             }
-            // An unknown bit leaves the last KNOWN value in place, so `0 -> x -> 0` counts
-            // nothing and `0 -> x -> 1` counts one. Replacing the whole vector would make the
-            // unknown itself the baseline.
-            prev = Some(match prev.take() {
-                None => cur,
-                Some(mut was) => {
-                    for (i, c) in cur.iter().enumerate() {
-                        if let (true, Some(c)) = (i < was.len(), level(*c)) {
-                            was[i] = c;
-                        }
-                    }
-                    was
-                }
-            });
+            prev = Some(cur);
         }
         Ok(counts)
     }
 }
 
-fn merge_counts(dst: &mut Vec<u64>, src: &[u64]) {
+fn merge_counts(dst: &mut Vec<f64>, src: &[f64]) {
     if dst.len() < src.len() {
-        dst.resize(src.len(), 0);
+        dst.resize(src.len(), 0.0);
     }
     for (d, s) in dst.iter_mut().zip(src) {
         *d += *s;
@@ -922,28 +906,22 @@ mod tests {
         );
     }
 
-    /// A scalar written in nine-state codes: `H` and `L` are levels, `W` is not.
+    /// A scalar written in nine-state codes, read as the reference reads a scalar: only
+    /// `0 1 X U Z` are values, so `H`, `L` and `W` are not read at all, and `U` is a value
+    /// (a change to or from it weighs one).
     ///
     /// Straight at `decode_chain`, because the conversion path drops these — the codes are
     /// `FST_RCV_*`, `1 | (state << 1) | (tdelta << 4)`, with the state indexing "xzhuwl-?".
     #[test]
-    fn nine_state_scalar_levels_are_weak_ones_and_zeros() {
-        // u (frame) -> H -> L -> W -> H, one time step apart
-        let seg = [0x00, 0x15, 0x1b, 0x19, 0x15];
-        let counts = decode_chain(
-            &seg,
-            1,
-            false,
-            Some(b"u"),
-            None,
-            f64::NEG_INFINITY,
-            None,
-            1e-9,
-        )
-        .unwrap();
-        // the `u` seeds nothing, H->L is a transition, the W is skipped without becoming the
-        // baseline, so the following H is a transition from the L
-        assert_eq!(counts, vec![2]);
+    fn nine_state_scalar_codes_are_read_as_the_reference_reads_them() {
+        let run = |seg: &[u8], frame: &[u8]| {
+            decode_chain(seg, 1, false, Some(frame), None, f64::NEG_INFINITY, None, 1e-9, false).unwrap()
+        };
+        // u (frame) -> H -> L -> W -> H: nothing after the frame is a value
+        assert_eq!(run(&[0x00, 0x15, 0x1b, 0x19, 0x15], b"u"), vec![0.0]);
+        // u (frame) -> 1 -> x -> 0: U->1 weighs one, 1->X and X->0 a half each
+        // (`1` = 0b10 | td 1 << 2 = 0x06; `x` = 1 | 0<<1 | 1<<4 = 0x11; `0` = 1<<2 = 0x04)
+        assert_eq!(run(&[0x00, 0x06, 0x11, 0x04], b"u"), vec![2.0]);
     }
 
     /// The same waveform in FST form must produce the same counts as `ninestate.vcd`, whose
@@ -960,23 +938,25 @@ mod tests {
         ))
         .expect("ninestate.fst");
         let f = Fst::parse(&bytes, None).unwrap();
-        let got = |n: &str| f.idx.toggles.get(n).copied().unwrap_or(0);
-        assert_eq!(got("top.clk"), 4);
+        let got = |n: &str| f.idx.toggles.get(n).copied().unwrap_or(0.0);
+        assert_eq!(got("top.clk"), 4.0);
         // `top.weak` is deliberately not asserted here: vcd2fst discards nine-state values on a
         // SCALAR (GTKWave's own fst2vcd reads the same file back with no changes for it), so the
         // fixture cannot carry them. The vector below does round-trip them, and the scalar path
         // is covered directly by `nine_state_scalar_levels_are_weak_ones_and_zeros`.
-        assert_eq!(got("top.bus[3]"), 1);
-        assert_eq!(got("top.bus[2]"), 2);
-        assert_eq!(got("top.bus[1]"), 0);
-        assert_eq!(got("top.bus[0]"), 1);
+        // Bus bits weighed raw, as the reference weighs them: U H L 0 Z / U L H 1 Z / U Z 1 1 Z /
+        // U 0 X 1 Z — a change weighs one, a half when either side is `X`/`Z`.
+        assert_eq!(got("top.bus[3]"), 3.5);
+        assert_eq!(got("top.bus[2]"), 3.5);
+        assert_eq!(got("top.bus[1]"), 1.5);
+        assert_eq!(got("top.bus[0]"), 2.5);
         assert_eq!(
             got("top.freq"),
-            2,
+            2.0,
             "one net, and the NaN frame is not its baseline"
         );
         assert!(!f.idx.toggles.keys().any(|k| k.starts_with("top.freq[")));
-        assert_eq!(got("top.label"), 0, "a string has no switching activity");
+        assert_eq!(got("top.label"), 0.0, "a string has no switching activity");
     }
 
     #[test]
@@ -1001,16 +981,16 @@ mod tests {
     fn counter_fst_bus_per_bit_totals_78() {
         let f = Fst::parse(&fixture(), None).unwrap();
         // per-bit cascade of a 32-bit incrementing counter: 40,20,10,5,2,1 = 78
-        let sum: u64 = f
+        let sum: f64 = f
             .idx
             .toggles
             .iter()
             .filter(|(k, _)| k.starts_with("counter_tb.i["))
             .map(|(_, &v)| v)
             .sum();
-        assert_eq!(sum, 78, "32-bit bus per-bit Hamming total");
+        assert_eq!(sum, 78.0, "32-bit bus per-bit Hamming total");
         // LSB toggles every increment
-        assert_eq!(f.idx.toggles.get("counter_tb.i[0]").copied(), Some(40));
+        assert_eq!(f.idx.toggles.get("counter_tb.i[0]").copied(), Some(40.0));
     }
 
     #[test]
@@ -1020,22 +1000,22 @@ mod tests {
         let fst = Fst::parse(&fixture(), None).unwrap();
         let vpath = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/counter.vcd");
         let vcd = crate::vcd::Vcd::load(vpath).unwrap();
-        let mut fset: Vec<u64> = fst
+        let mut fset: Vec<f64> = fst
             .idx
             .toggles
             .values()
             .copied()
-            .filter(|&v| v > 0)
+            .filter(|&v| v > 0.0)
             .collect();
-        let mut vset: Vec<u64> = vcd
+        let mut vset: Vec<f64> = vcd
             .idx
             .toggles
             .values()
             .copied()
-            .filter(|&v| v > 0)
+            .filter(|&v| v > 0.0)
             .collect();
-        fset.sort_unstable();
-        vset.sort_unstable();
+        fset.sort_by(f64::total_cmp);
+        vset.sort_by(f64::total_cmp);
         // FST attributes each chain to every aliased name; VCD (last-wins per symbol)
         // to one. Compare the *distinct* count values rather than raw multiplicity.
         fset.dedup();

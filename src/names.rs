@@ -44,7 +44,7 @@ use std::collections::HashMap;
 /// Shared storage/resolution for both the VCD and SAIF readers.
 #[derive(Clone, Default)]
 pub struct NetIndex {
-    pub toggles: HashMap<String, u64>, // full hierarchical path -> transition count
+    pub toggles: HashMap<String, f64>, // full hierarchical path -> transition count (a VCD X/Z change weighs a half)
     pub by_leaf: HashMap<String, Vec<String>>, // leaf name -> declared full paths
     pub scope: Option<String>,         // design instance path (job `scope:`)
 }
@@ -85,16 +85,16 @@ impl NetIndex {
     }
 
     /// Add `n` transitions to `full_path`.
-    pub fn add_toggles(&mut self, full_path: &str, n: u64) {
-        *self.toggles.entry(full_path.to_string()).or_insert(0) += n;
+    pub fn add_toggles(&mut self, full_path: &str, n: f64) {
+        *self.toggles.entry(full_path.to_string()).or_insert(0.0) += n;
     }
 
     /// Resolve a netlist `net` to the toggle count of a *unique* dumped signal.
     /// `None` = unresolved (absent) or ambiguous (leaf in multiple scopes) → the
     /// caller should fall back to the vectorless factor.
-    pub fn resolve(&self, net: &str) -> Option<u64> {
+    pub fn resolve(&self, net: &str) -> Option<f64> {
         let path = self.resolve_path(net)?;
-        Some(self.toggles.get(path).copied().unwrap_or(0))
+        Some(self.toggles.get(path).copied().unwrap_or(0.0))
     }
 
     /// Resolve a netlist `net` to the **full dumped path** of a unique signal, without
@@ -238,11 +238,11 @@ mod tests {
         // clk_in appears in the testbench AND the DUT; q only in the DUT.
         let mut i = NetIndex::default();
         i.declare("counter_tb.clk_in");
-        i.add_toggles("counter_tb.clk_in", 79);
+        i.add_toggles("counter_tb.clk_in", 79.0);
         i.declare("counter_tb.dut.clk_in");
-        i.add_toggles("counter_tb.dut.clk_in", 40);
+        i.add_toggles("counter_tb.dut.clk_in", 40.0);
         i.declare("counter_tb.dut.q");
-        i.add_toggles("counter_tb.dut.q", 13);
+        i.add_toggles("counter_tb.dut.q", 13.0);
         i
     }
 
@@ -250,7 +250,7 @@ mod tests {
     fn ambiguous_leaf_is_unresolved_without_scope() {
         let i = idx();
         assert_eq!(i.resolve("clk_in"), None); // collides tb vs dut -> refuse
-        assert_eq!(i.resolve("q"), Some(13)); // unique -> resolves
+        assert_eq!(i.resolve("q"), Some(13.0)); // unique -> resolves
         assert_eq!(i.collisions(), 1);
     }
 
@@ -258,15 +258,15 @@ mod tests {
     fn scope_disambiguates() {
         let mut i = idx();
         i.scope = Some("dut".to_string());
-        assert_eq!(i.resolve("clk_in"), Some(40)); // dut.clk_in via ".dut.clk_in" suffix
-        assert_eq!(i.resolve("q"), Some(13));
+        assert_eq!(i.resolve("clk_in"), Some(40.0)); // dut.clk_in via ".dut.clk_in" suffix
+        assert_eq!(i.resolve("q"), Some(13.0));
     }
 
     #[test]
     fn full_scope_path_exact() {
         let mut i = idx();
         i.scope = Some("counter_tb.dut".to_string());
-        assert_eq!(i.resolve("clk_in"), Some(40));
+        assert_eq!(i.resolve("clk_in"), Some(40.0));
     }
 
     #[test]
@@ -310,8 +310,8 @@ mod tests {
     fn single_scope_leaf_resolves() {
         let mut i = NetIndex::default();
         i.declare("counter.clk_in");
-        i.add_toggles("counter.clk_in", 5);
-        assert_eq!(i.resolve("clk_in"), Some(5)); // backward-compatible single-scope
+        i.add_toggles("counter.clk_in", 5.0);
+        assert_eq!(i.resolve("clk_in"), Some(5.0)); // backward-compatible single-scope
         assert_eq!(i.collisions(), 0);
     }
 }

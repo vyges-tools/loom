@@ -6,6 +6,10 @@
 //! (Hamming distance), so a bus's per-bit activity is measured, not lumped. Signals are
 //! keyed by their **full hierarchical path** (`$scope`/`$upscope`), and a netlist net
 //! resolves to one by leaf + optional `scope:` — see [`crate::names`]. Depth reserved: FST.
+//!
+//! Counted as the reference counts a dump: every value change weighs one, a half when either
+//! side is `X`/`Z` (see [`change_weight`], [`scalar_value`], [`bus_bits`]), and the whole-dump
+//! rate divides by the span from the dump's start to its last timestamp.
 
 use std::collections::HashMap;
 
@@ -45,7 +49,7 @@ pub struct SweepWindow {
     pub to_s: f64,       // window end, clamped to the dump's end
     pub sim_time_s: f64, // measured duration = to_s - from_s, clamped to the dump
     pub events: u64,     // value-change records inside the window (an activity indicator)
-    pub toggles: std::collections::HashMap<String, u64>, // full path -> transitions
+    pub toggles: std::collections::HashMap<String, f64>, // full path -> transitions (X/Z changes weigh a half)
 }
 
 /// A **single-pass** sweep: many measurement windows over one parse of one dump.
@@ -102,7 +106,7 @@ impl WindowActivity<'_> {
             return 0.0;
         }
         match self.decls.resolve_path(net) {
-            Some(p) => self.win.toggles.get(p).copied().unwrap_or(0) as f64 / self.win.sim_time_s,
+            Some(p) => self.win.toggles.get(p).copied().unwrap_or(0.0) / self.win.sim_time_s,
             None => 0.0,
         }
     }
@@ -329,6 +333,7 @@ struct Grid {
     window_s: f64,     // may be infinite (run to end of dump)
     step_s: f64,       // may be infinite (a single window)
     to_s: Option<f64>, // hard end; None grows the grid to the end of the dump
+    whole: bool,       // no window: the whole dump, measured from its start
 }
 
 impl Grid {
@@ -344,6 +349,7 @@ impl Grid {
             window_s,
             step_s: f64::INFINITY,
             to_s: to,
+            whole: window.is_none(),
         }
     }
 
@@ -438,7 +444,7 @@ impl Vcd {
     /// zero-duration sim). Resolution is scope-aware — see [`crate::names::NetIndex`].
     pub fn toggle_rate(&self, net: &str) -> f64 {
         match self.idx.resolve(net) {
-            Some(n) if self.sim_time_s > 0.0 => n as f64 / self.sim_time_s,
+            Some(n) if self.sim_time_s > 0.0 => n / self.sim_time_s,
             _ => 0.0,
         }
     }
@@ -533,6 +539,7 @@ impl Vcd {
                 window_s,
                 step_s,
                 to_s,
+                whole: false,
             },
         )
     }
@@ -560,14 +567,17 @@ impl Vcd {
 fn parse_grid(text: &str, grid: Grid) -> Result<VcdSweep, VcdError> {
     #[derive(Default, Clone)]
     struct Bucket {
-        toggles: HashMap<String, u64>,
+        toggles: HashMap<String, f64>,
         events: u64,
     }
-    // Credit one transition on `path` to every currently-open window.
-    fn bump(buckets: &mut [Bucket], active: Option<(usize, usize)>, path: &str) {
+    // Credit a change of weight `w` on `path` to every currently-open window.
+    fn bump(buckets: &mut [Bucket], active: Option<(usize, usize)>, path: &str, w: f64) {
+        if w == 0.0 {
+            return;
+        }
         if let Some((lo, hi)) = active {
             for b in &mut buckets[lo..=hi] {
-                *b.toggles.entry(path.to_string()).or_insert(0) += 1;
+                *b.toggles.entry(path.to_string()).or_insert(0.0) += w;
             }
         }
     }
@@ -600,11 +610,15 @@ fn parse_grid(text: &str, grid: Grid) -> Result<VcdSweep, VcdError> {
                              // vanished: it reported a toggle rate of zero while its alias reported the truth.
     let mut sym2sig: HashMap<String, Vec<Sig>> = HashMap::new();
     let mut last: HashMap<String, char> = HashMap::new(); // scalar full path -> last value
-    let mut vprev: HashMap<String, Vec<char>> = HashMap::new(); // sym -> last KNOWN bits ('?' = never seen)
+    let mut vprev: HashMap<String, Vec<char>> = HashMap::new(); // net -> last bits, raw ('\0' = never seen)
     let mut rprev: HashMap<String, String> = HashMap::new(); // real path -> last value
     let mut idx = NetIndex::default();
     let mut scope_stack: Vec<String> = Vec::new();
     let mut time_ticks: f64 = 0.0;
+    // The dump's start, as the reference takes it: the last timestamp before the first value
+    // (`$dumpvars` or a change) — the whole-dump rate divides by `last time - start`.
+    let mut start_ticks: f64 = 0.0;
+    let mut values_started = false;
     let mut active = grid.active(0.0);
     if let Some((_, hi)) = active {
         grow(&mut buckets, hi)?;
@@ -650,6 +664,8 @@ fn parse_grid(text: &str, grid: Grid) -> Result<VcdSweep, VcdError> {
             // `$comment` bodies contain anything at all, including things shaped exactly
             // like a timestamp and a value change. Read as data, a commented-out `#999 1!`
             // became a real transition — activity invented out of prose.
+            // The initial values: from here on a timestamp no longer moves the dump's start.
+            "$dumpvars" => values_started = true,
             "$comment" => {
                 for t in toks.by_ref() {
                     if t == "$end" {
@@ -699,6 +715,9 @@ fn parse_grid(text: &str, grid: Grid) -> Result<VcdSweep, VcdError> {
                     if let Ok(t) = rest.parse::<f64>() {
                         if t.is_finite() {
                             time_ticks = t;
+                            if !values_started {
+                                start_ticks = t;
+                            }
                             active = grid.active(time_ticks * tick_s);
                             if let Some((_, hi)) = active {
                                 grow(&mut buckets, hi)?;
@@ -709,35 +728,26 @@ fn parse_grid(text: &str, grid: Grid) -> Result<VcdSweep, VcdError> {
                     match first {
                         '0' | '1' | 'x' | 'X' | 'z' | 'Z' | 'u' | 'U' | 'w' | 'W' | 'h' | 'H'
                         | 'l' | 'L' | '-' => {
-                            // Scalar change: <value><sym>.
-                            //
-                            // `last` holds the last KNOWN value. An `x`/`z` is not a level,
-                            // it is the absence of one: it neither counts as a transition
-                            // nor replaces what we knew. So 0→x→1 counts ONE toggle (the
-                            // net did change), 0→x→0 counts none (it did not), and the
-                            // x-flood a `$dumpoff` writes over every signal — which is a
-                            // statement about the dumper, not the circuit — counts nothing
-                            // at all. Counting each of those as a transition inflated
-                            // activity, and therefore dynamic power, without a warning.
+                            // Scalar change: <value><sym>, weighed as the reference
+                            // weighs it — see `scalar_value` and `change_weight`.
                             let sym = &tok[1..];
-                            count_event(&mut buckets, active);
-                            let Some(v) = level(first) else {
-                                continue; // unknown: no transition, no new baseline
+                            values_started = true;
+                            let Some(v) = scalar_value(first) else {
+                                continue; // not a value the reference reads
                             };
+                            count_event(&mut buckets, active);
                             for sig in sym2sig.get(sym).map(Vec::as_slice).unwrap_or(&[]) {
                                 let Sig::Scalar(full) = sig else { continue };
-                                let prev = last.insert(full.clone(), v);
-                                if prev.map(|p| p != v).unwrap_or(false) {
-                                    bump(&mut buckets, active, full);
+                                if let Some(p) = last.insert(full.clone(), v) {
+                                    bump(&mut buckets, active, full, change_weight(p, v));
                                 }
                             }
                         }
                         'b' | 'B' => {
-                            // Vector change: b<value> <sym> — count each *bit* that flips.
-                            // Per bit, the same rule as a scalar: an `x`/`z` bit is unknown,
-                            // so it counts nothing and leaves that bit's last known value
-                            // in place.
+                            // Vector change: b<value> <sym> — each bit weighed on its own, on
+                            // the RAW character (`bus_bits`, `change_weight`).
                             let value = &tok[1..];
+                            values_started = true;
                             if let Some(sym) = toks.next() {
                                 count_event(&mut buckets, active);
                                 for sig in sym2sig.get(sym).map(Vec::as_slice).unwrap_or(&[]) {
@@ -752,19 +762,18 @@ fn parse_grid(text: &str, grid: Grid) -> Result<VcdSweep, VcdError> {
                                     // form so the two spellings agree on one baseline.
                                     let bits = match sig {
                                         Sig::Scalar(full) => {
-                                            let Some(v) = value.chars().next_back().and_then(level)
-                                            else {
+                                            // The value's last character is bit 0, raw.
+                                            let Some(v) = value.chars().next_back() else {
                                                 continue;
                                             };
-                                            let prev = last.insert(full.clone(), v);
-                                            if prev.map(|p| p != v).unwrap_or(false) {
-                                                bump(&mut buckets, active, full);
+                                            if let Some(p) = last.insert(full.clone(), v) {
+                                                bump(&mut buckets, active, full, change_weight(p, v));
                                             }
                                             continue;
                                         }
                                         Sig::Vector { bits } => bits,
                                     };
-                                    let cur = pad_bits(value, bits.len());
+                                    let cur = bus_bits(value, bits.len());
                                     // KEYED BY THE NET, NOT THE IDENTIFIER. One identifier
                                     // can name the same vector in several scopes — a port
                                     // carried down a hierarchy shares one symbol — and a
@@ -775,15 +784,15 @@ fn parse_grid(text: &str, grid: Grid) -> Result<VcdSweep, VcdError> {
                                     // keys by net and was right; this one credited the
                                     // vector's activity to whichever scope was declared
                                     // first and reported the rest as dead.
+                                    // '\0' = never seen: a bit's first value is no change.
                                     let prev = vprev.entry(bits[0].clone()).or_insert_with(|| {
-                                        std::iter::repeat_n('?', bits.len()).collect()
+                                        std::iter::repeat_n('\0', bits.len()).collect()
                                     });
-                                    for (i, c) in cur.iter().enumerate() {
-                                        let Some(c) = level(*c) else { continue };
+                                    for (i, &c) in cur.iter().enumerate() {
                                         if i < prev.len() {
                                             let was = prev[i];
-                                            if was != '?' && was != c {
-                                                bump(&mut buckets, active, &bits[i]);
+                                            if was != '\0' {
+                                                bump(&mut buckets, active, &bits[i], change_weight(was, c));
                                             }
                                             prev[i] = c;
                                         }
@@ -798,6 +807,7 @@ fn parse_grid(text: &str, grid: Grid) -> Result<VcdSweep, VcdError> {
                             // never made — the same off-by-one the scalar path avoids by
                             // comparing against a previous value.
                             let value = tok[1..].to_string();
+                            values_started = true;
                             if let Some(sym) = toks.next() {
                                 count_event(&mut buckets, active);
                                 for sig in sym2sig.get(sym).map(Vec::as_slice).unwrap_or(&[]) {
@@ -807,7 +817,7 @@ fn parse_grid(text: &str, grid: Grid) -> Result<VcdSweep, VcdError> {
                                         .map(|p| p != value)
                                         .unwrap_or(false);
                                     if changed {
-                                        bump(&mut buckets, active, full);
+                                        bump(&mut buckets, active, full, 1.0);
                                     }
                                 }
                             }
@@ -820,6 +830,7 @@ fn parse_grid(text: &str, grid: Grid) -> Result<VcdSweep, VcdError> {
     }
 
     let dump_end_s = time_ticks * tick_s;
+    let dump_start_s = (start_ticks * tick_s).min(dump_end_s);
     // A window is measured over the part of it the dump actually covers: a window
     // running past the end of the dump measured over its nominal length would divide
     // real transitions by time that was never simulated.
@@ -828,7 +839,8 @@ fn parse_grid(text: &str, grid: Grid) -> Result<VcdSweep, VcdError> {
         .enumerate()
         .map(|(i, b)| {
             let (w_from, w_to) = grid.bounds(i);
-            let from_s = w_from.clamp(0.0, dump_end_s);
+            // The whole dump is measured from its start, as the reference measures it.
+            let from_s = if grid.whole { dump_start_s } else { w_from.clamp(0.0, dump_end_s) };
             let to_s = w_to.clamp(from_s, dump_end_s);
             // A span thinner than the finest VCD timescale unit is not a short window, it is
             // the residue of clamping two nearly-equal floats. Left as-is it becomes a
@@ -852,7 +864,7 @@ fn parse_grid(text: &str, grid: Grid) -> Result<VcdSweep, VcdError> {
         let tail = windows.pop().expect("checked");
         let prev = windows.last_mut().expect("len > 1");
         for (path, n) in tail.toggles {
-            *prev.toggles.entry(path).or_insert(0) += n;
+            *prev.toggles.entry(path).or_insert(0.0) += n;
         }
         prev.events += tail.events;
     }
@@ -970,22 +982,28 @@ pub(crate) fn join_scope(scopes: &[String], leaf: &str) -> String {
     out
 }
 
-/// Map an IEEE 1164 nine-state character onto a countable level, or `None` for "no level".
+/// A scalar value change as the reference reads it (`VcdParse::parseVarValues`): the first
+/// character upper-cased, and only `0 1 X U Z` are values. Any other (`H L W -`) is not read at
+/// all — it neither counts nor becomes the previous value.
 ///
-/// `H` and `L` are the weak 1 and weak 0 — a pull-up holding a bus high is a driven level and a
-/// transition to it is a real transition. `U` (uninitialised), `X`, `W` (weak unknown), `Z` and
-/// `-` (don't care) are the absence of a level: they count nothing and do not become the
-/// baseline, so `0 -> x -> 0` is no toggle and `0 -> x -> 1` is one.
-///
-/// Both readers share this so a VHDL dump counts the same either way. Before, the VCD reader
-/// only recognised `0/1/x/z` as a scalar change at all and silently dropped every `H`/`L`
-/// toggle an nvc or GHDL dump writes, while the FST reader counted `U` and `W` as if they were
-/// levels — the same waveform, two different activity figures, neither of them right.
-pub(crate) fn level(c: char) -> Option<char> {
-    match c.to_ascii_lowercase() {
-        '0' | 'l' => Some('0'),
-        '1' | 'h' => Some('1'),
-        _ => None,
+/// Both readers share this and [`change_weight`], so a dump counts the same in VCD or FST form.
+pub(crate) fn scalar_value(c: char) -> Option<char> {
+    let c = c.to_ascii_uppercase();
+    matches!(c, '0' | '1' | 'X' | 'U' | 'Z').then_some(c)
+}
+
+/// The weight of one value change, as the reference counts it (`VcdCount::incrCounts`): none
+/// for no change, half when either side is `X` or `Z`, otherwise one — so `0 -> x -> 0` is one
+/// transition and an initial `x` settling to `0` is a half. The first value of a signal is never
+/// a change. A SCALAR value is upper-cased before it gets here and a BUS bit is not (the
+/// reference compares the raw character), so a bus bit `x` is not `X` and `x -> 0` weighs one.
+pub(crate) fn change_weight(prev: char, cur: char) -> f64 {
+    if prev == cur {
+        0.0
+    } else if matches!(prev, 'X' | 'Z') || matches!(cur, 'X' | 'Z') {
+        0.5
+    } else {
+        1.0
     }
 }
 
@@ -1001,19 +1019,19 @@ fn parse_range(range: Option<&str>) -> Option<(i64, i64)> {
     }
 }
 
-/// Left-extend a VCD vector value to `width` bits (VCD pads with `0`, or the leading
-/// `x`/`z`), returning it MSB-first as chars.
-pub(crate) fn pad_bits(value: &str, width: usize) -> Vec<char> {
+/// A bus value spread over `width` bits, MSB first, as the reference spreads it
+/// (`varAppendBusValue`): a one-character value fills every bit; a shorter value pads its HIGH
+/// bits with `0` (a leading `x`/`z` is not extended); a longer one keeps its low bits. The
+/// characters are kept raw — see [`change_weight`].
+pub(crate) fn bus_bits(value: &str, width: usize) -> Vec<char> {
     let chars: Vec<char> = value.chars().collect();
+    if chars.len() == 1 {
+        return vec![chars[0]; width];
+    }
     if chars.len() >= width {
         return chars[chars.len() - width..].to_vec();
     }
-    let fill = match chars.first() {
-        Some('x') | Some('X') => 'x',
-        Some('z') | Some('Z') => 'z',
-        _ => '0',
-    };
-    let mut out = vec![fill; width - chars.len()];
+    let mut out = vec!['0'; width - chars.len()];
     out.extend(chars);
     out
 }
@@ -1021,6 +1039,7 @@ pub(crate) fn pad_bits(value: &str, width: usize) -> Vec<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
 
     const VCD: &str = r#"
 $timescale 1ns $end
@@ -1071,27 +1090,27 @@ $enddefinitions $end
         let v = Vcd::parse(VCD).unwrap();
         assert!((v.sim_time_s - 20.0e-9).abs() < 1e-18);
         // clk: 0->1->0->1->0 = 4 transitions over 20 ns -> 200 MHz toggle rate
-        assert_eq!(*v.idx.toggles.get("top.clk").unwrap(), 4);
+        assert_eq!(*v.idx.toggles.get("top.clk").unwrap(), 4.0);
         assert!((v.toggle_rate("clk") - 2.0e8).abs() < 1.0); // leaf resolves (single scope)
-        assert_eq!(*v.idx.toggles.get("top.a").unwrap(), 1);
+        assert_eq!(*v.idx.toggles.get("top.a").unwrap(), 1.0);
     }
 
     #[test]
     fn window_restricts_and_rescales() {
         // [5ns,15ns): clk transitions at t=5 (0->1) and t=10 (1->0); t=15 excluded.
         let v = Vcd::parse_windowed(VCD, Some((5.0e-9, Some(15.0e-9)))).unwrap();
-        assert_eq!(*v.idx.toggles.get("top.clk").unwrap(), 2);
+        assert_eq!(*v.idx.toggles.get("top.clk").unwrap(), 2.0);
         assert!((v.sim_time_s - 10.0e-9).abs() < 1e-18);
         assert!((v.toggle_rate("clk") - 2.0e8).abs() < 1.0);
         // 'a' toggles once, at t=5 -> inside the window
-        assert_eq!(*v.idx.toggles.get("top.a").unwrap(), 1);
+        assert_eq!(*v.idx.toggles.get("top.a").unwrap(), 1.0);
     }
 
     #[test]
     fn window_open_ended_runs_to_end() {
         // [10ns, end]: clk transitions at 10, 15, 20 all counted (no upper bound).
         let v = Vcd::parse_windowed(VCD, Some((10.0e-9, None))).unwrap();
-        assert_eq!(*v.idx.toggles.get("top.clk").unwrap(), 3);
+        assert_eq!(*v.idx.toggles.get("top.clk").unwrap(), 3.0);
         assert!((v.sim_time_s - 10.0e-9).abs() < 1e-18); // 20ns dump end - 10ns from
     }
 
@@ -1119,8 +1138,8 @@ $enddefinitions $end
     fn scope_aware_resolution() {
         let v = Vcd::parse(VCD_HIER).unwrap();
         // tb.clk: 0->1->0 = 2 toggles; dut.clk: 0->1->0 = 2 toggles.
-        assert_eq!(*v.idx.toggles.get("tb.clk").unwrap(), 2);
-        assert_eq!(*v.idx.toggles.get("tb.dut.clk").unwrap(), 2);
+        assert_eq!(*v.idx.toggles.get("tb.clk").unwrap(), 2.0);
+        assert_eq!(*v.idx.toggles.get("tb.dut.clk").unwrap(), 2.0);
         assert_eq!(v.collisions(), 1);
         // Bare `clk` collides tb vs dut -> unresolved (0), no silent pick.
         assert_eq!(v.toggle_rate("clk"), 0.0);
@@ -1150,10 +1169,10 @@ b0101 !
     fn vector_counts_per_bit_toggles() {
         let v = Vcd::parse(VCD_VEC).unwrap();
         // 0000 -> 0011 : data[1],data[0] flip.  0011 -> 0101 : data[2],data[1] flip.
-        assert_eq!(*v.idx.toggles.get("top.data[0]").unwrap(), 1);
-        assert_eq!(*v.idx.toggles.get("top.data[1]").unwrap(), 2);
-        assert_eq!(*v.idx.toggles.get("top.data[2]").unwrap(), 1);
-        assert_eq!(v.idx.toggles.get("top.data[3]").copied().unwrap_or(0), 0);
+        assert_eq!(*v.idx.toggles.get("top.data[0]").unwrap(), 1.0);
+        assert_eq!(*v.idx.toggles.get("top.data[1]").unwrap(), 2.0);
+        assert_eq!(*v.idx.toggles.get("top.data[2]").unwrap(), 1.0);
+        assert_eq!(v.idx.toggles.get("top.data[3]").copied().unwrap_or(0.0), 0.0);
         // per-bit net resolves; data[1] = 2 toggles / 10 ns
         assert!((v.toggle_rate("data[1]") - 2.0e8).abs() < 1.0);
         // the old behaviour (one toggle for the whole vector) is gone — bits are independent
@@ -1192,8 +1211,8 @@ b0001 !
             let from = i as f64 * 5.0e-9;
             let one = Vcd::parse_windowed(VCD, Some((from, Some(from + 5.0e-9)))).unwrap();
             assert_eq!(
-                w.toggles.get("top.clk").copied().unwrap_or(0),
-                one.idx.toggles.get("top.clk").copied().unwrap_or(0),
+                w.toggles.get("top.clk").copied().unwrap_or(0.0),
+                one.idx.toggles.get("top.clk").copied().unwrap_or(0.0),
                 "window {i} disagrees with the same window parsed alone"
             );
             assert!((w.sim_time_s - one.sim_time_s).abs() < 1e-18);
@@ -1206,24 +1225,24 @@ b0001 !
                 .toggles
                 .get("top.clk")
                 .copied()
-                .unwrap_or(0),
-            0
+                .unwrap_or(0.0),
+            0.0
         );
         assert_eq!(
             sweep.windows[1]
                 .toggles
                 .get("top.clk")
                 .copied()
-                .unwrap_or(0),
-            1
+                .unwrap_or(0.0),
+            1.0
         );
         assert_eq!(
             sweep.windows[3]
                 .toggles
                 .get("top.clk")
                 .copied()
-                .unwrap_or(0),
-            1
+                .unwrap_or(0.0),
+            1.0
         );
     }
 
@@ -1244,14 +1263,14 @@ b0001 !
         // inventing or losing activity.
         let whole = Vcd::parse(VCD).unwrap();
         for net in ["top.clk", "top.a"] {
-            let swept: u64 = sweep
+            let swept: f64 = sweep
                 .windows
                 .iter()
-                .map(|w| w.toggles.get(net).copied().unwrap_or(0))
+                .map(|w| w.toggles.get(net).copied().unwrap_or(0.0))
                 .sum();
             assert_eq!(
                 swept,
-                whole.idx.toggles.get(net).copied().unwrap_or(0),
+                whole.idx.toggles.get(net).copied().unwrap_or(0.0),
                 "{net}: the sweep and the whole dump disagree on total transitions"
             );
         }
@@ -1288,16 +1307,16 @@ b0001 !
                 .toggles
                 .get("top.clk")
                 .copied()
-                .unwrap_or(0),
-            1
+                .unwrap_or(0.0),
+            1.0
         );
         assert_eq!(
             sweep.windows[1]
                 .toggles
                 .get("top.clk")
                 .copied()
-                .unwrap_or(0),
-            2
+                .unwrap_or(0.0),
+            2.0
         ); // #5, #10
     }
 
@@ -1312,16 +1331,16 @@ b0001 !
                 .toggles
                 .get("top.clk")
                 .copied()
-                .unwrap_or(0),
-            0
+                .unwrap_or(0.0),
+            0.0
         );
         assert_eq!(
             sweep.windows[1]
                 .toggles
                 .get("top.clk")
                 .copied()
-                .unwrap_or(0),
-            1
+                .unwrap_or(0.0),
+            1.0
         ); // #10
     }
 
@@ -1455,7 +1474,7 @@ $end
                 .toggles
                 .get("power_sweep.power_total_w")
                 .expect("series declared"),
-            2,
+            2.0,
             "three points, two of them changes after the initial value"
         );
     }
@@ -1531,10 +1550,10 @@ $end
         let v = Vcd::parse(VCD_VEC_GLITCH).unwrap();
         // bit0: +1 (0->1) and +1 (1->0) at #5, then +1 (0->1) at #10 = 3 total.
         // A first-vs-last reader would see only 0000->0000 (#5) then 0000->0001 (#10) = 1.
-        assert_eq!(*v.idx.toggles.get("top.data[0]").unwrap(), 3);
-        assert_eq!(v.idx.toggles.get("top.data[1]").copied().unwrap_or(0), 0);
-        assert_eq!(v.idx.toggles.get("top.data[2]").copied().unwrap_or(0), 0);
-        assert_eq!(v.idx.toggles.get("top.data[3]").copied().unwrap_or(0), 0);
+        assert_eq!(*v.idx.toggles.get("top.data[0]").unwrap(), 3.0);
+        assert_eq!(v.idx.toggles.get("top.data[1]").copied().unwrap_or(0.0), 0.0);
+        assert_eq!(v.idx.toggles.get("top.data[2]").copied().unwrap_or(0.0), 0.0);
+        assert_eq!(v.idx.toggles.get("top.data[3]").copied().unwrap_or(0.0), 0.0);
         // 3 transitions over the 10 ns dump.
         assert!((v.toggle_rate("data[0]") - 3.0e8).abs() < 1.0);
     }
