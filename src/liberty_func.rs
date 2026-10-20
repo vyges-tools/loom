@@ -185,6 +185,29 @@ impl Func {
         }
     }
 
+    /// The ports the expression names, each once, left to right (`FuncExpr::ports`, whose set is
+    /// ordered by pointer — see the caller for what that order decides).
+    pub(crate) fn ports(&self) -> Vec<&str> {
+        fn walk<'a>(f: &'a Func, out: &mut Vec<&'a str>) {
+            match f {
+                Func::Port(p) => {
+                    if !out.contains(&p.as_str()) {
+                        out.push(p);
+                    }
+                }
+                Func::Not(a) => walk(a, out),
+                Func::Or(a, b) | Func::And(a, b) | Func::Xor(a, b) => {
+                    walk(a, out);
+                    walk(b, out);
+                }
+                Func::One | Func::Zero => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(self, &mut out);
+        out
+    }
+
     /// The reference's `invert`: a negation is unwrapped, anything else negated (how a
     /// `three_state` DISABLE expression becomes the enable).
     pub(crate) fn invert(self) -> Func {

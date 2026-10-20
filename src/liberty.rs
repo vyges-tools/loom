@@ -238,6 +238,29 @@ pub struct Pin {
     pub cap_f: f64,       // same capacitance in Farads (power: net-load summation)
     pub recv: Option<RecvCap>, // CCS receiver model (input pins); None -> use `capacitance`
     pub clock: bool,      // `clock : true` — the cell's clock pin
+    /// A REGISTER CLOCK by its arcs, whatever `clock` says (`LibertyPort::isRegClk`): the pin a
+    /// `rising_edge` / `falling_edge` arc launches from, as a register clock-to-Q or a latch
+    /// enable-to-Q — see [`edge_arc_role`]. `clock : true` is optional in Liberty; a hard macro
+    /// (an efuse's STROBE, a PHY, some memories) often leaves it off.
+    ///
+    /// ⚠️ Not classified by an `ff_bank` / `latch_bank` group: an edge arc from a bank's clear or
+    /// preset pin reads as a register clock-to-Q here.
+    pub is_reg_clk: bool,
+    /// The output such an arc drives (`LibertyPort::isRegOutput`).
+    pub is_reg_output: bool,
+    /// A CHECK CLOCK (`LibertyPort::isCheckClk`): the pin a timing check is made against — the
+    /// `related_pin` of a setup, hold, recovery, removal, skew or non-sequential check — and a pin
+    /// with a pulse-width or period check on itself (`min_pulse_width`, `minimum_period`, the
+    /// `min_pulse_width_high/low` attributes), whose check arc runs from the pin to itself. Set
+    /// whether or not the group carries tables, as the reference sets it.
+    ///
+    /// ⚠️ So a pin with a pulse-width check on ITSELF is a check clock too (a flop's RESET_B with
+    /// `min_pulse_width_low`), as it is in the reference. Tracing clocks, take [`Pin::is_reg_clk`];
+    /// this adds the pins checks are made against.
+    pub is_check_clk: bool,
+    /// While reading: each check group's `related_pin` / `related_bus_pins` names, as written, and
+    /// `""` for a check on the pin itself — resolved to [`Pin::is_check_clk`] at the cell.
+    pub(crate) check_from: Vec<String>,
     /// Boolean `function` of an output pin, verbatim from Liberty (e.g. `"!A"`, `"A&B"`).
     /// `None` on inputs, and on outputs in libraries that omit it — a timing-only library is
     /// perfectly valid, so absence is not an error.
@@ -300,7 +323,10 @@ pub struct Cell {
     pub name: String,
     pub pins: BTreeMap<String, Pin>,
     pub is_seq: bool,              // has an `ff`/`latch` group
-    pub clock_pin: Option<String>, // the pin marked `clock : true`
+    /// The pin marked `clock : true` — an optional attribute: a macro may mark none, or launch
+    /// from several. Which pins ARE clocks by their arcs is [`Pin::is_reg_clk`] /
+    /// [`Pin::is_check_clk`], and [`Cell::reg_clk_pins`] lists the first.
+    pub clock_pin: Option<String>,
     pub leakage_w: f64,            // cell_leakage_power → Watts (power)
     pub int_energy_j: f64,         // representative per-transition internal energy → Joules (power)
     /// `cell_footprint` — the vendor's own grouping of interchangeable cells. When a library
@@ -447,6 +473,12 @@ fn interchangeable(a: &Cell, b: &Cell) -> bool {
 }
 
 impl Cell {
+    /// Every pin a register clock-to-Q or latch enable-to-Q arc launches from
+    /// ([`Pin::is_reg_clk`]), in name order — none, one, or several, with or without `clock : true`.
+    pub fn reg_clk_pins(&self) -> Vec<&str> {
+        self.pins.iter().filter(|(_, p)| p.is_reg_clk).map(|(n, _)| n.as_str()).collect()
+    }
+
     /// Input capacitance (Farads) of a pin — 0.0 if absent. (power)
     pub fn input_cap(&self, pin: &str) -> f64 {
         self.pins.get(pin).map(|p| p.cap_f).unwrap_or(0.0)
@@ -1097,9 +1129,37 @@ fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
     let mut recovery: Vec<Constraint> = Vec::new();
     let mut removal: Vec<Constraint> = Vec::new();
     let mut unmodelled_checks: Vec<String> = Vec::new();
+    // `readMinPulseWidth`: a `min_pulse_width_high` / `_low` attribute builds a width check arc
+    // from the pin to itself.
+    let mut check_from: Vec<String> = Vec::new();
+    if ["min_pulse_width_high", "min_pulse_width_low"].iter().any(|k| simple_attr(&own, k).is_some()) {
+        check_from.push(String::new());
+    }
     for g in pin_groups.iter().filter(|g| g.kw == "timing") {
         let tbody = &body[g.body.clone()];
         let (town, tspans) = level(tbody);
+        // The groups the reference builds a timing-CHECK arc for, from each `related_pin` /
+        // `related_bus_pins` name (none: no arc, a warning) — a pulse width or a period with no
+        // related pin is made on the pin itself. `nochange_*` builds nothing.
+        if let Some(tt) = simple_attr(&town, "timing_type") {
+            let on_self = tt == "min_pulse_width" || tt == "minimum_period";
+            let check = on_self
+                || ["setup_", "hold_", "recovery_", "removal_", "skew_", "non_seq_setup_", "non_seq_hold_"]
+                    .iter()
+                    .any(|k| tt.starts_with(k) && matches!(&tt[k.len()..], "rising" | "falling"));
+            if check {
+                let names: Vec<String> = ["related_pin", "related_bus_pins"]
+                    .iter()
+                    .filter_map(|k| simple_attr(&town, k))
+                    .flat_map(|v| v.split_whitespace().map(|n| n.trim_matches('"').to_string()).collect::<Vec<_>>())
+                    .filter(|n| !n.is_empty())
+                    .collect();
+                if names.is_empty() && on_self {
+                    check_from.push(String::new());
+                }
+                check_from.extend(names);
+            }
+        }
         // `retaining_rise/_fall` (+ `retain_*_slew`): the arc's contamination delay, which the
         // reference times the MIN analysis with. Not read; named, so a timer can say so.
         for (kw, _, _) in top_groups(tbody) {
@@ -1155,6 +1215,10 @@ fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
         removal,
         arcs,
         unmodelled_checks,
+        is_reg_clk: false,
+        is_reg_output: false,
+        is_check_clk: false,
+        check_from,
     }
 }
 
@@ -1575,6 +1639,88 @@ fn sequential_arcs(pins: &mut BTreeMap<String, Pin>, seqs: &[(String, String, St
     }
 }
 
+/// The role the reference gives a `rising_edge` / `falling_edge` arc from `from` to an output with
+/// `function` (`LibertyBuilder::makeRegLatchArcs`), over the cell's `ff` / `latch` groups `seqs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EdgeRole {
+    /// `regClkToQ` — and the fallback when no `ff` / `latch` claims the arc.
+    RegClkToQ,
+    LatchEnToQ,
+    LatchDtoQ,
+    RegSetClr,
+}
+
+/// `makeRegLatchArcs`: for each port the output's `function` names, the state group whose output
+/// (`IQ` or `IQN`) it is decides — `from` in its clock (`clocked_on`, a latch's `enable`) is a
+/// register clock-to-Q (a latch enable-to-Q); in a latch's `data_in`, latch D-to-Q; in `clear` or
+/// `preset`, the set/clear arc; else the next port. When none decides — no function, no state
+/// group, as on an efuse whose STROBE has edge arcs and no `ff` — the arc is ASSUMED a register
+/// clock-to-Q (`setHasInferedRegTimingArcs`).
+///
+/// ⚠️ The reference walks the ports in POINTER order (`LibertyPortSet` = `std::set<LibertyPort*>`);
+/// this walks them left to right. They differ only when a function names two state outputs that
+/// disagree about `from`, which no cell library we have does.
+pub(crate) fn edge_arc_role(from: &str, function: Option<&str>, seqs: &[(String, String, String)], names: &std::collections::BTreeSet<String>) -> EdgeRole {
+    use crate::liberty_func::Func;
+    let expr = |body: &str, key: &str| simple_attr(body, key).and_then(|e| Func::parse_in(&e, |p| names.contains(p)));
+    let Some(func) = function.and_then(|f| Func::parse_in(f, |_| true)) else { return EdgeRole::RegClkToQ };
+    for port in func.ports() {
+        let Some((kw, _, body)) = seqs.iter().find(|(_, args, _)| args.split(',').take(2).any(|a| a.trim().trim_matches('"') == port)) else {
+            continue;
+        };
+        let latch = kw == "latch";
+        if expr(body, if latch { "enable" } else { "clocked_on" }).is_some_and(|c| c.has_port(from)) {
+            return if latch { EdgeRole::LatchEnToQ } else { EdgeRole::RegClkToQ };
+        }
+        if latch && expr(body, "data_in").is_some_and(|d| d.has_port(from)) {
+            return EdgeRole::LatchDtoQ;
+        }
+        if ["clear", "preset"].iter().any(|k| expr(body, k).is_some_and(|e| e.has_port(from))) {
+            return EdgeRole::RegSetClr;
+        }
+    }
+    EdgeRole::RegClkToQ
+}
+
+/// `LibertyCell::makeTimingArcPortMaps`, the facts it sets on each port: a register clock-to-Q or
+/// latch enable-to-Q arc marks its from-pin [`Pin::is_reg_clk`] and its to-pin
+/// [`Pin::is_reg_output`]; every timing-check arc marks its from-pin [`Pin::is_check_clk`]. A
+/// related name that is a bus marks each of its bits.
+fn clock_roles(pins: &mut BTreeMap<String, Pin>, seqs: &[(String, String, String)], buses: &[(String, Vec<String>)]) {
+    let names: std::collections::BTreeSet<String> = pins.keys().cloned().collect();
+    let mut reg_clk = Vec::new();
+    let mut reg_out = Vec::new();
+    let mut check_clk = Vec::new();
+    for (pname, pin) in pins.iter() {
+        for a in pin.arcs.iter().filter(|a| a.clk_edge.is_some()) {
+            if matches!(edge_arc_role(&a.related_pin, pin.function.as_deref(), seqs, &names), EdgeRole::RegClkToQ | EdgeRole::LatchEnToQ) {
+                reg_clk.push(a.related_pin.clone());
+                reg_out.push(pname.clone());
+            }
+        }
+        for n in &pin.check_from {
+            if n.is_empty() {
+                check_clk.push(pname.clone());
+            } else if let Some((_, bits)) = buses.iter().find(|(b, _)| b == n) {
+                check_clk.extend(bits.iter().cloned());
+            } else {
+                check_clk.push(n.clone());
+            }
+        }
+    }
+    for (list, set) in [(reg_clk, 0), (reg_out, 1), (check_clk, 2)] {
+        for n in list {
+            if let Some(p) = pins.get_mut(&n) {
+                match set {
+                    0 => p.is_reg_clk = true,
+                    1 => p.is_reg_output = true,
+                    _ => p.is_check_clk = true,
+                }
+            }
+        }
+    }
+}
+
 /// The sense of every arc whose group states no `timing_sense`, as the reference builds the arcs:
 ///   * a combinational arc: the output pin's `function`, when it names the related pin; else, on a
 ///     three-state pin whose enable names it, non-unate;
@@ -1647,6 +1793,7 @@ fn merged_pin(name: &str, group: &Pin, inner: Option<(&Pin, &str)>) -> Pin {
         p.recovery.extend(ip.recovery.iter().cloned());
         p.removal.extend(ip.removal.iter().cloned());
         p.arcs.extend(ip.arcs.iter().cloned());
+        p.check_from.extend(ip.check_from.iter().cloned());
     }
     p
 }
@@ -1753,6 +1900,7 @@ fn parse_cell(
         .collect();
     sequential_arcs(&mut pins, &seqs);
     derive_senses(&mut pins);
+    clock_roles(&mut pins, &seqs, &buses);
     let ff = groups
         .iter()
         .find(|(k, _, _)| k == "ff" || k == "latch")
@@ -2125,6 +2273,7 @@ impl Lib {
                 s.push_str(&format!("\"capacitance\":{},", jnum(pin.capacitance)));
                 s.push_str(&format!("\"cap_f\":{},", jnum(pin.cap_f)));
                 s.push_str(&format!("\"clock\":{},", pin.clock));
+                s.push_str(&format!("\"is_reg_clk\":{},\"is_reg_output\":{},\"is_check_clk\":{},", pin.is_reg_clk, pin.is_reg_output, pin.is_check_clk));
                 let has_recv = pin.recv.as_ref().map(|r| !r.is_empty()).unwrap_or(false);
                 s.push_str(&format!("\"has_recv_ccs\":{},", has_recv));
                 s.push_str(&format!("\"setup_groups\":{},", pin.setup.len()));
@@ -3644,5 +3793,133 @@ mod per_library_thresholds {
         let b = a.cell_thresholds("INV_B");
         assert_eq!((b.slew_lower_rise, b.slew_upper_fall), (0.1, 0.9));
         assert_eq!(a.cell_thresholds("no_such_cell"), a.thresholds, "a port: the first library's");
+    }
+}
+
+/// Which pins are clocks, by their ARCS — the facts the reference reader sets on each port
+/// (`LibertyCell::makeTimingArcPortMaps`), none of which needs `clock : true`.
+#[cfg(test)]
+mod clock_roles_by_arcs {
+    use super::*;
+
+    const LIB: &str = r#"library (l) {
+      cell (EFUSE) {
+        pin (STROBE) { direction : input; }
+        pin (SEL) { direction : input;
+          timing () { related_pin : "STROBE"; timing_type : non_seq_setup_rising; rise_constraint (scalar) { values ("0.1"); } }
+          timing () { related_pin : "STROBE"; timing_type : non_seq_hold_falling; rise_constraint (scalar) { values ("0.1"); } } }
+        pin (Q) { direction : output;
+          timing () { related_pin : "STROBE"; timing_type : rising_edge;
+            cell_rise (scalar) { values ("1"); } rise_transition (scalar) { values ("0.1"); }
+            cell_fall (scalar) { values ("1"); } fall_transition (scalar) { values ("0.1"); } } }
+      }
+      cell (DFR) {
+        ff (IQ, IQN) { clocked_on : "CLK"; next_state : "D"; clear : "!RESET_B"; }
+        pin (CLK) { direction : input; clock : true; min_pulse_width_high : 0.2; }
+        pin (D) { direction : input;
+          timing () { related_pin : "CLK"; timing_type : setup_rising; rise_constraint (scalar) { values ("0.1"); } } }
+        pin (RESET_B) { direction : input; min_pulse_width_low : 0.3;
+          timing () { related_pin : "CLK"; timing_type : recovery_rising; rise_constraint (scalar) { values ("0.1"); } } }
+        pin (Q) { direction : output; function : "IQ";
+          timing () { related_pin : "CLK"; timing_type : rising_edge;
+            cell_rise (scalar) { values ("0.3"); } rise_transition (scalar) { values ("0.1"); }
+            cell_fall (scalar) { values ("0.3"); } fall_transition (scalar) { values ("0.1"); } }
+          timing () { related_pin : "RESET_B"; timing_type : falling_edge;
+            cell_fall (scalar) { values ("0.2"); } fall_transition (scalar) { values ("0.1"); } } }
+      }
+      cell (LAT) {
+        latch (IQ, IQN) { enable : "G"; data_in : "D"; }
+        pin (G) { direction : input; }
+        pin (D) { direction : input; }
+        pin (Q) { direction : output; function : "IQ";
+          timing () { related_pin : "G"; timing_type : rising_edge;
+            cell_rise (scalar) { values ("0.3"); } rise_transition (scalar) { values ("0.1"); } }
+          timing () { related_pin : "D"; timing_type : rising_edge;
+            cell_rise (scalar) { values ("0.2"); } rise_transition (scalar) { values ("0.1"); } } }
+      }
+      cell (NC) {
+        pin (A) { direction : input; }
+        pin (B) { direction : input;
+          timing () { related_pin : "A"; timing_type : nochange_high_high; } }
+        pin (W) { direction : input;
+          timing () { timing_type : min_pulse_width; rise_constraint (scalar) { values ("0.1"); } } }
+      }
+    }"#;
+
+    fn pin(lib: &Lib, cell: &str, pin: &str) -> (bool, bool, bool) {
+        let p = &lib.cell(cell).unwrap().pins[pin];
+        (p.is_reg_clk, p.is_reg_output, p.is_check_clk)
+    }
+
+    /// Rules: an edge arc with no `ff` / `latch` behind its output is ASSUMED a register clock-to-Q
+    /// (`makeRegLatchArcs`, `setHasInferedRegTimingArcs`), so its from-pin is a register clock with
+    /// no `clock : true`; a non-sequential check is a timing check, so its related pin is a check
+    /// clock. The efuse's STROBE is both.
+    #[test]
+    fn a_macro_strobe_with_no_clock_attribute_is_a_register_and_check_clock() {
+        let lib = Lib::parse(LIB).unwrap();
+        assert!(!lib.cell("EFUSE").unwrap().pins["STROBE"].clock);
+        assert_eq!(pin(&lib, "EFUSE", "STROBE"), (true, false, true));
+        assert_eq!(pin(&lib, "EFUSE", "Q"), (false, true, false));
+        assert_eq!(pin(&lib, "EFUSE", "SEL"), (false, false, false));
+    }
+
+    /// Rules: an edge arc from the `ff`'s `clear` pin is the set/clear arc, not clock-to-Q; a
+    /// recovery check makes its related pin (CLK) a check clock; a `min_pulse_width_*` attribute is
+    /// a width check from the pin to itself, so RESET_B is a check clock too.
+    #[test]
+    fn a_clear_edge_arc_is_not_a_clock_and_a_pulse_width_attribute_is_a_check_on_itself() {
+        let lib = Lib::parse(LIB).unwrap();
+        assert_eq!(pin(&lib, "DFR", "CLK"), (true, false, true));
+        assert_eq!(pin(&lib, "DFR", "RESET_B"), (false, false, true));
+        assert_eq!(pin(&lib, "DFR", "D"), (false, false, false));
+        assert_eq!(pin(&lib, "DFR", "Q"), (false, true, false));
+    }
+
+    /// Rules: a latch's enable-to-Q is a register clock (`latchEnToQ`); its data-to-Q is not
+    /// (`latchDtoQ`); `nochange_*` builds no arc, so marks nothing; a `min_pulse_width` group with no
+    /// related pin is a check on the pin itself.
+    #[test]
+    fn latch_enable_nochange_and_a_bare_pulse_width_group() {
+        let lib = Lib::parse(LIB).unwrap();
+        assert_eq!(pin(&lib, "LAT", "G"), (true, false, false));
+        assert_eq!(pin(&lib, "LAT", "D"), (false, false, false));
+        assert_eq!(pin(&lib, "NC", "A"), (false, false, false));
+        assert_eq!(pin(&lib, "NC", "W"), (false, false, true));
+    }
+
+    /// A macro with several launching pins, none marked `clock : true`, and a check made against a
+    /// BUS (`related_bus_pins`): every launching pin is a register clock, every bit a check clock.
+    #[test]
+    fn a_macro_with_several_clocks_and_a_bus_related_check() {
+        let lib = Lib::parse(r#"library (l) {
+          type (b2) { base_type : array; data_type : bit; bit_width : 2; bit_from : 1; bit_to : 0; downto : true; }
+          cell (PHY) {
+            pin (TXCLK) { direction : input; }
+            pin (RXCLK) { direction : input; }
+            bus (CK) { bus_type : b2; direction : input; }
+            pin (EN) { direction : input;
+              timing () { related_bus_pins : "CK"; timing_type : setup_rising; rise_constraint (scalar) { values ("0.1"); } } }
+            pin (TX) { direction : output;
+              timing () { related_pin : "TXCLK"; timing_type : rising_edge; cell_rise (scalar) { values ("1"); } rise_transition (scalar) { values ("0.1"); } } }
+            pin (RX) { direction : output;
+              timing () { related_pin : "RXCLK"; timing_type : falling_edge; cell_rise (scalar) { values ("1"); } rise_transition (scalar) { values ("0.1"); } } }
+          }
+        }"#).unwrap();
+        let c = lib.cell("PHY").unwrap();
+        assert_eq!(c.clock_pin, None);
+        assert_eq!(c.reg_clk_pins(), ["RXCLK", "TXCLK"]);
+        assert!(c.pins["CK[0]"].is_check_clk && c.pins["CK[1]"].is_check_clk);
+        assert!(!c.pins["EN"].is_check_clk);
+    }
+
+    /// The facts survive the library cache.
+    #[test]
+    fn the_cache_keeps_the_clock_facts() {
+        let lib = Lib::parse(LIB).unwrap();
+        let back = crate::libcache::decode(&crate::libcache::encode(&lib)).unwrap();
+        for (c, p) in [("EFUSE", "STROBE"), ("DFR", "RESET_B"), ("LAT", "G"), ("DFR", "Q")] {
+            assert_eq!(pin(&back, c, p), pin(&lib, c, p), "{c}/{p}");
+        }
     }
 }

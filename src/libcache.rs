@@ -19,7 +19,8 @@ use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, OutEdges, Pin, Pi
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLCG"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLCH"; // Vyges Liberty Cache — bump the trailing digit on any format change
+                                 // VLCH: Pin gained `is_reg_clk`, `is_reg_output`, `is_check_clk`.
                                  // VLCG: Constraint gained `clk_edge` + `related_pin`.
                                  // VLCF: Pin gained `unmodelled_checks`.
                                  // VLCE: Cell gained `dont_use`.
@@ -322,6 +323,9 @@ fn enc_pin(w: &mut W, p: &Pin) {
     for c in &p.unmodelled_checks {
         w.s(c);
     }
+    for b in [p.is_reg_clk, p.is_reg_output, p.is_check_clk] {
+        w.u8(b as u8);
+    }
 }
 fn dec_pin(r: &mut R) -> Option<Pin> {
     let name = r.s()?;
@@ -369,6 +373,7 @@ fn dec_pin(r: &mut R) -> Option<Pin> {
     for _ in 0..r.u64()? {
         unmodelled_checks.push(r.s()?);
     }
+    let (is_reg_clk, is_reg_output, is_check_clk) = (r.u8()? != 0, r.u8()? != 0, r.u8()? != 0);
     Some(Pin {
         name,
         direction,
@@ -385,6 +390,10 @@ fn dec_pin(r: &mut R) -> Option<Pin> {
         removal,
         arcs,
         unmodelled_checks,
+        is_reg_clk,
+        is_reg_output,
+        is_check_clk,
+        check_from: Vec::new(),
     })
 }
 
