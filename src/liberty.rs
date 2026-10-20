@@ -241,7 +241,7 @@ pub struct Pin {
     /// A REGISTER CLOCK by its arcs, whatever `clock` says (`LibertyPort::isRegClk`): the pin a
     /// `rising_edge` / `falling_edge` arc launches from, as a register clock-to-Q or a latch
     /// enable-to-Q — see [`edge_arc_role`]. `clock : true` is optional in Liberty; a hard macro
-    /// (an efuse's STROBE, a PHY, some memories) often leaves it off.
+    /// (a launch pin on a hard macro, a PHY, some memories) often leaves it off.
     ///
     /// ⚠️ Not classified by an `ff_bank` / `latch_bank` group: an edge arc from a bank's clear or
     /// preset pin reads as a register clock-to-Q here.
@@ -1654,7 +1654,7 @@ pub(crate) enum EdgeRole {
 /// (`IQ` or `IQN`) it is decides — `from` in its clock (`clocked_on`, a latch's `enable`) is a
 /// register clock-to-Q (a latch enable-to-Q); in a latch's `data_in`, latch D-to-Q; in `clear` or
 /// `preset`, the set/clear arc; else the next port. When none decides — no function, no state
-/// group, as on an efuse whose STROBE has edge arcs and no `ff` — the arc is ASSUMED a register
+/// group, as on a hard macro whose launch pin has edge arcs and no `ff` — the arc is ASSUMED a register
 /// clock-to-Q (`setHasInferedRegTimingArcs`).
 ///
 /// ⚠️ The reference walks the ports in POINTER order (`LibertyPortSet` = `std::set<LibertyPort*>`);
@@ -3803,13 +3803,13 @@ mod clock_roles_by_arcs {
     use super::*;
 
     const LIB: &str = r#"library (l) {
-      cell (EFUSE) {
-        pin (STROBE) { direction : input; }
+      cell (MACRO) {
+        pin (LCLK) { direction : input; }
         pin (SEL) { direction : input;
-          timing () { related_pin : "STROBE"; timing_type : non_seq_setup_rising; rise_constraint (scalar) { values ("0.1"); } }
-          timing () { related_pin : "STROBE"; timing_type : non_seq_hold_falling; rise_constraint (scalar) { values ("0.1"); } } }
+          timing () { related_pin : "LCLK"; timing_type : non_seq_setup_rising; rise_constraint (scalar) { values ("0.1"); } }
+          timing () { related_pin : "LCLK"; timing_type : non_seq_hold_falling; rise_constraint (scalar) { values ("0.1"); } } }
         pin (Q) { direction : output;
-          timing () { related_pin : "STROBE"; timing_type : rising_edge;
+          timing () { related_pin : "LCLK"; timing_type : rising_edge;
             cell_rise (scalar) { values ("1"); } rise_transition (scalar) { values ("0.1"); }
             cell_fall (scalar) { values ("1"); } fall_transition (scalar) { values ("0.1"); } } }
       }
@@ -3854,14 +3854,14 @@ mod clock_roles_by_arcs {
     /// Rules: an edge arc with no `ff` / `latch` behind its output is ASSUMED a register clock-to-Q
     /// (`makeRegLatchArcs`, `setHasInferedRegTimingArcs`), so its from-pin is a register clock with
     /// no `clock : true`; a non-sequential check is a timing check, so its related pin is a check
-    /// clock. The efuse's STROBE is both.
+    /// clock. The macro's launch pin is both.
     #[test]
-    fn a_macro_strobe_with_no_clock_attribute_is_a_register_and_check_clock() {
+    fn a_macro_launch_pin_with_no_clock_attribute_is_a_register_and_check_clock() {
         let lib = Lib::parse(LIB).unwrap();
-        assert!(!lib.cell("EFUSE").unwrap().pins["STROBE"].clock);
-        assert_eq!(pin(&lib, "EFUSE", "STROBE"), (true, false, true));
-        assert_eq!(pin(&lib, "EFUSE", "Q"), (false, true, false));
-        assert_eq!(pin(&lib, "EFUSE", "SEL"), (false, false, false));
+        assert!(!lib.cell("MACRO").unwrap().pins["LCLK"].clock);
+        assert_eq!(pin(&lib, "MACRO", "LCLK"), (true, false, true));
+        assert_eq!(pin(&lib, "MACRO", "Q"), (false, true, false));
+        assert_eq!(pin(&lib, "MACRO", "SEL"), (false, false, false));
     }
 
     /// Rules: an edge arc from the `ff`'s `clear` pin is the set/clear arc, not clock-to-Q; a
@@ -3918,7 +3918,7 @@ mod clock_roles_by_arcs {
     fn the_cache_keeps_the_clock_facts() {
         let lib = Lib::parse(LIB).unwrap();
         let back = crate::libcache::decode(&crate::libcache::encode(&lib)).unwrap();
-        for (c, p) in [("EFUSE", "STROBE"), ("DFR", "RESET_B"), ("LAT", "G"), ("DFR", "Q")] {
+        for (c, p) in [("MACRO", "LCLK"), ("DFR", "RESET_B"), ("LAT", "G"), ("DFR", "Q")] {
             assert_eq!(pin(&back, c, p), pin(&lib, c, p), "{c}/{p}");
         }
     }
