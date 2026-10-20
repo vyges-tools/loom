@@ -462,7 +462,7 @@ impl Vcd {
     /// Like [`load`](Vcd::load), but restrict activity to a `[from, to)` time window
     /// (seconds; `to = None` runs to end-of-dump). See [`parse_windowed`](Vcd::parse_windowed).
     pub fn load_windowed(path: &str, window: Option<(f64, Option<f64>)>) -> Result<Vcd, VcdError> {
-        let text = std::fs::read_to_string(path).map_err(|e| VcdError(format!("{path}: {e}")))?;
+        let text = crate::netlist::read_text(path).map_err(|e| VcdError(e.0))?; // gzipped or not, as the reference reads it
         Vcd::parse_windowed(&text, window)
     }
 
@@ -546,7 +546,7 @@ impl Vcd {
         step_s: Option<f64>,
         scope: Option<String>,
     ) -> Result<VcdSweep, VcdError> {
-        let text = std::fs::read_to_string(path).map_err(|e| VcdError(format!("{path}: {e}")))?;
+        let text = crate::netlist::read_text(path).map_err(|e| VcdError(e.0))?; // gzipped or not, as the reference reads it
         Ok(Vcd::parse_sweep(&text, from_s, to_s, window_s, step_s)?.with_scope(scope))
     }
 }
@@ -1537,5 +1537,30 @@ $end
         assert_eq!(v.idx.toggles.get("top.data[3]").copied().unwrap_or(0), 0);
         // 3 transitions over the 10 ns dump.
         assert!((v.toggle_rate("data[0]") - 3.0e8).abs() < 1.0);
+    }
+}
+
+/// The reference opens a VCD through zlib (`gzopen`), so a `.vcd.gz` reads as its text; so do
+/// `Vcd::load` and `Vcd::load_sweep`.
+#[cfg(all(test, feature = "gzip"))]
+mod gzip_tests {
+    use super::*;
+
+    #[test]
+    fn a_gzipped_vcd_loads_as_its_text() {
+        let text = "$timescale 1ns $end\n$scope module top $end\n$var wire 1 ! clk $end\n$upscope $end\n$enddefinitions $end\n#0\n0!\n#5\n1!\n#10\n0!\n#20\n";
+        let mut g = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+        g.extend(miniz_oxide::deflate::compress_to_vec(text.as_bytes(), 6));
+        g.extend_from_slice(&[0; 4]);
+        g.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        let f = std::env::temp_dir().join(format!("loom-vcd-gz-{}.vcd.gz", std::process::id()));
+        std::fs::write(&f, g).unwrap();
+        let v = Vcd::load(f.to_str().unwrap());
+        let w = Vcd::load_sweep(f.to_str().unwrap(), 0.0, None, 1e-8, None, None);
+        let _ = std::fs::remove_file(&f);
+        let plain = Vcd::parse(text).unwrap().toggle_rate("clk");
+        assert!(plain > 0.0);
+        assert_eq!(v.unwrap().toggle_rate("clk"), plain);
+        assert!(w.unwrap().window(0).toggle_rate("clk") > 0.0);
     }
 }

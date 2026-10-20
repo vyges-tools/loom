@@ -75,7 +75,8 @@ impl Saif {
     }
 
     pub fn load(path: &str) -> Result<Saif, SaifError> {
-        let text = std::fs::read_to_string(path).map_err(|e| SaifError(format!("{path}: {e}")))?;
+        // Gzipped or not, as the reference reads it (gzip inflates with the `gzip` feature).
+        let text = crate::netlist::read_text(path).map_err(|e| SaifError(e.0))?;
         Saif::parse(&text)
     }
 
@@ -388,5 +389,26 @@ mod tests {
         assert!((scoped.toggle_rate("clk") - 8.0e7).abs() < 1.0);
         // `q` is unique -> resolves regardless of scope
         assert!((s.toggle_rate("q") - 1.2e8).abs() < 1.0); // 6 / 50ns
+    }
+}
+
+/// The reference opens a SAIF through zlib, so a `.saif.gz` reads as its text; so does `Saif::load`.
+#[cfg(all(test, feature = "gzip"))]
+mod gzip_tests {
+    use super::*;
+
+    #[test]
+    fn a_gzipped_saif_loads_as_its_text() {
+        let text = "(SAIFILE (DURATION 100) (TIMESCALE 1 ns) (INSTANCE top (NET (a (T0 50) (T1 50) (TC 4)))))\n";
+        let mut g = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+        g.extend(miniz_oxide::deflate::compress_to_vec(text.as_bytes(), 6));
+        g.extend_from_slice(&[0; 4]);
+        g.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        let f = std::env::temp_dir().join(format!("loom-saif-gz-{}.saif.gz", std::process::id()));
+        std::fs::write(&f, g).unwrap();
+        let s = Saif::load(f.to_str().unwrap());
+        let _ = std::fs::remove_file(&f);
+        // 4 toggles over 100 ns = 4e7 /s, exactly what the plain text gives.
+        assert_eq!(s.unwrap().toggle_rate("a"), Saif::parse(text).unwrap().toggle_rate("a"));
     }
 }
