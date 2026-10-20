@@ -970,15 +970,19 @@ pub(crate) fn join_scope(scopes: &[String], leaf: &str) -> String {
     // mistook its own terminator for a name. GTKWave's vcd2fst does exactly that, and bakes the
     // literal name `$end` into the converted file — so a Verilator dump and its own conversion
     // described the same hierarchy under two different roots, neither of them the real one.
+    //
+    // A Verilog ESCAPED identifier (`\ctrl.state.out[1]`) is named without its escape, as the
+    // reference names it (`netVerilogToSta`): kept, the backslash made the path match no
+    // netlist net, and every such net — a flattened hierarchy writes hundreds — read as idle.
     for s in scopes
         .iter()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty() && *s != "$end")
     {
-        out.push_str(s);
+        out.push_str(s.strip_prefix('\\').unwrap_or(s));
         out.push('.');
     }
-    out.push_str(leaf);
+    out.push_str(leaf.strip_prefix('\\').unwrap_or(leaf));
     out
 }
 
@@ -1040,6 +1044,19 @@ pub(crate) fn bus_bits(value: &str, width: usize) -> Vec<char> {
 mod tests {
     use super::*;
 
+    /// Rule (`netVerilogToSta`): an escaped identifier is named without its escape, so the
+    /// dumped `\\ctrl.state.out[1]` is the netlist net `ctrl.state.out[1]`.
+    #[test]
+    fn an_escaped_name_is_read_without_its_escape() {
+        let v = Vcd::parse(
+            "$timescale 1ns $end\n$scope module top $end\n$var wire 1 ! \\ctrl.state.out[1] $end\n\
+             $upscope $end\n$enddefinitions $end\n#0\n0!\n#10\n1!\n#20\n",
+        )
+        .unwrap()
+        .with_scope(Some("top".into()));
+        assert_eq!(v.idx.toggles.get("top.ctrl.state.out[1]").copied(), Some(1.0));
+        assert!(v.toggle_rate("ctrl.state.out[1]") > 0.0);
+    }
 
     const VCD: &str = r#"
 $timescale 1ns $end
