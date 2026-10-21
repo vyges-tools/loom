@@ -1399,6 +1399,25 @@ impl ModuleReader {
     /// The module, its net names canonicalised now that every `assign` has been read.
     fn finish(self, pool: &mut StrPool) -> CompactModule {
         let mut nl = self.nl;
+        // A DUPLICATED instance name is renamed, as the reference's `checkInstanceName` does: the
+        // later one becomes `<name>_<k>`, k the first from 1 not already among the names seen so
+        // far. Kept, two instances answered to one name.
+        let mut seen: std::collections::HashSet<Sym> = std::collections::HashSet::with_capacity(nl.insts.len());
+        for x in nl.insts.iter_mut() {
+            if !seen.insert(x.name) {
+                let base = pool.get(x.name).to_string();
+                let mut k = 1;
+                let renamed = loop {
+                    let s = pool.intern(&format!("{base}_{k}"));
+                    if !seen.contains(&s) {
+                        break s;
+                    }
+                    k += 1;
+                };
+                x.name = renamed;
+                seen.insert(renamed);
+            }
+        }
         let one_bit_vec = self.one_bit_vec;
         // ---- canonicalise the net names, so both front ends describe one design ------------------
         //
@@ -1826,6 +1845,16 @@ endmodule
         let nl = parse("module top (a, q);\n  input wire a;\n  output reg [1:0] q;\nendmodule").unwrap();
         assert_eq!(nl.inputs, ["a"]);
         assert_eq!(nl.outputs, ["q[1]", "q[0]"]);
+    }
+
+    /// Rule (the reference's `checkInstanceName`): a later instance with a name already used is
+    /// renamed `<name>_<k>`, k the first from 1 not among the names seen so far.
+    #[test]
+    fn a_duplicated_instance_name_is_renamed() {
+        let src = "module top (input a, output y);\n  INV u (.A(a), .Y(y));\n  INV u_1 (.A(a), .Y(y));\n  INV u (.A(a), .Y(y));\n  INV u (.A(a), .Y(y));\nendmodule";
+        let nl = parse(src).unwrap();
+        let names: Vec<&str> = nl.insts.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, ["u", "u_1", "u_2", "u_3"]);
     }
 
     /// Rule (the reference reader's): a constant is `size` bits, filled from its least
