@@ -543,8 +543,12 @@ fn expand_bits(
 ) -> Vec<String> {
     // a declared vector by its WHOLE name first: an escaped vector `\ti[0] ` is canonically
     // `ti[0]`, which would otherwise read as a bit-select of `ti`
+    // — and a one-bit VECTOR too: `x` declared `[0:0]` is the bit `x[0]`, the name its port
+    // has. Whether that bit is then written bare is decided once, for every connection, by the
+    // one-bit-vector rule in `finish` — not here, or a port connected whole and the port itself
+    // would name two different nets.
     if let Some(&(m, l)) = decl_range.get(net) {
-        return if m != l { bus_bits(net, m, l) } else { vec![net.to_string()] };
+        return bus_bits(net, m, l);
     }
     // an escaped name that spells a select (`\a[1:0] `, tagged by `keep_escape`) is one name
     if net.starts_with(KEPT as char) {
@@ -790,6 +794,11 @@ struct CellPort {
 /// A port declaration's direction, as the reference's declaration map keeps it (`parseDcl`): the
 /// first declaration of a name wins, except that a `wire` (or `reg`, `tri`, a supply) is replaced
 /// by a later direction — a net type before or after `input` only modifies it.
+///
+/// 🔑 A DELIBERATE SIMPLIFICATION: a port's direction is input, output, inout or none. Some
+/// readers also derive `power` (a supply net type on a port) and `tristate` (a `tri` output);
+/// here such a port keeps its declared direction (`input`, `output`) and the net type stays a
+/// modifier. Connectivity is unchanged; only the reported direction differs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PortDir {
     Input,
@@ -2034,15 +2043,25 @@ impl ModuleReader {
                 seen.insert(renamed);
             }
         }
-        let one_bit_vec = self.one_bit_vec;
+        // A PORT keeps its index: `input [0:0] x` is the port bit `x[0]`, and every connection to
+        // it must say so. Only an internal one-bit vector is written bare (below), whatever order
+        // its `wire` and port declarations came in.
+        let one_bit_vec: std::collections::BTreeMap<String, String> = self
+            .one_bit_vec
+            .into_iter()
+            .filter(|(n, _)| matches!(dirs.get(n), None | Some(PortDir::Internal)))
+            .collect();
         // ---- canonicalise the net names, so both front ends describe one design ------------------
         //
         // Two normalisations, each because the same net is legitimately written more than one way
         // and every consumer joins by NAME:
         //
-        //   * `x[0]` where `x` is a one-bit vector is just `x`. Yosys's JSON cannot say otherwise —
-        //     it represents `wire [0:0] x` and `wire x` identically — so the bare form is the only
-        //     one both front ends can agree on.
+        //   * `x[0]` where `x` is an internal one-bit vector is just `x`. Yosys's JSON cannot say
+        //     otherwise — it represents `wire [0:0] x` and `wire x` identically — so the bare form
+        //     is the only one both front ends can agree on.
+        //     🔑 A DELIBERATE NOTATION: some readers keep the index (`x[0]`); this one writes the
+        //     bare name for an internal one-bit vector, and keeps the index on a PORT bit, which is
+        //     what the port is called. Connectivity is the same either way — only the name differs.
         //
         //   * a net tied to a PORT by `assign port = net;` is that port. Both names are the net's,
         //     and the port's is the one the DEF, the SPEF and the SDC all use, so it is the one that
@@ -2070,7 +2089,8 @@ impl ModuleReader {
                 continue;
             }
             let text = pool.get(net);
-            if let Some((base, rest)) = text.split_once('[') {
+            // the LAST bracket is the index: an escaped vector `\ti[0] ` declared `[0:0]` is `ti[0][0]`
+            if let Some((base, rest)) = text.rsplit_once('[') {
                 if let Some(idx) = rest.strip_suffix(']') {
                     if one_bit_vec.get(base).map(String::as_str) == Some(idx) {
                         let base = base.to_string();
@@ -2443,6 +2463,26 @@ endmodule
         );
         assert_eq!(nl.skipped_assigns, 2, "q (1 bit) = z (3 bits), and v (undeclared) = w (2 bits), are not merged");
         assert!(!nl.aliases.iter().any(|(l, _)| l == "q" || l.starts_with("q[")), "q is not declared [1:0]");
+    }
+
+    /// A one-bit VECTOR port is the bit `x[0]` — what the port is called — so a connection naming
+    /// it whole is `x[0]` too, or the port and the pin name two nets. An INTERNAL one-bit vector
+    /// is written bare (`w`), however the connection spells it: loom's notation, which the JSON
+    /// front end shares; some readers keep `w[0]`. Same connectivity, different name. A `wire`
+    /// re-declaring a port does not make the port bare.
+    #[test]
+    fn a_one_bit_vector_port_keeps_its_index_and_an_internal_one_is_bare() {
+        let src = "module top (x, z, q);\n  input [0:0] x;\n  output [0:0] z;\n  output [0:0] q;\n  wire [0:0] q;\n  wire [0:0] w;\n  INV u (.A(x), .ZN(w));\n  BUF b (.A(w[0]), .Z(z));\n  BUF c (.A(w), .Z(q[0]));\nendmodule";
+        let nl = parse(src).unwrap();
+        assert_eq!(nl.inputs, ["x[0]"]);
+        assert_eq!(nl.outputs, ["z[0]", "q[0]"]);
+        let c = |k: usize| -> Vec<(&str, &str)> { nl.insts[k].conns.iter().map(|(p, n)| (p.as_str(), n.as_str())).collect() };
+        assert_eq!(c(0), [("A", "x[0]"), ("ZN", "w")]);
+        assert_eq!(c(1), [("A", "w"), ("Z", "z[0]")]);
+        assert_eq!(c(2), [("A", "w"), ("Z", "q[0]")]);
+        // the index is the LAST bracket: an escaped one-bit vector `\t[0] ` is bare as `t[0]`
+        let nl = parse("module top (a);\n  input a;\n  wire [0:0] \\t[0] ;\n  INV u (.A(a), .ZN(\\t[0] ));\nendmodule").unwrap();
+        assert_eq!(nl.insts[0].conns[1], ("ZN".to_string(), "t[0]".to_string()));
     }
 
     /// Rule (the reference's `makeModule`): a module defined twice keeps its LAST definition; the
