@@ -511,7 +511,13 @@ fn expand_bits(
     net: &str,
     decl_range: &std::collections::BTreeMap<String, (i64, i64)>,
 ) -> Vec<String> {
-    if let Some((base, rest)) = net.split_once('[') {
+    // a declared vector by its WHOLE name first: an escaped vector `\ti[0] ` is canonically
+    // `ti[0]`, which would otherwise read as a bit-select of `ti`
+    if let Some(&(m, l)) = decl_range.get(net) {
+        return if m != l { bus_bits(net, m, l) } else { vec![net.to_string()] };
+    }
+    // the LAST bracket is the select: `ti[0][1:2]` is bits 1..2 of the vector `ti[0]`
+    if let Some((base, rest)) = net.rsplit_once('[') {
         if let Some(inner) = rest.strip_suffix(']') {
             if let Some((a, b)) = inner.split_once(':') {
                 if let (Ok(a), Ok(b)) = (a.trim().parse::<i64>(), b.trim().parse::<i64>()) {
@@ -1947,6 +1953,21 @@ endmodule
             want(&[("ci[0]", "a[3]"), ("ci[1]", "a[2]"), ("ci[2]", "a[1]"), ("ci[3]", "a[0]"), ("co[3]", "b[0]"), ("co[2]", "b[1]"), ("co[1]", "b[2]"), ("co[0]", "b[3]")])
         );
         assert_eq!(conns("c"), want(&[("D[3]", "b[0]"), ("D[2]", "b[1]"), ("D[1]", "b[2]"), ("D[0]", "b[3]")]));
+    }
+
+    /// An escaped VECTOR whose name holds brackets (`input [0:3] \ti[0] ;`) connected whole is
+    /// that vector, bit by bit — not a bit-select of a bus `ti`.
+    #[test]
+    fn an_escaped_vector_named_like_a_select_expands_whole() {
+        let src = "module top (\\ti[0] );\n input [0:3] \\ti[0] ;\n child u (.\\wi[0] (\\ti[0] ));\nendmodule\nmodule child (\\wi[0] );\n input [0:3] \\wi[0] ;\nendmodule\n";
+        let d = parse_all(src).unwrap();
+        let got: Vec<(String, String)> = d.top().insts[0].conns.clone();
+        let want: Vec<(String, String)> = (0..4).map(|k| (format!("wi[0][{k}]"), format!("ti[0][{k}]"))).collect();
+        assert_eq!(got, want);
+        // and a part-select of it is a range of THAT vector
+        let src = "module top (\\ti[0] );\n input [0:3] \\ti[0] ;\n CELL c (.D(\\ti[0] [1:2]));\nendmodule\n";
+        let nl = parse(src).unwrap();
+        assert_eq!(nl.insts[0].conns, [("D[1]".to_string(), "ti[0][1]".to_string()), ("D[0]".to_string(), "ti[0][2]".to_string())]);
     }
 
     /// An escaped scalar port `\foo[3] ` is canonically `foo[3]`, the name of a bit of the bus
