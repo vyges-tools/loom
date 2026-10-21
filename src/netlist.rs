@@ -1,13 +1,22 @@
-//! Structural (gate-level) Verilog reader — the connectivity STA needs.
+//! Structural (gate-level) Verilog reader — the connectivity STA and placement need.
 //!
-//! v0 reads a clean structural subset: the `module` header, `input`/`output`
-//! port declarations, and cell instances of the form
-//! `CELL inst ( .PIN(net), .PIN(net) );`. `wire`/`reg` declarations and the
-//! header port list are skipped (port direction comes from `input`/`output`);
-//! `assign`/`parameter` are skipped; a pin tied to a constant (`1'b0`) is recorded in
-//! `Inst::ties`, not as a connection. Bus
-//! ranges (`[7:0]`) are tolerated by skipping the range — v0 treats nets as
-//! scalar. Pure std — fully unit-tested offline.
+//! Reads every module in a file — header, `input`/`output`/`inout` ports (scalar and bussed),
+//! net declarations (`wire`/`tri`/`wand`/`wor`, `supply0`/`supply1`), `assign` statements and cell
+//! or module instances, by name (`.PIN(net)`) or by position — then picks the top module (the one
+//! nothing instantiates).
+//!
+//! 🔑 **The rules follow the reference reader, not a reading of the LRM**, and each is pinned by a
+//! test at its site:
+//! - a compiler-directive line (`` `timescale ``, `` `define ``) is dropped whole;
+//! - `a.b` is one hierarchical identifier, and an escaped identifier is stored canonical;
+//! - a bus expands in its DECLARED order (`[0:7]` runs 0 to 7), and a port keeps its own range
+//!   over a later net declaration of the same name;
+//! - `assign` merges nets bit for bit (a width mismatch is counted in `skipped_assigns`, not
+//!   merged), and a constant on a pin is recorded in `Inst::ties`, not as a connection;
+//! - a module defined twice keeps its LAST definition, and a duplicated instance name is renamed
+//!   `name_k`.
+//!
+//! `parameter` and behavioural code are skipped. Pure std — fully unit-tested offline.
 
 #[derive(Debug, Clone, Default)]
 pub struct Inst {
