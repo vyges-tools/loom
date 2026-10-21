@@ -1183,7 +1183,8 @@ pub fn parse_compact_reader<R: std::io::BufRead>(r: R) -> Result<CompactDesign, 
 ///   the bits were named as a Liberty bus is, the first connection bit on the highest index
 ///   (`P[k-1-i]`); that is undone here, and a one-bit pin takes the child's own bit name;
 /// - a pin the child has no port for (warning 201), or whose width is not the connection's
-///   (warning 200), is left UNCONNECTED, and counted in [`CompactModule::unbound_pins`].
+///   (warning 200), is left UNCONNECTED, and counted in [`CompactModule::unbound_pins`];
+/// - a BUNDLE port (`.X({a, b})` in the child's header) binds its members, in order, as a bus.
 ///
 /// A pin whose bits are ambiguous — an escaped scalar `\foo[3] ` canonicalises to the name of a
 /// bit of the bus `foo` — is left as written.
@@ -1295,8 +1296,9 @@ fn bind_defined_child_pins(mods: &mut [CompactModule], pool: &mut StrPool) {
                 // whole text is the port
                 let whole = || if let [(conn, k, _)] = bits[..] { Some(if conn { m.conn_table[k].0 } else { m.tie_table[k].0 }) } else { None };
                 let found = pool.find(&name).and_then(|s| by_name.get(&s)).or_else(|| whole().and_then(|s| by_name.get(&s)));
+                // a bundle (`.X(a, b)` in the child's header) is named like a bus of its members
                 let port = match found.map(|&k| &child[k]) {
-                    Some(port) if !port.bundle && port.bits.len() == width => port,
+                    Some(port) if port.bits.len() == width => port,
                     // no such port, or not the connection's width: the reference connects nothing
                     _ => {
                         for &(conn, k, _) in &bits {
@@ -2534,6 +2536,9 @@ endmodule
         assert_eq!(inst("g").conns, s(&[("", "a[1]"), ("", "a[0]"), ("", "z")]));
         assert_eq!(top.unbound_pins, 1 + 4 + 1 + 2);
         assert_eq!(top.positional, 3);
+        // BY NAME a bundle binds its members in order, as a bus does (`makeNamedInstPins`)
+        let d = parse_all("module top (a, b, y);\n input a, b;\n output y;\n bun u (.p({b, a}), .g(y));\nendmodule\nmodule bun (.p({e, f}), g);\n input e, f, g;\nendmodule\n").unwrap();
+        assert_eq!(d.top().insts[0].conns, s(&[("e", "b"), ("f", "a"), ("g", "y")]));
     }
 
     /// Rule (the reference's link): a name's width is its DECLARATION's wherever that is — a
