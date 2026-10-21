@@ -164,6 +164,8 @@ struct Lexer<R: std::io::BufRead> {
     mode: Mode,
     /// a punctuation token found while closing the token before it
     pending: Option<u8>,
+    /// only blanks (space, tab) since the last newline, or since the start of the file
+    bol: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -221,6 +223,7 @@ impl<R: std::io::BufRead> Lexer<R> {
             slash: false,
             mode: Mode::Normal,
             pending: None,
+            bol: true,
         }
     }
 
@@ -247,7 +250,23 @@ impl<R: std::io::BufRead> Lexer<R> {
                 if self.mode == Mode::Normal && !self.slash && !self.escaped && self.start.is_none() {
                     let ws = buf[used..].iter().take_while(|b| b.is_ascii_whitespace()).count();
                     if ws > 0 {
+                        let skipped = &buf[used..used + ws];
+                        self.bol = match skipped.iter().rposition(|&b| b == b'\n') {
+                            Some(k) => skipped[k + 1..].iter().all(|&b| b == b' ' || b == b'\t'),
+                            None => self.bol && skipped.iter().all(|&b| b == b' ' || b == b'\t'),
+                        };
                         used += ws;
+                        continue;
+                    }
+                    // A line that starts with a compiler directive is dropped WHOLE, as the
+                    // reference's lexer does (`^[ \t]*`.*{EOL}`): `` `timescale ``, `` `define ``,
+                    // `` `ifdef `` and the rest are not evaluated, only removed — both arms of an
+                    // `` `ifdef `` are read. Tokenised instead, `` `default_nettype wire `` made the
+                    // next statement a `wire` declaration and the instance in it was lost.
+                    if self.bol && buf[used] == b'`' {
+                        self.mode = Mode::LineComment;
+                        self.bol = false;
+                        used += 1;
                         continue;
                     }
                 }
@@ -256,6 +275,7 @@ impl<R: std::io::BufRead> Lexer<R> {
                     let stop = if self.escaped { STOP_ESCAPED } else { STOP };
                     let run = buf[used..].iter().take_while(|&&b| !stop[b as usize]).count();
                     if run > 0 {
+                        self.bol = false;
                         push_tok(&mut self.start, arena, &buf[used..used + run]);
                         used += run;
                         continue;
@@ -273,6 +293,7 @@ impl<R: std::io::BufRead> Lexer<R> {
                     Mode::LineComment => {
                         if c == b'\n' {
                             self.mode = Mode::Normal;
+                            self.bol = true;
                         }
                         continue;
                     }
@@ -282,6 +303,7 @@ impl<R: std::io::BufRead> Lexer<R> {
                     }
                     Mode::Normal => {}
                 }
+                self.bol = c == b'\n' || (self.bol && (c == b' ' || c == b'\t'));
                 if std::mem::take(&mut self.slash) {
                     if c == b'/' || c == b'*' {
                         self.mode = if c == b'/' { Mode::LineComment } else { Mode::BlockComment(false) };
@@ -1573,6 +1595,18 @@ endmodule
         assert_eq!(d.module_names(), ["leaf", "mid", "chip"]);
         assert_eq!(parse(src).unwrap().modules, ["leaf", "mid", "chip"]);
         assert!(mid.modules.is_empty() && leaf.modules.is_empty());
+    }
+
+    /// Rule (the reference lexer's `^[ \t]*`.*{EOL}`): a line that STARTS, after blanks, with a
+    /// compiler directive is dropped whole — not evaluated, so both arms of an `` `ifdef `` are
+    /// read. A backtick later in a line is not a directive line.
+    #[test]
+    fn a_directive_line_is_dropped_whole() {
+        let src = "`timescale 1ns/1ps\nmodule top (input a, output y);\n  wire n;\n \t`default_nettype wire\n  INV u0 (.A(a), .Y(n));\n`ifdef USE_POWER_PINS\n  BUF u1 (.A(n),\n`else\n  .VPWR(vdd),\n`endif\n  .Y(y));\nendmodule\n";
+        let nl = parse(src).unwrap();
+        let names: Vec<&str> = nl.insts.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, ["u0", "u1"], "the directive line before u0 is not a `wire` declaration");
+        assert_eq!(nl.insts[1].conns.len(), 3, "both arms of the ifdef are read: A, VPWR and Y");
     }
 
     /// Rule (the reference reader's): a constant is `size` bits, filled from its least
