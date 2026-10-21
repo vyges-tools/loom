@@ -1091,7 +1091,9 @@ impl ModuleReader {
             let mut range: Option<(i64, i64)> = None;
             while *i < n && t[*i] != ";" {
                 match t[*i] {
-                    "," => {}
+                    // a net type after the direction (`output reg q;`, `input wire a;`) is not a
+                    // name; read as one, it made a port called `reg`
+                    "," | "wire" | "reg" | "logic" | "signed" | "tri" | "wand" | "wor" | "supply0" | "supply1" => {}
                     "[" => {
                         *i += 1;
                         let mut spec = String::new();
@@ -1815,6 +1817,15 @@ endmodule
         let c: Vec<(&str, bool)> = nl.constants.iter().map(|(n, v)| (n.as_str(), *v)).collect();
         assert_eq!(c, [("VSS", false), ("VDD", true), ("VPWR", true)]);
         assert!(nl.insts[0].conns.iter().any(|(p, n)| p == "VGND" && n == "VSS"));
+    }
+
+    /// A net type after a port direction in the body (`output reg q;`) is not a port name.
+    /// (The reference's grammar rejects `output reg` outside the header; this reader accepts it.)
+    #[test]
+    fn a_net_type_after_a_direction_is_not_a_port() {
+        let nl = parse("module top (a, q);\n  input wire a;\n  output reg [1:0] q;\nendmodule").unwrap();
+        assert_eq!(nl.inputs, ["a"]);
+        assert_eq!(nl.outputs, ["q[1]", "q[0]"]);
     }
 
     /// Rule (the reference reader's): a constant is `size` bits, filled from its least
