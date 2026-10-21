@@ -562,7 +562,7 @@ fn is_const(net: &str) -> bool {
 /// (bus indices like `0`, sized constants) are NOT identifiers — used so a stray
 /// numeric token sitting before `(` is not mis-read as a cell instance.
 fn is_ident(t: &str) -> bool {
-    matches!(t.chars().next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '\\')
+    matches!(t.chars().next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '\\' || c == KEPT as char)
 }
 
 /// A name in a [`StrPool`]: four bytes, compared and hashed as an integer.
@@ -663,6 +663,38 @@ impl StrPool {
         self.ends.push(self.text.len() as u64);
         self.table[h] = id;
         Sym(id)
+    }
+
+    /// Strips the [`KEPT`] tag from every name that carries it, each symbol keeping its index.
+    fn untag_kept(&mut self) {
+        let mut text = String::with_capacity(self.text.len());
+        let mut ends = Vec::with_capacity(self.ends.len());
+        for i in 0..self.ends.len() {
+            let s = self.get(Sym(i as u32));
+            text.push_str(s.strip_prefix(KEPT as char).unwrap_or(s));
+            ends.push(text.len() as u64);
+        }
+        self.text = text;
+        self.ends = ends;
+        // the index again; a name that now spells another keeps both symbols, `find` the first
+        let cap = self.table.len();
+        self.table = vec![EMPTY; cap];
+        let mask = cap - 1;
+        for id in 0..self.ends.len() as u32 {
+            let s = self.get(Sym(id));
+            let mut h = fx_hash(s) as usize & mask;
+            let mut dup = false;
+            while self.table[h] != EMPTY {
+                if self.get(Sym(self.table[h])) == s {
+                    dup = true;
+                    break;
+                }
+                h = (h + 1) & mask;
+            }
+            if !dup {
+                self.table[h] = id;
+            }
+        }
     }
 
     fn grow(&mut self) {
@@ -875,6 +907,37 @@ pub fn parse_compact(text: &str) -> Result<CompactDesign, NetlistError> {
 
 /// Record that a token arrived escaped: one bit per name in the pool, not a string per name —
 /// on a netlist whose every name is escaped, a set of strings was most of the memory.
+/// Marks an escaped name the statement parser would otherwise read as syntax — see [`keep_escape`].
+const KEPT: u8 = 0x01;
+
+/// An escaped identifier is a NAME whatever it spells (the reference lexer returns it as an ID):
+/// `\output ` is a port called `output`, `\; ` a net, `\1x ` an instance. The canonical text the
+/// lexer hands over would read as a keyword, punctuation, a number or a constant, so such a token
+/// is tagged with [`KEPT`] (a byte no Verilog source holds) and parsed as the name it is; the
+/// tag is stripped from the pool once the file is read ([`StrPool::untag_kept`]). `tok` is the
+/// last token in `arena`, so the insert moves nothing else.
+fn keep_escape(arena: &mut Vec<u8>, tok: std::ops::Range<usize>, kept: &mut bool) -> std::ops::Range<usize> {
+    let w = &arena[tok.clone()];
+    let syntax = match w.first() {
+        Some(c) if c.is_ascii_alphabetic() || *c == b'_' || *c == b'\\' => {
+            w.contains(&b'\'') || std::str::from_utf8(w).is_ok_and(|t| is_keyword(t) || RESERVED.contains(&t))
+        }
+        _ => true,
+    };
+    if !syntax {
+        return tok;
+    }
+    arena.insert(tok.start, KEPT);
+    *kept = true;
+    tok.start..tok.end + 1
+}
+
+/// Words the statement parser acts on beyond [`is_keyword`].
+const RESERVED: &[&str] = &[
+    "signed", "logic", "task", "function", "initial", "generate", "always", "always_ff",
+    "always_comb", "always_latch",
+];
+
 fn mark_escaped(pool: &mut StrPool, bits: &mut Vec<u64>, tok: &[u8]) {
     let s = pool.intern(&String::from_utf8_lossy(tok));
     let (w, b) = (s.index() / 64, s.index() % 64);
@@ -891,6 +954,8 @@ pub fn parse_compact_reader<R: std::io::BufRead>(r: R) -> Result<CompactDesign, 
     let mut lx = Lexer::new(r);
     let mut pool = StrPool::default();
     let mut escaped = Vec::new();
+    // an escaped name that reads as syntax was tagged (see `keep_escape`); untagged at the end
+    let mut kept = false;
     let mut mods: Vec<CompactModule> = Vec::new();
     // ONE STATEMENT's tokens at a time — to its `;` at depth 0, or `endmodule` — in an arena
     // that is reused: the peak is the longest statement, not the module or the file.
@@ -903,6 +968,7 @@ pub fn parse_compact_reader<R: std::io::BufRead>(r: R) -> Result<CompactDesign, 
         spans.clear();
         let mut found = false;
         while let Some((t, esc)) = lx.next_into(&mut arena).map_err(io)? {
+            let t = if esc { keep_escape(&mut arena, t, &mut kept) } else { t };
             if esc {
                 mark_escaped(&mut pool, &mut escaped, &arena[t.clone()]);
             }
@@ -923,6 +989,7 @@ pub fn parse_compact_reader<R: std::io::BufRead>(r: R) -> Result<CompactDesign, 
             let (done, end) = match next {
                 None => (true, true),
                 Some((t, esc)) => {
+                    let t = if esc { keep_escape(&mut arena, t, &mut kept) } else { t };
                     if esc {
                         mark_escaped(&mut pool, &mut escaped, &arena[t.clone()]);
                     }
@@ -995,6 +1062,9 @@ pub fn parse_compact_reader<R: std::io::BufRead>(r: R) -> Result<CompactDesign, 
     let mut by_name = std::collections::HashMap::with_capacity(mods.len());
     for (k, m) in mods.iter().enumerate() {
         by_name.entry(m.name).or_insert(k);
+    }
+    if kept {
+        pool.untag_kept();
     }
     Ok(CompactDesign { pool, modules: mods, top, escaped, by_name })
 }
@@ -2017,6 +2087,22 @@ endmodule
         assert_eq!(pins("u"), ["k", "w[1]", "w[0]"]);
         assert_eq!(pins("c"), ["i[3]", "i[2]", "i[1]", "i[0]", "z"]);
         assert_eq!(top.unbound_pins, 5);
+    }
+
+    /// Rule (the reference lexer): an escaped identifier is a NAME, whatever it spells — `\output `
+    /// is a port called `output`, `\; ` and `\endmodule ` are nets, `\1x ` an instance — never the
+    /// keyword or punctuation its text reads as.
+    #[test]
+    fn an_escaped_keyword_or_symbol_is_a_name() {
+        let src = "module subk (input a, output \\output );\n  wire \\; ;\n  INV_X1 g1 (.A(a), .ZN(\\; ));\n  INV_X1 \\1x  (.A(\\; ), .ZN(\\output ));\n  INV_X1 g3 (.A(a), .ZN(\\endmodule ));\nendmodule\nmodule top (input a, output z);\n  subk u1 (.a(a), .\\output (z));\nendmodule\n";
+        let d = parse_all(src).unwrap();
+        let sub = d.module("subk").unwrap();
+        assert_eq!(sub.outputs, ["output"]);
+        let insts: Vec<(&str, Vec<(String, String)>)> = sub.insts.iter().map(|x| (x.name.as_str(), x.conns.clone())).collect();
+        let c = |v: &[(&str, &str)]| -> Vec<(String, String)> { v.iter().map(|(p, n)| (p.to_string(), n.to_string())).collect() };
+        assert_eq!(insts, [("g1", c(&[("A", "a"), ("ZN", ";")])), ("1x", c(&[("A", ";"), ("ZN", "output")])), ("g3", c(&[("A", "a"), ("ZN", "endmodule")]))]);
+        assert_eq!(d.top().insts[0].conns, c(&[("a", "a"), ("output", "z")]));
+        assert!(d.escaped_names().contains("output"));
     }
 
     /// An escaped VECTOR whose name holds brackets (`input [0:3] \ti[0] ;`) connected whole is
