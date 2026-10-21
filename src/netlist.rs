@@ -838,6 +838,9 @@ fn named_tag(pool: &mut StrPool, order: u32, pin: &str) -> Sym {
     pool.intern(&format!("{NAMED_TAG}{order}{NAMED_TAG}{pin}"))
 }
 
+/// One item of a held named pin: its place, and a name or a constant bit.
+type HeldItem = (u32, Result<String, bool>);
+
 fn read_named_tag(p: &str) -> Option<(u32, &str)> {
     let (order, pin) = p.strip_prefix(NAMED_TAG)?.split_once(NAMED_TAG)?;
     Some((order.parse().ok()?, pin))
@@ -1921,7 +1924,7 @@ impl ModuleReader {
             for x in nl.insts.iter_mut() {
                 let (cs, ts) = (&old_c[x.conns.0 as usize..x.conns.1 as usize], &old_t[x.ties.0 as usize..x.ties.1 as usize]);
                 // a held named pin, whole: its items in order — a name, or a constant bit
-                let mut held: Vec<(String, Vec<(u32, Result<String, bool>)>)> = Vec::new();
+                let mut held: Vec<(String, Vec<HeldItem>)> = Vec::new();
                 let mut item = |pin: &str, order: u32, v: Result<String, bool>| match held.iter_mut().find(|h| h.0 == pin) {
                     Some(h) => h.1.push((order, v)),
                     None => held.push((pin.to_string(), vec![(order, v)])),
