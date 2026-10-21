@@ -166,6 +166,8 @@ struct Lexer<R: std::io::BufRead> {
     pending: Option<u8>,
     /// only blanks (space, tab) since the last newline, or since the start of the file
     bol: bool,
+    /// a `.` right after an identifier, its meaning decided by the byte after it
+    dot: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -224,6 +226,7 @@ impl<R: std::io::BufRead> Lexer<R> {
             mode: Mode::Normal,
             pending: None,
             bol: true,
+            dot: false,
         }
     }
 
@@ -237,6 +240,10 @@ impl<R: std::io::BufRead> Lexer<R> {
             }
             let buf = self.r.fill_buf()?;
             if buf.is_empty() {
+                if std::mem::take(&mut self.dot) {
+                    self.pending = Some(b'.');
+                    return Ok(flush_tok(&mut self.start, &mut self.escaped, arena));
+                }
                 // the end: a `/` still waiting is an ordinary byte, and an open token closes
                 if std::mem::take(&mut self.slash) && self.mode == Mode::Normal {
                     push_tok(&mut self.start, arena, b"/");
@@ -247,7 +254,7 @@ impl<R: std::io::BufRead> Lexer<R> {
             while used < buf.len() {
                 // ⚡ whitespace between tokens is skipped in one go, and a run of ordinary token
                 // bytes is copied in one go
-                if self.mode == Mode::Normal && !self.slash && !self.escaped && self.start.is_none() {
+                if self.mode == Mode::Normal && !self.slash && !self.dot && !self.escaped && self.start.is_none() {
                     let ws = buf[used..].iter().take_while(|b| b.is_ascii_whitespace()).count();
                     if ws > 0 {
                         let skipped = &buf[used..used + ws];
@@ -270,7 +277,7 @@ impl<R: std::io::BufRead> Lexer<R> {
                         continue;
                     }
                 }
-                if self.mode == Mode::Normal && !self.slash {
+                if self.mode == Mode::Normal && !self.slash && !self.dot {
                     // inside an escaped identifier only whitespace (and a comment) ends it
                     let stop = if self.escaped { STOP_ESCAPED } else { STOP };
                     let run = buf[used..].iter().take_while(|&&b| !stop[b as usize]).count();
@@ -304,6 +311,18 @@ impl<R: std::io::BufRead> Lexer<R> {
                     Mode::Normal => {}
                 }
                 self.bol = c == b'\n' || (self.bol && (c == b' ' || c == b'\t'));
+                if std::mem::take(&mut self.dot) {
+                    if c.is_ascii_alphabetic() || c == b'_' {
+                        push_tok(&mut self.start, arena, b".");
+                    } else {
+                        // not a hierarchical name: the identifier ends, the `.` is punctuation,
+                        // and this byte is read again after it
+                        self.pending = Some(b'.');
+                        out = flush_tok(&mut self.start, &mut self.escaped, arena);
+                        used -= 1;
+                        break;
+                    }
+                }
                 if std::mem::take(&mut self.slash) {
                     if c == b'/' || c == b'*' {
                         self.mode = if c == b'/' { Mode::LineComment } else { Mode::BlockComment(false) };
@@ -343,6 +362,13 @@ impl<R: std::io::BufRead> Lexer<R> {
                     } else {
                         push_tok(&mut self.start, arena, &[c]);
                     }
+                    continue;
+                }
+                // A HIERARCHICAL name is one identifier: the reference lexer reads
+                // `{ID_TOKEN}("."{ID_TOKEN})*` as a single ID, so `u1.n` is a net called `u1.n`.
+                // Split, `.A(u1.n)` read as pin A on `u1` and a second pin `n`.
+                if c == b'.' && !self.escaped && self.start.is_some_and(|s| arena[s].is_ascii_alphabetic() || arena[s] == b'_') {
+                    self.dot = true;
                     continue;
                 }
                 match c {
@@ -1607,6 +1633,25 @@ endmodule
         let names: Vec<&str> = nl.insts.iter().map(|x| x.name.as_str()).collect();
         assert_eq!(names, ["u0", "u1"], "the directive line before u0 is not a `wire` declaration");
         assert_eq!(nl.insts[1].conns.len(), 3, "both arms of the ifdef are read: A, VPWR and Y");
+    }
+
+    /// Rule (the reference lexer's `{ID_TOKEN}("."{ID_TOKEN})*`): an identifier, a `.` and an
+    /// identifier with nothing between them are ONE name; a `.` before a pin name is not.
+    #[test]
+    fn a_hierarchical_name_is_one_identifier() {
+        let src = "module top (input a, output y);\n  INV u0 (.A(u1.n), .Y(y));\n  BUF u2 (.A(a),.Y(u3.m_2));\nendmodule";
+        let nl = parse(src).unwrap();
+        let c = |k: usize| nl.insts[k].conns.iter().map(|(p, n)| (p.as_str(), n.as_str())).collect::<Vec<_>>();
+        assert_eq!(c(0), [("A", "u1.n"), ("Y", "y")]);
+        assert_eq!(c(1), [("A", "a"), ("Y", "u3.m_2")]);
+        // a name ending at the end of the input before a `.`, and a number before one
+        let mut arena = Vec::new();
+        let mut lx = Lexer::new("x. 1.5".as_bytes());
+        let mut toks = Vec::new();
+        while let Some((r, _)) = lx.next_into(&mut arena).unwrap() {
+            toks.push(String::from_utf8_lossy(&arena[r]).into_owned());
+        }
+        assert_eq!(toks, ["x", ".", "1", ".", "5"]);
     }
 
     /// Rule (the reference reader's): a constant is `size` bits, filled from its least
