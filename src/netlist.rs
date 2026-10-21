@@ -461,21 +461,23 @@ fn const_bits(c: &str) -> Vec<bool> {
     bits
 }
 
-/// Recover declared ranges from names already expanded to bits (`a[7]`…`a[0]` -> `a` is 7:0).
-fn note_ranges(
-    names: &[String],
-    decl_range: &mut std::collections::BTreeMap<String, (i64, i64)>,
-) {
-    for nm in names {
-        let Some((base, rest)) = nm.split_once('[') else { continue };
-        let Some(b) = rest.strip_suffix(']').and_then(|x| x.parse::<i64>().ok()) else { continue };
-        let e = decl_range.entry(base.to_string()).or_insert((b, b));
-        e.0 = e.0.max(b);
-        e.1 = e.1.min(b);
+/// The bits of `base[from:to]`, FROM first: the reference's `VerilogBusNetNameIterator` steps from
+/// the left index to the right one, up or down, exactly as written. `[0:3]` is bits 0,1,2,3.
+fn bus_bits(base: &str, from: i64, to: i64) -> Vec<String> {
+    let step: i64 = if to >= from { 1 } else { -1 };
+    let mut out = Vec::with_capacity((to - from).unsigned_abs() as usize + 1);
+    let mut b = from;
+    loop {
+        out.push(format!("{base}[{b}]"));
+        if b == to {
+            break;
+        }
+        b += step;
     }
+    out
 }
 
-/// The bits a connection expression covers, most significant first.
+/// The bits a connection expression covers, in the order the reference names them (left index first).
 ///
 /// A bare name expands only when it is declared here as a vector — a black-box port's width is
 /// unknowable, but the width of what is connected to it is not. A part-select `x[7:4]` expands
@@ -488,22 +490,15 @@ fn expand_bits(
         if let Some(inner) = rest.strip_suffix(']') {
             if let Some((a, b)) = inner.split_once(':') {
                 if let (Ok(a), Ok(b)) = (a.trim().parse::<i64>(), b.trim().parse::<i64>()) {
-                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                    return (lo..=hi).rev().map(|x| format!("{base}[{x}]")).collect();
+                    return bus_bits(base, a, b);
                 }
             }
         }
         return vec![net.to_string()];
     }
     match decl_range.get(net).copied() {
-        Some((m, l)) => {
-            let (lo, hi) = if m <= l { (m, l) } else { (l, m) };
-            if hi > lo {
-                (lo..=hi).rev().map(|x| format!("{net}[{x}]")).collect()
-            } else {
-                vec![net.to_string()]
-            }
-        }
+        Some((m, l)) if m != l => bus_bits(net, m, l),
+        Some(_) => vec![net.to_string()],
         None => vec![net.to_string()],
     }
 }
@@ -952,6 +947,9 @@ struct ModuleReader {
     // every declared signal's range, so a connection naming a whole bus can be expanded the way
     // a synthesiser expands it
     decl_range: std::collections::BTreeMap<String, (i64, i64)>,
+    /// names declared by a PORT declaration: a later `wire` range does not replace theirs
+    /// (`VerilogModule::parseDcl` keeps the port's declaration over a wire "modifier")
+    port_decl: std::collections::HashSet<String>,
     /// the header has been read: only the FIRST statement is `module NAME ( … ) ;`
     started: bool,
 }
@@ -965,6 +963,7 @@ impl ModuleReader {
         let nl = &mut self.nl;
         let one_bit_vec = &mut self.one_bit_vec;
         let decl_range = &mut self.decl_range;
+        let port_decl = &mut self.port_decl;
         let mut i = 0;
 
         // module NAME ( ... ) ;  — keep name, skip the header port list
@@ -1017,11 +1016,11 @@ impl ModuleReader {
                         }
                         tok if is_ident(tok) && !is_keyword(tok) => {
                             if let Some(d) = dir {
+                                port_decl.insert(tok.to_string());
                                 let names: Vec<String> = match range {
                                     Some((h, l)) => {
-                                        let (hi, lo) = if h >= l { (h, l) } else { (l, h) };
-                                        decl_range.insert(tok.to_string(), (hi, lo));
-                                        (lo..=hi).rev().map(|b| format!("{tok}[{b}]")).collect()
+                                        decl_range.insert(tok.to_string(), (h, l));
+                                        bus_bits(tok, h, l)
                                     }
                                     None => vec![tok.to_string()],
                                 };
@@ -1050,7 +1049,8 @@ impl ModuleReader {
         // bit-nets the gates drive (and SDC `set_output_delay [get_ports count[3]]`
         // resolves). A range stays in effect for every name in the same declaration
         // (`output [3:0] a, b;` -> a and b both expand). Scalars (no range) pass through.
-        let read_names = |i: &mut usize| -> Vec<String> {
+        // ... and each declared range, as written, for `expand_bits`
+        let read_names = |i: &mut usize, decl_range: &mut std::collections::BTreeMap<String, (i64, i64)>, port_decl: &mut std::collections::HashSet<String>| -> Vec<String> {
             let mut names = Vec::new();
             let mut range: Option<(i64, i64)> = None;
             while *i < n && t[*i] != ";" {
@@ -1067,15 +1067,16 @@ impl ModuleReader {
                             Some((h.trim().parse::<i64>().ok()?, l.trim().parse::<i64>().ok()?))
                         });
                     }
-                    tok => match range {
-                        Some((h, l)) => {
-                            let (hi, lo) = if h >= l { (h, l) } else { (l, h) };
-                            for b in (lo..=hi).rev() {
-                                names.push(format!("{tok}[{b}]"));
+                    tok => {
+                        port_decl.insert(tok.to_string());
+                        match range {
+                            Some((h, l)) => {
+                                decl_range.insert(tok.to_string(), (h, l));
+                                names.extend(bus_bits(tok, h, l));
                             }
+                            None => names.push(tok.to_string()),
                         }
-                        None => names.push(tok.to_string()),
-                    },
+                    }
                 }
                 *i += 1;
             }
@@ -1089,14 +1090,12 @@ impl ModuleReader {
                 // from them — `expand_bits` needs it when an instance below connects the whole bus.
                 "input" => {
                     i += 1;
-                    let names = read_names(&mut i);
-                    note_ranges(&names, decl_range);
+                    let names = read_names(&mut i, decl_range, port_decl);
                     nl.inputs.extend(names.iter().map(|x| pool.intern(x)));
                 }
                 "output" => {
                     i += 1;
-                    let names = read_names(&mut i);
-                    note_ranges(&names, decl_range);
+                    let names = read_names(&mut i, decl_range, port_decl);
                     nl.outputs.extend(names.iter().map(|x| pool.intern(x)));
                 }
                 // `assign lhs = rhs ;` is not decoration: it is two names for the same net, and
@@ -1135,8 +1134,7 @@ impl ModuleReader {
                 // handling is shared — only the destination differs.
                 "inout" => {
                     i += 1;
-                    let names = read_names(&mut i);
-                    note_ranges(&names, decl_range);
+                    let names = read_names(&mut i, decl_range, port_decl);
                     nl.inouts.extend(names.iter().map(|x| pool.intern(x)));
                 }
                 "wire" | "reg" | "parameter" | "localparam" | "supply0" | "supply1" => {
@@ -1166,7 +1164,9 @@ impl ModuleReader {
                                 one_bit_vec.insert(t[i].to_string(), idx.clone());
                             }
                             if let Some(r) = range {
-                                decl_range.insert(t[i].to_string(), r);
+                                if !port_decl.contains(t[i]) {
+                                    decl_range.insert(t[i].to_string(), r);
+                                }
                             }
                         }
                         i += 1;
@@ -1652,6 +1652,26 @@ endmodule
             toks.push(String::from_utf8_lossy(&arena[r]).into_owned());
         }
         assert_eq!(toks, ["x", ".", "1", ".", "5"]);
+    }
+
+    /// Rule (the reference reader's `VerilogBusNetNameIterator`): a bus's bits run from the LEFT
+    /// index to the right one as declared — `[0:3]` is 0,1,2,3 — for a declaration, a part-select
+    /// and a whole-bus connection alike; a port's range is kept over a later `wire` range
+    /// (`parseDcl`). The first bit connected lands on the pin's most significant bit.
+    #[test]
+    fn a_bus_runs_in_its_declared_order() {
+        let src = "module top (x, y);\n  input [0:3] x;\n  output [3:0] y;\n  wire [0:1] w;\n  wire [7:0] x;\n  BUF4 u0 (.A(x), .Y(y));\n  BUF2 u1 (.A(w), .Y(y[1:0]));\n  BUF2 u2 (.A(x[2:3]), .Y(w));\nendmodule";
+        let nl = parse(src).unwrap();
+        assert_eq!(nl.inputs, ["x[0]", "x[1]", "x[2]", "x[3]"]);
+        assert_eq!(nl.outputs, ["y[3]", "y[2]", "y[1]", "y[0]"]);
+        let c = |k: usize| nl.insts[k].conns.iter().map(|(p, n)| format!("{p}={n}")).collect::<Vec<_>>().join(" ");
+        assert_eq!(c(0), "A[3]=x[0] A[2]=x[1] A[1]=x[2] A[0]=x[3] Y[3]=y[3] Y[2]=y[2] Y[1]=y[1] Y[0]=y[0]");
+        assert_eq!(c(1), "A[1]=w[0] A[0]=w[1] Y[1]=y[1] Y[0]=y[0]");
+        assert_eq!(c(2), "A[1]=x[2] A[0]=x[3] Y[1]=w[0] Y[0]=w[1]");
+        // ANSI header ports the same way
+        let nl = parse("module m (input [1:3] a, output z);\n  AND3 g (.A(a), .Y(z));\nendmodule").unwrap();
+        assert_eq!(nl.inputs, ["a[1]", "a[2]", "a[3]"]);
+        assert_eq!(nl.insts[0].conns[0], ("A[2]".to_string(), "a[1]".to_string()));
     }
 
     /// Rule (the reference reader's): a constant is `size` bits, filled from its least
