@@ -2058,6 +2058,18 @@ impl ModuleReader {
         let mut canonical: Vec<(Sym, Sym)> = to_port.into_iter().collect();
         canonical.sort_by(|a, b| pool.get(a.0).cmp(pool.get(b.0)));
         nl.canonical = canonical;
+        // The reference binds a constant's bits to nets NAMED `zero_` and `one_`, in the same table
+        // as every other name, and holds any net made under either name constant
+        // (`VerilogBindingTbl::ensureNetBinding`): a user net called `zero_` IS the constant 0.
+        for (name, v) in [("zero_", false), ("one_", true)] {
+            let Some(s) = pool.find(name) else { continue };
+            let used = nl.conn_table.iter().any(|c| c.1 == s)
+                || nl.aliases.iter().any(|a| a.0 == s || a.1 == s)
+                || nl.inputs.iter().chain(&nl.outputs).chain(&nl.inouts).chain(&nl.undirected).any(|p| *p == s);
+            if used && !nl.constants.contains(&(s, v)) {
+                nl.constants.push((s, v));
+            }
+        }
 
     nl
     }
@@ -2554,6 +2566,16 @@ endmodule
         let d = parse_all("module top (a, y);\n sub u (.i(a), .o(y));\n input [3:0] a;\n output [3:0] y;\nendmodule\nmodule sub (i, o);\n input [3:0] i;\n output [3:0] o;\nendmodule\n").unwrap();
         assert_eq!(d.top().insts[0].conns.len(), 8);
         assert_eq!(d.top().unbound_pins, 0);
+    }
+
+    /// Rule (the reference's `ensureNetBinding`): a net NAMED `zero_` or `one_` is the constant 0
+    /// or 1 the reader binds constants to — a user's wire or port of that name included.
+    #[test]
+    fn a_net_named_zero_or_one_is_constant() {
+        let nl = parse("module top (input zero_, input a, output y);\n  wire one_;\n  BUF b (.A(zero_), .Z(y));\n  INV i (.A(a), .ZN(one_));\nendmodule\n").unwrap();
+        assert_eq!(nl.constants, [("zero_".to_string(), false), ("one_".to_string(), true)]);
+        let nl = parse("module top (input a, output y);\n  BUF b (.A(a), .Z(y));\nendmodule\n").unwrap();
+        assert!(nl.constants.is_empty(), "named only where it is used");
     }
 
     /// Rule (the reference lexer, flex longest match): an escaped identifier runs to the next
