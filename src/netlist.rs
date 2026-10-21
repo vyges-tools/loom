@@ -546,6 +546,10 @@ fn expand_bits(
     if let Some(&(m, l)) = decl_range.get(net) {
         return if m != l { bus_bits(net, m, l) } else { vec![net.to_string()] };
     }
+    // an escaped name that spells a select (`\a[1:0] `, tagged by `keep_escape`) is one name
+    if net.starts_with(KEPT as char) {
+        return vec![net.to_string()];
+    }
     // the LAST bracket is the select: `ti[0][1:2]` is bits 1..2 of the vector `ti[0]`
     if let Some((base, rest)) = net.rsplit_once('[') {
         if let Some(inner) = rest.strip_suffix(']') {
@@ -1025,7 +1029,10 @@ fn keep_escape(arena: &mut Vec<u8>, tok: std::ops::Range<usize>, kept: &mut bool
     let w = &arena[tok.clone()];
     let syntax = match w.first() {
         Some(c) if c.is_ascii_alphabetic() || *c == b'_' || *c == b'\\' => {
-            w.contains(&b'\'') || std::str::from_utf8(w).is_ok_and(|t| is_keyword(t) || RESERVED.contains(&t))
+            // `\a[1:0] ` is ONE net named so, not a part-select of `a`
+            w.contains(&b'\'')
+                || (w.contains(&b'[') && w.contains(&b':'))
+                || std::str::from_utf8(w).is_ok_and(|t| is_keyword(t) || RESERVED.contains(&t))
         }
         _ => true,
     };
@@ -1225,7 +1232,7 @@ fn bind_defined_child_pins(mods: &mut [CompactModule], pool: &mut StrPool) {
     for m in mods.iter_mut() {
         let mut drop_conn = vec![false; m.conn_table.len()];
         let mut drop_tie = vec![false; m.tie_table.len()];
-        let mut dropped = 0usize;
+        let (mut dropped, mut overwritten) = (0usize, 0usize);
         for x in 0..m.insts.len() {
             let (c, t) = (m.insts[x].conns, m.insts[x].ties);
             let (c, t) = (c.0 as usize..c.1 as usize, t.0 as usize..t.1 as usize);
@@ -1313,8 +1320,26 @@ fn bind_defined_child_pins(mods: &mut [CompactModule], pool: &mut StrPool) {
                     if conn { m.conn_table[k].0 = to } else { m.tie_table[k].0 = to }
                 }
             }
+            // A port bit connected twice keeps the LAST connection: the reference reconnects the
+            // pin (`makeInstPin` -> `connect`, which disconnects the previous net), so the earlier
+            // one is gone — not unbound, overwritten.
+            // ⚠️ "Last" is in the instance statement's pin order there. Nets and constant ties are
+            // kept in separate tables here, so nets are taken before ties: a bit connected to both a
+            // net and a constant in one instance may keep the wrong one. No case has witnessed it.
+            let mut last: HashMap<Sym, (bool, usize)> = HashMap::new();
+            let order = c.clone().map(|k| (true, k)).chain(t.clone().map(|k| (false, k)));
+            for (conn, k) in order {
+                let (p, gone) = if conn { (m.conn_table[k].0, drop_conn[k]) } else { (m.tie_table[k].0, drop_tie[k]) };
+                if gone {
+                    continue;
+                }
+                if let Some((pc, pk)) = last.insert(p, (conn, k)) {
+                    if pc { drop_conn[pk] = true } else { drop_tie[pk] = true }
+                    overwritten += 1;
+                }
+            }
         }
-        if dropped > 0 {
+        if dropped + overwritten > 0 {
             m.unbound_pins += dropped;
             let (old_c, old_t) = (std::mem::take(&mut m.conn_table), std::mem::take(&mut m.tie_table));
             for x in m.insts.iter_mut() {
@@ -1865,24 +1890,26 @@ impl ModuleReader {
         let refs_bits = |refs: &[String]| -> Vec<String> {
             refs.iter().filter(|r| !is_const(r)).flat_map(|r| expand_bits(r, &decl_range)).collect()
         };
-        let mut port_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut port_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut bit_dir: std::collections::HashMap<String, Option<PortDir>> = std::collections::HashMap::new();
         let mut cell_ports: Vec<CellPort> = Vec::new();
         let mut members: Vec<String> = Vec::new();
         for h in &self.header {
             match h {
                 HeaderPort::Named { port, .. } => {
-                    if port_names.insert(port.as_str()) {
+                    if port_names.insert(port.clone()) {
                         cell_ports.push(make_port(port, &dirs, &decl_range, &mut bit_dir, pool));
                     }
                 }
                 // a port per bit of the expression, then the bundle over them
                 HeaderPort::Bundle { port, refs } => {
-                    if port_names.insert(port.as_str()) {
+                    if port_names.insert(port.clone()) {
                         members.clear();
                         members.extend(refs_bits(refs));
                         let mut bits = Vec::with_capacity(members.len());
                         for m in &members {
+                            // a member's name is listed: a later entry of that name repeats it
+                            port_names.insert(m.clone());
                             let p = make_port(m, &dirs, &decl_range, &mut bit_dir, pool);
                             bits.extend(p.bits.iter().copied());
                             cell_ports.push(p);
@@ -2576,6 +2603,19 @@ endmodule
         assert_eq!(nl.constants, [("zero_".to_string(), false), ("one_".to_string(), true)]);
         let nl = parse("module top (input a, output y);\n  BUF b (.A(a), .Z(y));\nendmodule\n").unwrap();
         assert!(nl.constants.is_empty(), "named only where it is used");
+    }
+
+    /// Rules (the reference's `makeCellPorts` and `makeInstPin`): a `.X(expr)` entry LISTS its
+    /// members' names, so a later entry of one of them is a repeat (warning 165); a port bit
+    /// connected twice keeps the last connection. And an escaped name that spells a part-select,
+    /// `\a[1:0] `, is one net.
+    #[test]
+    fn a_repeated_port_and_a_select_shaped_name() {
+        let d = parse_all("module top (a, y);\n input a;\n output y;\n sub u (.a(a), .b(y));\nendmodule\nmodule sub (.a(b), .b(a));\n input b;\n output a;\nendmodule\n").unwrap();
+        assert_eq!(d.top().insts[0].conns, [("b".to_string(), "y".to_string())]);
+        assert_eq!(d.module("sub").unwrap().inputs, ["b"]);
+        let nl = parse("module top (input a, output z);\n  wire \\a[1:0] ;\n  BUF g1 (.A(a), .Z(\\a[1:0] ));\nendmodule\n").unwrap();
+        assert_eq!(nl.insts[0].conns[1], ("Z".to_string(), "a[1:0]".to_string()));
     }
 
     /// Rule (the reference lexer, flex longest match): an escaped identifier runs to the next
