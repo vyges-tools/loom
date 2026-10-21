@@ -957,6 +957,7 @@ pub fn parse_compact_reader<R: std::io::BufRead>(r: R) -> Result<CompactDesign, 
     if mods.is_empty() {
         return Err(NetlistError("no module found".into()));
     }
+    name_defined_child_pins(&mut mods, &mut pool);
 
     // TOP is the module no other module instantiates. That is the definition, and it does not
     // depend on declaration order — which is the only thing position could have told us.
@@ -976,6 +977,65 @@ pub fn parse_compact_reader<R: std::io::BufRead>(r: R) -> Result<CompactDesign, 
         by_name.entry(m.name).or_insert(k);
     }
     Ok(CompactDesign { pool, modules: mods, top, escaped, by_name })
+}
+
+/// A bus pin of an instance of a module DEFINED in the file, renamed bit by bit in the CHILD's
+/// declared order: the reference's `makeNamedInstPins` walks the child port's members (from its
+/// left index to its right) and pairs each with the connection's next bit. At the instance the
+/// child is not known yet — it may be defined later — so its bits were named as a Liberty bus is,
+/// the first connection bit on the highest index (`P[k-1-i]`); that is undone here.
+///
+/// Only where the widths agree: on a mismatch the reference warns and connects nothing, which this
+/// reader does not model (the pin keeps its Liberty-style names).
+fn name_defined_child_pins(mods: &mut [CompactModule], pool: &mut StrPool) {
+    fn split_bit(s: &str) -> Option<(&str, usize)> {
+        let (base, rest) = s.rsplit_once('[')?;
+        Some((base, rest.strip_suffix(']')?.parse().ok()?))
+    }
+    // each defined module's bus ports: base -> its bits in declared order
+    let mut ports: std::collections::HashMap<Sym, std::collections::HashMap<String, Vec<Sym>>> = Default::default();
+    for m in mods.iter() {
+        let mut by_base: std::collections::HashMap<String, Vec<Sym>> = Default::default();
+        for &p in m.inputs.iter().chain(&m.outputs).chain(&m.inouts) {
+            if let Some((base, _)) = split_bit(pool.get(p)) {
+                by_base.entry(base.to_string()).or_default().push(p);
+            }
+        }
+        by_base.retain(|_, v| v.len() > 1);
+        if !by_base.is_empty() {
+            ports.insert(m.name, by_base);
+        }
+    }
+    if ports.is_empty() {
+        return;
+    }
+    for m in mods.iter_mut() {
+        for x in 0..m.insts.len() {
+            let Some(child) = ports.get(&m.insts[x].cell) else { continue };
+            let (c, t) = (m.insts[x].conns, m.insts[x].ties);
+            // the bits of each pin as written here: `P[j]` for j = k-1 down to 0, conns and ties
+            let mut width: std::collections::HashMap<String, usize> = Default::default();
+            let pins = m.conn_table[c.0 as usize..c.1 as usize].iter().map(|e| e.0).chain(m.tie_table[t.0 as usize..t.1 as usize].iter().map(|e| e.0));
+            for p in pins {
+                if let Some((base, _)) = split_bit(pool.get(p)) {
+                    *width.entry(base.to_string()).or_default() += 1;
+                }
+            }
+            let rename = |p: Sym| -> Sym {
+                let Some((base, j)) = split_bit(pool.get(p)) else { return p };
+                match (child.get(base), width.get(base)) {
+                    (Some(bits), Some(&k)) if bits.len() == k && j < k => bits[k - 1 - j],
+                    _ => p,
+                }
+            };
+            for e in &mut m.conn_table[c.0 as usize..c.1 as usize] {
+                e.0 = rename(e.0);
+            }
+            for e in &mut m.tie_table[t.0 as usize..t.1 as usize] {
+                e.0 = rename(e.0);
+            }
+        }
+    }
 }
 
 /// One module, read ONE STATEMENT at a time — as the reference's parser consumes it: what
@@ -1854,6 +1914,25 @@ endmodule
         let nl = parse("module top (a, q);\n  input wire a;\n  output reg [1:0] q;\nendmodule").unwrap();
         assert_eq!(nl.inputs, ["a"]);
         assert_eq!(nl.outputs, ["q[1]", "q[0]"]);
+    }
+
+    /// Rule (the reference's `makeNamedInstPins`): a bus pin of a module DEFINED in the file takes
+    /// the connection's bits in the CHILD's declared order — its port member iterator — paired one
+    /// for one with the connection's bits, left index first. `ci[0:3]` on `a[3:0]` is ci[0]=a[3];
+    /// `co[3:0]` on `b[0:3]` is co[3]=b[0]. (A cell not defined here keeps the Liberty-bus naming,
+    /// first bit on the highest index.)
+    #[test]
+    fn a_defined_childs_pin_bits_follow_its_declared_order() {
+        let src = "module top (a, b);\n input [3:0] a;\n input [0:3] b;\n child u (.ci(a), .co(b));\n CELL c (.D(b));\nendmodule\nmodule child (ci, co);\n input [0:3] ci;\n input [3:0] co;\nendmodule\n";
+        let d = parse_all(src).unwrap();
+        let top = d.top();
+        let conns = |name: &str| -> Vec<(String, String)> { top.insts.iter().find(|x| x.name == name).unwrap().conns.clone() };
+        let want = |v: &[(&str, &str)]| -> Vec<(String, String)> { v.iter().map(|(p, n)| (p.to_string(), n.to_string())).collect() };
+        assert_eq!(
+            conns("u"),
+            want(&[("ci[0]", "a[3]"), ("ci[1]", "a[2]"), ("ci[2]", "a[1]"), ("ci[3]", "a[0]"), ("co[3]", "b[0]"), ("co[2]", "b[1]"), ("co[1]", "b[2]"), ("co[0]", "b[3]")])
+        );
+        assert_eq!(conns("c"), want(&[("D[3]", "b[0]"), ("D[2]", "b[1]"), ("D[1]", "b[2]"), ("D[0]", "b[3]")]));
     }
 
     /// Rule (the reference's `checkInstanceName`): a later instance with a name already used is
