@@ -70,6 +70,9 @@ pub struct Netlist {
     /// Dropping these breaks connectivity rather than merely thinning it: a tool writes
     /// `assign out = n42;` and the output port has no driver at all as far as we are concerned.
     pub aliases: Vec<(String, String)>,
+    /// `assign`s whose two sides are not the same width, and so were NOT merged — the reference
+    /// warns and merges nothing (`mergeAssignNet`, warning 203), and so does this reader.
+    pub skipped_assigns: usize,
     /// **The renaming this reader applied**, as `written name -> canonical name`.
     ///
     /// 🔑 A net tied to a port by `assign port = net;` is reported under the PORT's name, because
@@ -119,6 +122,12 @@ impl Netlist {
             notes.push(format!(
                 "{} `assign` alias(es) — resolve them or two names for one net stay separate",
                 self.aliases.len()
+            ));
+        }
+        if self.skipped_assigns > 0 {
+            notes.push(format!(
+                "{} `assign`(s) with sides of different widths not merged, as the reference does",
+                self.skipped_assigns
             ));
         }
         if self.behavioural > 0 {
@@ -662,6 +671,8 @@ pub struct CompactModule {
     /// `(pin, value)` of every instance — see [`Inst::ties`]
     tie_table: Vec<(Sym, bool)>,
     pub aliases: Vec<(Sym, Sym)>,
+    /// see [`Netlist::skipped_assigns`]
+    pub skipped_assigns: usize,
     /// written name -> canonical name — see [`Netlist::canonical`]
     pub canonical: Vec<(Sym, Sym)>,
     pub behavioural: usize,
@@ -698,6 +709,7 @@ impl CompactModule {
                 })
                 .collect(),
             aliases: self.aliases.iter().map(|(a, b)| (st(a), st(b))).collect(),
+            skipped_assigns: self.skipped_assigns,
             canonical: self.canonical.iter().map(|(a, b)| (st(a), st(b))).collect(),
             behavioural: self.behavioural,
             positional: self.positional,
@@ -1101,15 +1113,35 @@ impl ModuleReader {
                 // `assign lhs = rhs ;` is not decoration: it is two names for the same net, and
                 // tools emit it for port aliases and constant ties. Skipping it leaves the lhs
                 // with no driver.
+                //
+                // 🔑 BIT FOR BIT, as the reference's `mergeAssignNet` merges them: a whole bus, a
+                // part-select and a concatenation on either side are expanded and paired, a
+                // constant's bits tie, and a statement may hold several (`assign a = b, c = d;`).
+                // Kept as one alias of the first names written, `assign w = x;` on buses joined no
+                // bit, and a concatenation lost every member after its first.
                 "assign" => {
                     i += 1;
-                    let lhs = read_expr(t, &mut i);
-                    if i < n && t[i] == "=" {
-                        i += 1;
-                    }
-                    let rhs = read_expr(t, &mut i);
-                    if !lhs.is_empty() && !rhs.is_empty() {
-                        nl.aliases.push((pool.intern(&lhs), pool.intern(&rhs)));
+                    loop {
+                        let mut j = i;
+                        let lhs = read_conn_value(t, &mut j);
+                        i = j;
+                        if i < n && t[i] == "=" {
+                            i += 1;
+                        }
+                        let mut j = i;
+                        let rhs = read_conn_value(t, &mut j);
+                        i = j;
+                        if !lhs.is_empty() && !rhs.is_empty() {
+                            match assign_pairs(&lhs, &rhs, decl_range) {
+                                Some(pairs) => nl.aliases.extend(pairs.iter().map(|(a, b)| (pool.intern(a), pool.intern(b)))),
+                                None => nl.skipped_assigns += 1,
+                            }
+                        }
+                        if i < n && t[i] == "," {
+                            i += 1;
+                            continue;
+                        }
+                        break;
                     }
                     while i < n && t[i] != ";" {
                         i += 1;
@@ -1139,7 +1171,8 @@ impl ModuleReader {
                 }
                 // `tri`, `wand` and `wor` declare nets as `wire` does (the reference grammar's
                 // `dcl_type`); skipped, a `tri [3:0] t` connected whole was one bit
-                "wire" | "reg" | "parameter" | "localparam" | "supply0" | "supply1" | "tri" | "wand" | "wor" => {
+                kw @ ("wire" | "reg" | "parameter" | "localparam" | "supply0" | "supply1" | "tri" | "wand" | "wor") => {
+                    let is_net = !matches!(kw, "reg" | "parameter" | "localparam");
                     i += 1;
                     // an optional `[ msb:lsb ]` range, then the names it applies to
                     let mut single: Option<String> = None;
@@ -1169,6 +1202,21 @@ impl ModuleReader {
                                 if !port_decl.contains(t[i]) {
                                     decl_range.insert(t[i].to_string(), r);
                                 }
+                            }
+                            // `wire a = b;` is an assignment too (the reference merges a
+                            // declaration's assigns as `assign`'s); the right-hand side is read
+                            // here so its names are not taken as declared
+                            if t.get(i + 1) == Some(&"=") {
+                                let lhs = vec![t[i].to_string()];
+                                i += 2;
+                                let rhs = read_conn_value(t, &mut i);
+                                if is_net && !rhs.is_empty() {
+                                    match assign_pairs(&lhs, &rhs, decl_range) {
+                                        Some(pairs) => nl.aliases.extend(pairs.iter().map(|(a, b)| (pool.intern(a), pool.intern(b)))),
+                                        None => nl.skipped_assigns += 1,
+                                    }
+                                }
+                                continue;
                             }
                         }
                         i += 1;
@@ -1433,12 +1481,29 @@ fn read_conn_value(t: &[&str], i: &mut usize) -> Vec<String> {
     out
 }
 
-/// The left- or right-hand side of an `assign`, as a single name (bit-selects reassembled).
-fn read_expr(t: &[&str], i: &mut usize) -> String {
-    let mut j = *i;
-    let v = read_conn_value(t, &mut j);
-    *i = j;
-    v.first().cloned().unwrap_or_default()
+/// The bits of one side of an assignment, left index first: names expanded by their declared
+/// range, a constant as `1'b0` / `1'b1` per bit (the reference binds them to its `zero_` / `one_`).
+fn assign_bits(vals: &[String], decl_range: &std::collections::BTreeMap<String, (i64, i64)>) -> Vec<String> {
+    vals.iter()
+        .flat_map(|v| {
+            if is_const(v) {
+                const_bits(v).into_iter().map(|b| if b { "1'b1".to_string() } else { "1'b0".to_string() }).collect()
+            } else {
+                expand_bits(v, decl_range)
+            }
+        })
+        .collect()
+}
+
+/// `lhs = rhs` as the reference's `mergeAssignNet` takes it: bit for bit when the two sides are
+/// the same width, and NOTHING when they are not. `None` for a width mismatch.
+fn assign_pairs(
+    lhs: &[String],
+    rhs: &[String],
+    decl_range: &std::collections::BTreeMap<String, (i64, i64)>,
+) -> Option<Vec<(String, String)>> {
+    let (l, r) = (assign_bits(lhs, decl_range), assign_bits(rhs, decl_range));
+    (l.len() == r.len()).then(|| l.into_iter().zip(r).collect())
 }
 
 pub fn load(path: &str) -> Result<Netlist, NetlistError> {
@@ -1684,6 +1749,23 @@ endmodule
         let nl = parse(src).unwrap();
         let pins: Vec<&str> = nl.insts[0].conns.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(pins, ["A[1]", "A[0]", "B[1]", "B[0]", "C[1]", "C[0]", "Y[1]", "Y[0]"]);
+    }
+
+    /// Rule (the reference's `mergeAssignNet`): an assignment merges its two sides BIT FOR BIT —
+    /// buses, part-selects and concatenations expanded, a constant's bits tied — and merges
+    /// nothing when the widths differ (warning 203). A statement may hold several, and a net
+    /// declaration's `= rhs` is one too.
+    #[test]
+    fn an_assign_merges_bit_for_bit() {
+        let src = "module top (x, y, z);\n  input [0:1] x;\n  output [1:0] y;\n  output [2:0] z;\n  wire [1:0] w;\n  wire [1:0] v = w;\n  wire s = x[0], q;\n  assign w = x, z = {y[0], 2'b10};\n  assign y = {q, s};\n  assign q = z;\nendmodule";
+        let nl = parse(src).unwrap();
+        let a: Vec<String> = nl.aliases.iter().map(|(l, r)| format!("{l}={r}")).collect();
+        assert_eq!(
+            a,
+            ["v[1]=w[1]", "v[0]=w[0]", "s=x[0]", "w[1]=x[0]", "w[0]=x[1]", "z[2]=y[0]", "z[1]=1'b1", "z[0]=1'b0", "y[1]=q", "y[0]=s"]
+        );
+        assert_eq!(nl.skipped_assigns, 1, "q (1 bit) = z (3 bits) is not merged");
+        assert!(!nl.aliases.iter().any(|(l, _)| l == "q" || l.starts_with("q[")), "q is not declared [1:0]");
     }
 
     /// Rule (the reference reader's): a constant is `size` bits, filled from its least
