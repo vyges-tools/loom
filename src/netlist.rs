@@ -73,6 +73,13 @@ pub struct Netlist {
     /// `assign`s whose two sides are not the same width, and so were NOT merged — the reference
     /// warns and merges nothing (`mergeAssignNet`, warning 203), and so does this reader.
     pub skipped_assigns: usize,
+    /// Nets a `supply0` (false) / `supply1` (true) declaration holds constant, by the name as
+    /// declared — the reference's `addConstantNet`. Pins stay connected to the net; this is
+    /// what says its value.
+    ///
+    /// ⚠️ The reference binds the declared NAME, so `supply0 [3:0] g;` marks the net `g`, not
+    /// its bits; transcribed as it does.
+    pub constants: Vec<(String, bool)>,
     /// **The renaming this reader applied**, as `written name -> canonical name`.
     ///
     /// 🔑 A net tied to a port by `assign port = net;` is reported under the PORT's name, because
@@ -673,6 +680,8 @@ pub struct CompactModule {
     pub aliases: Vec<(Sym, Sym)>,
     /// see [`Netlist::skipped_assigns`]
     pub skipped_assigns: usize,
+    /// see [`Netlist::constants`]
+    pub constants: Vec<(Sym, bool)>,
     /// written name -> canonical name — see [`Netlist::canonical`]
     pub canonical: Vec<(Sym, Sym)>,
     pub behavioural: usize,
@@ -710,6 +719,7 @@ impl CompactModule {
                 .collect(),
             aliases: self.aliases.iter().map(|(a, b)| (st(a), st(b))).collect(),
             skipped_assigns: self.skipped_assigns,
+            constants: self.constants.iter().map(|(s, v)| (st(s), *v)).collect(),
             canonical: self.canonical.iter().map(|(a, b)| (st(a), st(b))).collect(),
             behavioural: self.behavioural,
             positional: self.positional,
@@ -1209,6 +1219,9 @@ impl ModuleReader {
                     }
                     while i < n && t[i] != ";" {
                         if is_ident(t[i]) && !is_keyword(t[i]) {
+                            if kw == "supply0" || kw == "supply1" {
+                                nl.constants.push((pool.intern(t[i]), kw == "supply1"));
+                            }
                             if let Some(idx) = &single {
                                 one_bit_vec.insert(t[i].to_string(), idx.clone());
                             }
@@ -1791,6 +1804,17 @@ endmodule
         assert_eq!(d.module_names(), ["top", "leaf"]);
         assert_eq!(d.module("leaf").unwrap().insts[0].name, "u1");
         assert_eq!(d.top().module, "top");
+    }
+
+    /// Rule (the reference's `makeModuleInstBody`): a `supply0` / `supply1` net is held at 0 / 1
+    /// by its declared name, and pins stay connected to it.
+    #[test]
+    fn a_supply_net_is_constant() {
+        let src = "module top (input a, output y);\n  supply0 VSS;\n  supply1 VDD, VPWR;\n  INV u0 (.A(a), .VGND(VSS), .VPWR(VDD), .Y(y));\nendmodule";
+        let nl = parse(src).unwrap();
+        let c: Vec<(&str, bool)> = nl.constants.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+        assert_eq!(c, [("VSS", false), ("VDD", true), ("VPWR", true)]);
+        assert!(nl.insts[0].conns.iter().any(|(p, n)| p == "VGND" && n == "VSS"));
     }
 
     /// Rule (the reference reader's): a constant is `size` bits, filled from its least
