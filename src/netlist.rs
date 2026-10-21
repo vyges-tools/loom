@@ -82,6 +82,10 @@ pub struct Netlist {
     /// `assign`s whose two sides are not the same width, and so were NOT merged — the reference
     /// warns and merges nothing (`mergeAssignNet`, warning 203), and so does this reader.
     pub skipped_assigns: usize,
+    /// Pin bits of instances of modules DEFINED in the file left unconnected, as the reference
+    /// leaves them: the module has no such port (warning 201), or the port is not the
+    /// connection's width (warning 200). A cell that is not defined here is never checked.
+    pub unbound_pins: usize,
     /// Nets a `supply0` (false) / `supply1` (true) declaration holds constant, by the name as
     /// declared — the reference's `addConstantNet`. Pins stay connected to the net; this is
     /// what says its value.
@@ -144,6 +148,13 @@ impl Netlist {
             notes.push(format!(
                 "{} `assign`(s) with sides of different widths not merged, as the reference does",
                 self.skipped_assigns
+            ));
+        }
+        if self.unbound_pins > 0 {
+            notes.push(format!(
+                "{} pin bit(s) of a module instance left unconnected (no such port, or a width \
+                 mismatch), as the reference does",
+                self.unbound_pins
             ));
         }
         if self.behavioural > 0 {
@@ -695,6 +706,8 @@ pub struct CompactModule {
     pub aliases: Vec<(Sym, Sym)>,
     /// see [`Netlist::skipped_assigns`]
     pub skipped_assigns: usize,
+    /// see [`Netlist::unbound_pins`]
+    pub unbound_pins: usize,
     /// see [`Netlist::constants`]
     pub constants: Vec<(Sym, bool)>,
     /// written name -> canonical name — see [`Netlist::canonical`]
@@ -734,6 +747,7 @@ impl CompactModule {
                 .collect(),
             aliases: self.aliases.iter().map(|(a, b)| (st(a), st(b))).collect(),
             skipped_assigns: self.skipped_assigns,
+            unbound_pins: self.unbound_pins,
             constants: self.constants.iter().map(|(s, v)| (st(s), *v)).collect(),
             canonical: self.canonical.iter().map(|(a, b)| (st(a), st(b))).collect(),
             behavioural: self.behavioural,
@@ -963,7 +977,7 @@ pub fn parse_compact_reader<R: std::io::BufRead>(r: R) -> Result<CompactDesign, 
     if mods.is_empty() {
         return Err(NetlistError("no module found".into()));
     }
-    name_defined_child_pins(&mut mods, &mut pool);
+    bind_defined_child_pins(&mut mods, &mut pool);
 
     // TOP is the module no other module instantiates. That is the definition, and it does not
     // depend on declaration order — which is the only thing position could have told us.
@@ -985,75 +999,110 @@ pub fn parse_compact_reader<R: std::io::BufRead>(r: R) -> Result<CompactDesign, 
     Ok(CompactDesign { pool, modules: mods, top, escaped, by_name })
 }
 
-/// A bus pin of an instance of a module DEFINED in the file, renamed bit by bit in the CHILD's
-/// declared order: the reference's `makeNamedInstPins` walks the child port's members (from its
-/// left index to its right) and pairs each with the connection's next bit. At the instance the
-/// child is not known yet — it may be defined later — so its bits were named as a Liberty bus is,
-/// the first connection bit on the highest index (`P[k-1-i]`); that is undone here.
+/// The named pins of every instance of a module DEFINED in the file, bound as the reference's
+/// `makeNamedInstPins` binds them — once the whole file is read, since a child may be defined
+/// after its parent:
+/// - a pin takes the connection's bits in the CHILD's declared order: the child port's members
+///   (from its left index to its right) each pair with the connection's next bit. At the instance
+///   the bits were named as a Liberty bus is, the first connection bit on the highest index
+///   (`P[k-1-i]`); that is undone here, and a one-bit pin takes the child's own bit name;
+/// - a pin the child has no port for (warning 201), or whose width is not the connection's
+///   (warning 200), is left UNCONNECTED, and counted in [`CompactModule::unbound_pins`].
 ///
-/// Only where the widths agree: on a mismatch the reference warns and connects nothing, which this
-/// reader does not model (the pin keeps its Liberty-style names).
-fn name_defined_child_pins(mods: &mut [CompactModule], pool: &mut StrPool) {
+/// A pin or a port whose bits are ambiguous — an escaped scalar `\foo[3] ` canonicalises to the
+/// name of a bit of the bus `foo` — is left as written. Positional connections are not bound here.
+fn bind_defined_child_pins(mods: &mut [CompactModule], pool: &mut StrPool) {
+    use std::collections::HashMap;
     fn split_bit(s: &str) -> Option<(&str, usize)> {
         let (base, rest) = s.rsplit_once('[')?;
         Some((base, rest.strip_suffix(']')?.parse().ok()?))
     }
-    // each defined module's bus ports: base -> its bits in declared order
-    let mut ports: std::collections::HashMap<Sym, std::collections::HashMap<String, Vec<Sym>>> = Default::default();
-    for m in mods.iter() {
-        let mut by_base: std::collections::HashMap<String, Vec<Sym>> = Default::default();
-        for &p in m.inputs.iter().chain(&m.outputs).chain(&m.inouts) {
-            if let Some((base, _)) = split_bit(pool.get(p)) {
-                by_base.entry(base.to_string()).or_default().push(p);
-            }
+    // the bits of each pin, by its name: (j of `P[j]`, or None for a scalar `P`) — a well-formed
+    // pin is one scalar, or bits 0..k-1 once each
+    fn shape(bits: &[Option<usize>]) -> Option<usize> {
+        if let [None] = bits {
+            return Some(1);
         }
-        // a bus port's bits carry each index once; a second `foo[3]` is an escaped scalar that
-        // canonicalises to a bit's name, and the port is left as written
-        by_base.retain(|_, v| {
-            let idx: std::collections::HashSet<usize> = v.iter().filter_map(|&p| split_bit(pool.get(p)).map(|b| b.1)).collect();
-            v.len() > 1 && idx.len() == v.len()
-        });
-        if !by_base.is_empty() {
-            ports.insert(m.name, by_base);
-        }
+        let mut js: Vec<usize> = bits.iter().copied().collect::<Option<Vec<_>>>()?;
+        js.sort_unstable();
+        js.iter().enumerate().all(|(i, &j)| i == j).then_some(js.len())
     }
-    if ports.is_empty() {
-        return;
+    let key = |pool: &StrPool, p: Sym| -> (String, Option<usize>) {
+        match split_bit(pool.get(p)) {
+            Some((base, j)) => (base.to_string(), Some(j)),
+            None => (pool.get(p).to_string(), None),
+        }
+    };
+    // each defined module's ports: name -> its bits in declared order, or None when ambiguous
+    let mut ports: HashMap<Sym, HashMap<String, Option<Vec<Sym>>>> = HashMap::new();
+    for m in mods.iter() {
+        let mut by: HashMap<String, (Vec<Sym>, Vec<Option<usize>>)> = HashMap::new();
+        for &p in m.inputs.iter().chain(&m.outputs).chain(&m.inouts) {
+            let (k, j) = key(pool, p);
+            let e = by.entry(k).or_default();
+            e.0.push(p);
+            e.1.push(j);
+        }
+        let named = by.into_iter().map(|(k, (bits, js))| (k, shape(&js).map(|_| bits))).collect();
+        ports.insert(m.name, named);
     }
     for m in mods.iter_mut() {
+        let mut drop_conn = vec![false; m.conn_table.len()];
+        let mut drop_tie = vec![false; m.tie_table.len()];
+        let mut dropped = 0usize;
         for x in 0..m.insts.len() {
             let Some(child) = ports.get(&m.insts[x].cell) else { continue };
             let (c, t) = (m.insts[x].conns, m.insts[x].ties);
-            // the bits of each pin as written here: `P[j]` for j = k-1 down to 0, conns and ties
-            let mut seen: std::collections::HashMap<String, Vec<usize>> = Default::default();
-            let pins = m.conn_table[c.0 as usize..c.1 as usize].iter().map(|e| e.0).chain(m.tie_table[t.0 as usize..t.1 as usize].iter().map(|e| e.0));
-            for p in pins {
-                if let Some((base, j)) = split_bit(pool.get(p)) {
-                    seen.entry(base.to_string()).or_default().push(j);
+            let (c, t) = (c.0 as usize..c.1 as usize, t.0 as usize..t.1 as usize);
+            // (table, index) of every bit of each named pin; a positional one (no name) is skipped
+            let mut pins: HashMap<String, Vec<(bool, usize, Option<usize>)>> = HashMap::new();
+            for k in c.clone() {
+                let p = m.conn_table[k].0;
+                if !pool.get(p).is_empty() {
+                    let (name, j) = key(pool, p);
+                    pins.entry(name).or_default().push((true, k, j));
                 }
             }
-            // a pin's width, only where its bits are exactly 0..k-1 once each (an escaped scalar
-            // named like one of its bits makes it ambiguous, and it is left as written)
-            let width: std::collections::HashMap<String, usize> = seen
-                .into_iter()
-                .filter_map(|(base, mut js)| {
-                    js.sort_unstable();
-                    js.iter().enumerate().all(|(i, &j)| i == j).then_some((base, js.len()))
-                })
-                .collect();
-            let rename = |p: Sym| -> Sym {
-                let Some((base, j)) = split_bit(pool.get(p)) else { return p };
-                match (child.get(base), width.get(base)) {
-                    (Some(bits), Some(&k)) if bits.len() == k && j < k => bits[k - 1 - j],
-                    _ => p,
+            for k in t.clone() {
+                let p = m.tie_table[k].0;
+                if !pool.get(p).is_empty() {
+                    let (name, j) = key(pool, p);
+                    pins.entry(name).or_default().push((false, k, j));
                 }
-            };
-            for e in &mut m.conn_table[c.0 as usize..c.1 as usize] {
-                e.0 = rename(e.0);
             }
-            for e in &mut m.tie_table[t.0 as usize..t.1 as usize] {
-                e.0 = rename(e.0);
+            for (name, bits) in pins {
+                let js: Vec<Option<usize>> = bits.iter().map(|b| b.2).collect();
+                let Some(width) = shape(&js) else { continue };
+                let port = match child.get(&name) {
+                    Some(None) => continue,
+                    Some(Some(port)) if port.len() == width => port,
+                    // no such port, or not the connection's width: the reference connects nothing
+                    _ => {
+                        for &(conn, k, _) in &bits {
+                            if conn { drop_conn[k] = true } else { drop_tie[k] = true }
+                        }
+                        dropped += bits.len();
+                        continue;
+                    }
+                };
+                for &(conn, k, j) in &bits {
+                    let to = port[width - 1 - j.unwrap_or(0)];
+                    if conn { m.conn_table[k].0 = to } else { m.tie_table[k].0 = to }
+                }
             }
+        }
+        if dropped == 0 {
+            continue;
+        }
+        m.unbound_pins += dropped;
+        let (old_c, old_t) = (std::mem::take(&mut m.conn_table), std::mem::take(&mut m.tie_table));
+        for x in m.insts.iter_mut() {
+            let c0 = m.conn_table.len() as u32;
+            m.conn_table.extend((x.conns.0..x.conns.1).filter(|&k| !drop_conn[k as usize]).map(|k| old_c[k as usize]));
+            let t0 = m.tie_table.len() as u32;
+            m.tie_table.extend((x.ties.0..x.ties.1).filter(|&k| !drop_tie[k as usize]).map(|k| old_t[k as usize]));
+            x.conns = (c0, m.conn_table.len() as u32);
+            x.ties = (t0, m.tie_table.len() as u32);
         }
     }
 }
@@ -1953,6 +2002,21 @@ endmodule
             want(&[("ci[0]", "a[3]"), ("ci[1]", "a[2]"), ("ci[2]", "a[1]"), ("ci[3]", "a[0]"), ("co[3]", "b[0]"), ("co[2]", "b[1]"), ("co[1]", "b[2]"), ("co[0]", "b[3]")])
         );
         assert_eq!(conns("c"), want(&[("D[3]", "b[0]"), ("D[2]", "b[1]"), ("D[1]", "b[2]"), ("D[0]", "b[3]")]));
+    }
+
+    /// Rule (the reference's `makeNamedInstPins`): a named pin of a module DEFINED in the file is
+    /// left unconnected when the module has no such port (warning 201) or the port's width is not
+    /// the connection's (warning 200) — counted in `unbound_pins`. A black box is not checked.
+    #[test]
+    fn a_defined_childs_pin_of_the_wrong_width_or_no_port_is_unconnected() {
+        let src = "module top (a, s);\n input [3:0] a;\n input s;\n child u (.i(a), .k(s), .z(s), .w(a[1:0]));\n CELL c (.i(a), .z(s));\nendmodule\nmodule child (i, k, w);\n input [1:0] i;\n input k;\n input [1:0] w;\nendmodule\n";
+        let d = parse_all(src).unwrap();
+        let top = d.top();
+        let pins = |n: &str| -> Vec<String> { top.insts.iter().find(|x| x.name == n).unwrap().conns.iter().map(|(p, _)| p.clone()).collect() };
+        // i: 4 bits on a 2-bit port; z: no such port — both dropped. k and w bind.
+        assert_eq!(pins("u"), ["k", "w[1]", "w[0]"]);
+        assert_eq!(pins("c"), ["i[3]", "i[2]", "i[1]", "i[0]", "z"]);
+        assert_eq!(top.unbound_pins, 5);
     }
 
     /// An escaped VECTOR whose name holds brackets (`input [0:3] \ti[0] ;`) connected whole is
