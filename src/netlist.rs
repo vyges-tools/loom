@@ -217,7 +217,10 @@ enum Mode {
 /// Bytes that end a run of an ordinary token: ASCII whitespace, `/` (a comment may start),
 /// `\\` and the punctuation the parser reads as tokens of their own.
 const STOP: [bool; 256] = stop_table(false);
-/// The same inside an escaped identifier, which only whitespace (or a comment) ends.
+/// The same inside an escaped identifier, which ONLY whitespace ends — a `//` or `/*` in one is
+/// part of its name. The reference's flex scanner takes the longest match from where it stands,
+/// and from a backslash that is `\\[^ \t\r\n]+[\r\n\t ]`: a comment rule only competes at a token's
+/// start. Ending the name at `//` read `wire \a//b ;` as `wire \a` and lost the rest of the line.
 const STOP_ESCAPED: [bool; 256] = stop_table(true);
 
 const fn stop_table(escaped: bool) -> [bool; 256] {
@@ -226,8 +229,7 @@ const fn stop_table(escaped: bool) -> [bool; 256] {
     while i < 256 {
         let b = i as u8;
         t[i] = b.is_ascii_whitespace()
-            || b == b'/'
-            || (!escaped && matches!(b, b'\\' | b'(' | b')' | b';' | b',' | b'.' | b'[' | b']' | b'='));
+            || (!escaped && matches!(b, b'/' | b'\\' | b'(' | b')' | b';' | b',' | b'.' | b'[' | b']' | b'='));
         i += 1;
     }
     t
@@ -314,7 +316,7 @@ impl<R: std::io::BufRead> Lexer<R> {
                     }
                 }
                 if self.mode == Mode::Normal && !self.slash && !self.dot {
-                    // inside an escaped identifier only whitespace (and a comment) ends it
+                    // inside an escaped identifier only whitespace ends it
                     let stop = if self.escaped { STOP_ESCAPED } else { STOP };
                     let run = buf[used..].iter().take_while(|&&b| !stop[b as usize]).count();
                     if run > 0 {
@@ -326,7 +328,8 @@ impl<R: std::io::BufRead> Lexer<R> {
                 }
                 let c = buf[used];
                 used += 1;
-                // Comments — BOTH forms — end whatever token is open, escaped or not.
+                // Comments — BOTH forms — end whatever ordinary token is open (an escaped one
+                // never reaches here on a `/`: see STOP_ESCAPED).
                 //
                 // `/* ... */` spans lines and is where tools park disabled code. Left in, its contents
                 // tokenize like anything else, and `/* INV bogus (.A(a)); */` becomes a real instance in
@@ -2103,6 +2106,18 @@ endmodule
         assert_eq!(insts, [("g1", c(&[("A", "a"), ("ZN", ";")])), ("1x", c(&[("A", ";"), ("ZN", "output")])), ("g3", c(&[("A", "a"), ("ZN", "endmodule")]))]);
         assert_eq!(d.top().insts[0].conns, c(&[("a", "a"), ("output", "z")]));
         assert!(d.escaped_names().contains("output"));
+    }
+
+    /// Rule (the reference lexer, flex longest match): an escaped identifier runs to the next
+    /// whitespace, so `//` and `/*` inside it are part of the name — a comment only starts where a
+    /// token could. Outside one, both comment forms still remove what they cover.
+    #[test]
+    fn a_comment_marker_inside_an_escaped_name_is_part_of_it() {
+        let src = "module top (input a, output z);\n  wire \\a//b ;\n  INV_X1 u1 (.A(a), .ZN(\\a//b )); // a real comment (.A(z))\n  INV_X1 \\u/*2  (.A(\\a//b ), .ZN(z)); /* BUF_X1 x (.A(a)); */\nendmodule\n";
+        let nl = parse(src).unwrap();
+        let insts: Vec<(&str, Vec<(String, String)>)> = nl.insts.iter().map(|x| (x.name.as_str(), x.conns.clone())).collect();
+        let c = |v: &[(&str, &str)]| -> Vec<(String, String)> { v.iter().map(|(p, n)| (p.to_string(), n.to_string())).collect() };
+        assert_eq!(insts, [("u1", c(&[("A", "a"), ("ZN", "a//b")])), ("u/*2", c(&[("A", "a//b"), ("ZN", "z")]))]);
     }
 
     /// An escaped VECTOR whose name holds brackets (`input [0:3] \ti[0] ;`) connected whole is
