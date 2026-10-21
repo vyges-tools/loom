@@ -39,6 +39,12 @@ pub struct Inst {
 pub struct Netlist {
     /// The TOP module: the one no other module in the file instantiates.
     pub module: String,
+    /// The port bits, in the order the module's HEADER names them, by declared direction.
+    ///
+    /// 🔑 **The header says what is a port** — the reference's `makeCellPorts`: a declared
+    /// `input` the header does not list is a net (warning 197), `{a, b}` in the header makes no
+    /// port (2721), `y[1]` makes a port NAMED `y[1]`, and `i[1:0]` exposes bits 1..0 of `i`.
+    /// Ports were taken from the declarations until 2026-10-21, in declaration order.
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
     /// `inout` ports, kept SEPARATE from `inputs` and `outputs`.
@@ -118,6 +124,10 @@ pub struct Netlist {
     /// maps to is in the cell's LEF/Liberty, not in the netlist. The net is what connectivity
     /// needs; the count is here so a consumer that needs pin names knows they are missing.
     pub positional: usize,
+    /// Header ports with no `input`/`output`/`inout` declaration (warning 166), or only a net
+    /// one: the reference makes them ports with no direction, so they are in none of `inputs`,
+    /// `outputs` or `inouts`. Header order.
+    pub undirected: Vec<String>,
 }
 
 impl Netlist {
@@ -155,6 +165,12 @@ impl Netlist {
                 "{} pin bit(s) of a module instance left unconnected (no such port, or a width \
                  mismatch), as the reference does",
                 self.unbound_pins
+            ));
+        }
+        if !self.undirected.is_empty() {
+            notes.push(format!(
+                "{} header port(s) with no direction declared — ports, but neither input nor output",
+                self.undirected.len()
             ));
         }
         if self.behavioural > 0 {
@@ -749,6 +765,75 @@ pub struct CompactModule {
     pub canonical: Vec<(Sym, Sym)>,
     pub behavioural: usize,
     pub positional: usize,
+    /// see [`Netlist::undirected`]
+    pub undirected: Vec<Sym>,
+    /// the module's ports as a PARENT sees them, in header order — see [`CellPort`]
+    cell_ports: Vec<CellPort>,
+}
+
+/// One port of a module as the reference's `makeCellPorts` makes it from the header: a name, a
+/// bit-select (a port NAMED `y[1]`), or a part-select's name (`i[1:0]` makes the port `i`, every
+/// bit its declaration has); a `.X(expr)` entry makes a port per bit of `expr`, then the BUNDLE `X`
+/// over them. Positional connections pair with these in this order.
+#[derive(Debug, Clone)]
+struct CellPort {
+    name: Sym,
+    /// in declared order, left index first; for a bundle, its members
+    bits: Vec<Sym>,
+    bundle: bool,
+}
+
+/// A port declaration's direction, as the reference's declaration map keeps it (`parseDcl`): the
+/// first declaration of a name wins, except that a `wire` (or `reg`, `tri`, a supply) is replaced
+/// by a later direction — a net type before or after `input` only modifies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortDir {
+    Input,
+    Output,
+    Inout,
+    Internal,
+}
+
+fn declare(dirs: &mut std::collections::HashMap<String, PortDir>, name: &str, d: PortDir) {
+    match dirs.get(name) {
+        Some(&PortDir::Internal) if d != PortDir::Internal => {
+            dirs.insert(name.to_string(), d);
+        }
+        Some(_) => {}
+        None => {
+            dirs.insert(name.to_string(), d);
+        }
+    }
+}
+
+/// One entry of a module header's port list (the reference grammar's `port`).
+#[derive(Debug, Clone)]
+enum HeaderPort {
+    /// `a`, `y[1]`, or `i[1:0]`: the port `port`, and the expression the entry names — its bits
+    /// are the pins the module has as a TOP (`linkNetwork` looks each up)
+    Named { port: String, refs: String },
+    /// `.X(expr)`: a port per bit of `expr`, then the bundle `X`
+    Bundle { port: String, refs: Vec<String> },
+    /// `{a, b}`, or anything else with no port identifier: no port (warning 2721)
+    Unnamed { refs: Vec<String> },
+}
+
+/// The pin name a POSITIONAL connection carries until the file is read and it is bound: the
+/// expression's place `k` in the list and the bit's place `b` (`s` its bit, once expanded) in the
+/// expression. A byte no Verilog source holds starts it; none survives the read.
+const POS_TAG: char = '\u{2}';
+
+fn pos_tag(pool: &mut StrPool, k: u32, b: u32, s: Option<u32>) -> Sym {
+    match s {
+        Some(s) => pool.intern(&format!("{POS_TAG}{k}.{b}.{s}")),
+        None => pool.intern(&format!("{POS_TAG}{k}.{b}")),
+    }
+}
+
+/// `(k, b, s)` of a positional tag, or `None` for a real pin name.
+fn read_pos_tag(p: &str) -> Option<(u32, u32, u32)> {
+    let mut it = p.strip_prefix(POS_TAG)?.split('.').map(|x| x.parse::<u32>());
+    Some((it.next()?.ok()?, it.next()?.ok()?, it.next().unwrap_or(Ok(0)).ok()?))
 }
 
 impl CompactModule {
@@ -787,6 +872,7 @@ impl CompactModule {
             canonical: self.canonical.iter().map(|(a, b)| (st(a), st(b))).collect(),
             behavioural: self.behavioural,
             positional: self.positional,
+            undirected: self.undirected.iter().map(st).collect(),
             ..Default::default()
         }
     }
@@ -1072,9 +1158,10 @@ pub fn parse_compact_reader<R: std::io::BufRead>(r: R) -> Result<CompactDesign, 
     Ok(CompactDesign { pool, modules: mods, top, escaped, by_name })
 }
 
-/// The named pins of every instance of a module DEFINED in the file, bound as the reference's
-/// `makeNamedInstPins` binds them — once the whole file is read, since a child may be defined
-/// after its parent:
+/// The pins of every instance of a module DEFINED in the file, bound to its ports as the reference
+/// binds them — once the whole file is read, since a child may be defined after its parent.
+///
+/// NAMED pins (`makeNamedInstPins`):
 /// - a pin takes the connection's bits in the CHILD's declared order: the child port's members
 ///   (from its left index to its right) each pair with the connection's next bit. At the instance
 ///   the bits were named as a Liberty bus is, the first connection bit on the highest index
@@ -1082,8 +1169,14 @@ pub fn parse_compact_reader<R: std::io::BufRead>(r: R) -> Result<CompactDesign, 
 /// - a pin the child has no port for (warning 201), or whose width is not the connection's
 ///   (warning 200), is left UNCONNECTED, and counted in [`CompactModule::unbound_pins`].
 ///
-/// A pin or a port whose bits are ambiguous — an escaped scalar `\foo[3] ` canonicalises to the
-/// name of a bit of the bus `foo` — is left as written. Positional connections are not bound here.
+/// A pin whose bits are ambiguous — an escaped scalar `\foo[3] ` canonicalises to the name of a
+/// bit of the bus `foo` — is left as written.
+///
+/// POSITIONAL values (`makeOrderedInstPins`) pair with the child's ports in HEADER order — the
+/// k-th value with the k-th port, bit by bit, the port's bits from its left index. A value whose
+/// width is not its port's (warning 202) connects nothing; a bundle port (`.X(a, b)` in the
+/// header) cannot be connected by position (2723); values past the last port connect nothing.
+/// Every other cell's positional pins get the empty name (see [`Netlist::positional`]).
 fn bind_defined_child_pins(mods: &mut [CompactModule], pool: &mut StrPool) {
     use std::collections::HashMap;
     fn split_bit(s: &str) -> Option<(&str, usize)> {
@@ -1106,28 +1199,64 @@ fn bind_defined_child_pins(mods: &mut [CompactModule], pool: &mut StrPool) {
             None => (pool.get(p).to_string(), None),
         }
     };
-    // each defined module's ports: name -> its bits in declared order, or None when ambiguous
-    let mut ports: HashMap<Sym, HashMap<String, Option<Vec<Sym>>>> = HashMap::new();
-    for m in mods.iter() {
-        let mut by: HashMap<String, (Vec<Sym>, Vec<Option<usize>>)> = HashMap::new();
-        for &p in m.inputs.iter().chain(&m.outputs).chain(&m.inouts) {
-            let (k, j) = key(pool, p);
-            let e = by.entry(k).or_default();
-            e.0.push(p);
-            e.1.push(j);
-        }
-        let named = by.into_iter().map(|(k, (bits, js))| (k, shape(&js).map(|_| bits))).collect();
-        ports.insert(m.name, named);
-    }
+    // each defined module's ports, in header order, and by name
+    let ports: HashMap<Sym, (Vec<CellPort>, HashMap<Sym, usize>)> = mods
+        .iter()
+        .map(|m| (m.name, (m.cell_ports.clone(), m.cell_ports.iter().enumerate().map(|(k, p)| (p.name, k)).collect())))
+        .collect();
+    let none = pool.intern("");
     for m in mods.iter_mut() {
         let mut drop_conn = vec![false; m.conn_table.len()];
         let mut drop_tie = vec![false; m.tie_table.len()];
         let mut dropped = 0usize;
         for x in 0..m.insts.len() {
-            let Some(child) = ports.get(&m.insts[x].cell) else { continue };
             let (c, t) = (m.insts[x].conns, m.insts[x].ties);
             let (c, t) = (c.0 as usize..c.1 as usize, t.0 as usize..t.1 as usize);
-            // (table, index) of every bit of each named pin; a positional one (no name) is skipped
+            // positional bits: (k, b, s) -> (table, index)
+            let mut pos: Vec<((u32, u32, u32), bool, usize)> = Vec::new();
+            for k in c.clone() {
+                if let Some(tag) = read_pos_tag(pool.get(m.conn_table[k].0)) {
+                    pos.push((tag, true, k));
+                }
+            }
+            for k in t.clone() {
+                if let Some(tag) = read_pos_tag(pool.get(m.tie_table[k].0)) {
+                    pos.push((tag, false, k));
+                }
+            }
+            let Some((child, by_name)) = ports.get(&m.insts[x].cell) else {
+                for &(_, conn, k) in &pos {
+                    if conn { m.conn_table[k].0 = none } else { m.tie_table[k].0 = none }
+                }
+                continue;
+            };
+            // an instance connects by position or by name, never both
+            if !pos.is_empty() {
+                pos.sort_unstable();
+                let mut at = 0;
+                let mut port_iter = child.iter();
+                while at < pos.len() {
+                    let k = pos[at].0 .0;
+                    let end = at + pos[at..].iter().take_while(|e| e.0 .0 == k).count();
+                    let value = &pos[at..end];
+                    match port_iter.next() {
+                        Some(port) if !port.bundle && port.bits.len() == value.len() => {
+                            for (j, &(_, conn, idx)) in value.iter().enumerate() {
+                                if conn { m.conn_table[idx].0 = port.bits[j] } else { m.tie_table[idx].0 = port.bits[j] }
+                            }
+                        }
+                        _ => {
+                            for &(_, conn, idx) in value {
+                                if conn { drop_conn[idx] = true } else { drop_tie[idx] = true }
+                            }
+                            dropped += value.len();
+                        }
+                    }
+                    at = end;
+                }
+                continue;
+            }
+            // (table, index) of every bit of each named pin
             let mut pins: HashMap<String, Vec<(bool, usize, Option<usize>)>> = HashMap::new();
             for k in c.clone() {
                 let p = m.conn_table[k].0;
@@ -1146,9 +1275,12 @@ fn bind_defined_child_pins(mods: &mut [CompactModule], pool: &mut StrPool) {
             for (name, bits) in pins {
                 let js: Vec<Option<usize>> = bits.iter().map(|b| b.2).collect();
                 let Some(width) = shape(&js) else { continue };
-                let port = match child.get(&name) {
-                    Some(None) => continue,
-                    Some(Some(port)) if port.len() == width => port,
+                // a one-bit pin whose base names no port may be an escaped scalar, `\\wi[0] `: its
+                // whole text is the port
+                let whole = || if let [(conn, k, _)] = bits[..] { Some(if conn { m.conn_table[k].0 } else { m.tie_table[k].0 }) } else { None };
+                let found = pool.find(&name).and_then(|s| by_name.get(&s)).or_else(|| whole().and_then(|s| by_name.get(&s)));
+                let port = match found.map(|&k| &child[k]) {
+                    Some(port) if !port.bundle && port.bits.len() == width => port,
                     // no such port, or not the connection's width: the reference connects nothing
                     _ => {
                         for &(conn, k, _) in &bits {
@@ -1159,24 +1291,25 @@ fn bind_defined_child_pins(mods: &mut [CompactModule], pool: &mut StrPool) {
                     }
                 };
                 for &(conn, k, j) in &bits {
-                    let to = port[width - 1 - j.unwrap_or(0)];
+                    let to = if width == 1 { port.bits[0] } else { port.bits[width - 1 - j.unwrap_or(0)] };
                     if conn { m.conn_table[k].0 = to } else { m.tie_table[k].0 = to }
                 }
             }
         }
-        if dropped == 0 {
-            continue;
+        if dropped > 0 {
+            m.unbound_pins += dropped;
+            let (old_c, old_t) = (std::mem::take(&mut m.conn_table), std::mem::take(&mut m.tie_table));
+            for x in m.insts.iter_mut() {
+                let c0 = m.conn_table.len() as u32;
+                m.conn_table.extend((x.conns.0..x.conns.1).filter(|&k| !drop_conn[k as usize]).map(|k| old_c[k as usize]));
+                let t0 = m.tie_table.len() as u32;
+                m.tie_table.extend((x.ties.0..x.ties.1).filter(|&k| !drop_tie[k as usize]).map(|k| old_t[k as usize]));
+                x.conns = (c0, m.conn_table.len() as u32);
+                x.ties = (t0, m.tie_table.len() as u32);
+            }
         }
-        m.unbound_pins += dropped;
-        let (old_c, old_t) = (std::mem::take(&mut m.conn_table), std::mem::take(&mut m.tie_table));
-        for x in m.insts.iter_mut() {
-            let c0 = m.conn_table.len() as u32;
-            m.conn_table.extend((x.conns.0..x.conns.1).filter(|&k| !drop_conn[k as usize]).map(|k| old_c[k as usize]));
-            let t0 = m.tie_table.len() as u32;
-            m.tie_table.extend((x.ties.0..x.ties.1).filter(|&k| !drop_tie[k as usize]).map(|k| old_t[k as usize]));
-            x.conns = (c0, m.conn_table.len() as u32);
-            x.ties = (t0, m.tie_table.len() as u32);
-        }
+        // what is still by position, bit by bit, once bound
+        m.positional = m.conn_table.iter().filter(|(p, _)| *p == none).count();
     }
 }
 
@@ -1199,6 +1332,12 @@ struct ModuleReader {
     port_decl: std::collections::HashSet<String>,
     /// the header has been read: only the FIRST statement is `module NAME ( … ) ;`
     started: bool,
+    /// the header's port list, in order — what the ports ARE (see [`Netlist::inputs`])
+    header: Vec<HeaderPort>,
+    /// each declared name's direction, by the reference's rule — see [`PortDir`]
+    dirs: std::collections::HashMap<String, PortDir>,
+    /// an instance connects by position: its connections are expanded at [`ModuleReader::finish`]
+    pos_tagged: bool,
 }
 
 impl ModuleReader {
@@ -1232,58 +1371,83 @@ impl ModuleReader {
             // just lists names that the `input`/`output` statements below will declare properly.
             if i < n && t[i] == "(" {
                 i += 1;
-                let mut depth = 1;
-                let (mut dir, mut range): (Option<&str>, Option<(i64, i64)>) = (None, None);
-                while i < n && depth > 0 {
+                // the entries, split at the commas between them (not those inside `(…)` or `{…}`)
+                let mut entries: Vec<&[&str]> = Vec::new();
+                let (mut s0, mut depth, mut brace) = (i, 0i32, 0i64);
+                while i < n {
                     match t[i] {
                         "(" => depth += 1,
-                        ")" => {
-                            depth -= 1;
-                            if depth == 0 {
-                                i += 1;
-                                break;
-                            }
+                        ")" if depth == 0 => break,
+                        ")" => depth -= 1,
+                        "," if depth == 0 && brace == 0 => {
+                            entries.push(&t[s0..i]);
+                            s0 = i + 1;
                         }
-                        // a direction keyword starts a new ANSI declaration; the range and direction
-                        // then apply to every name until the next one
-                        d @ ("input" | "output" | "inout") => {
-                            dir = Some(d);
-                            range = None;
+                        tok => brace += tok.matches('{').count() as i64 - tok.matches('}').count() as i64,
+                    }
+                    i += 1;
+                }
+                entries.push(&t[s0..i.min(n)]);
+                i += 1; // past `)`
+                let dirs = &mut self.dirs;
+                let header = &mut self.header;
+                // An ANSI entry carries its direction, type and range; a bare name after it takes
+                // the same ones (`input [3:0] a, b`)
+                let (mut dir, mut range): (Option<PortDir>, Option<(i64, i64)>) = (None, None);
+                for e in entries.into_iter().filter(|e| !e.is_empty()) {
+                    let mut k = 0;
+                    let d = match e[0] {
+                        "input" => Some(PortDir::Input),
+                        "output" => Some(PortDir::Output),
+                        "inout" => Some(PortDir::Inout),
+                        _ => None,
+                    };
+                    if d.is_some() {
+                        (dir, range, k) = (d, None, 1);
+                        while k < e.len() && matches!(e[k], "wire" | "reg" | "logic" | "signed") {
+                            k += 1;
                         }
-                        "wire" | "reg" | "logic" | "signed" => {}
-                        "," => {}
-                        "[" => {
-                            let spec = t.get(i + 1).copied().unwrap_or_default();
+                        if e.get(k) == Some(&"[") {
+                            let close = e.iter().position(|x| *x == "]").unwrap_or(e.len());
+                            let spec: String = e[k + 1..close].concat();
                             range = spec.split_once(':').and_then(|(h, l)| {
                                 Some((h.trim().parse::<i64>().ok()?, l.trim().parse::<i64>().ok()?))
                             });
-                            while i < n && t[i] != "]" {
-                                i += 1;
-                            }
+                            k = close + 1;
                         }
-                        tok if is_ident(tok) && !is_keyword(tok) => {
-                            if let Some(d) = dir {
-                                port_decl.insert(tok.to_string());
-                                let names: Vec<String> = match range {
-                                    Some((h, l)) => {
-                                        decl_range.insert(tok.to_string(), (h, l));
-                                        bus_bits(tok, h, l)
-                                    }
-                                    None => vec![tok.to_string()],
-                                };
-                                let names = names.iter().map(|x| pool.intern(x));
-                                match d {
-                                    "input" => nl.inputs.extend(names),
-                                    "output" => nl.outputs.extend(names),
-                                    // ⚠️ Recorded, not folded into inputs: see `Netlist::inouts`.
-                                    "inout" => nl.inouts.extend(names),
-                                    _ => {}
-                                }
-                            }
-                        }
-                        _ => {}
                     }
-                    i += 1;
+                    if let Some(d) = dir {
+                        if let Some(&name) = e.get(k).filter(|x| is_ident(x) && !is_keyword(x)) {
+                            port_decl.insert(name.to_string());
+                            if let Some(r) = range {
+                                decl_range.insert(name.to_string(), r);
+                            }
+                            declare(dirs, name, d);
+                            header.push(HeaderPort::Named { port: name.to_string(), refs: name.to_string() });
+                        }
+                        continue;
+                    }
+                    // A non-ANSI entry names a port; the `input`/`output` statements below give
+                    // it its direction and range (the reference grammar's `port`)
+                    let entry = match e {
+                        [".", x, "(", rest @ .., ")"] => {
+                            let mut j = 0;
+                            HeaderPort::Bundle { port: x.to_string(), refs: read_conn_value(rest, &mut j) }
+                        }
+                        [name] if is_ident(name) => HeaderPort::Named { port: name.to_string(), refs: name.to_string() },
+                        [name, "[", sel @ .., "]"] if is_ident(name) => {
+                            let sel = sel.concat();
+                            let refs = format!("{name}[{sel}]");
+                            // a part-select is the port `name`; a bit-select is a port NAMED `name[k]`
+                            let port = if sel.contains(':') { name.to_string() } else { refs.clone() };
+                            HeaderPort::Named { port, refs }
+                        }
+                        _ => {
+                            let mut j = 0;
+                            HeaderPort::Unnamed { refs: read_conn_value(e, &mut j) }
+                        }
+                    };
+                    header.push(entry);
                 }
             }
             if i < n && t[i] == ";" {
@@ -1318,13 +1482,10 @@ impl ModuleReader {
                     }
                     tok => {
                         port_decl.insert(tok.to_string());
-                        match range {
-                            Some((h, l)) => {
-                                decl_range.insert(tok.to_string(), (h, l));
-                                names.extend(bus_bits(tok, h, l));
-                            }
-                            None => names.push(tok.to_string()),
+                        if let Some(r) = range {
+                            decl_range.insert(tok.to_string(), r);
                         }
+                        names.push(tok.to_string());
                     }
                 }
                 *i += 1;
@@ -1335,17 +1496,20 @@ impl ModuleReader {
         while i < n {
             match t[i] {
                 "endmodule" => break,
-                // The names come back already expanded to bits, so the declared range is recovered
-                // from them — `expand_bits` needs it when an instance below connects the whole bus.
+                // A direction and a range for each name; whether it is a PORT is the header's to
+                // say, once the module is read (`finish`). The range is kept for `expand_bits` too,
+                // when an instance below connects the whole bus.
                 "input" => {
                     i += 1;
-                    let names = read_names(&mut i, decl_range, port_decl);
-                    nl.inputs.extend(names.iter().map(|x| pool.intern(x)));
+                    for x in read_names(&mut i, decl_range, port_decl) {
+                        declare(&mut self.dirs, &x, PortDir::Input);
+                    }
                 }
                 "output" => {
                     i += 1;
-                    let names = read_names(&mut i, decl_range, port_decl);
-                    nl.outputs.extend(names.iter().map(|x| pool.intern(x)));
+                    for x in read_names(&mut i, decl_range, port_decl) {
+                        declare(&mut self.dirs, &x, PortDir::Output);
+                    }
                 }
                 // `assign lhs = rhs ;` is not decoration: it is two names for the same net, and
                 // tools emit it for port aliases and constant ties. Skipping it leaves the lhs
@@ -1403,8 +1567,9 @@ impl ModuleReader {
                 // handling is shared — only the destination differs.
                 "inout" => {
                     i += 1;
-                    let names = read_names(&mut i, decl_range, port_decl);
-                    nl.inouts.extend(names.iter().map(|x| pool.intern(x)));
+                    for x in read_names(&mut i, decl_range, port_decl) {
+                        declare(&mut self.dirs, &x, PortDir::Inout);
+                    }
                 }
                 // `tri`, `wand` and `wor` declare nets as `wire` does (the reference grammar's
                 // `dcl_type`); skipped, a `tri [3:0] t` connected whole was one bit
@@ -1432,6 +1597,9 @@ impl ModuleReader {
                     }
                     while i < n && t[i] != ";" {
                         if is_ident(t[i]) && !is_keyword(t[i]) {
+                            if !matches!(kw, "parameter" | "localparam") {
+                                declare(&mut self.dirs, t[i], PortDir::Internal);
+                            }
                             if kw == "supply0" || kw == "supply1" {
                                 nl.constants.push((pool.intern(t[i]), kw == "supply1"));
                             }
@@ -1514,6 +1682,7 @@ impl ModuleReader {
                         // name — that lives in the cell's LEF/Liberty — but the NET is what
                         // connectivity needs, so it is recorded with an empty pin and counted.
                         let named = (i..n).take_while(|&k| t[k] != ";").any(|k| t[k] == ".");
+                        let (mut pos_k, mut pos_b) = (0u32, 0u32);
                         while i < n && depth > 0 {
                             match t[i] {
                                 "(" => {
@@ -1569,23 +1738,35 @@ impl ModuleReader {
                                     }
                                     i += 1;
                                 }
+                                // Each value's bits are tagged with its place in the list and
+                                // theirs in it (`pos_tag`), constants included: a module defined in
+                                // the file binds them to its ports in order once the file is read
+                                // (`makeOrderedInstPins`); any other cell gets the empty pin name.
                                 _ if !named => {
                                     let tok = t[i];
-                                    if is_const(tok) {
-                                        let none = pool.intern("");
-                                        nl.tie_table.extend(const_bits(tok).into_iter().map(|v| (none, v)));
+                                    if tok == "," {
+                                        if depth == 1 {
+                                            (pos_k, pos_b) = (pos_k + 1, 0);
+                                        }
                                         i += 1;
-                                    } else if is_ident(tok) {
+                                    } else if is_const(tok) || is_ident(tok) || tok.starts_with('{') {
                                         let mut j = i;
-                                        let nets = read_conn_value(t, &mut j);
-                                        for net in nets {
-                                            if !is_const(&net) {
-                                                let none = pool.intern("");
-                                                nl.conn_table.push((none, pool.intern(&net)));
+                                        for v in read_conn_value(t, &mut j) {
+                                            if is_const(&v) {
+                                                for bit in const_bits(&v) {
+                                                    let p = pos_tag(pool, pos_k, pos_b, Some(0));
+                                                    nl.tie_table.push((p, bit));
+                                                    pos_b += 1;
+                                                }
+                                            } else {
+                                                let p = pos_tag(pool, pos_k, pos_b, None);
+                                                nl.conn_table.push((p, pool.intern(&v)));
                                                 nl.positional += 1;
+                                                pos_b += 1;
                                             }
                                         }
-                                        i = j;
+                                        self.pos_tagged = true;
+                                        i = j.max(i + 1);
                                     } else {
                                         i += 1;
                                     }
@@ -1610,6 +1791,106 @@ impl ModuleReader {
     /// The module, its net names canonicalised now that every `assign` has been read.
     fn finish(self, pool: &mut StrPool) -> CompactModule {
         let mut nl = self.nl;
+        let (dirs, decl_range) = (self.dirs, self.decl_range);
+        // ---- the ports: what the HEADER makes (`makeCellPorts`), then the top's pins ----------
+        //
+        // `makeCellPort`: a declared name takes its declaration's direction and range; one with no
+        // declaration is a scalar port with no direction (warning 166). A name listed twice is one
+        // port (165); `{a, b}` makes none (2721).
+        fn make_port(
+            name: &str,
+            dirs: &std::collections::HashMap<String, PortDir>,
+            decl_range: &std::collections::BTreeMap<String, (i64, i64)>,
+            bit_dir: &mut std::collections::HashMap<String, Option<PortDir>>,
+            pool: &mut StrPool,
+        ) -> CellPort {
+            let dir = dirs.get(name).copied();
+            let bits = match (dir, decl_range.get(name)) {
+                (Some(_), Some(&(h, l))) => bus_bits(name, h, l),
+                _ => vec![name.to_string()],
+            };
+            for b in &bits {
+                bit_dir.insert(b.clone(), dir);
+            }
+            CellPort { name: pool.intern(name), bits: bits.iter().map(|b| pool.intern(b)).collect(), bundle: false }
+        }
+        let refs_bits = |refs: &[String]| -> Vec<String> {
+            refs.iter().filter(|r| !is_const(r)).flat_map(|r| expand_bits(r, &decl_range)).collect()
+        };
+        let mut port_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut bit_dir: std::collections::HashMap<String, Option<PortDir>> = std::collections::HashMap::new();
+        let mut cell_ports: Vec<CellPort> = Vec::new();
+        let mut members: Vec<String> = Vec::new();
+        for h in &self.header {
+            match h {
+                HeaderPort::Named { port, .. } => {
+                    if port_names.insert(port.as_str()) {
+                        cell_ports.push(make_port(port, &dirs, &decl_range, &mut bit_dir, pool));
+                    }
+                }
+                // a port per bit of the expression, then the bundle over them
+                HeaderPort::Bundle { port, refs } => {
+                    if port_names.insert(port.as_str()) {
+                        members.clear();
+                        members.extend(refs_bits(refs));
+                        let mut bits = Vec::with_capacity(members.len());
+                        for m in &members {
+                            let p = make_port(m, &dirs, &decl_range, &mut bit_dir, pool);
+                            bits.extend(p.bits.iter().copied());
+                            cell_ports.push(p);
+                        }
+                        cell_ports.push(CellPort { name: pool.intern(port), bits, bundle: true });
+                    }
+                }
+                HeaderPort::Unnamed { .. } => {}
+            }
+        }
+        // As a TOP (`linkNetwork`): each entry's bits, in header order, that are a port's — once.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for h in &self.header {
+            let bits = match h {
+                // a whole declared name is every bit its declaration has — a `[0:0]` port's one bit
+                // is `x[0]` — as `makeCellPort` made it
+                HeaderPort::Named { refs, .. } => match decl_range.get(refs) {
+                    Some(&(h, l)) if dirs.contains_key(refs) => bus_bits(refs, h, l),
+                    _ => expand_bits(refs, &decl_range),
+                },
+                HeaderPort::Bundle { refs, .. } | HeaderPort::Unnamed { refs } => refs_bits(refs),
+            };
+            for b in bits {
+                let Some(&d) = bit_dir.get(&b) else { continue };
+                if !seen.insert(b.clone()) {
+                    continue;
+                }
+                let s = pool.intern(&b);
+                match d {
+                    Some(PortDir::Input) => nl.inputs.push(s),
+                    Some(PortDir::Output) => nl.outputs.push(s),
+                    Some(PortDir::Inout) => nl.inouts.push(s),
+                    _ => nl.undirected.push(s),
+                }
+            }
+        }
+        nl.cell_ports = cell_ports;
+        // ---- positional connections, expanded to bits now that every declaration is read -------
+        if self.pos_tagged {
+            let old = std::mem::take(&mut nl.conn_table);
+            for x in nl.insts.iter_mut() {
+                let c0 = nl.conn_table.len() as u32;
+                for &(p, net) in &old[x.conns.0 as usize..x.conns.1 as usize] {
+                    let Some((k, b, _)) = read_pos_tag(pool.get(p)) else {
+                        nl.conn_table.push((p, net));
+                        continue;
+                    };
+                    let net = pool.get(net).to_string();
+                    for (s, bit) in expand_bits(&net, &decl_range).into_iter().enumerate() {
+                        let tag = pos_tag(pool, k, b, Some(s as u32));
+                        nl.conn_table.push((tag, pool.intern(&bit)));
+                    }
+                }
+                x.conns = (c0, nl.conn_table.len() as u32);
+            }
+        }
         // A DUPLICATED instance name is renamed, as the reference's `checkInstanceName` does: the
         // later one becomes `<name>_<k>`, k the first from 1 not already among the names seen so
         // far. Kept, two instances answered to one name.
@@ -2106,6 +2387,57 @@ endmodule
         assert_eq!(insts, [("g1", c(&[("A", "a"), ("ZN", ";")])), ("1x", c(&[("A", ";"), ("ZN", "output")])), ("g3", c(&[("A", "a"), ("ZN", "endmodule")]))]);
         assert_eq!(d.top().insts[0].conns, c(&[("a", "a"), ("output", "z")]));
         assert!(d.escaped_names().contains("output"));
+    }
+
+    /// Rule (the reference's `makeCellPorts` and `linkNetwork`): the HEADER says what is a port,
+    /// in its order. A declared `input` it does not list is a net (warning 197); `{a, b}` makes no
+    /// port (2721); `y[1]` is a port NAMED `y[1]`, with no declaration and so no direction (166);
+    /// `i[1:0]` is the port `i` — every bit its declaration has as a child, bits 1..0 as a top.
+    #[test]
+    fn the_header_says_what_is_a_port() {
+        let d = parse_all("module sub (z, {a, b}, i[1:0], w, y[1]);\n input a, b, w, k;\n input [3:0] i;\n output z;\n output [1:0] y;\nendmodule\n").unwrap();
+        let sub = d.module("sub").unwrap();
+        assert_eq!(sub.inputs, ["i[1]", "i[0]", "w"], "a, b and k are nets; i shows the bits the header names");
+        assert_eq!(sub.outputs, ["z"]);
+        assert_eq!(sub.undirected, ["y[1]"]);
+        // header order, not declaration order
+        let nl = parse("module m (y, a);\n input a;\n output y;\nendmodule\n").unwrap();
+        assert_eq!((nl.inputs.as_slice(), nl.outputs.as_slice()), (&["a".to_string()][..], &["y".to_string()][..]));
+        // as a CHILD, `i` is all four bits: a two-bit connection does not fit it
+        let d = parse_all("module top (p, q);\n input [1:0] p;\n output q;\n sub u (.i(p), .z(q));\nendmodule\nmodule sub (i[1:0], z);\n input [3:0] i;\n output z;\nendmodule\n").unwrap();
+        assert_eq!(d.top().insts[0].conns, [("z".to_string(), "q".to_string())]);
+        assert_eq!(d.top().unbound_pins, 2);
+        // a one-bit vector port is its one bit, `x[0]`; an escaped scalar `\\wi[0] ` is a port
+        // a parent connects by that whole name
+        let d = parse_all("module top (x, \\t[0] );\n input [0:0] x;\n input \\t[0] ;\n leaf u (.\\wi[0] (\\t[0] ), .v(x[0]));\nendmodule\nmodule leaf (\\wi[0] , v);\n input \\wi[0] ;\n input [0:0] v;\nendmodule\n").unwrap();
+        assert_eq!(d.top().inputs, ["x[0]", "t[0]"]);
+        assert_eq!(d.top().insts[0].conns, [("wi[0]".to_string(), "t[0]".to_string()), ("v[0]".to_string(), "x[0]".to_string())]);
+    }
+
+    /// Rule (the reference's `makeOrderedInstPins`): a module defined in the file binds POSITIONAL
+    /// values to its ports in header order, bit by bit from each port's left index; a value of the
+    /// wrong width (warning 202), one on a bundle port (2723) and one past the last port connect
+    /// nothing. Any other cell keeps the empty pin name, a bit per pin.
+    #[test]
+    fn positional_values_bind_to_a_defined_childs_ports_in_header_order() {
+        let src = "module top (a, c, y, z);\n input [3:0] a;\n input c;\n output [1:0] y;\n output z;\n \
+                   sub u1 (y, {c, 1'b0}, a);\n sub u2 (z, a, a, c);\n bun u3 (c, z, a[1:0]);\n LEAF g (a[1:0], z);\nendmodule\n\
+                   module sub (o, i, d);\n output [0:1] o;\n input [1:0] i;\n input [3:0] d;\nendmodule\n\
+                   module bun (.p({e, f}), g);\n input e, f, g;\nendmodule\n";
+        let d = parse_all(src).unwrap();
+        let top = d.top();
+        let inst = |n: &str| top.insts.iter().find(|x| x.name == n).unwrap();
+        let s = |v: &[(&str, &str)]| -> Vec<(String, String)> { v.iter().map(|(p, n)| (p.to_string(), n.to_string())).collect() };
+        assert_eq!(inst("u1").conns, s(&[("o[0]", "y[1]"), ("o[1]", "y[0]"), ("i[1]", "c"), ("d[3]", "a[3]"), ("d[2]", "a[2]"), ("d[1]", "a[1]"), ("d[0]", "a[0]")]));
+        assert_eq!(inst("u1").ties, [("i[0]".to_string(), false)]);
+        // z is one bit on a two-bit port, a four on a two, then a on d, and c is past the end
+        assert_eq!(inst("u2").conns, s(&[("d[3]", "a[3]"), ("d[2]", "a[2]"), ("d[1]", "a[1]"), ("d[0]", "a[0]")]));
+        // bun's ports are e, f, then the bundle p, then g: c goes to e, z to f, and a[1:0] — the
+        // bundle's width — still connects nothing
+        assert_eq!(inst("u3").conns, s(&[("e", "c"), ("f", "z")]));
+        assert_eq!(inst("g").conns, s(&[("", "a[1]"), ("", "a[0]"), ("", "z")]));
+        assert_eq!(top.unbound_pins, 1 + 4 + 1 + 2);
+        assert_eq!(top.positional, 3);
     }
 
     /// Rule (the reference lexer, flex longest match): an escaped identifier runs to the next
