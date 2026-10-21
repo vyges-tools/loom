@@ -1001,7 +1001,12 @@ fn name_defined_child_pins(mods: &mut [CompactModule], pool: &mut StrPool) {
                 by_base.entry(base.to_string()).or_default().push(p);
             }
         }
-        by_base.retain(|_, v| v.len() > 1);
+        // a bus port's bits carry each index once; a second `foo[3]` is an escaped scalar that
+        // canonicalises to a bit's name, and the port is left as written
+        by_base.retain(|_, v| {
+            let idx: std::collections::HashSet<usize> = v.iter().filter_map(|&p| split_bit(pool.get(p)).map(|b| b.1)).collect();
+            v.len() > 1 && idx.len() == v.len()
+        });
         if !by_base.is_empty() {
             ports.insert(m.name, by_base);
         }
@@ -1014,13 +1019,22 @@ fn name_defined_child_pins(mods: &mut [CompactModule], pool: &mut StrPool) {
             let Some(child) = ports.get(&m.insts[x].cell) else { continue };
             let (c, t) = (m.insts[x].conns, m.insts[x].ties);
             // the bits of each pin as written here: `P[j]` for j = k-1 down to 0, conns and ties
-            let mut width: std::collections::HashMap<String, usize> = Default::default();
+            let mut seen: std::collections::HashMap<String, Vec<usize>> = Default::default();
             let pins = m.conn_table[c.0 as usize..c.1 as usize].iter().map(|e| e.0).chain(m.tie_table[t.0 as usize..t.1 as usize].iter().map(|e| e.0));
             for p in pins {
-                if let Some((base, _)) = split_bit(pool.get(p)) {
-                    *width.entry(base.to_string()).or_default() += 1;
+                if let Some((base, j)) = split_bit(pool.get(p)) {
+                    seen.entry(base.to_string()).or_default().push(j);
                 }
             }
+            // a pin's width, only where its bits are exactly 0..k-1 once each (an escaped scalar
+            // named like one of its bits makes it ambiguous, and it is left as written)
+            let width: std::collections::HashMap<String, usize> = seen
+                .into_iter()
+                .filter_map(|(base, mut js)| {
+                    js.sort_unstable();
+                    js.iter().enumerate().all(|(i, &j)| i == j).then_some((base, js.len()))
+                })
+                .collect();
             let rename = |p: Sym| -> Sym {
                 let Some((base, j)) = split_bit(pool.get(p)) else { return p };
                 match (child.get(base), width.get(base)) {
@@ -1933,6 +1947,19 @@ endmodule
             want(&[("ci[0]", "a[3]"), ("ci[1]", "a[2]"), ("ci[2]", "a[1]"), ("ci[3]", "a[0]"), ("co[3]", "b[0]"), ("co[2]", "b[1]"), ("co[1]", "b[2]"), ("co[0]", "b[3]")])
         );
         assert_eq!(conns("c"), want(&[("D[3]", "b[0]"), ("D[2]", "b[1]"), ("D[1]", "b[2]"), ("D[0]", "b[3]")]));
+    }
+
+    /// An escaped scalar port `\foo[3] ` is canonically `foo[3]`, the name of a bit of the bus
+    /// `foo` beside it: it is not a ninth bit, and the bus's bits are not renumbered around it.
+    #[test]
+    fn an_escaped_scalar_is_not_a_bit_of_the_bus_it_names() {
+        let src = "module top (foo, \\foo[3] , y);\n input [7:0] foo;\n input \\foo[3] ;\n output y;\n child u (.foo(foo), .\\foo[3] (\\foo[3] ), .y(y));\nendmodule\nmodule child (foo, \\foo[3] , y);\n input [7:0] foo;\n input \\foo[3] ;\n output y;\nendmodule\n";
+        let d = parse_all(src).unwrap();
+        let u = &d.top().insts[0];
+        for k in 0..8 {
+            let p = format!("foo[{k}]");
+            assert!(u.conns.iter().any(|(a, n)| a == &p && n == &p), "{p} is on {p}");
+        }
     }
 
     /// Rule (the reference's `checkInstanceName`): a later instance with a name already used is
