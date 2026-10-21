@@ -507,7 +507,7 @@ fn is_keyword(t: &str) -> bool {
     matches!(
         t,
         "module" | "endmodule" | "input" | "output" | "inout" | "wire" | "reg"
-            | "assign" | "parameter" | "localparam" | "supply0" | "supply1"
+            | "assign" | "parameter" | "localparam" | "supply0" | "supply1" | "tri" | "wand" | "wor"
     )
 }
 
@@ -1137,7 +1137,9 @@ impl ModuleReader {
                     let names = read_names(&mut i, decl_range, port_decl);
                     nl.inouts.extend(names.iter().map(|x| pool.intern(x)));
                 }
-                "wire" | "reg" | "parameter" | "localparam" | "supply0" | "supply1" => {
+                // `tri`, `wand` and `wor` declare nets as `wire` does (the reference grammar's
+                // `dcl_type`); skipped, a `tri [3:0] t` connected whole was one bit
+                "wire" | "reg" | "parameter" | "localparam" | "supply0" | "supply1" | "tri" | "wand" | "wor" => {
                     i += 1;
                     // an optional `[ msb:lsb ]` range, then the names it applies to
                     let mut single: Option<String> = None;
@@ -1672,6 +1674,16 @@ endmodule
         let nl = parse("module m (input [1:3] a, output z);\n  AND3 g (.A(a), .Y(z));\nendmodule").unwrap();
         assert_eq!(nl.inputs, ["a[1]", "a[2]", "a[3]"]);
         assert_eq!(nl.insts[0].conns[0], ("A[2]".to_string(), "a[1]".to_string()));
+    }
+
+    /// Rule (the reference grammar's `dcl_type`): `tri`, `wand` and `wor` declare nets with a
+    /// range, as `wire` does.
+    #[test]
+    fn tri_wand_and_wor_declare_a_range() {
+        let src = "module top (output [1:0] y);\n  tri [1:0] t;\n  wand [1:0] a;\n  wor [1:0] o;\n  B u0 (.A(t), .B(a), .C(o), .Y(y));\nendmodule";
+        let nl = parse(src).unwrap();
+        let pins: Vec<&str> = nl.insts[0].conns.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(pins, ["A[1]", "A[0]", "B[1]", "B[0]", "C[1]", "C[0]", "Y[1]", "Y[0]"]);
     }
 
     /// Rule (the reference reader's): a constant is `size` bits, filled from its least
