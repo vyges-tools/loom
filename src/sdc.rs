@@ -17,8 +17,7 @@
 //!   or `-clock`, plus per-port overrides) — the I/O timing budget, each with its
 //!   clock, flags (`-max`, `-min`, `-rise`, `-fall`, `-add_delay`, …) and accessor
 //! - `set_clock_uncertainty [-setup|-hold]` — setup/hold guard band
-//! - `set_clock_latency` — captured (source latency applied to the I/O budget), and
-//!   kept per command
+//! - `set_clock_latency` — kept per command ([`Sdc::clock_latencies`], with its flags)
 //! - `set_input_transition`, `set_load` — boundary slew / load
 //! - `set_timing_derate -late|-early` — OCV derate
 //! - `set_false_path` / `set_multicycle_path` — timing exceptions
@@ -380,7 +379,12 @@ pub struct Sdc {
     pub output_delays: Vec<IoDelay>,
     pub setup_uncertainty: f64,
     pub hold_uncertainty: f64,
-    pub clock_latency: f64, // source/network latency (library time units), applied to the I/O budget
+    /// The LARGEST `set_clock_latency` value, of any kind and on any object (library time units).
+    ///
+    /// ⚠️ Kept for compatibility only — do not apply it to I/O delays. A clock's latency is on both
+    /// the launch and the capture side of a path, so on one clock it cancels; what does not cancel
+    /// (per clock, source vs network, on a pin) is only visible in [`Sdc::clock_latencies`].
+    pub clock_latency: f64,
     /// What `set_units` declared, `(flag, value)` — `("-time", "1ps")`. NOT applied: every value
     /// stays in the library's units, as the reference reads them; a consumer compares these with
     /// its library and warns on a mismatch, as the reference does.
@@ -419,8 +423,9 @@ pub struct Sdc {
     /// Every `set_propagated_clock`'s objects, in file order (still in [`Sdc::ignored`] for a
     /// consumer that does not model a propagated clock).
     pub propagated: Vec<Objects>,
-    /// Every `set_clock_latency`, per command (its value is also folded into
-    /// [`Sdc::clock_latency`]); a consumer that does not model latency refuses any.
+    /// Every `set_clock_latency`, per command, with its flags (`-source`, `-min`/`-max`,
+    /// `-rise`/`-fall`, `-early`/`-late`): the record a consumer models latency from. A consumer
+    /// that does not model latency where it fails to cancel refuses on these.
     pub clock_latencies: Vec<EnvCmd>,
     /// Every `set_clock_transition`, per command (`-rise`/`-fall`/`-min`/`-max` in its flags):
     /// an IDEAL clock's slew at its register clock pins. Still in [`Sdc::ignored`] for a consumer
