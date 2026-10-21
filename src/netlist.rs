@@ -830,6 +830,19 @@ fn pos_tag(pool: &mut StrPool, k: u32, b: u32, s: Option<u32>) -> Sym {
     }
 }
 
+/// The pin name a NAMED connection carries while what it names is not declared yet: its place in
+/// the connection, then the pin. Expanded, and the pin's bits named, at [`ModuleReader::finish`].
+const NAMED_TAG: char = '\u{3}';
+
+fn named_tag(pool: &mut StrPool, order: u32, pin: &str) -> Sym {
+    pool.intern(&format!("{NAMED_TAG}{order}{NAMED_TAG}{pin}"))
+}
+
+fn read_named_tag(p: &str) -> Option<(u32, &str)> {
+    let (order, pin) = p.strip_prefix(NAMED_TAG)?.split_once(NAMED_TAG)?;
+    Some((order.parse().ok()?, pin))
+}
+
 /// `(k, b, s)` of a positional tag, or `None` for a real pin name.
 fn read_pos_tag(p: &str) -> Option<(u32, u32, u32)> {
     let mut it = p.strip_prefix(POS_TAG)?.split('.').map(|x| x.parse::<u32>());
@@ -1338,6 +1351,8 @@ struct ModuleReader {
     dirs: std::collections::HashMap<String, PortDir>,
     /// an instance connects by position: its connections are expanded at [`ModuleReader::finish`]
     pos_tagged: bool,
+    /// a named connection waits for a later declaration — see [`named_tag`]
+    named_deferred: bool,
 }
 
 impl ModuleReader {
@@ -1597,16 +1612,21 @@ impl ModuleReader {
                     }
                     while i < n && t[i] != ";" {
                         if is_ident(t[i]) && !is_keyword(t[i]) {
-                            if !matches!(kw, "parameter" | "localparam") {
+                            // `wire [3:0] w = …;` DECLARES NOTHING: the reference keeps only a
+                            // named argument (`parseDcl`, `isNamed`), so `w` stays an undeclared
+                            // one-bit net and the assignment's widths are 1 and the right side's
+                            // (warning 203 for a wider one). A supply's constant still applies.
+                            let declared = t.get(i + 1) != Some(&"=");
+                            if declared && !matches!(kw, "parameter" | "localparam") {
                                 declare(&mut self.dirs, t[i], PortDir::Internal);
                             }
                             if kw == "supply0" || kw == "supply1" {
                                 nl.constants.push((pool.intern(t[i]), kw == "supply1"));
                             }
-                            if let Some(idx) = &single {
+                            if let (true, Some(idx)) = (declared, &single) {
                                 one_bit_vec.insert(t[i].to_string(), idx.clone());
                             }
-                            if let Some(r) = range {
+                            if let (true, Some(r)) = (declared, range) {
                                 if !port_decl.contains(t[i]) {
                                     decl_range.insert(t[i].to_string(), r);
                                 }
@@ -1717,6 +1737,29 @@ impl ModuleReader {
                                     // reader listed one.
                                     // A CONSTANT is as many bits as its size says, so a concatenation that
                                     // holds one numbers its other members correctly; its bits are ties.
+                                    //
+                                    // ⚠️ The width of a name is its DECLARATION's, and the reference
+                                    // reads it at link time, so a declaration may follow the instance
+                                    // (`sub u (.i(a)); input [3:0] a;`). A connection naming something
+                                    // not declared yet is held as written (`named_tag`) and expanded
+                                    // at `finish`.
+                                    if nets.iter().any(|v| !is_const(v) && !v.contains('[') && !self.dirs.contains_key(v.as_str())) {
+                                        let mut order = 0u32;
+                                        for v in &nets {
+                                            if is_const(v) {
+                                                for bit in const_bits(v) {
+                                                    nl.tie_table.push((named_tag(pool, order, &pin), bit));
+                                                    order += 1;
+                                                }
+                                            } else {
+                                                nl.conn_table.push((named_tag(pool, order, &pin), pool.intern(v)));
+                                                order += 1;
+                                            }
+                                        }
+                                        self.named_deferred = true;
+                                        i += 1;
+                                        continue;
+                                    }
                                     let bits: Vec<Result<String, bool>> = nets
                                         .iter()
                                         .flat_map(|net| -> Vec<Result<String, bool>> {
@@ -1872,12 +1915,60 @@ impl ModuleReader {
             }
         }
         nl.cell_ports = cell_ports;
-        // ---- positional connections, expanded to bits now that every declaration is read -------
-        if self.pos_tagged {
-            let old = std::mem::take(&mut nl.conn_table);
+        // ---- held connections, expanded to bits now that every declaration is read -----------
+        if self.pos_tagged || self.named_deferred {
+            let (old_c, old_t) = (std::mem::take(&mut nl.conn_table), std::mem::take(&mut nl.tie_table));
             for x in nl.insts.iter_mut() {
-                let c0 = nl.conn_table.len() as u32;
-                for &(p, net) in &old[x.conns.0 as usize..x.conns.1 as usize] {
+                let (cs, ts) = (&old_c[x.conns.0 as usize..x.conns.1 as usize], &old_t[x.ties.0 as usize..x.ties.1 as usize]);
+                // a held named pin, whole: its items in order — a name, or a constant bit
+                let mut held: Vec<(String, Vec<(u32, Result<String, bool>)>)> = Vec::new();
+                let mut item = |pin: &str, order: u32, v: Result<String, bool>| match held.iter_mut().find(|h| h.0 == pin) {
+                    Some(h) => h.1.push((order, v)),
+                    None => held.push((pin.to_string(), vec![(order, v)])),
+                };
+                for &(p, net) in cs {
+                    if let Some((order, pin)) = read_named_tag(pool.get(p)) {
+                        item(pin, order, Ok(pool.get(net).to_string()));
+                    }
+                }
+                for &(p, v) in ts {
+                    if let Some((order, pin)) = read_named_tag(pool.get(p)) {
+                        item(pin, order, Err(v));
+                    }
+                }
+                let (c0, t0) = (nl.conn_table.len() as u32, nl.tie_table.len() as u32);
+                for &(p, v) in ts {
+                    if read_named_tag(pool.get(p)).is_none() {
+                        nl.tie_table.push((p, v));
+                    }
+                }
+                let mut emitted = vec![false; held.len()];
+                for &(p, net) in cs {
+                    if let Some((_, pin)) = read_named_tag(pool.get(p)) {
+                        // the whole pin, where its first bit was
+                        let h = held.iter().position(|h| h.0 == pin).unwrap_or(0);
+                        if std::mem::replace(&mut emitted[h], true) {
+                            continue;
+                        }
+                        let (pin, items) = (held[h].0.clone(), &mut held[h].1);
+                        items.sort_by_key(|e| e.0);
+                        let bits: Vec<Result<String, bool>> = items
+                            .iter()
+                            .flat_map(|(_, v)| match v {
+                                Ok(n) => expand_bits(n, &decl_range).into_iter().map(Ok).collect::<Vec<_>>(),
+                                Err(b) => vec![Err(*b)],
+                            })
+                            .collect();
+                        let k = bits.len();
+                        for (idx, bit) in bits.into_iter().enumerate() {
+                            let p = pool.intern(&if k == 1 { pin.clone() } else { format!("{pin}[{}]", k - 1 - idx) });
+                            match bit {
+                                Ok(n) => nl.conn_table.push((p, pool.intern(&n))),
+                                Err(v) => nl.tie_table.push((p, v)),
+                            }
+                        }
+                        continue;
+                    }
                     let Some((k, b, _)) = read_pos_tag(pool.get(p)) else {
                         nl.conn_table.push((p, net));
                         continue;
@@ -1889,6 +1980,7 @@ impl ModuleReader {
                     }
                 }
                 x.conns = (c0, nl.conn_table.len() as u32);
+                x.ties = (t0, nl.tie_table.len() as u32);
             }
         }
         // A DUPLICATED instance name is renamed, as the reference's `checkInstanceName` does: the
@@ -2294,7 +2386,8 @@ endmodule
     /// Rule (the reference's `mergeAssignNet`): an assignment merges its two sides BIT FOR BIT —
     /// buses, part-selects and concatenations expanded, a constant's bits tied — and merges
     /// nothing when the widths differ (warning 203). A statement may hold several, and a net
-    /// declaration's `= rhs` is one too.
+    /// declaration's `= rhs` is one too — but its left side is UNDECLARED, one bit (`isNamed`):
+    /// `wire [1:0] v = w;` is 1 bit against 2, and merges nothing.
     #[test]
     fn an_assign_merges_bit_for_bit() {
         let src = "module top (x, y, z);\n  input [0:1] x;\n  output [1:0] y;\n  output [2:0] z;\n  wire [1:0] w;\n  wire [1:0] v = w;\n  wire s = x[0], q;\n  assign w = x, z = {y[0], 2'b10};\n  assign y = {q, s};\n  assign q = z;\nendmodule";
@@ -2302,9 +2395,9 @@ endmodule
         let a: Vec<String> = nl.aliases.iter().map(|(l, r)| format!("{l}={r}")).collect();
         assert_eq!(
             a,
-            ["v[1]=w[1]", "v[0]=w[0]", "s=x[0]", "w[1]=x[0]", "w[0]=x[1]", "z[2]=y[0]", "z[1]=1'b1", "z[0]=1'b0", "y[1]=q", "y[0]=s"]
+            ["s=x[0]", "w[1]=x[0]", "w[0]=x[1]", "z[2]=y[0]", "z[1]=1'b1", "z[0]=1'b0", "y[1]=q", "y[0]=s"]
         );
-        assert_eq!(nl.skipped_assigns, 1, "q (1 bit) = z (3 bits) is not merged");
+        assert_eq!(nl.skipped_assigns, 2, "q (1 bit) = z (3 bits), and v (undeclared) = w (2 bits), are not merged");
         assert!(!nl.aliases.iter().any(|(l, _)| l == "q" || l.starts_with("q[")), "q is not declared [1:0]");
     }
 
@@ -2438,6 +2531,21 @@ endmodule
         assert_eq!(inst("g").conns, s(&[("", "a[1]"), ("", "a[0]"), ("", "z")]));
         assert_eq!(top.unbound_pins, 1 + 4 + 1 + 2);
         assert_eq!(top.positional, 3);
+    }
+
+    /// Rule (the reference's link): a name's width is its DECLARATION's wherever that is — a
+    /// declaration after the instance that connects it counts, in the connection's own place.
+    #[test]
+    fn a_declaration_after_the_instance_still_gives_the_width() {
+        let src = "module top (a, y);\n CELL u (.Q(y), .D({1'b1, a}), .E(a[0]));\n input [1:0] a;\n output y;\nendmodule\n";
+        let nl = parse(src).unwrap();
+        let c: Vec<String> = nl.insts[0].conns.iter().map(|(p, n)| format!("{p}={n}")).collect();
+        assert_eq!(c, ["Q=y", "D[1]=a[1]", "D[0]=a[0]", "E=a[0]"]);
+        assert_eq!(nl.insts[0].ties, [("D[2]".to_string(), true)]);
+        // and a defined child binds it by its port's width
+        let d = parse_all("module top (a, y);\n sub u (.i(a), .o(y));\n input [3:0] a;\n output [3:0] y;\nendmodule\nmodule sub (i, o);\n input [3:0] i;\n output [3:0] o;\nendmodule\n").unwrap();
+        assert_eq!(d.top().insts[0].conns.len(), 8);
+        assert_eq!(d.top().unbound_pins, 0);
     }
 
     /// Rule (the reference lexer, flex longest match): an escaped identifier runs to the next
