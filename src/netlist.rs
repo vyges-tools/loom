@@ -737,7 +737,7 @@ impl CompactDesign {
         &self.modules[self.top]
     }
 
-    /// The module DEFINED under `name`, if the file defines it (the first, if twice).
+    /// The module DEFINED under `name`, if the file defines it (the last definition, if twice).
     pub fn module(&self, name: &str) -> Option<&CompactModule> {
         let s = self.pool.find(name)?;
         self.by_name.get(&s).map(|&i| &self.modules[i])
@@ -796,8 +796,8 @@ impl Design {
     }
 
     /// The module DEFINED under `name`, if the file defines it. An instance whose cell is not
-    /// found here is a leaf — a library cell or a black box. A name defined twice gives the
-    /// first definition.
+    /// found here is a leaf — a library cell or a black box. A name defined twice keeps only its
+    /// last definition, as the reference does.
     pub fn module(&self, name: &str) -> Option<&Netlist> {
         self.by_name.get(name).map(|&i| &self.modules[i])
     }
@@ -920,6 +920,20 @@ pub fn parse_compact_reader<R: std::io::BufRead>(r: R) -> Result<CompactDesign, 
             }
         }
         mods.push(reader.finish(&mut pool));
+    }
+    // A module DEFINED TWICE keeps its LAST definition: the reference's `makeModule` deletes the
+    // earlier cell and makes the new one. Kept both, the first answered every lookup. (Once, at
+    // the end: per module it was quadratic in the module count.)
+    let mut last: std::collections::HashMap<Sym, usize> = std::collections::HashMap::with_capacity(mods.len());
+    for (k, m) in mods.iter().enumerate() {
+        last.insert(m.name, k);
+    }
+    if last.len() < mods.len() {
+        let mut k = 0;
+        mods.retain(|m| {
+            k += 1;
+            last[&m.name] == k - 1
+        });
     }
     if mods.is_empty() {
         return Err(NetlistError("no module found".into()));
@@ -1766,6 +1780,17 @@ endmodule
         );
         assert_eq!(nl.skipped_assigns, 1, "q (1 bit) = z (3 bits) is not merged");
         assert!(!nl.aliases.iter().any(|(l, _)| l == "q" || l.starts_with("q[")), "q is not declared [1:0]");
+    }
+
+    /// Rule (the reference's `makeModule`): a module defined twice keeps its LAST definition; the
+    /// earlier one is gone.
+    #[test]
+    fn a_module_defined_twice_keeps_the_last() {
+        let src = "module leaf (input a, output y);\n  INV u0 (.A(a), .Y(y));\nendmodule\nmodule top (input a, output y);\n  leaf l (.a(a), .y(y));\nendmodule\nmodule leaf (input a, output y);\n  BUF u1 (.A(a), .Y(y));\nendmodule\n";
+        let d = parse_all(src).unwrap();
+        assert_eq!(d.module_names(), ["top", "leaf"]);
+        assert_eq!(d.module("leaf").unwrap().insts[0].name, "u1");
+        assert_eq!(d.top().module, "top");
     }
 
     /// Rule (the reference reader's): a constant is `size` bits, filled from its least
