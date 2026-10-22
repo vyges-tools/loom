@@ -2108,8 +2108,7 @@ impl Sdc {
     }
 
     pub fn load(path: &str) -> Result<Sdc, SdcError> {
-        let text = std::fs::read_to_string(path).map_err(|e| SdcError(format!("{path}: {e}")))?;
-        Sdc::parse(&text)
+        Sdc::parse(&read_lossy(path)?)
     }
 
     /// [`Sdc::parse`] against a linked design, as the reference reads constraints after linking:
@@ -2123,9 +2122,19 @@ impl Sdc {
 
     /// [`Sdc::load`] against a linked design — see [`Sdc::parse_with`].
     pub fn load_with(path: &str, design: &SdcDesign) -> Result<Sdc, SdcError> {
-        let text = std::fs::read_to_string(path).map_err(|e| SdcError(format!("{path}: {e}")))?;
-        Sdc::parse_with(&text, design)
+        Sdc::parse_with(&read_lossy(path)?, design)
     }
+}
+
+/// A constraint file's text. A byte that is not UTF-8 is read lossily, as the reference's Tcl
+/// `source` decodes it instead of refusing the file: such bytes sit in comments (a Latin-1 `©` in
+/// a vendor header), and refusing them dropped every constraint in the file.
+fn read_lossy(path: &str) -> Result<String, SdcError> {
+    let bytes = std::fs::read(path).map_err(|e| SdcError(format!("{path}: {e}")))?;
+    Ok(match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    })
 }
 
 pub use crate::sdc_query::SdcDesign;
@@ -2918,5 +2927,23 @@ mod clock_transition_kept {
         assert_eq!(s.clock_transitions.len(), 2);
         assert_eq!((s.clock_transitions[0].value, s.clock_transitions[0].flags.clone(), s.clock_transitions[0].objects.clone()), (0.04, vec!["-rise".to_string()], vec!["c".to_string()]));
         assert!(s.ignored.iter().any(|c| c == "set_clock_transition"));
+    }
+
+    // Rule (reference: Tcl `source` decodes the file): a byte that is not UTF-8 does not refuse the
+    // file. A contest SDC carries a Latin-1 `©` (0xA9) in its header comment; read strictly, every
+    // constraint after it was lost.
+    #[test]
+    fn a_byte_that_is_not_utf8_does_not_refuse_the_file() {
+        let dir = std::env::temp_dir().join(format!("loom-sdc-latin1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("c.sdc");
+        let mut bytes = b"# Copyright \xa9 2011\n".to_vec();
+        bytes.extend_from_slice(b"create_clock -name mclk -period 300.0 [get_ports clk]\n");
+        std::fs::write(&p, bytes).unwrap();
+        let s = Sdc::load(p.to_str().unwrap()).unwrap();
+        assert_eq!((s.clocks.len(), s.clocks[0].period), (1, 300.0));
+        let with = Sdc::load_with(p.to_str().unwrap(), &SdcDesign::default()).unwrap();
+        assert_eq!(with.clocks.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
