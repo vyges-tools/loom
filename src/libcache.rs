@@ -388,6 +388,7 @@ fn dec_pin(r: &mut R) -> Option<Pin> {
         clock,
         function,
         three_state: None,
+        set_clr_from: Vec::new(),
         setup,
         hold,
         recovery,

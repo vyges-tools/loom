@@ -312,6 +312,9 @@ pub struct Pin {
     pub unmodelled_checks: Vec<String>,
     /// `three_state` (the DISABLE expression), for `derive_senses`.
     pub(crate) three_state: Option<String>,
+    /// While reading: the pins a set/clear arc INTO this pin is timed from (`timing_type : clear` /
+    /// `preset` with its table), for `preset_clear_check_roles`.
+    pub(crate) set_clr_from: Vec<String>,
 }
 
 impl Pin {
@@ -1164,6 +1167,7 @@ fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
     let mut recovery: Vec<Constraint> = Vec::new();
     let mut removal: Vec<Constraint> = Vec::new();
     let mut unmodelled_checks: Vec<String> = Vec::new();
+    let mut set_clr_from: Vec<String> = Vec::new();
     // `readMinPulseWidth`: a `min_pulse_width_high` / `_low` attribute builds a width check arc
     // from the pin to itself.
     let mut check_from: Vec<String> = Vec::new();
@@ -1226,6 +1230,16 @@ fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
             //   * skew, non_seq_setup/hold, min_pulse_width, minimum_period are checks this
             //     reader does not model;
             //   * nochange_*, retaining_time and unknown types the reference drops itself.
+            // a set/clear arc exists only with the table of the edge it drives (`makePresetClrArcs`:
+            // a preset drives the rise, a clear the fall)
+            Some(tt @ ("clear" | "preset")) => {
+                let a = parse_arc(tbody, &town, &tspans, ctx);
+                let t = if tt == "preset" { &a.cell_rise } else { &a.cell_fall };
+                if !t.values.is_empty() {
+                    let names = format!("{} {}", a.related_pin, a.related_bus_pins);
+                    set_clr_from.extend(names.split(|c: char| c.is_whitespace() || c == ',').map(|n| n.trim_matches('"')).filter(|n| !n.is_empty()).map(String::from));
+                }
+            }
             Some(tt) => {
                 let check = ["non_seq_setup", "non_seq_hold", "skew_", "min_pulse_width", "minimum_period"].iter().any(|k| tt.starts_with(k));
                 if check && !unmodelled_checks.iter().any(|c| c == tt) {
@@ -1244,6 +1258,7 @@ fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
         clock,
         function,
         three_state,
+        set_clr_from,
         setup,
         hold,
         recovery,
@@ -1653,6 +1668,7 @@ fn sequential_arcs(pins: &mut BTreeMap<String, Pin>, seqs: &[(String, String, St
         let clock = expr(body, if kw == "ff" { "clocked_on" } else { "enable" });
         let (clear, preset) = (expr(body, "clear"), expr(body, "preset"));
         let data = if kw == "latch" { expr(body, "data_in") } else { None };
+        let mut set_clr = Vec::new();
         pin.arcs.retain_mut(|a| {
             if a.clk_edge.is_some() || !matches!(a.kind.as_str(), "" | "combinational") {
                 return true;
@@ -1669,7 +1685,14 @@ fn sequential_arcs(pins: &mut BTreeMap<String, Pin>, seqs: &[(String, String, St
                     }
                     true
                 }
-                _ if clear.as_ref().is_some_and(|e| e.has_port(from)) || preset.as_ref().is_some_and(|e| e.has_port(from)) => false,
+                _ if clear.as_ref().is_some_and(|e| e.has_port(from)) || preset.as_ref().is_some_and(|e| e.has_port(from)) => {
+                    // a set/clear arc, built only with the table of the edge it drives
+                    let t = if clear.as_ref().is_some_and(|e| e.has_port(from)) { &a.cell_fall } else { &a.cell_rise };
+                    if !t.values.is_empty() {
+                        set_clr.push(from.to_string());
+                    }
+                    false
+                }
                 _ => {
                     // a latch's D->Q (`makeLatchDtoQArcs`): its edges follow the sense of `data_in`
                     // at `from`, whatever the group or the output (an inverted IQN among them) says
@@ -1686,6 +1709,22 @@ fn sequential_arcs(pins: &mut BTreeMap<String, Pin>, seqs: &[(String, String, St
                 }
             }
         });
+        pin.set_clr_from.extend(set_clr);
+    }
+}
+
+/// `LibertyCell::translatePresetClrCheckRoles`: a setup or hold check ON a pin that some set/clear
+/// arc is timed from is a recovery or removal check — libraries write the async pin's checks as
+/// `setup_rising` / `hold_rising` (icsprout55's DFFRQN on RN, among others).
+fn preset_clear_check_roles(pins: &mut BTreeMap<String, Pin>) {
+    let from: std::collections::BTreeSet<String> = pins.values().flat_map(|p| p.set_clr_from.iter().cloned()).collect();
+    for name in from {
+        if let Some(p) = pins.get_mut(&name) {
+            let setup = std::mem::take(&mut p.setup);
+            let hold = std::mem::take(&mut p.hold);
+            p.recovery.extend(setup);
+            p.removal.extend(hold);
+        }
     }
 }
 
@@ -1956,6 +1995,7 @@ fn parse_cell(
         .map(|(k, a, b)| (k.clone(), a.clone(), b.to_string()))
         .collect();
     sequential_arcs(&mut pins, &seqs);
+    preset_clear_check_roles(&mut pins);
     derive_senses(&mut pins);
     clock_roles(&mut pins, &seqs, &buses);
     let ff = groups
@@ -3910,6 +3950,43 @@ mod dont_use_cells {
             assert_eq!(pairs(lib, "EBUF", 1), from_rise, "disabled by TE_B rising, to either edge");
             assert_eq!(pairs(lib, "EBUF", 2), [true, false, false, true], "A->Z stays positive unate");
             assert_eq!(pairs(lib, "EBUFD", 0), from_rise, "a declared sense is taken as written");
+        }
+    }
+
+    /// Reference rule (`translatePresetClrCheckRoles`): a setup / hold check on a pin that a
+    /// set/clear arc is timed from becomes recovery / removal. The arc exists only with the table of
+    /// the edge it drives (`makePresetClrArcs`: clear -> fall, preset -> rise), and an untyped group
+    /// from the `ff`'s clear/preset pin is one too (`makeTimingArcs`).
+    #[test]
+    fn checks_on_a_set_or_clear_pin_are_recovery_and_removal() {
+        let chk = r#"timing () { related_pin : "CK"; timing_type : setup_rising; rise_constraint (scalar) { values ("1"); } }
+      timing () { related_pin : "CK"; timing_type : hold_rising; rise_constraint (scalar) { values ("2"); } }"#;
+        let cell = |name: &str, q_timing: &str| {
+            format!(
+                r#"cell ({name}) {{ area : 1.0;
+    ff (IQ, IQN) {{ clocked_on : "CK"; next_state : "D"; clear : "!RN"; }}
+    pin (CK) {{ direction : input; clock : true; capacitance : 0.001; }}
+    pin (D) {{ direction : input; capacitance : 0.001; {chk} }}
+    pin (RN) {{ direction : input; capacitance : 0.001; {chk} }}
+    pin (Q) {{ direction : output; function : "IQ"; {q_timing} }} }}"#
+            )
+        };
+        let l = Lib::parse(&format!(
+            "library (r) {{ {} {} {} }}",
+            cell("EXPL", r#"timing () { related_pin : "RN"; timing_type : clear; timing_sense : positive_unate; cell_fall (scalar) { values ("3"); } }"#),
+            cell("INFER", r#"timing () { related_pin : "RN"; timing_sense : positive_unate; cell_fall (scalar) { values ("3"); } }"#),
+            cell("NOFALL", r#"timing () { related_pin : "RN"; timing_type : clear; cell_rise (scalar) { values ("3"); } }"#),
+        ))
+        .unwrap();
+        let roles = |c: &str, p: &str| {
+            let p = &l.cells[c].pins[p];
+            (p.setup.len(), p.hold.len(), p.recovery.len(), p.removal.len())
+        };
+        assert_eq!(roles("EXPL", "RN"), (0, 0, 1, 1), "a timing_type clear arc from RN");
+        assert_eq!(roles("INFER", "RN"), (0, 0, 1, 1), "an untyped group from the ff's clear pin");
+        assert_eq!(roles("NOFALL", "RN"), (1, 1, 0, 0), "a clear with no fall table builds no arc");
+        for c in ["EXPL", "INFER", "NOFALL"] {
+            assert_eq!(roles(c, "D"), (1, 1, 0, 0), "{c}: D keeps its setup and hold");
         }
     }
 
