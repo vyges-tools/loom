@@ -106,6 +106,9 @@ impl Arc {
     /// sense. A caller times `to_rise` only where [`OutEdges::drives`] it.
     ///
     /// - a sequential arc launches on its clock edge, to either output edge;
+    /// - a tri-state enable or disable arc (`makeTristateEnableArcs` / `…DisableArcs`) launches
+    ///   on ONE input edge to both output edges — the rise when positive, the fall when negative
+    ///   (Z->1 / 0->Z are timed with the rise table, Z->0 / 1->Z with the fall table);
     /// - a latch D-to-Q arc (`makeLatchDtoQArcs`) is negative only when the latch's `data_in` is,
     ///   and otherwise pairs like edges — non-unate included;
     /// - any other arc: positive pairs like edges, negative opposite ones, non-unate every pair.
@@ -114,6 +117,8 @@ impl Arc {
             return from_rise == (e == ClkEdge::Rise);
         }
         match (self.kind.as_str(), self.sense.as_str()) {
+            (k, "positive_unate") if k.starts_with("three_state_") => from_rise,
+            (k, "negative_unate") if k.starts_with("three_state_") => !from_rise,
             ("latch_d_to_q", "negative_unate") => from_rise != to_rise,
             ("latch_d_to_q", _) => from_rise == to_rise,
             (_, "positive_unate") => from_rise == to_rise,
@@ -1791,8 +1796,15 @@ fn derive_senses(pins: &mut BTreeMap<String, Pin>) {
                     (_, Some(e)) if e.has_port(from) => Sense::NonUnate,
                     _ => Sense::Unknown,
                 }
-            } else if a.kind.starts_with("three_state_") {
+            } else if a.kind.starts_with("three_state_enable") {
                 enable.as_ref().map_or(Sense::Unknown, |e| e.port_timing_sense(from))
+            } else if a.kind.starts_with("three_state_disable") {
+                // the OPPOSITE of the enable's sense (`makeTristateDisableArcs`): the edge that disables
+                match enable.as_ref().map_or(Sense::Unknown, |e| e.port_timing_sense(from)) {
+                    Sense::Positive => Sense::Negative,
+                    Sense::Negative => Sense::Positive,
+                    s => s,
+                }
             } else {
                 Sense::Unknown
             };
@@ -3856,6 +3868,48 @@ mod dont_use_cells {
             assert_eq!(pairs(lib, "LATI", "Q"), opposite, "data_in !D is negative");
             assert_eq!(pairs(lib, "LATX", "Q"), like, "a NON-unate data_in still pairs like edges only");
             assert_eq!(pairs(lib, "INV", "Y"), opposite, "a plain arc keeps its function's sense");
+        }
+    }
+
+    /// Reference rule (`makeTristateEnableArcs` / `makeTristateDisableArcs`): a tri-state arc
+    /// launches on ONE input edge to both output edges — the rise when its sense is positive, the
+    /// fall when negative. With no `timing_sense`, an enable arc takes the sense of the tri-state
+    /// ENABLE (`three_state` inverted) at the pin and a disable arc the opposite. sky130 `ebufn`
+    /// (`three_state : "TE_B"`): enabled by TE_B falling, disabled by TE_B rising.
+    #[test]
+    fn a_tristate_arc_launches_on_one_input_edge() {
+        let t = r#"cell_rise (scalar) { values ("1"); } cell_fall (scalar) { values ("2"); }"#;
+        let l = Lib::parse(&format!(
+            r#"library (t) {{
+  cell (EBUF) {{ area : 1.0;
+    pin (A) {{ direction : input; capacitance : 0.001; }}
+    pin (TE_B) {{ direction : input; capacitance : 0.001; }}
+    pin (Z) {{ direction : output; function : "A"; three_state : "TE_B";
+      timing () {{ related_pin : "TE_B"; timing_type : three_state_enable; {t} }}
+      timing () {{ related_pin : "TE_B"; timing_type : three_state_disable; {t} }}
+      timing () {{ related_pin : "A"; {t} }} }} }}
+  cell (EBUFD) {{ area : 1.0;
+    pin (A) {{ direction : input; capacitance : 0.001; }}
+    pin (TE_B) {{ direction : input; capacitance : 0.001; }}
+    pin (Z) {{ direction : output; function : "A"; three_state : "TE_B";
+      timing () {{ related_pin : "TE_B"; timing_type : three_state_enable; timing_sense : positive_unate; {t} }} }} }}
+}}"#
+        ))
+        .unwrap();
+        let pairs = |l: &Lib, c: &str, k: usize| {
+            let a = &l.cells[c].pins["Z"].arcs[k];
+            [(true, true), (true, false), (false, true), (false, false)].map(|(f, t)| a.feeds(f, t))
+        };
+        let from_rise = [true, true, false, false];
+        let from_fall = [false, false, true, true];
+        let back = crate::libcache::decode(&crate::libcache::encode(&l)).unwrap();
+        for lib in [&l, &back] {
+            let kinds: Vec<&str> = lib.cells["EBUF"].pins["Z"].arcs.iter().map(|a| a.kind.as_str()).collect();
+            assert_eq!(kinds, ["three_state_enable", "three_state_disable", ""]);
+            assert_eq!(pairs(lib, "EBUF", 0), from_fall, "enabled by TE_B falling, to either edge");
+            assert_eq!(pairs(lib, "EBUF", 1), from_rise, "disabled by TE_B rising, to either edge");
+            assert_eq!(pairs(lib, "EBUF", 2), [true, false, false, true], "A->Z stays positive unate");
+            assert_eq!(pairs(lib, "EBUFD", 0), from_rise, "a declared sense is taken as written");
         }
     }
 
