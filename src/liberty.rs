@@ -98,7 +98,8 @@ pub struct Arc {
     // POCV then falls back to the global pocv_sigma fraction.
     pub sigma_rise: Table,
     pub sigma_fall: Table,
-    /// While reading: no edge has a table, so the reference builds no arc — the reader drops it.
+    /// While reading: no edge has a table, so the reference builds the arc set with no arc in it —
+    /// its role still marks the ports (`makeTimingArcPortMaps`); the reader drops it after that.
     pub(crate) no_edges: bool,
 }
 
@@ -1266,10 +1267,8 @@ fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
                 | "three_state_enable_fall" | "three_state_disable" | "three_state_disable_rise"
                 | "three_state_disable_fall",
             ) => {
-                let a = parse_arc(tbody, &town, &tspans, ctx);
-                if !a.no_edges {
-                    arcs.push(a);
-                }
+                // kept until the clock roles are read: an arc with no edge is still a set
+                arcs.push(parse_arc(tbody, &town, &tspans, ctx))
             }
             // Everything else is NOT a delay arc, and read as one it was a zero-delay path that
             // does not exist — onto an input pin, or a clock pin to itself:
@@ -2120,6 +2119,10 @@ fn parse_cell(
     preset_clear_check_roles(&mut pins);
     derive_senses(&mut pins);
     clock_roles(&mut pins, &seqs, &buses);
+    // the reference made the arc SET (its role marks the ports, above) but no arc in it
+    for p in pins.values_mut() {
+        p.arcs.retain(|a| !a.no_edges);
+    }
     let ff = groups
         .iter()
         .find(|(k, _, _)| k == "ff" || k == "latch")
@@ -4164,7 +4167,9 @@ mod dont_use_cells {
 
     /// Reference rule (`LibertyReader::makeTableModels`): an arc has an edge only when that edge
     /// has a table — its `cell_<edge>` OR its `<edge>_transition`; no model is made otherwise, and
-    /// no model builds no arc. A timing group with neither edge's table has no arc at all.
+    /// no model builds no arc. A timing group with neither edge's table has no arc at all — but
+    /// its arc SET is still made, so a clock-to-Q set with no table still marks a register clock
+    /// (`makeTimingArcPortMaps` reads the set's role).
     #[test]
     fn an_edge_with_no_table_has_no_arc() {
         let l = Lib::parse(
@@ -4179,6 +4184,11 @@ mod dont_use_cells {
       timing () { related_pin : "B"; fall_transition (scalar) { values ("2"); } }
       timing () { related_pin : "D"; cell_rise (nope) { values ("3"); } cell_fall (nope) { values ("3"); } }
       timing () { related_pin : "E"; timing_type : combinational_rise; cell_fall (scalar) { values ("4"); } } } }
+  cell (F) { area : 1.0; ff (IQ, IQN) { clocked_on : "CK"; next_state : "D"; }
+    pin (CK) { direction : input; clock : true; capacitance : 0.001; }
+    pin (D) { direction : input; capacitance : 0.001; }
+    pin (Q) { direction : output; function : "IQ";
+      timing () { related_pin : "CK"; timing_type : rising_edge; cell_rise (nope) { values ("1"); } } } }
 }"#,
         )
         .unwrap();
@@ -4191,6 +4201,9 @@ mod dont_use_cells {
             assert_eq!(edges("D"), None, "no table of either edge: no arc");
             assert_eq!(edges("E"), None, "a rise-only type with only a fall table: no arc");
             assert_eq!(arcs.len(), 2);
+            let ff = &lib.cells["F"];
+            assert!(ff.pins["Q"].arcs.is_empty(), "a clock-to-Q group with no table: no arc");
+            assert!(ff.pins["CK"].is_reg_clk && ff.pins["Q"].is_reg_output, "but its set marks the ports");
         }
     }
 
