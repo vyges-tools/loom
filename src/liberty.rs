@@ -1986,6 +1986,10 @@ fn merged_pin(name: &str, group: &Pin, inner: Option<(&Pin, &str)>) -> Pin {
         p.removal.extend(ip.removal.iter().cloned());
         p.arcs.extend(ip.arcs.iter().cloned());
         p.check_from.extend(ip.check_from.iter().cloned());
+        p.set_clr_from.extend(ip.set_clr_from.iter().cloned());
+        for (to, from) in p.clock_tree_paths.iter_mut().zip(&ip.clock_tree_paths) {
+            to.extend(from.iter().cloned());
+        }
     }
     p
 }
@@ -4092,6 +4096,20 @@ mod dont_use_cells {
         for c in ["EXPL", "INFER", "NOFALL"] {
             assert_eq!(roles(c, "D"), (1, 1, 0, 0), "{c}: D keeps its setup and hold");
         }
+        // the clear arc in a bus member's own pin group counts too
+        let b = Lib::parse(&format!(
+            r#"library (r2) {{
+  type (b1) {{ base_type : array; data_type : bit; bit_width : 1; bit_from : 0; bit_to : 0; }}
+  cell (BUSQ) {{ area : 1.0;
+    pin (CK) {{ direction : input; clock : true; capacitance : 0.001; }}
+    pin (RN) {{ direction : input; capacitance : 0.001; {chk} }}
+    bus (Q) {{ bus_type : b1; direction : output;
+      pin (Q[0]) {{ timing () {{ related_pin : "RN"; timing_type : clear; cell_fall (scalar) {{ values ("3"); }} }} }} }} }}
+}}"#
+        ))
+        .unwrap();
+        let rn = &b.cells["BUSQ"].pins["RN"];
+        assert_eq!((rn.setup.len(), rn.recovery.len()), (0, 1), "a bus member's clear arc");
     }
 
     /// Reference rule (`readTableModel` / `readTableTemplates`): a timing table is looked up in the
@@ -4175,12 +4193,20 @@ mod dont_use_cells {
     pin (CLK2) { direction : input; clock : true; capacitance : 0.001;
       timing () { timing_type : max_clock_tree_path;
         cell_rise (scalar) { values ("9.0"); } cell_fall (scalar) { values ("9.0"); } } } }
+  type (b2) { base_type : array; data_type : bit; bit_width : 2; bit_from : 1; bit_to : 0; downto : true; }
   cell (S) { area : 1.0; pin (A) { direction : input; capacitance : 0.001; } }
+  cell (W) { area : 1.0; is_macro_cell : true;
+    bus (G) { bus_type : b2; direction : input;
+      pin (G[0]) { clock : true; capacitance : 0.5;
+        timing () { timing_type : max_clock_tree_path; timing_sense : positive_unate;
+          cell_rise (scalar) { values ("7.0"); } cell_fall (scalar) { values ("7.5"); } } } } }
 }"#,
         )
         .unwrap();
         let back = crate::libcache::decode(&crate::libcache::encode(&l)).unwrap();
         for lib in [&l, &back] {
+            assert_eq!(lib.cells["W"].pins["G[0]"].clk_tree_delay(0.2, true, true), 7.0, "a bus member's own pin group");
+            assert_eq!(lib.cells["W"].pins["G[1]"].clk_tree_delay(0.2, true, true), 0.0);
             let clk = &lib.cells["M"].pins["CLK"];
             assert!(lib.cells["M"].is_macro && !lib.cells["S"].is_macro);
             assert!(clk.arcs.is_empty(), "not a delay arc");
