@@ -1303,7 +1303,17 @@ fn span_table(body: &str, spans: &[GroupSpan], kw: &str, ctx: &Ctx, kind: Axes) 
     spans
         .iter()
         .find(|g| g.kw == kw)
-        .map(|g| orient(parse_table(&body[g.body.clone()]), ctx.templates.get(g.args.as_str()), kind))
+        .map(|g| {
+            // ⛔ a table names its template; one that is not a timing (`lu_table_template`)
+            // template, nor the built-in `scalar`, is dropped as the reference drops it
+            // (`readTableModel`: warning 1253) — and an arc left with no table has no arc
+            let name = g.args.trim().trim_matches('"');
+            match ctx.templates.get(name) {
+                Some(t) => orient(parse_table(&body[g.body.clone()]), Some(t), kind),
+                None if name == "scalar" => orient(parse_table(&body[g.body.clone()]), None, kind),
+                None => Table::default(),
+            }
+        })
         .unwrap_or_default()
 }
 
@@ -1338,19 +1348,23 @@ struct Ctx<'a> {
     default_cap: [f64; 3],
 }
 
-/// Every `*_template` group directly in the library (`lu_table_template`, `power_lut_template`,
-/// `ocv_table_template`, …). Names are unique across them in practice; the first wins.
+/// The library's TIMING table templates: its `lu_table_template` groups — the only kind a delay,
+/// transition, constraint or receiver table is looked up in (`TableTemplateType::delay`); power,
+/// current and OCV templates are other kinds. A name defined twice is one template whose axes the
+/// later definition overwrites, each axis it states (`makeTableTemplate` finds the first, then
+/// `setAxisN`).
 fn templates(lib_body: &str, spans: &[GroupSpan]) -> Templates {
     let mut out = Templates::new();
-    for g in spans.iter().filter(|g| g.kw.ends_with("_template")) {
+    for g in spans.iter().filter(|g| g.kw == "lu_table_template") {
         let body = &lib_body[g.body.clone()];
         let own = own_attrs(body);
-        let var = |k: &str| simple_attr(&own, k).unwrap_or_default();
-        let idx = |k: &str| next_paren_after(&own, k).map(|v| floats(&v.replace('"', ""))).unwrap_or_default();
-        out.entry(g.args.clone()).or_insert(Template {
-            vars: [var("variable_1"), var("variable_2")],
-            index: [idx("index_1"), idx("index_2")],
-        });
+        let t = out.entry(g.args.trim().trim_matches('"').to_string()).or_default();
+        for (n, (vk, ik)) in [("variable_1", "index_1"), ("variable_2", "index_2")].into_iter().enumerate() {
+            if let Some(v) = simple_attr(&own, vk) {
+                t.vars[n] = v;
+                t.index[n] = next_paren_after(&own, ik).map(|v| floats(&v.replace('"', ""))).unwrap_or_default();
+            }
+        }
     }
     out
 }
@@ -2801,6 +2815,7 @@ mod ccs_skip_tests {
     const CCS_LIB: &str = r#"
 library (demo) {
   capacitive_load_unit (1, pf);
+  lu_table_template (t) { variable_1 : input_net_transition; index_1 ("0.01, 0.1"); }
   cell (INV) {
     pin (A) {
       direction : input;
@@ -2996,6 +3011,8 @@ mod async_check_tests {
     const DFRTP: &str = r#"library(t) {
   time_unit : "1ns";
   capacitive_load_unit (1, pf);
+  lu_table_template(t) { variable_1 : input_net_transition; variable_2 : total_output_net_capacitance; }
+  lu_table_template(s) { variable_1 : related_pin_transition; variable_2 : constrained_pin_transition; }
   cell (DFRTP) {
     ff (IQ, IQN) { clocked_on : "CLK"; next_state : "D"; clear : "!RESET_B"; }
     pin(CLK) { direction : input; clock : true; capacitance : 0.001; }
@@ -3988,6 +4005,37 @@ mod dont_use_cells {
         for c in ["EXPL", "INFER", "NOFALL"] {
             assert_eq!(roles(c, "D"), (1, 1, 0, 0), "{c}: D keeps its setup and hold");
         }
+    }
+
+    /// Reference rule (`readTableModel` / `readTableTemplates`): a timing table is looked up in the
+    /// library's `lu_table_template`s only (plus the built-in `scalar`); one naming any other
+    /// template — undefined, or a `power_lut_template` — is DROPPED (warning 1253), and an arc
+    /// with no table of an edge has no arc for it. A template defined twice keeps the later axes.
+    #[test]
+    fn a_table_with_no_timing_template_is_dropped() {
+        let l = Lib::parse(
+            r#"library (t) {
+  lu_table_template (dl) { variable_1 : input_net_transition; variable_2 : total_output_net_capacitance; }
+  lu_table_template (dl) { variable_1 : total_output_net_capacitance; variable_2 : input_net_transition; }
+  power_lut_template (pw) { variable_1 : input_transition_time; variable_2 : total_output_net_capacitance; }
+  cell (C) { area : 1.0;
+    pin (A) { direction : input; capacitance : 0.001; }
+    pin (Y) { direction : output; function : "A";
+      timing () { related_pin : "A";
+        cell_rise (dl) { index_1 ("1, 2"); index_2 ("10, 20"); values ("1, 2", "3, 4"); }
+        cell_fall (pw) { index_1 ("1, 2"); index_2 ("10, 20"); values ("1, 2", "3, 4"); }
+        rise_transition (scalar) { values ("5"); }
+        fall_transition (nope) { values ("6"); } } } }
+}"#,
+        )
+        .unwrap();
+        let a = &l.cells["C"].pins["Y"].arcs[0];
+        // the later `dl` puts the load first: the table is turned to (slew, load)
+        assert_eq!(a.cell_rise.index_1, [10.0, 20.0], "axes by the LATER definition of dl");
+        assert_eq!(a.cell_rise.values, [[1.0, 3.0], [2.0, 4.0]]);
+        assert!(a.cell_fall.values.is_empty(), "a power template is not a timing template");
+        assert_eq!(a.rise_transition.lookup(0.0, 0.0), 5.0, "scalar is built in");
+        assert!(a.fall_transition.values.is_empty(), "an undefined template drops the table");
     }
 
     /// Reference rule (`getAttrBool`): `true` / `false` are matched IGNORING CASE (`stringEqual`

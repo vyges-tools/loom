@@ -65,6 +65,7 @@ fn good_lib(in_library: &str, in_cell: &str, in_pin: &str, in_timing: &str) -> S
   leakage_power_unit : "1nW";
   capacitive_load_unit(1.0, "pf");
   nom_voltage : 1.8;
+  lu_table_template (t) {{ variable_1 : input_net_transition; variable_2 : total_output_net_capacitance; }}
 {in_library}
   cell (INV) {{
     area : 3.5;
