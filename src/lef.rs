@@ -31,6 +31,37 @@ pub struct Layer {
     pub ac_peak: f64,      // AC peak current-density limit (mA/um)
 }
 
+/// Accumulate a layer's tokens to its `;`-terminated statements and apply each one; a quoted
+/// string (a `PROPERTY LEF58_x "...;..."` value) carries its semicolons and keywords inside.
+fn feed_layer_stmt(toks: &[&str], stmt: &mut Vec<String>, in_quote: &mut bool, layer: &mut Layer) {
+    for t in toks {
+        if *in_quote {
+            stmt.push((*t).to_string());
+            if t.ends_with('"') {
+                *in_quote = false;
+            }
+            continue;
+        }
+        if t.starts_with('"') && !(t.len() > 1 && t.ends_with('"')) {
+            *in_quote = true;
+            stmt.push((*t).to_string());
+            continue;
+        }
+        if *t == ";" {
+            apply_layer_stmt(stmt, layer);
+            stmt.clear();
+        } else if let Some(head) = t.strip_suffix(';') {
+            if !head.is_empty() {
+                stmt.push(head.to_string());
+            }
+            apply_layer_stmt(stmt, layer);
+            stmt.clear();
+        } else {
+            stmt.push((*t).to_string());
+        }
+    }
+}
+
 /// Pin direction from a cell-LEF `MACRO`/`PIN` (`DIRECTION INPUT|OUTPUT|INOUT`).
 /// Drives SPEF `*CONN` driver/load marking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -242,6 +273,16 @@ impl Lef {
                 .collect();
             let toks: Vec<&str> = words.iter().map(String::as_str).collect();
 
+            // ⛔ INSIDE A QUOTED STRING NOTHING IS A KEYWORD: the reference's lexer reads a quoted
+            // string as one token. gscl45nm's via1 carries a `LEF58_SPACINGTABLE "…` string with a
+            // line `LAYER metal1 NOSTACK`; matched as a line, it opened a layer and via1 was lost.
+            if in_quote {
+                if let Some((_, l)) = cur.as_mut() {
+                    feed_layer_stmt(&toks, &mut stmt, &mut in_quote, l);
+                    continue;
+                }
+            }
+
             // ---- shielded blocks: NONDEFAULTRULE and SITE, to their `END <name>` ----
             // A NONDEFAULTRULE carries its own `LAYER met1 … END met1`; read as a tech layer, it
             // REPLACED met1 with the rule's width, losing the layer's resistance and thickness.
@@ -398,7 +439,7 @@ impl Lef {
                     }
                 }
                 rest => {
-                    if cur.is_some() {
+                    if let Some((_, l)) = cur.as_mut() {
                         // ---- STATEMENTS, NOT LINES ----
                         //
                         // A LEF statement ends at `;`, and may span many lines. `SPACINGTABLE`
@@ -416,32 +457,7 @@ impl Lef {
                         //
                         // Quotes are respected, because a `PROPERTY LEF58_x "...;..."` string
                         // legally contains semicolons that do not end anything.
-                        for t in rest {
-                            if in_quote {
-                                stmt.push((*t).to_string());
-                                if t.ends_with('"') {
-                                    in_quote = false;
-                                }
-                                continue;
-                            }
-                            if t.starts_with('"') && !(t.len() > 1 && t.ends_with('"')) {
-                                in_quote = true;
-                                stmt.push((*t).to_string());
-                                continue;
-                            }
-                            if *t == ";" {
-                                apply_layer_stmt(&stmt, cur.as_mut().map(|(_, l)| l).unwrap());
-                                stmt.clear();
-                            } else if let Some(head) = t.strip_suffix(';') {
-                                if !head.is_empty() {
-                                    stmt.push(head.to_string());
-                                }
-                                apply_layer_stmt(&stmt, cur.as_mut().map(|(_, l)| l).unwrap());
-                                stmt.clear();
-                            } else {
-                                stmt.push((*t).to_string());
-                            }
-                        }
+                        feed_layer_stmt(rest, &mut stmt, &mut in_quote, l);
                     }
                 }
             }
@@ -507,6 +523,24 @@ mod tests {
     /// through a rail-spanning pin, so current enters around the middle. On `dfstp_2`, a
     /// 9.66 um cell, that is a 4.83 um displacement; measured against PDNSim it moved the
     /// along-rail IR drop by ~10% on a block of wide cells.
+    /// Reference rule (its LEF lexer): a quoted string is one token, so a line inside it that
+    /// begins with `LAYER` (a `LEF58_SPACINGTABLE` row, as gscl45nm's via1 writes) opens nothing
+    /// and the layer that holds it is kept.
+    #[test]
+    fn a_keyword_inside_a_quoted_property_opens_nothing() {
+        let l = Lef::parse(
+            "\
+LAYER metal1\n  TYPE ROUTING ;\n  WIDTH 0.065 ;\nEND metal1\n\
+LAYER via1\n  TYPE CUT ;\n  PROPERTY LEF58_SPACINGTABLE\n  \"SPACINGTABLE DEFAULT 0.12\n    LAYER metal1 NOSTACK\n    VIA x ;\n  \" ;\nEND via1\n\
+LAYER metal2\n  TYPE ROUTING ;\n  WIDTH 0.07 ;\nEND metal2\n",
+        )
+        .unwrap();
+        assert!(l.layers.contains_key("via1"), "{:?}", l.layers.keys().collect::<Vec<_>>());
+        assert_eq!(l.routing_order, vec!["metal1", "metal2"]);
+        assert_eq!(l.width("metal1"), 0.065);
+        assert!(l.vias.is_empty());
+    }
+
     #[test]
     fn a_macro_keeps_its_size() {
         let l = Lef::parse(
