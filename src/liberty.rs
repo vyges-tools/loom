@@ -312,6 +312,10 @@ pub struct Pin {
     pub unmodelled_checks: Vec<String>,
     /// `three_state` (the DISABLE expression), for `derive_senses`.
     pub(crate) three_state: Option<String>,
+    /// `min_clock_tree_path` (first) and `max_clock_tree_path` (second) groups on this pin — a
+    /// MACRO's internal clock network delay to its clock pin, for [`Pin::clk_tree_delay`]. Each is
+    /// an arc with no `related_pin`; empty when the library states none.
+    pub clock_tree_paths: [Vec<Arc>; 2],
     /// While reading: the pins a set/clear arc INTO this pin is timed from (`timing_type : clear` /
     /// `preset` with its table), for `preset_clear_check_roles`.
     pub(crate) set_clr_from: Vec<String>,
@@ -337,6 +341,27 @@ impl Pin {
             }
             None => false,
         }
+    }
+
+    /// A macro's internal clock-tree delay to this (clock) pin for an input edge `rising` and an
+    /// early (`max == false`) or late analysis, at input slew `in_slew` — the reference's
+    /// `LibertyPort::clkTreeDelay`: the first `min_` / `max_clock_tree_path` group whose arc to this
+    /// edge is launched by the SAME edge, its delay table read at `(in_slew, 0)`; 0 when none is.
+    /// ⚠️ The arc it asks for is the LAST one built to the edge (`TimingArcSet::arcTo`), and a
+    /// non-unate or unstated sense builds the opposite edge's last — so only a `positive_unate`
+    /// group ever answers. The reference subtracts the delay for a macro on an ideal clock
+    /// (clock-to-Q and the check margin).
+    pub fn clk_tree_delay(&self, in_slew: f64, rising: bool, max: bool) -> f64 {
+        for a in &self.clock_tree_paths[usize::from(max)] {
+            let t = if rising { &a.cell_rise } else { &a.cell_fall };
+            if t.values.is_empty() {
+                continue;
+            }
+            if a.sense == "positive_unate" {
+                return t.lookup(in_slew, 0.0);
+            }
+        }
+        0.0
     }
 
     /// The capacitive load this input pin presents to its driver (pF): the
@@ -393,6 +418,9 @@ pub struct Cell {
     /// default (`false`). A design may still instantiate the cell; only a resize/insert move
     /// may not choose it (see [`Lib::equivalence_class`]).
     pub dont_use: bool,
+    /// `is_macro_cell : true` (`LibertyCell::isMacro`): a hard macro, whose clock-tree-path delays
+    /// the reference takes out on an ideal clock — see [`Pin::clk_tree_delay`].
+    pub is_macro: bool,
     /// Its own library's slew and delay thresholds, when they are not the merged library's
     /// ([`Lib::merge`] sets it on a later library's cells whose thresholds differ). The reference
     /// times a driver with its own library's thresholds and converts each wire delay and load
@@ -1168,6 +1196,7 @@ fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
     let mut removal: Vec<Constraint> = Vec::new();
     let mut unmodelled_checks: Vec<String> = Vec::new();
     let mut set_clr_from: Vec<String> = Vec::new();
+    let mut clock_tree_paths: [Vec<Arc>; 2] = [Vec::new(), Vec::new()];
     // `readMinPulseWidth`: a `min_pulse_width_high` / `_low` attribute builds a width check arc
     // from the pin to itself.
     let mut check_from: Vec<String> = Vec::new();
@@ -1230,6 +1259,11 @@ fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
             //   * skew, non_seq_setup/hold, min_pulse_width, minimum_period are checks this
             //     reader does not model;
             //   * nochange_*, retaining_time and unknown types the reference drops itself.
+            Some(tt @ ("min_clock_tree_path" | "max_clock_tree_path")) => {
+                let mut a = parse_arc(tbody, &town, &tspans, ctx);
+                a.related_pin.clear();
+                clock_tree_paths[usize::from(tt.starts_with("max"))].push(a);
+            }
             // a set/clear arc exists only with the table of the edge it drives (`makePresetClrArcs`:
             // a preset drives the rise, a clear the fall)
             Some(tt @ ("clear" | "preset")) => {
@@ -1259,6 +1293,7 @@ fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
         function,
         three_state,
         set_clr_from,
+        clock_tree_paths,
         setup,
         hold,
         recovery,
@@ -2113,6 +2148,7 @@ fn parse_cell(
         .and_then(|s| lnum(&s))
         .unwrap_or(0.0);
     let dont_use = bool_attr(&own, "dont_use");
+    let is_macro = bool_attr(&own, "is_macro_cell");
     Cell {
         name,
         pins,
@@ -2126,6 +2162,7 @@ fn parse_cell(
         clock_gating,
         scan_pins,
         dont_use,
+        is_macro,
         thresholds: None,
     }
 }
@@ -4117,6 +4154,42 @@ mod dont_use_cells {
         assert_eq!(f("Z[1]").as_deref(), Some("S"), "a member's own pin group keeps its function");
         assert_eq!(t("Z[3]").as_deref(), Some("EN[3]"), "three_state by bus INDEX 3, not offset 0");
         assert_eq!(t("Z[0]").as_deref(), Some("EN[0]"));
+    }
+
+    /// Reference rule (`LibertyPort::clkTreeDelay`, `makeClockTreePathArcs`, `isMacro`): a macro's
+    /// `min_` / `max_clock_tree_path` groups on its clock pin are its internal clock delay per
+    /// edge and analysis; only a `positive_unate` group answers (the arc asked for is the last one
+    /// built to the edge, which a non-unate group builds from the other edge). They survive the
+    /// cache, with `is_macro_cell`.
+    #[test]
+    fn a_macro_clock_pin_carries_its_clock_tree_delay() {
+        let l = Lib::parse(
+            r#"library (m) {
+  lu_table_template (s1) { variable_1 : input_net_transition; index_1 ("0.1, 0.3"); }
+  cell (M) { area : 1.0; is_macro_cell : true;
+    pin (CLK) { direction : input; clock : true; capacitance : 0.001;
+      timing () { timing_type : min_clock_tree_path; timing_sense : positive_unate;
+        cell_rise (s1) { values ("1.0, 2.0"); } cell_fall (scalar) { values ("1.5"); } }
+      timing () { timing_type : max_clock_tree_path; timing_sense : positive_unate;
+        cell_rise (scalar) { values ("3.0"); } cell_fall (scalar) { values ("3.5"); } } }
+    pin (CLK2) { direction : input; clock : true; capacitance : 0.001;
+      timing () { timing_type : max_clock_tree_path;
+        cell_rise (scalar) { values ("9.0"); } cell_fall (scalar) { values ("9.0"); } } } }
+  cell (S) { area : 1.0; pin (A) { direction : input; capacitance : 0.001; } }
+}"#,
+        )
+        .unwrap();
+        let back = crate::libcache::decode(&crate::libcache::encode(&l)).unwrap();
+        for lib in [&l, &back] {
+            let clk = &lib.cells["M"].pins["CLK"];
+            assert!(lib.cells["M"].is_macro && !lib.cells["S"].is_macro);
+            assert!(clk.arcs.is_empty(), "not a delay arc");
+            assert!((clk.clk_tree_delay(0.2, true, false) - 1.5).abs() < 1e-6, "min rise, by its slew axis");
+            assert_eq!(clk.clk_tree_delay(0.2, false, false), 1.5);
+            assert_eq!(clk.clk_tree_delay(0.2, true, true), 3.0);
+            assert_eq!(clk.clk_tree_delay(0.2, false, true), 3.5);
+            assert_eq!(lib.cells["M"].pins["CLK2"].clk_tree_delay(0.2, true, true), 0.0, "an unstated sense never answers");
+        }
     }
 
     /// Reference rule (`getAttrBool`): `true` / `false` are matched IGNORING CASE (`stringEqual`

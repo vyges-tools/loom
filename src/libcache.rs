@@ -19,7 +19,8 @@ use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, OutEdges, Pin, Pi
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLCI"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLCJ"; // Vyges Liberty Cache — bump the trailing digit on any format change
+                                 // VLCJ: Pin gained `clock_tree_paths`, Cell `is_macro`.
                                  // VLCI: Arc keeps its kind (`Arc::feeds` pairs edges by it: latch D->Q).
                                  // VLCH: Pin gained `is_reg_clk`, `is_reg_output`, `is_check_clk`.
                                  // VLCG: Constraint gained `clk_edge` + `related_pin`.
@@ -330,6 +331,12 @@ fn enc_pin(w: &mut W, p: &Pin) {
     for b in [p.is_reg_clk, p.is_reg_output, p.is_check_clk] {
         w.u8(b as u8);
     }
+    for paths in &p.clock_tree_paths {
+        w.u64(paths.len() as u64);
+        for a in paths {
+            enc_arc(w, a);
+        }
+    }
 }
 fn dec_pin(r: &mut R) -> Option<Pin> {
     let name = r.s()?;
@@ -378,6 +385,12 @@ fn dec_pin(r: &mut R) -> Option<Pin> {
         unmodelled_checks.push(r.s()?);
     }
     let (is_reg_clk, is_reg_output, is_check_clk) = (r.u8()? != 0, r.u8()? != 0, r.u8()? != 0);
+    let mut clock_tree_paths: [Vec<Arc>; 2] = [Vec::new(), Vec::new()];
+    for paths in &mut clock_tree_paths {
+        for _ in 0..r.u64()? {
+            paths.push(dec_arc(r)?);
+        }
+    }
     Some(Pin {
         name,
         direction,
@@ -389,6 +402,7 @@ fn dec_pin(r: &mut R) -> Option<Pin> {
         function,
         three_state: None,
         set_clr_from: Vec::new(),
+        clock_tree_paths,
         setup,
         hold,
         recovery,
@@ -444,6 +458,7 @@ fn enc_cell(w: &mut W, c: &Cell) {
         w.s(v);
     }
     w.u8(c.dont_use as u8);
+    w.u8(c.is_macro as u8);
 }
 fn dec_cell(r: &mut R) -> Option<Cell> {
     let name = r.s()?;
@@ -482,6 +497,7 @@ fn dec_cell(r: &mut R) -> Option<Cell> {
         scan_pins.insert(k, r.s()?);
     }
     let dont_use = r.u8()? != 0;
+    let is_macro = r.u8()? != 0;
     Some(Cell {
         name,
         pins,
@@ -495,6 +511,7 @@ fn dec_cell(r: &mut R) -> Option<Cell> {
         clock_gating,
         scan_pins,
         dont_use,
+        is_macro,
         // a cached file is one library: its cells carry their own thresholds only once merged
         thresholds: None,
     })
