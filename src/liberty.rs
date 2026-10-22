@@ -2108,7 +2108,17 @@ fn parse_cell(
             _ => {}
         }
     }
-    slice_bus_functions(&mut pins, &buses, &bus_funcs);
+    // `makeSeqPorts`: a bank's state variables are internal BUS ports `IQ[n-1:0]`, members MSB
+    // first — so a bus or bundle function naming one reads its member at each bit's offset
+    let mut func_buses = buses.clone();
+    for (_, args, _) in groups.iter().filter(|(k, _, _)| k == "ff_bank" || k == "latch_bank") {
+        let parts: Vec<&str> = args.split(',').map(|x| x.trim().trim_matches('"').trim()).collect();
+        let Some(n) = parts.get(2).and_then(|x| x.parse::<usize>().ok()) else { continue };
+        for name in parts.iter().take(2).filter(|x| !x.is_empty()) {
+            func_buses.push((name.to_string(), (0..n).rev().map(|i| format!("{name}[{i}]")).collect()));
+        }
+    }
+    slice_bus_functions(&mut pins, &func_buses, &bus_funcs);
     expand_arcs(&mut pins, &buses, &bus_bits);
     let seqs: Vec<(String, String, String)> = groups
         .iter()
@@ -4205,6 +4215,37 @@ mod dont_use_cells {
             assert!(ff.pins["Q"].arcs.is_empty(), "a clock-to-Q group with no table: no arc");
             assert!(ff.pins["CK"].is_reg_clk && ff.pins["Q"].is_reg_output, "but its set marks the ports");
         }
+    }
+
+    /// Reference rule (`makeSeqPorts`, `LibertyPort::setFunction`): an `ff_bank (IQN, IQNN, n)`
+    /// makes its state variables internal bus ports `IQN[n-1:0]`, members MSB first, and a bundle's
+    /// (or bus's) function is sliced per member by OFFSET — so in the reference's asap7 multi-bit
+    /// flops `bundle (QN) { members (QN0, QN1); function : "IQN"; }` gives QN0 `IQN[1]`, QN1 `IQN[0]`.
+    #[test]
+    fn a_bank_state_variable_is_sliced_like_a_bus() {
+        let l = Lib::parse(
+            r#"library (k) {
+  cell (C) { area : 1.0;
+    pin (CLK) { direction : input; clock : true; capacitance : 0.001; }
+    bundle (D) { members (D0, D1); direction : input; capacitance : 0.001; }
+    bundle (QN) { members (QN0, QN1); direction : output; function : "IQN"; }
+    bundle (Q) { members (Q0, Q1); direction : output; function : "!IQNN & CLK"; }
+    pin (X) { direction : output; function : "IQN"; }
+    ff_bank (IQN, IQNN, 2) { clocked_on : "CLK"; next_state : "!D"; } }
+  cell (L) { area : 1.0;
+    pin (G) { direction : input; capacitance : 0.001; }
+    bundle (D) { members (D0, D1); direction : input; capacitance : 0.001; }
+    bundle (Q) { members (Q0, Q1); direction : output; function : "IQ"; }
+    latch_bank (IQ, IQN, 2) { enable : "G"; data_in : "D"; } }
+}"#,
+        )
+        .unwrap();
+        let f = |p: &str| l.cells["C"].pins[p].function.clone();
+        assert_eq!(f("QN0").as_deref(), Some("IQN[1]"), "offset 0 is the MSB");
+        assert_eq!(f("QN1").as_deref(), Some("IQN[0]"));
+        assert_eq!(f("Q1").as_deref(), Some("!IQNN[0] & CLK"), "the inverted state too; a scalar stays");
+        assert_eq!(f("X").as_deref(), Some("IQN"), "a scalar pin's function is not sliced");
+        assert_eq!(l.cells["L"].pins["Q0"].function.as_deref(), Some("IQ[1]"), "a latch bank likewise");
     }
 
     /// Reference rule (`LibertyPort::setFunction` / `setTristateEnable`, `FuncExpr::bitSubExpr`):
