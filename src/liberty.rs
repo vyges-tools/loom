@@ -1871,6 +1871,53 @@ fn derive_senses(pins: &mut BTreeMap<String, Pin>) {
     }
 }
 
+/// A bus's `function` and `three_state`, given to each member BIT as the reference gives them
+/// (`LibertyPort::setFunction` / `setTristateEnable` → `FuncExpr::bitSubExpr`): every bus the
+/// expression names becomes its member at the bit's OFFSET for the function (`out[0]` of
+/// `function : "in"` reads `in[0]`, by position), and at the bit's BUS INDEX for the three_state;
+/// a bus of one bit is that bit; an offset past the bus leaves the bit with none. A member whose
+/// own `pin` group states the attribute keeps it as written.
+fn slice_bus_functions(
+    pins: &mut BTreeMap<String, Pin>,
+    buses: &[(String, Vec<String>)],
+    bus_funcs: &[(Vec<String>, Option<String>, Option<String>)],
+) {
+    let slice = |expr: &str, k: usize| -> Option<String> {
+        let mut out = String::new();
+        let b = expr.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i] as char;
+            if c.is_ascii_alphabetic() || c == '_' {
+                let j = (i..b.len()).find(|&j| !((b[j] as char).is_ascii_alphanumeric() || b[j] == b'_')).unwrap_or(b.len());
+                let id = &expr[i..j];
+                match buses.iter().find(|(n, _)| n == id).filter(|_| b.get(j) != Some(&b'[')) {
+                    Some((_, m)) if m.len() == 1 => out.push_str(&m[0]),
+                    Some((_, m)) => out.push_str(m.get(k)?),
+                    None => out.push_str(id),
+                }
+                i = j;
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        }
+        Some(out)
+    };
+    let index = |m: &str| m.rsplit_once('[').and_then(|(_, r)| r.trim_end_matches(']').parse::<usize>().ok());
+    for (members, func, tri) in bus_funcs {
+        for (k, m) in members.iter().enumerate() {
+            let Some(p) = pins.get_mut(m) else { continue };
+            if let Some(f) = func.as_ref().filter(|f| p.function.as_ref() == Some(*f)) {
+                p.function = slice(f, k);
+            }
+            if let Some(t) = tri.as_ref().filter(|t| p.three_state.as_ref() == Some(*t)) {
+                p.three_state = index(m).and_then(|i| slice(t, i));
+            }
+        }
+    }
+}
+
 fn merged_pin(name: &str, group: &Pin, inner: Option<(&Pin, &str)>) -> Pin {
     let mut p = group.clone();
     p.name = name.to_string();
@@ -1938,6 +1985,7 @@ fn parse_cell(
     // many of its leading arcs came from the BUS-level timing groups — what `expand_arcs` needs.
     let mut buses: Vec<(String, Vec<String>)> = Vec::new();
     let mut bus_bits: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
+    let mut bus_funcs: Vec<(Vec<String>, Option<String>, Option<String>)> = Vec::new();
     let (own, spans) = level(body);
     let groups: Vec<(String, String, &str)> = spans.into_iter().map(|g| (g.kw, g.args, &body[g.body])).collect();
     // Pins at the CELL's level only, plus the bits of its buses and the members of its bundles.
@@ -1974,6 +2022,7 @@ fn parse_cell(
                     bus_bits.insert(m.clone(), (i, members.len(), own.arcs.len()));
                 }
                 buses.push((args.clone(), members.clone()));
+                bus_funcs.push((members.clone(), own.function.clone(), own.three_state.clone()));
                 for (ikw, iargs, ibody) in top_groups(gbody) {
                     if ikw != "pin" {
                         continue;
@@ -2002,6 +2051,7 @@ fn parse_cell(
             _ => {}
         }
     }
+    slice_bus_functions(&mut pins, &buses, &bus_funcs);
     expand_arcs(&mut pins, &buses, &bus_bits);
     let seqs: Vec<(String, String, String)> = groups
         .iter()
@@ -4036,6 +4086,37 @@ mod dont_use_cells {
         assert!(a.cell_fall.values.is_empty(), "a power template is not a timing template");
         assert_eq!(a.rise_transition.lookup(0.0, 0.0), 5.0, "scalar is built in");
         assert!(a.fall_transition.values.is_empty(), "an undefined template drops the table");
+    }
+
+    /// Reference rule (`LibertyPort::setFunction` / `setTristateEnable`, `FuncExpr::bitSubExpr`):
+    /// a bus's `function` gives each member bit the named buses' members at the bit's OFFSET, and
+    /// its `three_state` at the bit's BUS INDEX. The reference's own test `liberty_arcs_one2one_1`:
+    /// `Y[3:0]` with `function : "!A"` over `A[7:0]` makes `Y[0]` (offset 3) read `!A[4]`.
+    #[test]
+    fn a_bus_function_is_sliced_per_member() {
+        let l = Lib::parse(
+            r#"library (b) {
+  type (b8) { base_type : array; data_type : bit; bit_width : 8; bit_from : 7; bit_to : 0; downto : true; }
+  type (b4) { base_type : array; data_type : bit; bit_width : 4; bit_from : 3; bit_to : 0; downto : true; }
+  type (u4) { base_type : array; data_type : bit; bit_width : 4; bit_from : 0; bit_to : 3; downto : false; }
+  type (b1) { base_type : array; data_type : bit; bit_width : 1; bit_from : 0; bit_to : 0; }
+  cell (C) { area : 1.0;
+    bus (A) { bus_type : b8; direction : input; capacitance : 0.001; }
+    bus (EN) { bus_type : u4; direction : input; capacitance : 0.001; }
+    bus (S) { bus_type : b1; direction : input; capacitance : 0.001; }
+    bus (Y) { bus_type : b4; direction : output; function : "!A & S"; }
+    bus (Z) { bus_type : b4; direction : output; function : "A"; three_state : "EN";
+      pin (Z[1]) { function : "S"; } } }
+}"#,
+        )
+        .unwrap();
+        let f = |p: &str| l.cells["C"].pins[p].function.clone();
+        let t = |p: &str| l.cells["C"].pins[p].three_state.clone();
+        assert_eq!(f("Y[3]").as_deref(), Some("!A[7] & S[0]"), "offset 0; a one-bit bus is its bit");
+        assert_eq!(f("Y[0]").as_deref(), Some("!A[4] & S[0]"), "offset 3 of A[7:0] is A[4]");
+        assert_eq!(f("Z[1]").as_deref(), Some("S"), "a member's own pin group keeps its function");
+        assert_eq!(t("Z[3]").as_deref(), Some("EN[3]"), "three_state by bus INDEX 3, not offset 0");
+        assert_eq!(t("Z[0]").as_deref(), Some("EN[0]"));
     }
 
     /// Reference rule (`getAttrBool`): `true` / `false` are matched IGNORING CASE (`stringEqual`
