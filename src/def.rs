@@ -367,6 +367,8 @@ impl Def {
         let unresolved_vias = vias.unresolved.get();
         let comps = parse_components(&tref);
         let pins = parse_pins(&tref);
+        let mut nets = nets;
+        attach_pins(&mut nets, &pins);
         Ok(Def {
             units_per_um: scale,
             dbu: scale,
@@ -843,6 +845,32 @@ fn orient_pt(x: i64, y: i64, orient: &str) -> (i64, i64) {
 /// ( x2 y2 ) … + FIXED ( ox oy ) <orient> ;`. Several `LAYER` rectangles may share one `PORT`
 /// and one placement, which is exactly how a power pin is written — so rectangles are collected
 /// and the placement applied to all of them when the entry ends.
+/// Which nets the block terminals are on, as the reference decides it: a pin is created on the
+/// net its `PINS` entry names (`+ NET`), and a `( PIN <name> )` connection in `NETS` creates the
+/// pin only when no pin of that name exists — otherwise it changes nothing, so a pin stays on
+/// its `PINS` net. The keyword is read without case (`( pin x )`) and kept as `PIN`.
+fn attach_pins(nets: &mut [DefNet], pins: &[DefPin]) {
+    let on: BTreeMap<&str, &str> = pins.iter().map(|p| (p.name.as_str(), p.net.as_str())).collect();
+    for n in nets.iter_mut() {
+        for c in n.pins.iter_mut() {
+            if c.0 != "PIN" && c.0.eq_ignore_ascii_case("PIN") {
+                c.0 = "PIN".to_string();
+            }
+        }
+        let name = n.name.clone();
+        n.pins.retain(|(i, p)| i != "PIN" || on.get(p.as_str()).is_none_or(|net| *net == name));
+    }
+    let index: BTreeMap<String, usize> = nets.iter().enumerate().map(|(k, n)| (n.name.clone(), k)).collect();
+    for p in pins.iter().filter(|p| !p.net.is_empty()) {
+        if let Some(&k) = index.get(&p.net) {
+            let n = &mut nets[k];
+            if !n.pins.iter().any(|(i, q)| i == "PIN" && *q == p.name) {
+                n.pins.push(("PIN".to_string(), p.name.clone()));
+            }
+        }
+    }
+}
+
 /// A `PINS` entry named `<pin>.extra<N>` (or, for a bus bit, `<bus>.extra<N>[<i>]`) is more
 /// placements of the pin `<pin>` (`<bus>[<i>]`) when that pin is already defined — the
 /// reference's reader adds them to it; otherwise it is a pin of its own, under its full name.
@@ -1718,6 +1746,27 @@ mod special_rule_tests {
         let x: Vec<i64> = d.pins[0].shapes.iter().map(|s| s.1).collect();
         assert_eq!(x, [100, 500]);
         assert_eq!(d.pins[1].shapes.len(), 2);
+    }
+
+    /// Reference rule (its PIN and NET readers): a pin is on the net its `PINS` entry names; a
+    /// `( PIN x )` in `NETS` creates pin x only when none exists, so it cannot move a pin to
+    /// another net; the keyword is read without case.
+    #[test]
+    fn a_pin_is_on_the_net_its_pins_entry_names() {
+        let def = "UNITS DISTANCE MICRONS 1000 ;\nPINS 3 ;\n- clk + NET clk + DIRECTION INPUT ;\n\
+                   - out1 + NET out + DIRECTION OUTPUT ;\n- in + NET in ;\nEND PINS\n\
+                   NETS 4 ;\n- clk ( r1 CP ) ;\n- out ( r2 Q ) ;\n- out1 ( r3 Q ) ( PIN out1 ) ;\n- in ( pin in ) ( u1 A ) ;\nEND NETS\n";
+        let d = Def::parse(def).unwrap();
+        let conns = |name: &str| -> Vec<(String, String)> {
+            let mut v = d.nets.iter().find(|n| n.name == name).unwrap().pins.clone();
+            v.sort();
+            v
+        };
+        let c = |i: &str, p: &str| (i.to_string(), p.to_string());
+        assert_eq!(conns("clk"), [c("PIN", "clk"), c("r1", "CP")]);
+        assert_eq!(conns("out"), [c("PIN", "out1"), c("r2", "Q")]);
+        assert_eq!(conns("out1"), [c("r3", "Q")]);
+        assert_eq!(conns("in"), [c("PIN", "in"), c("u1", "A")]);
     }
 
     fn snet(body: &str) -> NetGeom {
