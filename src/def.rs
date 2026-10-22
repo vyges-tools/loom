@@ -235,10 +235,22 @@ pub struct Def {
 impl ViaDef {
     /// A via given by its shapes: its routing layers (bottom, top) and cut from the LEF stack.
     fn resolve_shapes(&mut self, lef: &crate::lef::Lef) {
-        if !self.below.is_empty() || self.shape_layers.is_empty() {
+        let pos = |l: &str| lef.routing_order.iter().position(|r| r == l);
+        if !self.below.is_empty() {
+            // A `LAYERS` via: the reference keeps the three names as written (bottom, cut, top),
+            // then builds a box on each, and every box widens the via's bottom and top to the
+            // lowest and highest layer in the stack. Written out of order (`LAYERS metal4
+            // metal5 via4`), the via still joins metal4 and metal5, not a cut layer.
+            let mut routing: Vec<&String> = [&self.below, &self.cut_layer, &self.above].into_iter().filter(|l| pos(l).is_some()).collect();
+            routing.sort_by_key(|l| pos(l));
+            if let [b, .., t] = routing[..] {
+                (self.below, self.above) = (b.to_string(), t.to_string());
+            }
             return;
         }
-        let pos = |l: &str| lef.routing_order.iter().position(|r| r == l);
+        if self.shape_layers.is_empty() {
+            return;
+        }
         let mut routing: Vec<&String> = self.shape_layers.iter().filter(|l| pos(l).is_some()).collect();
         routing.sort_by_key(|l| pos(l));
         routing.dedup();
@@ -1735,6 +1747,19 @@ END NETS\nEND DESIGN\n";
         assert_eq!(d.unresolved_vias, 0);
         let v = &d.via_defs["V_RECT"];
         assert_eq!((v.below.as_str(), v.above.as_str(), v.cut_layer.as_str(), v.cuts), ("met1", "met2", "via", 2));
+    }
+
+    /// Reference rule (its via boxes): a `LAYERS` via's bottom and top are the lowest and highest
+    /// of its three layers in the stack, whatever order the DEF writes them in; the cut stays
+    /// the middle name as written.
+    #[test]
+    fn a_layers_via_written_out_of_order_joins_its_two_metals() {
+        let lef = crate::lef::Lef::parse(LEF).unwrap();
+        let def = DEF.replace("+ LAYERS met1 via met2", "+ LAYERS met1 met2 via");
+        let d = Def::parse_with(&def, &lef).unwrap();
+        let v = &d.via_defs["V_RULE"];
+        assert_eq!((v.below.as_str(), v.above.as_str(), v.cut_layer.as_str()), ("met1", "met2", "met2"));
+        assert_eq!(layers(&d, "b"), vec!["met2", "met1"]);
     }
 
     /// Without the LEF a technology via cannot switch the layer: the path stays (as before) and
