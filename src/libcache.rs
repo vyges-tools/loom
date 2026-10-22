@@ -251,6 +251,7 @@ fn dec_arc(r: &mut R) -> Option<Arc> {
         },
         sigma_rise: dec_table(r)?,
         sigma_fall: dec_table(r)?,
+        no_edges: false,
         // read LAST, as it is written: a struct literal's fields are evaluated in written order
         out_edges: match r.u8()? {
             1 => OutEdges::Rise,
@@ -714,6 +715,7 @@ library (demo) {
         const SEQ: &str = r#"
 library (seqdemo) {
   capacitive_load_unit (1, pf);
+  lu_table_template (t) { variable_1 : input_net_transition; index_1 ("0.1, 0.2"); }
   cell (DFF) {
     pin (CLK) { direction : input; clock : true; capacitance : 0.001; }
     pin (Q) {

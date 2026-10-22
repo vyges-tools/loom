@@ -98,6 +98,8 @@ pub struct Arc {
     // POCV then falls back to the global pocv_sigma fraction.
     pub sigma_rise: Table,
     pub sigma_fall: Table,
+    /// While reading: no edge has a table, so the reference builds no arc — the reader drops it.
+    pub(crate) no_edges: bool,
 }
 
 impl Arc {
@@ -1073,7 +1075,7 @@ fn parse_arc(timing_body: &str, own: &str, spans: &[GroupSpan], ctx: &Ctx) -> Ar
     } else {
         OutEdges::Both
     };
-    Arc {
+    let mut a = Arc {
         related_pin: simple_attr(own, "related_pin").unwrap_or_default(),
         related_bus_pins: simple_attr(own, "related_bus_pins").unwrap_or_default(),
         kind: tt.clone(),
@@ -1094,7 +1096,19 @@ fn parse_arc(timing_body: &str, own: &str, spans: &[GroupSpan], ctx: &Ctx) -> Ar
         },
         sigma_rise: tbl("ocv_sigma_cell_rise"),
         sigma_fall: tbl("ocv_sigma_cell_fall"),
-    }
+        no_edges: false,
+    };
+    // an edge has an arc only with a table for it — its delay or its transition (`makeTableModels`
+    // makes no model otherwise, and no model builds no arc)
+    let rise = a.out_edges.drives(true) && !(a.cell_rise.values.is_empty() && a.rise_transition.values.is_empty());
+    let fall = a.out_edges.drives(false) && !(a.cell_fall.values.is_empty() && a.fall_transition.values.is_empty());
+    a.out_edges = match (rise, fall) {
+        (true, false) => OutEdges::Rise,
+        (false, true) => OutEdges::Fall,
+        _ => a.out_edges,
+    };
+    a.no_edges = !rise && !fall;
+    a
 }
 
 /// Parse CCS `output_current_rise`/`output_current_fall` waveforms from an arc, each current
@@ -1251,7 +1265,12 @@ fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
                 | "falling_edge" | "three_state_enable" | "three_state_enable_rise"
                 | "three_state_enable_fall" | "three_state_disable" | "three_state_disable_rise"
                 | "three_state_disable_fall",
-            ) => arcs.push(parse_arc(tbody, &town, &tspans, ctx)),
+            ) => {
+                let a = parse_arc(tbody, &town, &tspans, ctx);
+                if !a.no_edges {
+                    arcs.push(a);
+                }
+            }
             // Everything else is NOT a delay arc, and read as one it was a zero-delay path that
             // does not exist — onto an input pin, or a clock pin to itself:
             //   * clear / preset are async EFFECT arcs (dfrtp RESET_B->Q); the reference builds
@@ -3579,7 +3598,7 @@ mod timing_type_tests {
     fn arcs(types: &[&str]) -> Vec<Arc> {
         let groups: String = types
             .iter()
-            .map(|t| format!("timing () {{ related_pin : A; timing_type : {t}; cell_rise (scalar) {{ values (\"1\"); }} }}\n"))
+            .map(|t| format!("timing () {{ related_pin : A; timing_type : {t}; cell_rise (scalar) {{ values (\"1\"); }} cell_fall (scalar) {{ values (\"1\"); }} }}\n"))
             .collect();
         let l = Lib::parse(&format!(
             "library (l) {{ cell (C) {{ pin (A) {{ direction : input; }} pin (Y) {{ direction : output; {groups} }} }} }}"
@@ -4141,6 +4160,38 @@ mod dont_use_cells {
         assert!(a.cell_fall.values.is_empty(), "a power template is not a timing template");
         assert_eq!(a.rise_transition.lookup(0.0, 0.0), 5.0, "scalar is built in");
         assert!(a.fall_transition.values.is_empty(), "an undefined template drops the table");
+    }
+
+    /// Reference rule (`LibertyReader::makeTableModels`): an arc has an edge only when that edge
+    /// has a table — its `cell_<edge>` OR its `<edge>_transition`; no model is made otherwise, and
+    /// no model builds no arc. A timing group with neither edge's table has no arc at all.
+    #[test]
+    fn an_edge_with_no_table_has_no_arc() {
+        let l = Lib::parse(
+            r#"library (e) {
+  cell (C) { area : 1.0;
+    pin (A) { direction : input; capacitance : 0.001; }
+    pin (B) { direction : input; capacitance : 0.001; }
+    pin (D) { direction : input; capacitance : 0.001; }
+    pin (E) { direction : input; capacitance : 0.001; }
+    pin (Y) { direction : output; function : "A & B & D & E";
+      timing () { related_pin : "A"; cell_rise (scalar) { values ("1"); } }
+      timing () { related_pin : "B"; fall_transition (scalar) { values ("2"); } }
+      timing () { related_pin : "D"; cell_rise (nope) { values ("3"); } cell_fall (nope) { values ("3"); } }
+      timing () { related_pin : "E"; timing_type : combinational_rise; cell_fall (scalar) { values ("4"); } } } }
+}"#,
+        )
+        .unwrap();
+        let back = crate::libcache::decode(&crate::libcache::encode(&l)).unwrap();
+        for lib in [&l, &back] {
+            let arcs = &lib.cells["C"].pins["Y"].arcs;
+            let edges = |p: &str| arcs.iter().find(|a| a.related_pin == p).map(|a| a.out_edges);
+            assert_eq!(edges("A"), Some(OutEdges::Rise), "a delay table alone makes the edge");
+            assert_eq!(edges("B"), Some(OutEdges::Fall), "a transition table alone makes the edge");
+            assert_eq!(edges("D"), None, "no table of either edge: no arc");
+            assert_eq!(edges("E"), None, "a rise-only type with only a fall table: no arc");
+            assert_eq!(arcs.len(), 2);
+        }
     }
 
     /// Reference rule (`LibertyPort::setFunction` / `setTristateEnable`, `FuncExpr::bitSubExpr`):

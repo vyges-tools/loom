@@ -319,7 +319,9 @@ fn table_values_stay_in_library_time_units() {
 fn a_declared_ccs_table_we_cannot_read_is_counted_separately() {
     let arc_with = |vectors: &str| {
         format!(
-            "library (d) {{\n  capacitive_load_unit (1, pf);\n  cell (INV) {{\n\
+            "library (d) {{\n  capacitive_load_unit (1, pf);\n\
+             \x20 lu_table_template (t) {{ variable_1 : input_net_transition; variable_2 : total_output_net_capacitance; }}\n\
+             \x20 cell (INV) {{\n\
              \x20   pin (A) {{ direction : input; capacitance : 0.004; }}\n\
              \x20   pin (Y) {{ direction : output;\n\
              \x20     timing () {{ related_pin : \"A\";\n\
