@@ -19,7 +19,8 @@ use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, OutEdges, Pin, Pi
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLCH"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLCI"; // Vyges Liberty Cache — bump the trailing digit on any format change
+                                 // VLCI: Arc keeps its kind (`Arc::feeds` pairs edges by it: latch D->Q).
                                  // VLCH: Pin gained `is_reg_clk`, `is_reg_output`, `is_check_clk`.
                                  // VLCG: Constraint gained `clk_edge` + `related_pin`.
                                  // VLCF: Pin gained `unmodelled_checks`.
@@ -228,9 +229,10 @@ fn enc_arc(w: &mut W, a: &Arc) {
         OutEdges::Rise => 1,
         OutEdges::Fall => 2,
     });
+    w.s(&a.kind);
 }
 fn dec_arc(r: &mut R) -> Option<Arc> {
-    Some(Arc {
+    let mut a = Arc {
         related_pin: r.s()?,
         related_bus_pins: String::new(),
         kind: String::new(),
@@ -254,7 +256,9 @@ fn dec_arc(r: &mut R) -> Option<Arc> {
             2 => OutEdges::Fall,
             _ => OutEdges::Both,
         },
-    })
+    };
+    a.kind = r.s()?;
+    Some(a)
 }
 
 fn dir_u8(d: Dir) -> u8 {

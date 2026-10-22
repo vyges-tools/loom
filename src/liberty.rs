@@ -100,6 +100,29 @@ pub struct Arc {
     pub sigma_fall: Table,
 }
 
+impl Arc {
+    /// Does an input edge (`from_rise`) launch the output edge (`to_rise`) through this arc — the
+    /// reference's timing arcs (`LibertyBuilder`), which pair edges by the arc's KIND as well as its
+    /// sense. A caller times `to_rise` only where [`OutEdges::drives`] it.
+    ///
+    /// - a sequential arc launches on its clock edge, to either output edge;
+    /// - a latch D-to-Q arc (`makeLatchDtoQArcs`) is negative only when the latch's `data_in` is,
+    ///   and otherwise pairs like edges — non-unate included;
+    /// - any other arc: positive pairs like edges, negative opposite ones, non-unate every pair.
+    pub fn feeds(&self, from_rise: bool, to_rise: bool) -> bool {
+        if let Some(e) = self.clk_edge {
+            return from_rise == (e == ClkEdge::Rise);
+        }
+        match (self.kind.as_str(), self.sense.as_str()) {
+            ("latch_d_to_q", "negative_unate") => from_rise != to_rise,
+            ("latch_d_to_q", _) => from_rise == to_rise,
+            (_, "positive_unate") => from_rise == to_rise,
+            (_, "negative_unate") => from_rise != to_rise,
+            _ => true,
+        }
+    }
+}
+
 /// A setup or hold constraint: rise/fall tables indexed by
 /// (index_1 = related/clock transition, index_2 = constrained/data transition).
 /// Evaluated by bilinear interpolation at the operating slews (like delay arcs),
@@ -1608,8 +1631,8 @@ fn expand_arcs(pins: &mut BTreeMap<String, Pin>, buses: &[(String, Vec<String>)]
 /// output whose function is one sequential's output (`IQ`): as the reference builds it, from a
 /// pin in the CLOCK expression (`clocked_on`, a latch's `enable`) of positive or negative sense
 /// it is a `rising_edge` arc — negative too, as the reference has it; from a pin in `clear` or
-/// `preset` it is that async effect arc, which is not a delay arc here. Otherwise it stays
-/// combinational (a latch's D->Q among them).
+/// `preset` it is that async effect arc, which is not a delay arc here. From a pin in a latch's
+/// `data_in` it is the latch D->Q arc (see [`Arc::feeds`]). Otherwise it stays combinational.
 fn sequential_arcs(pins: &mut BTreeMap<String, Pin>, seqs: &[(String, String, String)]) {
     use crate::liberty_func::{Func, Sense};
     if seqs.is_empty() {
@@ -1624,6 +1647,7 @@ fn sequential_arcs(pins: &mut BTreeMap<String, Pin>, seqs: &[(String, String, St
         };
         let clock = expr(body, if kw == "ff" { "clocked_on" } else { "enable" });
         let (clear, preset) = (expr(body, "clear"), expr(body, "preset"));
+        let data = if kw == "latch" { expr(body, "data_in") } else { None };
         pin.arcs.retain_mut(|a| {
             if a.clk_edge.is_some() || !matches!(a.kind.as_str(), "" | "combinational") {
                 return true;
@@ -1640,7 +1664,21 @@ fn sequential_arcs(pins: &mut BTreeMap<String, Pin>, seqs: &[(String, String, St
                     }
                     true
                 }
-                _ => !(clear.as_ref().is_some_and(|e| e.has_port(from)) || preset.as_ref().is_some_and(|e| e.has_port(from))),
+                _ if clear.as_ref().is_some_and(|e| e.has_port(from)) || preset.as_ref().is_some_and(|e| e.has_port(from)) => false,
+                _ => {
+                    // a latch's D->Q (`makeLatchDtoQArcs`): its edges follow the sense of `data_in`
+                    // at `from`, whatever the group or the output (an inverted IQN among them) says
+                    if let Some(d) = data.as_ref().filter(|d| d.has_port(from)) {
+                        a.kind = "latch_d_to_q".into();
+                        a.sense = match d.port_timing_sense(from) {
+                            Sense::Positive => "positive_unate",
+                            Sense::Negative => "negative_unate",
+                            _ => "non_unate",
+                        }
+                        .into();
+                    }
+                    true
+                }
             }
         });
     }
@@ -3767,6 +3805,58 @@ mod dont_use_cells {
         // the cache round-trips the flag
         let back = crate::libcache::decode(&crate::libcache::encode(&l)).unwrap();
         assert!(back.cells["INV_X2"].dont_use && !back.cells["INV_X4"].dont_use);
+    }
+
+    /// Reference rule (`makeLatchDtoQArcs`): a latch's D->Q arc pairs edges by the sense of the
+    /// latch's `data_in` at D — negative pairs opposite edges, anything else like edges — whatever
+    /// the timing group declares and whichever of IQ / IQN the output is. So sky130 `dlrbn`'s
+    /// D->Q_N, declared negative_unate, is timed D rise -> Q_N rise. The edges survive the cache.
+    #[test]
+    fn a_latch_d_to_q_arc_pairs_edges_by_the_data_in_sense() {
+        let l = Lib::parse(
+            r#"library (l) {
+  cell (LAT) { area : 1.0;
+    latch (IQ, IQN) { enable : "G"; data_in : "D"; }
+    pin (D) { direction : input; capacitance : 0.001; }
+    pin (G) { direction : input; capacitance : 0.001; }
+    pin (Q) { direction : output; function : "IQ";
+      timing () { related_pin : "D"; timing_sense : positive_unate; cell_rise (scalar) { values ("1"); } cell_fall (scalar) { values ("2"); } } }
+    pin (QN) { direction : output; function : "IQN";
+      timing () { related_pin : "D"; timing_sense : negative_unate; cell_rise (scalar) { values ("1"); } cell_fall (scalar) { values ("2"); } } } }
+  cell (LATI) { area : 1.0;
+    latch (IQ, IQN) { enable : "G"; data_in : "!D"; }
+    pin (D) { direction : input; capacitance : 0.001; }
+    pin (G) { direction : input; capacitance : 0.001; }
+    pin (Q) { direction : output; function : "IQ";
+      timing () { related_pin : "D"; cell_rise (scalar) { values ("1"); } cell_fall (scalar) { values ("2"); } } } }
+  cell (LATX) { area : 1.0;
+    latch (IQ, IQN) { enable : "G"; data_in : "D ^ S"; }
+    pin (D) { direction : input; capacitance : 0.001; }
+    pin (S) { direction : input; capacitance : 0.001; }
+    pin (G) { direction : input; capacitance : 0.001; }
+    pin (Q) { direction : output; function : "IQ";
+      timing () { related_pin : "D"; cell_rise (scalar) { values ("1"); } cell_fall (scalar) { values ("2"); } } } }
+  cell (INV) { area : 1.0;
+    pin (A) { direction : input; capacitance : 0.001; }
+    pin (Y) { direction : output; function : "!A";
+      timing () { related_pin : "A"; cell_rise (scalar) { values ("1"); } cell_fall (scalar) { values ("2"); } } } }
+}"#,
+        )
+        .unwrap();
+        let pairs = |l: &Lib, c: &str, p: &str| {
+            let a = &l.cells[c].pins[p].arcs[0];
+            [(true, true), (true, false), (false, true), (false, false)].map(|(f, t)| a.feeds(f, t))
+        };
+        let like = [true, false, false, true];
+        let opposite = [false, true, true, false];
+        let back = crate::libcache::decode(&crate::libcache::encode(&l)).unwrap();
+        for lib in [&l, &back] {
+            assert_eq!(pairs(lib, "LAT", "Q"), like);
+            assert_eq!(pairs(lib, "LAT", "QN"), like, "data_in D is positive: the IQN output does not invert it");
+            assert_eq!(pairs(lib, "LATI", "Q"), opposite, "data_in !D is negative");
+            assert_eq!(pairs(lib, "LATX", "Q"), like, "a NON-unate data_in still pairs like edges only");
+            assert_eq!(pairs(lib, "INV", "Y"), opposite, "a plain arc keeps its function's sense");
+        }
     }
 
     /// Reference rule (`getAttrBool`): `true` / `false` are matched IGNORING CASE (`stringEqual`
