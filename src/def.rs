@@ -369,6 +369,7 @@ impl Def {
         let pins = parse_pins(&tref);
         let mut nets = nets;
         attach_pins(&mut nets, &pins);
+        connect_once(&mut nets);
         Ok(Def {
             units_per_um: scale,
             dbu: scale,
@@ -845,6 +846,28 @@ fn orient_pt(x: i64, y: i64, orient: &str) -> (i64, i64) {
 /// ( x2 y2 ) … + FIXED ( ox oy ) <orient> ;`. Several `LAYER` rectangles may share one `PORT`
 /// and one placement, which is exactly how a power pin is written — so rectangles are collected
 /// and the placement applied to all of them when the entry ends.
+/// An instance pin is on one net. The reference connects each `( <inst> <pin> )` in file order
+/// and a connection DISCONNECTS the pin from the net it was on, so a pin listed by two nets ends
+/// on the later one and the earlier net loses it.
+fn connect_once(nets: &mut [DefNet]) {
+    let mut last: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for (k, n) in nets.iter().enumerate() {
+        for (i, p) in &n.pins {
+            if i != "PIN" && i != "*" {
+                last.insert((i.clone(), p.clone()), k);
+            }
+        }
+    }
+    // ... and a connection to the net it is already on changes nothing: listed twice by one
+    // net, it is there once
+    for (k, n) in nets.iter_mut().enumerate() {
+        let mut seen = std::collections::BTreeSet::new();
+        n.pins.retain(|(i, p)| {
+            i == "PIN" || i == "*" || (last.get(&(i.clone(), p.clone())) == Some(&k) && seen.insert((i.clone(), p.clone())))
+        });
+    }
+}
+
 /// Which nets the block terminals are on, as the reference decides it: a pin is created on the
 /// net its `PINS` entry names (`+ NET`), and a `( PIN <name> )` connection in `NETS` creates the
 /// pin only when no pin of that name exists — otherwise it changes nothing, so a pin stays on
@@ -1767,6 +1790,17 @@ mod special_rule_tests {
         assert_eq!(conns("out"), [c("PIN", "out1"), c("r2", "Q")]);
         assert_eq!(conns("out1"), [c("r3", "Q")]);
         assert_eq!(conns("in"), [c("PIN", "in"), c("u1", "A")]);
+    }
+
+    /// Reference rule (its NET reader connects, and a connection first disconnects): an instance
+    /// pin listed by two nets is on the later one only, and listed twice by one net is there once.
+    #[test]
+    fn an_instance_pin_listed_twice_is_on_the_later_net() {
+        let def = "UNITS DISTANCE MICRONS 1000 ;\nNETS 2 ;\n- x ( d0 Q ) ( u1 A ) ;\n- out ( d0 Q ) ( d0 Q ) ;\nEND NETS\n";
+        let d = Def::parse(def).unwrap();
+        let conns = |name: &str| d.nets.iter().find(|n| n.name == name).unwrap().pins.clone();
+        assert_eq!(conns("x"), [("u1".to_string(), "A".to_string())]);
+        assert_eq!(conns("out"), [("d0".to_string(), "Q".to_string())]);
     }
 
     fn snet(body: &str) -> NetGeom {
