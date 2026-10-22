@@ -762,6 +762,13 @@ fn idents_in(expr: &str) -> Vec<String> {
 ///
 /// ⚠️ It scans the whole of `body`. A hot path reads its attributes from [`own_attrs`], computed
 /// once, rather than from a body that carries large tables.
+/// A boolean attribute: `true` / `false` in ANY case, as the reference reads them (`getAttrBool`
+/// compares with `stringEqual`, which folds case). ⛔ An exact `== "true"` missed gf180's SRAM macro,
+/// which says `dont_use : TRUE;`.
+fn bool_attr(body: &str, key: &str) -> bool {
+    simple_attr(body, key).is_some_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
 fn simple_attr(body: &str, key: &str) -> Option<String> {
     let b = body.as_bytes();
     let k = key.as_bytes();
@@ -1118,7 +1125,7 @@ fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
             }
         })
     };
-    let clock = simple_attr(&own, "clock").as_deref() == Some("true");
+    let clock = bool_attr(&own, "clock");
     // Liberty puts `function` on the OUTPUT pin, not the cell. It is what makes two cells
     // comparable: a resize must not change what a gate computes.
     let function = simple_attr(&own, "function").filter(|f| !f.is_empty());
@@ -1951,7 +1958,7 @@ fn parse_cell(
     let area = simple_attr(&own, "area")
         .and_then(|s| lnum(&s))
         .unwrap_or(0.0);
-    let dont_use = simple_attr(&own, "dont_use").as_deref() == Some("true");
+    let dont_use = bool_attr(&own, "dont_use");
     Cell {
         name,
         pins,
@@ -3760,6 +3767,26 @@ mod dont_use_cells {
         // the cache round-trips the flag
         let back = crate::libcache::decode(&crate::libcache::encode(&l)).unwrap();
         assert!(back.cells["INV_X2"].dont_use && !back.cells["INV_X4"].dont_use);
+    }
+
+    /// Reference rule (`getAttrBool`): `true` / `false` are matched IGNORING CASE (`stringEqual`
+    /// folds case). gf180's SRAM macro writes `dont_use : TRUE;` and its clock pin could as well.
+    #[test]
+    fn boolean_attributes_ignore_case() {
+        let l = Lib::parse(
+            r#"library (b) {
+  cell (M1) { area : 1.0; dont_use : TRUE;
+    pin (CLK) { direction : input; clock : True; capacitance : 0.001; }
+    pin (A) { direction : input; clock : FALSE; capacitance : 0.001; } }
+  cell (M2) { area : 1.0; dont_use : False;
+    pin (A) { direction : input; capacitance : 0.001; } }
+}"#,
+        )
+        .unwrap();
+        assert!(l.cells["M1"].dont_use, "TRUE is true");
+        assert!(!l.cells["M2"].dont_use, "False is false");
+        assert!(l.cells["M1"].pins["CLK"].clock, "True is true");
+        assert!(!l.cells["M1"].pins["A"].clock);
     }
 }
 
