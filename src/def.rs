@@ -843,6 +843,21 @@ fn orient_pt(x: i64, y: i64, orient: &str) -> (i64, i64) {
 /// ( x2 y2 ) … + FIXED ( ox oy ) <orient> ;`. Several `LAYER` rectangles may share one `PORT`
 /// and one placement, which is exactly how a power pin is written — so rectangles are collected
 /// and the placement applied to all of them when the entry ends.
+/// A `PINS` entry named `<pin>.extra<N>` (or, for a bus bit, `<bus>.extra<N>[<i>]`) is more
+/// placements of the pin `<pin>` (`<bus>[<i>]`) when that pin is already defined — the
+/// reference's reader adds them to it; otherwise it is a pin of its own, under its full name.
+/// `None`: not an extra; `Some(None)`: one bus character without the other, which the reference
+/// refuses (the statement is dropped); `Some(Some(base))`: the pin it extends.
+fn extra_pin_base(name: &str) -> Option<Option<String>> {
+    let k = name.find(".extra")?;
+    let tail = &name[k..];
+    Some(match (tail.find('['), tail.find(']')) {
+        (Some(l), Some(_)) => Some(format!("{}{}", &name[..k], &tail[l..])),
+        (None, None) => Some(name[..k].to_string()),
+        _ => None,
+    })
+}
+
 fn parse_pins(toks: &[&str]) -> Vec<DefPin> {
     let mut out = Vec::new();
     let Some(s) = section_start(toks, "PINS") else {
@@ -882,7 +897,19 @@ fn parse_pins(toks: &[&str]) -> Vec<DefPin> {
                  out: &mut Vec<DefPin>| {
         if let Some(mut p) = cur.take() {
             place(&mut p, rel, origin, orient);
-            out.push(p);
+            match extra_pin_base(&p.name) {
+                // an unmatched bus character after `.extra`: the reference drops the statement
+                Some(None) => {}
+                Some(Some(base)) => match out.iter_mut().find(|q| q.name == base) {
+                    Some(q) => {
+                        q.shapes.append(&mut p.shapes);
+                        q.use_power |= p.use_power;
+                        q.use_ground |= p.use_ground;
+                    }
+                    None => out.push(p),
+                },
+                None => out.push(p),
+            }
         }
         rel.clear();
         *origin = (0, 0);
@@ -1671,6 +1698,26 @@ mod special_rule_tests {
         let d = Def::parse(def).unwrap();
         let shapes: Vec<(i64, i64)> = d.pins[0].shapes.iter().map(|s| (s.1, s.2)).collect();
         assert_eq!(shapes, [(900, 900), (8900, 8900)]);
+    }
+
+    /// Reference rule (its PIN reader): `<pin>.extra<N>` — `<bus>.extra<N>[<i>]` for a bus bit —
+    /// adds placements to the pin already defined under the base name; with no such pin it is a
+    /// pin of its own; one bus character without the other drops the statement.
+    #[test]
+    fn an_extra_pin_adds_placements_to_its_base_pin() {
+        let def = "UNITS DISTANCE MICRONS 1000 ;\nPINS 6 ;\n\
+                   - VDD + NET VDD + USE POWER + LAYER m5 ( 0 0 ) ( 10 10 ) + FIXED ( 100 100 ) N ;\n\
+                   - VDD.extra1 + NET VDD + USE POWER + LAYER m5 ( 0 0 ) ( 10 10 ) + FIXED ( 500 500 ) N ;\n\
+                   - d[3] + NET d[3] + LAYER m2 ( 0 0 ) ( 10 10 ) + FIXED ( 0 0 ) N ;\n\
+                   - d.extra2[3] + NET d[3] + LAYER m2 ( 0 0 ) ( 10 10 ) + FIXED ( 50 0 ) N ;\n\
+                   - lone.extra1 + NET lone + LAYER m2 ( 0 0 ) ( 10 10 ) + FIXED ( 0 50 ) N ;\n\
+                   - bad.extra1[2 + NET bad + LAYER m2 ( 0 0 ) ( 10 10 ) + FIXED ( 0 90 ) N ;\nEND PINS\n";
+        let d = Def::parse(def).unwrap();
+        let names: Vec<&str> = d.pins.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["VDD", "d[3]", "lone.extra1"]);
+        let x: Vec<i64> = d.pins[0].shapes.iter().map(|s| s.1).collect();
+        assert_eq!(x, [100, 500]);
+        assert_eq!(d.pins[1].shapes.len(), 2);
     }
 
     fn snet(body: &str) -> NetGeom {
