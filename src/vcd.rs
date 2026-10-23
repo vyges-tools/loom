@@ -110,6 +110,18 @@ impl WindowActivity<'_> {
             None => 0.0,
         }
     }
+
+    /// Transitions / second for a netlist net by the reference's rule — only a dump entry that
+    /// names a port or an instance pin counts ([`crate::names::PinPaths`]).
+    pub fn pin_rate(&self, pins: &crate::names::PinPaths, net: &str) -> f64 {
+        if self.win.sim_time_s <= 0.0 {
+            return 0.0;
+        }
+        match pins.resolve_path(self.decls, net) {
+            Some(p) => self.win.toggles.get(p).copied().unwrap_or(0.0) / self.win.sim_time_s,
+            None => 0.0,
+        }
+    }
 }
 
 /// A step-held real-valued series to lay alongside a dump: `(time_s, value)` points, each
@@ -444,6 +456,15 @@ impl Vcd {
     /// zero-duration sim). Resolution is scope-aware — see [`crate::names::NetIndex`].
     pub fn toggle_rate(&self, net: &str) -> f64 {
         match self.idx.resolve(net) {
+            Some(n) if self.sim_time_s > 0.0 => n / self.sim_time_s,
+            _ => 0.0,
+        }
+    }
+
+    /// Transitions / second for a netlist net by the reference's rule — only a dump entry that
+    /// names a port or an instance pin counts ([`crate::names::PinPaths`]).
+    pub fn pin_rate(&self, pins: &crate::names::PinPaths, net: &str) -> f64 {
+        match pins.resolve(&self.idx, net) {
             Some(n) if self.sim_time_s > 0.0 => n / self.sim_time_s,
             _ => 0.0,
         }

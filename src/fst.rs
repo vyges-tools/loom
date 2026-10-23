@@ -72,6 +72,15 @@ impl Fst {
         }
     }
 
+    /// Transitions / second for a netlist net by the reference's rule — only a dump entry that
+    /// names a port or an instance pin counts ([`crate::names::PinPaths`]).
+    pub fn pin_rate(&self, pins: &crate::names::PinPaths, net: &str) -> f64 {
+        match pins.resolve(&self.idx, net) {
+            Some(n) if self.sim_time_s > 0.0 => n / self.sim_time_s,
+            _ => 0.0,
+        }
+    }
+
     pub fn with_scope(mut self, scope: Option<String>) -> Self {
         self.idx.scope = scope;
         self

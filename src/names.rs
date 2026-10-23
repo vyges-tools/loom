@@ -146,6 +146,54 @@ impl NetIndex {
     }
 }
 
+/// The dumped names that may carry a netlist net's activity: the reference's rule for which
+/// dump entries annotate the design.
+///
+/// 🔑 **The reference annotates PINS, never nets.** Its VCD reader looks each variable up as a pin
+/// (`findPin` on the variable's path below the scope) and its SAIF reader looks each `NET` entry
+/// up as a pin of the enclosing instance. So an entry counts only when it names a **top-level
+/// port** or a **leaf instance's pin** (`inst/pin`, spelled `inst.pin` in a dump path). An entry
+/// naming a bare internal net — `n1` between `u1/X` and `u2/A` — matches no pin and is dropped,
+/// whatever it toggles; so is a power/ground pin. Keyed by net here because the consumers are:
+/// a net's rate is the first of its candidates the dump carries — its port, then its instance
+/// pins in netlist order (the reference gives each pin its own entry; every pin of one net
+/// carries one signal, so they agree unless the dump itself disagrees).
+#[derive(Clone, Debug, Default)]
+pub struct PinPaths {
+    by_net: HashMap<String, Vec<String>>,
+}
+
+impl PinPaths {
+    /// From a netlist. `is_pg(cell, pin)` names the power/ground pins, which never annotate.
+    pub fn new(nl: &crate::netlist::Netlist, is_pg: impl Fn(&str, &str) -> bool) -> Self {
+        let mut by_net: HashMap<String, Vec<String>> = HashMap::new();
+        for port in nl.inputs.iter().chain(&nl.outputs).chain(&nl.inouts) {
+            by_net.entry(port.clone()).or_default().push(port.clone());
+        }
+        for inst in &nl.insts {
+            for (pin, net) in &inst.conns {
+                if pin.is_empty() || is_pg(&inst.cell, pin) {
+                    continue; // a positional connection names no pin
+                }
+                by_net.entry(net.clone()).or_default().push(format!("{}.{pin}", inst.name));
+            }
+        }
+        PinPaths { by_net }
+    }
+
+    /// The dumped path that carries `net`'s activity in `idx`, by [`PinPaths`]'s rule; `None`
+    /// when no port or pin of the net is in the dump (or each is ambiguous).
+    pub fn resolve_path<'a>(&self, idx: &'a NetIndex, net: &str) -> Option<&'a str> {
+        self.by_net.get(net)?.iter().find_map(|cand| idx.resolve_path(cand))
+    }
+
+    /// The transition count of `net` in `idx` by this rule.
+    pub fn resolve(&self, idx: &NetIndex, net: &str) -> Option<f64> {
+        let path = self.resolve_path(idx, net)?;
+        Some(idx.toggles.get(path).copied().unwrap_or(0.0))
+    }
+}
+
 /// The last `.`-separated component of a hierarchical path.
 pub fn leaf_of(path: &str) -> &str {
     path.rsplit('.').next().unwrap_or(path)
@@ -233,6 +281,85 @@ pub(crate) fn unescape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The probe the rule was read from: `n1` is a NET (u1/X -> u2/A), `a` and `y` are ports.
+    const PROBE_V: &str = "module top (a, y);\n input a; output y; wire n1;\n \
+        buf1 u1 (.A(a), .X(n1));\n buf1 u2 (.A(n1), .X(y));\nendmodule\n";
+
+    /// Reference rule (VCD reader, `addVarPin`): a variable annotates only through `findPin` on
+    /// its path below the scope — a top-level port or a leaf instance pin. A variable naming the
+    /// internal net `n1` annotates nothing; `a` and `y` annotate their ports.
+    #[test]
+    fn a_dump_entry_naming_an_internal_net_annotates_nothing() {
+        let nl = crate::netlist::parse(PROBE_V).unwrap();
+        let pins = PinPaths::new(&nl, |_, _| false);
+        let vcd = crate::vcd::Vcd::parse(
+            "$timescale 1ns $end\n$scope module tb $end\n$scope module top $end\n\
+             $var wire 1 ! a $end\n$var wire 1 \" n1 $end\n$var wire 1 # y $end\n\
+             $upscope $end\n$upscope $end\n$enddefinitions $end\n\
+             #0\n0!\n0\"\n0#\n#10\n1!\n1\"\n1#\n#20\n0!\n0\"\n0#\n#30\n1!\n#40\n0!\n#100\n",
+        )
+        .unwrap()
+        .with_scope(Some("tb.top".into()));
+        assert!((vcd.pin_rate(&pins, "a") - 4.0e7).abs() < 1.0, "port a: 4 toggles / 100 ns");
+        assert!((vcd.pin_rate(&pins, "y") - 2.0e7).abs() < 1.0, "port y: 2 toggles / 100 ns");
+        assert_eq!(vcd.pin_rate(&pins, "n1"), 0.0, "n1 is no pin: dropped");
+        // the net-keyed reading the rule replaces gives n1 the dumped rate
+        assert!(vcd.toggle_rate("n1") > 0.0);
+    }
+
+    /// The other side of the same rule: a variable naming an instance PIN (`u1/X`, dumped as
+    /// scope `u1`, variable `X`) annotates that pin, and so the net the pin is on.
+    #[test]
+    fn a_dump_entry_naming_an_instance_pin_annotates_its_net() {
+        let nl = crate::netlist::parse(PROBE_V).unwrap();
+        let pins = PinPaths::new(&nl, |_, _| false);
+        let vcd = crate::vcd::Vcd::parse(
+            "$timescale 1ns $end\n$scope module tb $end\n$scope module top $end\n\
+             $scope module u1 $end\n$var wire 1 ! X $end\n$upscope $end\n\
+             $upscope $end\n$upscope $end\n$enddefinitions $end\n\
+             #0\n0!\n#10\n1!\n#20\n0!\n#100\n",
+        )
+        .unwrap()
+        .with_scope(Some("tb.top".into()));
+        assert!((vcd.pin_rate(&pins, "n1") - 2.0e7).abs() < 1.0, "u1/X is on n1");
+        assert_eq!(vcd.toggle_rate("n1"), 0.0, "the net-keyed reading misses it");
+    }
+
+    /// SAIF (reference `setNetDurations`: `findPin(parent, name)`): a top-level `NET` entry for an
+    /// internal net is no pin of the top instance; one inside the leaf instance `u2` is its pin.
+    #[test]
+    fn a_saif_net_entry_annotates_only_a_port_or_an_instance_pin() {
+        let nl = crate::netlist::parse(PROBE_V).unwrap();
+        let pins = PinPaths::new(&nl, |_, _| false);
+        let s = crate::saif::Saif::parse(
+            "(SAIFILE (DURATION 100) (TIMESCALE 1 ns) (INSTANCE top \
+             (NET (a (T0 50) (T1 50) (TC 4)) (n1 (T0 50) (T1 50) (TC 6))) \
+             (INSTANCE u2 (NET (A (T0 50) (T1 50) (TC 2))))))",
+        )
+        .unwrap()
+        .with_scope(Some("top".into()));
+        assert!((s.pin_rate(&pins, "a") - 4.0e7).abs() < 1.0);
+        assert!((s.pin_rate(&pins, "n1") - 2.0e7).abs() < 1.0, "u2/A carries n1, not the NET n1 entry");
+    }
+
+    /// A power/ground pin never annotates, even when the dump names it.
+    #[test]
+    fn a_power_pin_never_annotates() {
+        let nl = crate::netlist::parse(
+            "module top (a); input a; wire vdd; buf1 u1 (.A(a), .VPWR(vdd)); endmodule\n",
+        )
+        .unwrap();
+        let pins = PinPaths::new(&nl, |_, pin| pin == "VPWR");
+        let s = crate::saif::Saif::parse(
+            "(SAIFILE (DURATION 100) (TIMESCALE 1 ns) (INSTANCE top \
+             (INSTANCE u1 (NET (VPWR (T0 50) (T1 50) (TC 2))))))",
+        )
+        .unwrap()
+        .with_scope(Some("top".into()));
+        assert_eq!(s.pin_rate(&pins, "vdd"), 0.0);
+        assert!(PinPaths::new(&nl, |_, _| false).resolve(&s.idx, "vdd").is_some(), "the predicate is what drops it");
+    }
 
     fn idx() -> NetIndex {
         // clk_in appears in the testbench AND the DUT; q only in the DUT.
