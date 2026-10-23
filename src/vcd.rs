@@ -640,6 +640,12 @@ fn parse_grid(text: &str, grid: Grid) -> Result<VcdSweep, VcdError> {
     // (`$dumpvars` or a change) — the whole-dump rate divides by `last time - start`.
     let mut start_ticks: f64 = 0.0;
     let mut values_started = false;
+    // Whether the reference has entered its value loop (`parseVarValues`). ⛔ **It enters on
+    // `$dumpvars`, or on the first value-change token outside one — and that token is LOST**: the
+    // value loop starts by reading the NEXT token, so the change that triggered it is never
+    // applied. A dump with no `$dumpvars` loses its first change, and that signal's next change
+    // then reads as its initial value rather than a transition. Transcribed as the reference reads.
+    let mut in_value_loop = false;
     let mut active = grid.active(0.0);
     if let Some((_, hi)) = active {
         grow(&mut buckets, hi)?;
@@ -686,7 +692,10 @@ fn parse_grid(text: &str, grid: Grid) -> Result<VcdSweep, VcdError> {
             // like a timestamp and a value change. Read as data, a commented-out `#999 1!`
             // became a real transition — activity invented out of prose.
             // The initial values: from here on a timestamp no longer moves the dump's start.
-            "$dumpvars" => values_started = true,
+            "$dumpvars" => {
+                values_started = true;
+                in_value_loop = true;
+            }
             "$comment" => {
                 for t in toks.by_ref() {
                     if t == "$end" {
@@ -723,6 +732,11 @@ fn parse_grid(text: &str, grid: Grid) -> Result<VcdSweep, VcdError> {
                     let sig = build_sig(&ty, width, &base, range.as_deref(), &mut idx);
                     sym2sig.entry(sym).or_default().push(sig);
                 }
+            }
+            _ if !in_value_loop && !tok.starts_with('#') && !tok.starts_with('$') => {
+                // The token that starts the reference's value loop — see `in_value_loop`.
+                in_value_loop = true;
+                values_started = true;
             }
             _ => {
                 if let Some(rest) = tok.strip_prefix('#') {
@@ -1071,12 +1085,31 @@ mod tests {
     fn an_escaped_name_is_read_without_its_escape() {
         let v = Vcd::parse(
             "$timescale 1ns $end\n$scope module top $end\n$var wire 1 ! \\ctrl.state.out[1] $end\n\
-             $upscope $end\n$enddefinitions $end\n#0\n0!\n#10\n1!\n#20\n",
+             $upscope $end\n$enddefinitions $end\n#0\n$dumpvars\n0!\n#10\n1!\n#20\n",
         )
         .unwrap()
         .with_scope(Some("top".into()));
         assert_eq!(v.idx.toggles.get("top.ctrl.state.out[1]").copied(), Some(1.0));
         assert!(v.toggle_rate("ctrl.state.out[1]") > 0.0);
+    }
+
+    /// Reference rule (`VcdParse::read`, `parseVarValues`): outside `$dumpvars`, the first
+    /// value-change token starts the value loop and is itself discarded — the loop begins by
+    /// reading the NEXT token. Witnessed on the reference (`upstream-net-var`): `a` is dumped
+    /// 0,1,0,1,0 at 0/10/20/30/40 ns with no `$dumpvars`, the `0` at 0 ns is never applied, the
+    /// `1` at 10 ns becomes its initial value, and it reads THREE transitions, not four. `y`,
+    /// dumped after it, keeps its initial value and both changes.
+    #[test]
+    fn without_dumpvars_the_first_value_change_is_lost() {
+        let text = "$timescale 1ns $end\n$scope module tb $end\n$scope module top $end\n\
+             $var wire 1 ! a $end\n$var wire 1 # y $end\n$upscope $end\n$upscope $end\n\
+             $enddefinitions $end\n#0\n0!\n0#\n#10\n1!\n1#\n#20\n0!\n0#\n#30\n1!\n#40\n0!\n#100\n";
+        let v = Vcd::parse(text).unwrap();
+        assert_eq!(v.idx.toggles.get("tb.top.a").copied(), Some(3.0));
+        assert_eq!(v.idx.toggles.get("tb.top.y").copied(), Some(2.0));
+        // with `$dumpvars` nothing is lost
+        let v = Vcd::parse(&text.replace("#0\n0!", "#0\n$dumpvars\n0!")).unwrap();
+        assert_eq!(v.idx.toggles.get("tb.top.a").copied(), Some(4.0));
     }
 
     const VCD: &str = r#"
@@ -1087,6 +1120,7 @@ $var wire 1 " a $end
 $upscope $end
 $enddefinitions $end
 #0
+$dumpvars
 0!
 0"
 #5
@@ -1111,6 +1145,7 @@ $upscope $end
 $upscope $end
 $enddefinitions $end
 #0
+$dumpvars
 0!
 0@
 #5
@@ -1196,6 +1231,7 @@ $var wire 4 ! data [3:0] $end
 $upscope $end
 $enddefinitions $end
 #0
+$dumpvars
 b0000 !
 #5
 b0011 !
@@ -1229,6 +1265,7 @@ $var wire 4 ! data [3:0] $end
 $upscope $end
 $enddefinitions $end
 #0
+$dumpvars
 b0000 !
 #5
 b0001 !
@@ -1605,7 +1642,7 @@ mod gzip_tests {
 
     #[test]
     fn a_gzipped_vcd_loads_as_its_text() {
-        let text = "$timescale 1ns $end\n$scope module top $end\n$var wire 1 ! clk $end\n$upscope $end\n$enddefinitions $end\n#0\n0!\n#5\n1!\n#10\n0!\n#20\n";
+        let text = "$timescale 1ns $end\n$scope module top $end\n$var wire 1 ! clk $end\n$upscope $end\n$enddefinitions $end\n#0\n$dumpvars\n0!\n#5\n1!\n#10\n0!\n#20\n";
         let mut g = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
         g.extend(miniz_oxide::deflate::compress_to_vec(text.as_bytes(), 6));
         g.extend_from_slice(&[0; 4]);

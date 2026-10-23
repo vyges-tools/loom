@@ -301,7 +301,9 @@ mod tests {
         )
         .unwrap()
         .with_scope(Some("tb.top".into()));
-        assert!((vcd.pin_rate(&pins, "a") - 4.0e7).abs() < 1.0, "port a: 4 toggles / 100 ns");
+        // The reference's own figure: 3 transitions, not the 4 dumped — the dump has no
+        // `$dumpvars`, so `a`'s first change is lost (see the VCD reader's `in_value_loop`).
+        assert!((vcd.pin_rate(&pins, "a") - 3.0e7).abs() < 1.0, "port a: 3 transitions / 100 ns");
         assert!((vcd.pin_rate(&pins, "y") - 2.0e7).abs() < 1.0, "port y: 2 toggles / 100 ns");
         assert_eq!(vcd.pin_rate(&pins, "n1"), 0.0, "n1 is no pin: dropped");
         // the net-keyed reading the rule replaces gives n1 the dumped rate
@@ -318,7 +320,7 @@ mod tests {
             "$timescale 1ns $end\n$scope module tb $end\n$scope module top $end\n\
              $scope module u1 $end\n$var wire 1 ! X $end\n$upscope $end\n\
              $upscope $end\n$upscope $end\n$enddefinitions $end\n\
-             #0\n0!\n#10\n1!\n#20\n0!\n#100\n",
+             #0\n$dumpvars\n0!\n#10\n1!\n#20\n0!\n#100\n",
         )
         .unwrap()
         .with_scope(Some("tb.top".into()));

@@ -7,7 +7,16 @@
 
 use vyges_loom::vcd::Vcd;
 
+/// A dump whose values open with `$dumpvars` after the first timestamp, as dumpers write them.
+/// ⚠️ Without it the reference DROPS the first value change (the token that starts its value
+/// loop) — a rule of its own, pinned in the reader's unit tests; these cases test the others.
 fn vcd(decls: &str, body: &str) -> String {
+    let body = match body.split_once('\n') {
+        Some((first, rest)) if first.starts_with('#') && !body.contains("$dumpvars") => {
+            format!("{first}\n$dumpvars\n{rest}")
+        }
+        _ => body.to_string(),
+    };
     format!(
         "$timescale 1ns $end\n$scope module top $end\n{decls}$upscope $end\n\
          $enddefinitions $end\n{body}"
@@ -77,7 +86,7 @@ fn an_aliased_identifier_credits_every_name() {
 fn a_comment_body_is_not_activity() {
     let v = Vcd::parse(&vcd(
         "$var wire 1 ! clk $end\n",
-        "$comment\n#999\n1!\n0!\n1!\n$end\n#0\n0!\n#10\n1!\n",
+        "$comment\n#999\n1!\n0!\n1!\n$end\n#0\n$dumpvars\n0!\n#10\n1!\n",
     ))
     .unwrap();
     assert_eq!(toggles(&v, "clk"), 1.0);
