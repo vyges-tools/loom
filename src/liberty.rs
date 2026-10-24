@@ -429,7 +429,38 @@ pub struct Cell {
     /// times a driver with its own library's thresholds and converts each wire delay and load
     /// slew to the load's (`thresholdAdjust`). `None`: the library's own ([`Lib::cell_thresholds`]).
     pub thresholds: Option<Thresholds>,
+    /// The cell's own `ff` or `latch` group, when it has exactly one and no bank or `statetable`
+    /// (`None` otherwise, a combinational cell included). ⛔ Read at the cell's own level: a
+    /// `test_cell`'s `ff` describes scan mode.
+    pub seq_group: Option<SeqGroup>,
 }
+
+/// An `ff` or `latch` group as written: the two state variables it declares, which the output
+/// pins' functions read (`Q : "IQ"`), and the expressions that drive them, unparsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeqGroup {
+    /// A `latch` group rather than an `ff`.
+    pub latch: bool,
+    /// The state variables, `ff (IQ, IQN)`: the stored value and its complement.
+    pub iq: String,
+    pub iqn: String,
+    /// The group's attributes among [`SEQ_GROUP_ATTRS`], by name, values as written.
+    pub attrs: BTreeMap<String, String>,
+}
+
+/// The attributes an `ff` / `latch` group may state (Liberty's own names).
+pub const SEQ_GROUP_ATTRS: [&str; 10] = [
+    "next_state",
+    "clocked_on",
+    "clocked_on_also",
+    "enable",
+    "enable_also",
+    "data_in",
+    "clear",
+    "preset",
+    "clear_preset_var1",
+    "clear_preset_var2",
+];
 
 impl Lib {
     /// The cells interchangeable with `cell`, **ranked by `area` ascending** — a drive-strength
@@ -2185,6 +2216,7 @@ fn parse_cell(
         .unwrap_or(0.0);
     let dont_use = bool_attr(&own, "dont_use");
     let is_macro = bool_attr(&own, "is_macro_cell");
+    let seq_group = seq_group(&groups);
     Cell {
         name,
         pins,
@@ -2200,7 +2232,26 @@ fn parse_cell(
         dont_use,
         is_macro,
         thresholds: None,
+        seq_group,
     }
+}
+
+/// The cell's one `ff` / `latch` group (see [`Cell::seq_group`]), from its top-level groups.
+fn seq_group<B: AsRef<str>>(groups: &[(String, String, B)]) -> Option<SeqGroup> {
+    let mut seqs = groups
+        .iter()
+        .filter(|(k, _, _)| matches!(k.as_str(), "ff" | "latch" | "ff_bank" | "latch_bank" | "statetable"));
+    let (kw, args, body) = seqs.next()?;
+    if seqs.next().is_some() || !matches!(kw.as_str(), "ff" | "latch") {
+        return None;
+    }
+    let vars: Vec<&str> = args.split(',').map(|a| a.trim().trim_matches('"').trim()).collect();
+    let [iq, iqn] = vars[..] else { return None };
+    let attrs = SEQ_GROUP_ATTRS
+        .iter()
+        .filter_map(|k| simple_attr(body.as_ref(), k).map(|v| (k.to_string(), v)))
+        .collect();
+    Some(SeqGroup { latch: kw == "latch", iq: iq.to_string(), iqn: iqn.to_string(), attrs })
 }
 
 /// Options controlling how much of a Liberty file is parsed.
@@ -4501,6 +4552,71 @@ mod clock_roles_by_arcs {
         let back = crate::libcache::decode(&crate::libcache::encode(&lib)).unwrap();
         for (c, p) in [("MACRO", "LCLK"), ("DFR", "RESET_B"), ("LAT", "G"), ("DFR", "Q")] {
             assert_eq!(pin(&back, c, p), pin(&lib, c, p), "{c}/{p}");
+        }
+    }
+
+    /// A cell's own `ff` / `latch` group is kept as written: its two state variables and the
+    /// expressions driving them, so a logic checker can model the register (Liberty: the output
+    /// pins read the state variables, `next_state` is loaded on `clocked_on`, `clear` / `preset`
+    /// force it asynchronously). ⛔ A `test_cell`'s `ff` is scan mode and never the cell's; a bank
+    /// or a `statetable` gives `None` rather than one register of several.
+    #[test]
+    fn a_cells_own_ff_group_is_kept_as_written() {
+        const SRC: &str = r#"
+library (seqgroups) {
+  cell (DFR) {
+    pin (CLK) { direction : input; clock : true; }
+    pin (D) { direction : input; }
+    pin (RESET_B) { direction : input; }
+    pin (Q) { direction : output; function : "IQ"; }
+    ff ("IQ", "IQ_N") { next_state : "D"; clocked_on : "CLK"; clear : "!RESET_B"; }
+  }
+  cell (SDF) {
+    pin (CLK) { direction : input; clock : true; }
+    pin (D) { direction : input; }
+    pin (SCD) { direction : input; }
+    pin (SCE) { direction : input; }
+    pin (Q) { direction : output; function : "IQ"; }
+    ff (IQ, IQ_N) { next_state : "(D&!SCE) | (SCD&SCE)"; clocked_on : "CLK"; }
+    test_cell () {
+      pin (D) { direction : input; }
+      pin (Q) { direction : output; function : "IQ"; }
+      ff (IQ, IQ_N) { next_state : "SCD"; clocked_on : "CLK"; }
+    }
+  }
+  cell (LAT) {
+    pin (G) { direction : input; }
+    pin (D) { direction : input; }
+    pin (Q) { direction : output; function : "IQ"; }
+    latch (IQ, IQ_N) { enable : "G"; data_in : "D"; }
+  }
+  cell (BANK) {
+    pin (CLK) { direction : input; clock : true; }
+    pin (Q) { direction : output; }
+    ff_bank (IQ, IQ_N, 2) { next_state : "D"; clocked_on : "CLK"; }
+  }
+  cell (INV) {
+    pin (A) { direction : input; }
+    pin (Y) { direction : output; function : "!A"; }
+  }
+}
+"#;
+        let lib = Lib::parse(SRC).unwrap();
+        let g = |c: &str| lib.cells[c].seq_group.clone();
+        let dfr = g("DFR").expect("DFR has an ff");
+        assert_eq!((dfr.latch, dfr.iq.as_str(), dfr.iqn.as_str()), (false, "IQ", "IQ_N"));
+        let attrs: Vec<(&str, &str)> = dfr.attrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(attrs, [("clear", "!RESET_B"), ("clocked_on", "CLK"), ("next_state", "D")]);
+        assert_eq!(g("SDF").unwrap().attrs["next_state"], "(D&!SCE) | (SCD&SCE)", "the cell's own ff, not test_cell's");
+        let lat = g("LAT").unwrap();
+        assert!(lat.latch);
+        assert_eq!((lat.attrs["enable"].as_str(), lat.attrs["data_in"].as_str()), ("G", "D"));
+        assert_eq!(g("BANK"), None);
+        assert_eq!(g("INV"), None);
+        // and the cache keeps it: dropped there, a warm load would read every register as absent
+        let back = crate::libcache::decode(&crate::libcache::encode(&lib)).expect("decode");
+        for c in ["DFR", "SDF", "LAT", "BANK", "INV"] {
+            assert_eq!(back.cells[c].seq_group, lib.cells[c].seq_group, "{c}");
         }
     }
 }

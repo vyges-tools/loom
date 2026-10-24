@@ -19,7 +19,7 @@ use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, OutEdges, Pin, Pi
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLCJ"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLCK"; // Vyges Liberty Cache — bump the trailing digit on any format change
                                  // VLCJ: Pin gained `clock_tree_paths`, Cell `is_macro`.
                                  // VLCI: Arc keeps its kind (`Arc::feeds` pairs edges by it: latch D->Q).
                                  // VLCH: Pin gained `is_reg_clk`, `is_reg_output`, `is_check_clk`.
@@ -460,6 +460,20 @@ fn enc_cell(w: &mut W, c: &Cell) {
     }
     w.u8(c.dont_use as u8);
     w.u8(c.is_macro as u8);
+    match &c.seq_group {
+        Some(g) => {
+            w.u8(1);
+            w.u8(g.latch as u8);
+            w.s(&g.iq);
+            w.s(&g.iqn);
+            w.u64(g.attrs.len() as u64);
+            for (k, v) in &g.attrs {
+                w.s(k);
+                w.s(v);
+            }
+        }
+        None => w.u8(0),
+    }
 }
 fn dec_cell(r: &mut R) -> Option<Cell> {
     let name = r.s()?;
@@ -499,6 +513,20 @@ fn dec_cell(r: &mut R) -> Option<Cell> {
     }
     let dont_use = r.u8()? != 0;
     let is_macro = r.u8()? != 0;
+    let seq_group = match r.u8()? {
+        0 => None,
+        1 => {
+            let latch = r.u8()? != 0;
+            let (iq, iqn) = (r.s()?, r.s()?);
+            let mut attrs = BTreeMap::new();
+            for _ in 0..r.u64()? {
+                let k = r.s()?;
+                attrs.insert(k, r.s()?);
+            }
+            Some(crate::liberty::SeqGroup { latch, iq, iqn, attrs })
+        }
+        _ => return None,
+    };
     Some(Cell {
         name,
         pins,
@@ -515,6 +543,7 @@ fn dec_cell(r: &mut R) -> Option<Cell> {
         is_macro,
         // a cached file is one library: its cells carry their own thresholds only once merged
         thresholds: None,
+        seq_group,
     })
 }
 
