@@ -15,7 +15,7 @@
 //! absent operand is absent), which [`Func::parse_in`] reports as `None`.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Func {
+pub enum Func {
     Port(String),
     Not(Box<Func>),
     Or(Box<Func>, Box<Func>),
@@ -157,7 +157,7 @@ impl Parser {
 
 impl Func {
     /// Parse `s`; `None` on a syntax error or when it names a port `is_port` rejects.
-    pub(crate) fn parse_in(s: &str, is_port: impl Fn(&str) -> bool) -> Option<Func> {
+    pub fn parse_in(s: &str, is_port: impl Fn(&str) -> bool) -> Option<Func> {
         let mut p = Parser { toks: scan(s), at: 0 };
         let e = p.expr(0)?;
         if p.at != p.toks.len() || !e.ports_all(&is_port) {
@@ -187,7 +187,7 @@ impl Func {
 
     /// The ports the expression names, each once, left to right (`FuncExpr::ports`, whose set is
     /// ordered by pointer — see the caller for what that order decides).
-    pub(crate) fn ports(&self) -> Vec<&str> {
+    pub fn ports(&self) -> Vec<&str> {
         fn walk<'a>(f: &'a Func, out: &mut Vec<&'a str>) {
             match f {
                 Func::Port(p) => {
