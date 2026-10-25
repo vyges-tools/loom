@@ -297,6 +297,29 @@ pub struct ClockUncertainty {
     pub to: Vec<String>,
 }
 
+/// One `set_case_analysis` / `set_logic_zero` / `set_logic_one` / `set_logic_dc`: the value as
+/// written (`0`, `1`, `zero`, `one`, `rise`, `rising`, `fall`, `falling`; `set_logic_*` give
+/// `0`, `1`, `X`), the object accessor and its objects.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogicValueCmd {
+    pub cmd: String,
+    pub value: String,
+    pub accessor: String,
+    pub objects: Vec<String>,
+}
+
+impl LogicValueCmd {
+    /// The constant the value holds a pin at: `Some(false)` / `Some(true)` for 0 and 1, `None`
+    /// for a transition or don't-care (no constant).
+    pub fn constant(&self) -> Option<bool> {
+        match self.value.as_str() {
+            "0" | "zero" => Some(false),
+            "1" | "one" => Some(true),
+            _ => None,
+        }
+    }
+}
+
 /// One `set_driving_cell`: `-lib_cell`, `-library`, `-pin`, `-from_pin`, the input transitions
 /// (`-input_transition_rise/-fall`, in the SDC's user unit; 0 when absent), any other flag, and
 /// the ports.
@@ -436,6 +459,10 @@ pub struct Sdc {
     /// Every `set_driving_cell`, as written (still in [`Sdc::ignored`] for a consumer that does
     /// not model input drives).
     pub driving_cells: Vec<DrivingCell>,
+    /// Every `set_case_analysis`, and every `set_logic_*`, in file order (still in
+    /// [`Sdc::ignored`] for a consumer that does not model constants).
+    pub case_values: Vec<LogicValueCmd>,
+    pub logic_values: Vec<LogicValueCmd>,
     /// Every `set_load` and `set_input_transition`, per command, for a consumer that models
     /// them per object ([`Sdc::load`] / [`Sdc::input_transition`] keep one design-wide value).
     pub env: Vec<EnvCmd>,
@@ -2011,6 +2038,24 @@ impl Sdc {
                     }
                     sdc.ignored.push("set_max_transition".to_string());
                 }
+                "set_case_analysis" | "set_logic_zero" | "set_logic_one" | "set_logic_dc" => {
+                    let pos: Vec<&String> = toks[1..].iter().filter(|t| !t.starts_with('-')).collect();
+                    let (value, obj) = match toks[0].as_str() {
+                        "set_case_analysis" => (pos.first().map(|v| v.to_string()), pos.get(1)),
+                        "set_logic_zero" => (Some("0".into()), pos.first()),
+                        "set_logic_one" => (Some("1".into()), pos.first()),
+                        _ => (Some("X".into()), pos.first()),
+                    };
+                    match (value, obj) {
+                        (Some(value), Some(obj)) => {
+                            let inner = obj.strip_prefix('[').map(|i| tokenize(i.trim_end_matches(']').trim())).unwrap_or_default();
+                            let c = LogicValueCmd { cmd: toks[0].clone(), value, accessor: inner.first().cloned().unwrap_or_default(), objects: resolve_objs(obj) };
+                            if toks[0] == "set_case_analysis" { sdc.case_values.push(c) } else { sdc.logic_values.push(c) }
+                        }
+                        _ => sdc.rejected.push(format!("{} without a value and objects", toks[0])),
+                    }
+                    sdc.ignored.push(toks[0].clone());
+                }
                 "set_driving_cell" => {
                     sdc.driving_cells.push(driving_cell(&toks));
                     sdc.ignored.push("set_driving_cell".to_string());
@@ -2378,6 +2423,17 @@ mod max_transition_tests {
         assert_eq!(d.objects, vec!["in1".to_string()]);
         assert!(d.flags.is_empty());
         assert!(s.ignored_affecting_timing().contains(&"set_driving_cell"));
+    }
+
+    // Rule: set_case_analysis and set_logic_* keep their value and objects, in file order, and
+    // stay in `ignored`; only 0/zero and 1/one hold a pin constant.
+    #[test]
+    fn case_and_logic_values_are_kept_as_written() {
+        let s = Sdc::parse("set_case_analysis 0 [get_ports {kld}]\nset_case_analysis rise [get_pins u1/A]\nset_logic_one [get_ports {a b}]\n").unwrap();
+        let c: Vec<(&str, &str, Vec<String>, Option<bool>)> = s.case_values.iter().map(|c| (c.value.as_str(), c.accessor.as_str(), c.objects.clone(), c.constant())).collect();
+        assert_eq!(c, vec![("0", "get_ports", vec!["kld".to_string()], Some(false)), ("rise", "get_pins", vec!["u1/A".to_string()], None)]);
+        assert_eq!((s.logic_values[0].constant(), s.logic_values[0].objects.clone()), (Some(true), vec!["a".to_string(), "b".to_string()]));
+        assert!(s.ignored_affecting_timing().contains(&"set_case_analysis"));
     }
 
     // Rule: the design-wide set_max_fanout keeps its value (unitless) and stays in `ignored`;
