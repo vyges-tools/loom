@@ -876,6 +876,32 @@ fn tokenize(line: &str) -> Vec<String> {
 /// `[get_pins x/y]`, `[get_clocks clk]`, `[all_inputs]`, `[all_outputs]`, a
 /// brace list, or a bare name. Returns the sentinel `*INPUTS*` / `*OUTPUTS*`
 /// for the `all_*` accessors so the caller can expand against the netlist.
+/// `[lsearch -inline -all -not -exact [all_inputs] [get_ports P]]` — every input but P, the usual
+/// way to constrain every input except the clock's — as the accessor `all_inputs_except` (or
+/// `all_outputs_except`) naming the excluded port. Tcl's `lsearch -not -exact` drops the elements
+/// EQUAL to the pattern: one port is a one-element list equal to its element; a pattern of two or
+/// more ports equals no element, so it is not read here (`None`).
+fn all_ports_except(tok: &str) -> Option<(String, Vec<String>)> {
+    let inner = tok.strip_prefix('[')?.strip_suffix(']')?.trim();
+    let parts = tokenize(inner);
+    let [cmd, a, b, c, d, list, pattern] = parts.as_slice() else { return None };
+    if cmd != "lsearch" {
+        return None;
+    }
+    let mut opts = [a.as_str(), b.as_str(), c.as_str(), d.as_str()];
+    opts.sort_unstable();
+    if opts != ["-all", "-exact", "-inline", "-not"] {
+        return None;
+    }
+    let accessor = match resolve_objs(list).as_slice() {
+        [one] if one == "*INPUTS*" => "all_inputs_except",
+        [one] if one == "*OUTPUTS*" => "all_outputs_except",
+        _ => return None,
+    };
+    let excluded = resolve_objs(pattern);
+    (excluded.len() == 1).then(|| (accessor.to_string(), excluded))
+}
+
 fn resolve_objs(tok: &str) -> Vec<String> {
     if let Some(inner) = tok.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
         let inner = inner.trim();
@@ -1853,8 +1879,10 @@ impl Sdc {
                         sdc.rejected.push(format!("{} without a port list", toks[0]));
                         continue;
                     };
-                    let accessor = named.accessor;
-                    let objs = named.names;
+                    let (accessor, objs) = match pos.get(1).and_then(|o| all_ports_except(o)) {
+                        Some(except) => except,
+                        None => (named.accessor, named.names),
+                    };
                     // the `all_*` collections, by exact name — a pattern like `*_in` is a name
                     let default = objs.iter().any(|o| o == "*INPUTS*" || o == "*OUTPUTS*");
                     let ports: Vec<String> = objs.into_iter().filter(|o| !SENTINELS.contains(&o.as_str())).collect();
@@ -2319,6 +2347,21 @@ mod list_obj_tests {
     fn a_plain_get_ports_is_unaffected() {
         assert_eq!(resolve_objs("[get_ports {clk}]"), vec!["clk"]);
         assert_eq!(resolve_objs("[all_inputs]"), vec!["*INPUTS*"]);
+    }
+
+    // `lsearch -not -exact` drops the inputs EQUAL to the pattern: one port is removed; a pattern
+    // of two ports equals no element and is not read as an exclusion.
+    #[test]
+    fn every_input_but_the_clock_port() {
+        let t = "set clk_port [get_ports clk]\ncreate_clock -name clk -period 690 $clk_port\n\
+                 set non_clock_inputs [lsearch -inline -all -not -exact [all_inputs] $clk_port]\n\
+                 set_input_delay 138 -clock clk $non_clock_inputs\n";
+        let s = Sdc::parse(t).unwrap();
+        let d = &s.input_delays[0];
+        assert_eq!((d.accessor.as_str(), d.ports.clone(), d.default), ("all_inputs_except", vec!["clk".to_string()], false));
+        assert_eq!(all_ports_except("[lsearch -inline -all -not -exact [all_inputs] [get_ports {a b}]]"), None);
+        assert_eq!(all_ports_except("[lsearch -inline -all -exact [all_inputs] [get_ports a]]"), None);
+        assert_eq!(all_ports_except("[lsearch -all -inline -exact -not [all_outputs] [get_ports y]]"), Some(("all_outputs_except".into(), vec!["y".into()])));
     }
 }
 
