@@ -19,7 +19,8 @@ use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, OutEdges, Pin, Pi
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLCK"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLCL"; // Vyges Liberty Cache — bump the trailing digit on any format change
+                                 // VLCL: Cell gained `ports`.
                                  // VLCJ: Pin gained `clock_tree_paths`, Cell `is_macro`.
                                  // VLCI: Arc keeps its kind (`Arc::feeds` pairs edges by it: latch D->Q).
                                  // VLCH: Pin gained `is_reg_clk`, `is_reg_output`, `is_check_clk`.
@@ -474,6 +475,21 @@ fn enc_cell(w: &mut W, c: &Cell) {
         }
         None => w.u8(0),
     }
+    w.u64(c.ports.len() as u64);
+    for p in &c.ports {
+        w.s(&p.name);
+        w.u8(p.direction as u8);
+        w.u8(p.pwr_gnd as u8);
+        match p.bus {
+            Some((from, to)) => {
+                w.u8(1);
+                w.u64(from as u64);
+                w.u64(to as u64);
+            }
+            None => w.u8(0),
+        }
+        w.u64(p.size as u64);
+    }
 }
 fn dec_cell(r: &mut R) -> Option<Cell> {
     let name = r.s()?;
@@ -527,6 +543,28 @@ fn dec_cell(r: &mut R) -> Option<Cell> {
         }
         _ => return None,
     };
+    let mut ports = Vec::new();
+    for _ in 0..r.u64()? {
+        use crate::liberty::PortDirection as D;
+        let name = r.s()?;
+        let direction = match r.u8()? {
+            0 => D::Input,
+            1 => D::Output,
+            2 => D::Tristate,
+            3 => D::Bidirect,
+            4 => D::Internal,
+            5 => D::Unknown,
+            _ => return None,
+        };
+        let pwr_gnd = r.u8()? != 0;
+        let bus = match r.u8()? {
+            0 => None,
+            1 => Some((r.u64()? as i64, r.u64()? as i64)),
+            _ => return None,
+        };
+        let size = r.u64()? as u32;
+        ports.push(crate::liberty::CellPort { name, direction, pwr_gnd, bus, size });
+    }
     Some(Cell {
         name,
         pins,
@@ -544,6 +582,7 @@ fn dec_cell(r: &mut R) -> Option<Cell> {
         // a cached file is one library: its cells carry their own thresholds only once merged
         thresholds: None,
         seq_group,
+        ports,
     })
 }
 
@@ -818,6 +857,10 @@ library (neg) {
         // encode∘decode is the identity on bytes → lossless round-trip.
         assert_eq!(bytes, encode(&back));
         assert_eq!(back.cells.len(), lib.cells.len());
+        for (cn, c) in &lib.cells {
+            assert!(!c.ports.is_empty(), "{cn} lists its ports");
+            assert_eq!(back.cells[cn].ports, c.ports, "{cn} ports lost across the cache");
+        }
         assert!((back.voltage - lib.voltage).abs() < 1e-12);
         assert_eq!(back.units, lib.units, "units lost across the cache");
         // Thresholds must survive the cache. A field parsed but not encoded works on the

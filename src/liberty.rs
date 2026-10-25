@@ -433,6 +433,41 @@ pub struct Cell {
     /// (`None` otherwise, a combinational cell included). ⛔ Read at the cell's own level: a
     /// `test_cell`'s `ff` describes scan mode.
     pub seq_group: Option<SeqGroup>,
+    /// The cell's own ports in the order the reference makes them: its depth-0 groups in file
+    /// order, each `pin` group one port per name it lists, a `bus` one port (only when its
+    /// `bus_type` is declared), a `bundle` first its members not yet made and then itself, a
+    /// `pg_pin` one port. A bus's bits are not listed; neither are a test cell's pins nor the
+    /// state variables of an `ff` / `latch`.
+    pub ports: Vec<CellPort>,
+}
+
+/// How a port's direction reads (`direction`, `three_state`, `pg_pin`), with the cases a
+/// consumer that only wants "input" or "output" must tell apart kept apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortDirection {
+    Input,
+    Output,
+    /// `direction : output` with a non-empty `three_state`.
+    Tristate,
+    /// `direction : inout`.
+    Bidirect,
+    /// `direction : internal`.
+    Internal,
+    /// No direction stated, or one this reader does not know.
+    Unknown,
+}
+
+/// One of a cell's own ports, as the cell lists them (see [`Cell::ports`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CellPort {
+    pub name: String,
+    pub direction: PortDirection,
+    /// A `pg_pin`: power, ground or well. Its direction is [`PortDirection::Unknown`].
+    pub pwr_gnd: bool,
+    /// A bus: its bits run `name[from]` to `name[to]`.
+    pub bus: Option<(i64, i64)>,
+    /// Bits: a bus's `|to - from| + 1`, a bundle's member count, otherwise 1.
+    pub size: u32,
 }
 
 /// An `ff` or `latch` group as written: the two state variables it declares, which the output
@@ -2082,6 +2117,7 @@ fn parse_cell(
     // with `signal_type` instead. Read by the substring scan, it came last and overwrote the real
     // pins: scan flops lost their clock pin, caps, checks and arcs — the public sky130 `sdf*` cells
     // among them.
+    let ports = cell_ports(&groups, types);
     for (kw, args, gbody) in &groups {
         match kw.as_str() {
             "pin" => {
@@ -2233,7 +2269,87 @@ fn parse_cell(
         is_macro,
         thresholds: None,
         seq_group,
+        ports,
     }
+}
+
+/// A port group's direction: `direction` at its own level, then an output with a non-empty
+/// `three_state` is a tristate.
+fn port_direction(own: &str) -> PortDirection {
+    let dir = match simple_attr(own, "direction").as_deref() {
+        Some("input") => PortDirection::Input,
+        Some("output") => PortDirection::Output,
+        Some("inout") => PortDirection::Bidirect,
+        Some("internal") => PortDirection::Internal,
+        _ => PortDirection::Unknown,
+    };
+    let tristate = simple_attr(own, "three_state").is_some_and(|t| !t.is_empty());
+    if dir == PortDirection::Output && tristate {
+        PortDirection::Tristate
+    } else {
+        dir
+    }
+}
+
+/// See [`Cell::ports`]. A direction set on a bundle reaches its members; a `pin` group inside a
+/// bundle then sets its member's own.
+fn cell_ports<B: AsRef<str>>(groups: &[(String, String, B)], types: &BTreeMap<String, (i64, i64)>) -> Vec<CellPort> {
+    let mut ports: Vec<CellPort> = Vec::new();
+    let names = |args: &str| -> Vec<String> {
+        args.split(',').map(|n| n.trim().trim_matches('"').to_string()).filter(|n| !n.is_empty()).collect()
+    };
+    let port = |name: String, direction, size| CellPort { name, direction, pwr_gnd: false, bus: None, size };
+    for (kw, args, gbody) in groups {
+        let gbody = gbody.as_ref();
+        match kw.as_str() {
+            "pin" => {
+                let dir = port_direction(&own_attrs(gbody));
+                ports.extend(names(args).into_iter().map(|n| port(n, dir, 1)));
+            }
+            "bus" => {
+                let Some((from, to)) = simple_attr(gbody, "bus_type").and_then(|t| types.get(&t).copied()) else {
+                    continue;
+                };
+                let size = (to - from).unsigned_abs() as u32 + 1;
+                for n in names(args) {
+                    ports.push(CellPort { bus: Some((from, to)), ..port(n, port_direction(&own_attrs(gbody)), size) });
+                }
+            }
+            "bundle" => {
+                let Some(name) = names(args).into_iter().next() else { continue };
+                let members: Vec<String> = next_paren_after(gbody, "members").map(|m| names(&m)).unwrap_or_default();
+                let dir = port_direction(&own_attrs(gbody));
+                for m in &members {
+                    if !ports.iter().any(|p| &p.name == m) {
+                        ports.push(port(m.clone(), PortDirection::Unknown, 1));
+                    }
+                }
+                for p in ports.iter_mut().filter(|p| members.contains(&p.name)) {
+                    p.direction = dir;
+                }
+                ports.push(port(name, dir, members.len() as u32));
+                for (ikw, iargs, ibody) in top_groups(gbody) {
+                    if ikw != "pin" {
+                        continue;
+                    }
+                    let idir = port_direction(&own_attrs(ibody));
+                    for n in names(&iargs) {
+                        match ports.iter_mut().find(|p| p.name == n) {
+                            Some(p) => p.direction = idir,
+                            None => ports.push(port(n, idir, 1)),
+                        }
+                    }
+                }
+            }
+            "pg_pin" => {
+                if let Some(n) = names(args).into_iter().next() {
+                    ports.push(CellPort { pwr_gnd: true, ..port(n, PortDirection::Unknown, 1) });
+                }
+            }
+            _ => {}
+        }
+    }
+    ports
 }
 
 /// The cell's one `ff` / `latch` group (see [`Cell::seq_group`]), from its top-level groups.
@@ -3473,6 +3589,63 @@ mod cell_structure_tests {
         assert_eq!(c.pins["DM1"].direction, Dir::In);
         assert_eq!(c.pins["DM0"].capacitance, 0.004f32 as f64);
         assert!(!c.pins.contains_key("D") && !c.pins.contains_key("DM"), "the group is not a pin");
+    }
+
+    // Rule: a cell's ports are its depth-0 groups in file order — a `pin` group one port per name,
+    // a `bus` one port of |to-from|+1 bits, a `bundle` its new members then itself, a `pg_pin`
+    // one port — never a bus's bits; a bundle's direction reaches its members.
+    #[test]
+    fn ports_are_listed_in_file_order_buses_whole() {
+        let l = Lib::parse(LIB).unwrap();
+        let c = l.cell("sram").unwrap();
+        let got: Vec<(&str, PortDirection, u32)> = c.ports.iter().map(|p| (p.name.as_str(), p.direction, p.size)).collect();
+        use PortDirection::*;
+        assert_eq!(
+            got,
+            [("CLK", Input, 1), ("D", Input, 4), ("Q", Output, 4), ("DM0", Input, 1), ("DM1", Input, 1), ("DM", Input, 2)]
+        );
+        assert_eq!(c.ports[1].bus, Some((3, 0)));
+        assert!(c.ports.iter().all(|p| !p.pwr_gnd));
+    }
+
+    // Rule: an output with a non-empty `three_state` is a tristate; `inout` is bidirectional;
+    // `internal` and a missing direction are kept apart from both; a `pg_pin` is power/ground
+    // with no direction; a bus whose `bus_type` is not declared makes no port.
+    #[test]
+    fn port_directions_keep_tristate_bidirect_and_pg_apart() {
+        const PG: &str = r#"library (pg) {
+          cell (tb) {
+            pg_pin (VDD) { pg_type : primary_power; }
+            pin (A, B) { direction : input; }
+            pin (EN) { direction : input; }
+            pin (Z) { direction : output; three_state : "!EN"; function : "A"; }
+            pin (Y) { direction : output; three_state : ""; function : "B"; }
+            pin (IO) { direction : inout; }
+            pin (N) { direction : internal; }
+            pin (U) { }
+            bus (X) { bus_type : nowhere; direction : input; }
+            pg_pin (VSS) { pg_type : primary_ground; }
+          }
+        }"#;
+        let l = Lib::parse(PG).unwrap();
+        let c = l.cell("tb").unwrap();
+        use PortDirection::*;
+        let got: Vec<(&str, PortDirection, bool)> = c.ports.iter().map(|p| (p.name.as_str(), p.direction, p.pwr_gnd)).collect();
+        assert_eq!(
+            got,
+            [
+                ("VDD", Unknown, true),
+                ("A", Input, false),
+                ("B", Input, false),
+                ("EN", Input, false),
+                ("Z", Tristate, false),
+                ("Y", Output, false),
+                ("IO", Bidirect, false),
+                ("N", Internal, false),
+                ("U", Unknown, false),
+                ("VSS", Unknown, true),
+            ]
+        );
     }
 
     // Rule: `clock_gating_integrated_cell` is exposed as written; a cell without it has `None`.
