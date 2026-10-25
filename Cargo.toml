@@ -15,6 +15,9 @@ build = "build.rs"
 # clean-roomed in-tree, so `fst` pulls exactly one third-party crate, and only for
 # consumers that enable it (vyges-power). Default consumers stay std-only.
 [features]
+# The command-line entry built into the library too (`cli_main`), for the suite binaries
+# that link every engine and run the one they are invoked as.
+suite = []
 default = []
 fst = ["dep:miniz_oxide"]
 # `netlist::load`/`load_all` read gzipped netlists (the same pure-Rust inflater).

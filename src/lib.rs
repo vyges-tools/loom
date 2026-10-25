@@ -25,6 +25,10 @@
 //! No external dependencies — builds and tests offline. Standard file formats
 //! are the plug boundary; loom is where they are parsed once into shared state.
 
+// The crate's own name inside it: the command-line entry ([`cli_main`]) is built into the
+// library too, and its `vyges_loom::…` paths resolve here.
+extern crate self as vyges_loom;
+
 pub mod liberty;
 /// Liberty `function` expressions, parsed as the reference parses them (a logic checker reads a
 /// cell's function from here).
@@ -97,3 +101,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const GIT_SHA: &str = env!("VYGES_GIT_SHA");
 
 pub const COPYRIGHT: &str = "© 2026 Vyges. All Rights Reserved.  https://vyges.com";
+
+/// The `vyges-loom` command-line entry (the binary's `main`), built into the library too so a
+/// suite binary can link every engine and run the one it is invoked as.
+#[cfg(feature = "suite")]
+#[doc(hidden)]
+#[path = "main.rs"]
+pub mod cli_main;

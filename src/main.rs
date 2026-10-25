@@ -78,7 +78,7 @@ fn load_all(files: &[String]) -> (Design, Vec<String>) {
     (d, errs)
 }
 
-fn main() -> ExitCode {
+pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // Tool-level contract. Declares the descriptor format this binary speaks, so a caller can tell
