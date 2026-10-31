@@ -1299,6 +1299,14 @@ fn unknown_command(line: &str) -> Option<String> {
     unknown_substituted_command(line).or_else(|| resolve_command(&tokenize(line.trim()).into_iter().next()?).err())
 }
 
+/// Queries a synthesis tool has and the reference does not, known here so that a constraint using
+/// one is refused by name and the read goes on (user 2026-10-31), not stopped as at an unknown
+/// command. `remove_from_collection` is read in one form ([`all_ports_except`]). `load_of
+/// <lib>/<cell>/<pin>` (a library pin's capacitance) is never evaluated: OpenTitan's
+/// `set_load [load_of ${LOAD_CELL_LIB}/…]` names cells its flow sets in a setup script outside
+/// the constraint file, so its command is refused (listed with the queries not evaluated).
+const EXTENSION_QUERIES: [&str; 2] = ["remove_from_collection", "load_of"];
+
 /// [`unknown_command`] in the `[...]` substitutions of `line` only, not its own command word.
 fn unknown_substituted_command(line: &str) -> Option<String> {
     let cs: Vec<char> = line.chars().collect();
@@ -1346,9 +1354,10 @@ fn unknown_substituted_command(line: &str) -> Option<String> {
         if is_subscript(inner) {
             continue;
         }
-        // a query this reader adds to the reference's (see `all_ports_except`): its own
-        // arguments are still checked; a form it does not read is refused with its command
-        let own = tokenize(inner.trim()).first().is_some_and(|c| c == "remove_from_collection");
+        // a query this reader knows beyond the reference's (`remove_from_collection`, see
+        // `all_ports_except`; `load_of`, never evaluated): its own arguments are still checked,
+        // and a form it does not read is refused with its command rather than stopping the read
+        let own = tokenize(inner.trim()).first().is_some_and(|c| EXTENSION_QUERIES.contains(&c.as_str()));
         if let Some(why) = if own { unknown_substituted_command(inner) } else { unknown_command(inner) } {
             return Some(why);
         }
@@ -3384,6 +3393,18 @@ mod exception_check_tests {
         let w = s.write(&crate::sdc_write::WriteOpts::default());
         assert!(w.not_written.iter().any(|n| n.contains("more than one port")), "{:?}", w.not_written);
         assert!(w.text.contains("[lsearch -inline -all -not -exact [all_inputs] [get_ports {clk_i}]]"), "{}", w.text);
+    }
+
+    /// A LOOM EXTENSION (user 2026-10-31): `[load_of <lib>/<cell>/<pin>]` is known, never
+    /// evaluated — its command is refused by name and what follows is read; a bare `load_of`
+    /// still stops the read, as any command the reference does not know.
+    #[test]
+    fn load_of_is_refused_with_its_command_and_the_read_goes_on() {
+        let s = Sdc::parse("set_load [load_of lib/BUF/A] [all_outputs]\nset_load 1 [get_ports x]\n").unwrap();
+        assert_eq!(s.env.len(), 1);
+        assert_eq!(s.env[0].objects, ["x"]);
+        assert!(s.unevaluated_queries.iter().any(|q| q.contains("load_of lib/BUF/A")), "{:?}", s.unevaluated_queries);
+        assert!(Sdc::parse("load_of lib/BUF/A").err().is_some_and(|e| e.0.contains("invalid command name \"load_of\"")));
     }
 
     /// Rule (`set_clock_uncertainty`, Sdc.tcl): -from and -to come together and take only the
