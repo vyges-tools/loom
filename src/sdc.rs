@@ -97,23 +97,43 @@ fn endpoint_matches(set: &[String], name: &str) -> bool {
 /// pattern against port names, a bus port's name being the bus (`boot_addr_i`), and a port
 /// query or an implicit object argument names every bit of a bus it matches. A pattern with a
 /// subscript matches the bus part as a pattern, then the bit: `[n]`, a `[a:b]` range, or `[*]`.
+///
+/// A pattern is bus-form when its last `[…]` starts with a digit or `*` (`parseBusName`); only
+/// then is it matched as a bus, and NEVER as a whole-name glob: `req_msg[1?]` is bit 1 (the
+/// subscript is read as an integer, its leading digits), not bits 10 to 19.
 pub fn object_matches(pattern: &str, name: &str) -> bool {
     let named = |p: &str, n: &str| p == n || (p.contains(['*', '?']) && glob(p, n));
-    if named(pattern, name) {
+    let bus_form = pattern
+        .strip_suffix(']')
+        .and_then(|p| p.rsplit_once('['))
+        .filter(|(b, sub)| !b.is_empty() && !b.ends_with('\\') && sub.starts_with(|c: char| c.is_ascii_digit() || c == '*'));
+    let Some((pbase, sub)) = bus_form else {
+        // a plain pattern is matched against PORT names: a scalar's, or a bit's bus (every bit of
+        // a bus it names) — never a bit's own name, so `req_msg[?]` names nothing
+        return match bus_bit(name) {
+            Some((base, _)) => named(pattern, base),
+            None => named(pattern, name),
+        };
+    };
+    if pattern == name {
         return true;
     }
     let Some((base, bit)) = bus_bit(name) else { return false };
-    match pattern.strip_suffix(']').and_then(|p| p.rsplit_once('[')).filter(|(b, _)| !b.ends_with('\\')) {
-        None => named(pattern, base),
-        Some((pbase, sub)) => {
-            named(pbase, base)
-                && match sub.split_once(':') {
-                    _ if sub == "*" => true,
-                    Some((a, b)) => matches!((a.parse::<i64>(), b.parse::<i64>()), (Ok(a), Ok(b)) if (a.min(b)..=a.max(b)).contains(&bit)),
-                    None => sub.parse::<i64>() == Ok(bit),
-                }
+    // `std::stoi`: the leading digits (after optional space and sign)
+    let stoi = |t: &str| -> Option<i64> {
+        let t = t.trim_start();
+        let n = t.char_indices().take_while(|&(i, c)| c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+'))).count();
+        t[..n].parse().ok()
+    };
+    named(pbase, base)
+        && if sub.starts_with('*') {
+            true
+        } else {
+            match sub.split_once(':') {
+                Some((a, b)) => matches!((stoi(a), stoi(b)), (Some(a), Some(b)) if (a.min(b)..=a.max(b)).contains(&bit)),
+                None => stoi(sub) == Some(bit),
+            }
         }
-    }
 }
 
 /// `name[n]` as (`name`, n) — a bus bit, as the netlist names one; an escaped `\[` is part of a name.
@@ -2732,6 +2752,14 @@ mod bus_match_tests {
             ("clk", "clk2", false),
             // an escaped subscript is part of a scalar's name, not a bus bit
             ("a", "a\\[3]", false),
+            // parseBusName: a subscript starting with a digit is read as an integer (stoi), one
+            // starting with `*` names every bit; anything else is no subscript, and a plain
+            // pattern never matches a bit's own name
+            ("req_msg[1?]", "req_msg[1]", true),
+            ("req_msg[1?]", "req_msg[10]", false),
+            ("req_msg[1*]", "req_msg[12]", false),
+            ("req_msg[*x]", "req_msg[5]", true),
+            ("req_msg[?]", "req_msg[5]", false),
         ] {
             assert_eq!(object_matches(p, n), hit, "{p} vs {n}");
         }
