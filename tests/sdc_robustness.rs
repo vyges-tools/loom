@@ -51,10 +51,11 @@ const HANDLED: &[&str] = &[
 ];
 
 /// The mined commands the reference does NOT know (`invalid command name`; measured on the pinned
-/// reference's own command list, 2026-10-31). Each stops the reference's `read_sdc`, so each now
-/// stops this reader too (user 2026-10-31) — the whole file, not one command. Synthesis-tool and
-/// vendor commands, used in real constraint files: `set_size_only` 16 times, `set_critical_range`
-/// 15, `derive_pll_clocks` and `derive_clock_uncertainty` 8 each.
+/// reference's own command list, 2026-10-31). Each stops the reference's `read_sdc`, so each
+/// stops this reader too (user 2026-10-31) — the whole file, not one command — EXCEPT the
+/// synthesis-only ones ([`vyges_loom::sdc::BENIGN_FOR_TIMING`]), which are read past (user
+/// 2026-10-31). Used in real constraint files: `set_size_only` 16 times, `set_critical_range` 15,
+/// `derive_pll_clocks` and `derive_clock_uncertainty` 8 each.
 const UNKNOWN_TO_REFERENCE: &[&str] = &[
     "append_to_collection",
     "axi_araddr_i",
@@ -78,7 +79,8 @@ fn known_unmodelled() -> Vec<&'static str> {
 }
 
 /// **Every mined command the reference does not know stops the read**, naming itself, as the
-/// reference's `read_sdc` stops at it; and no other mined command does.
+/// reference's `read_sdc` stops at it, unless it is synthesis-only, which is read past and
+/// recorded; and no other mined command stops it.
 #[test]
 fn a_mined_command_the_reference_does_not_know_stops_the_read() {
     for c in commands() {
@@ -86,7 +88,10 @@ fn a_mined_command_the_reference_does_not_know_stops_the_read() {
             continue;
         }
         let r = Sdc::parse(&good_sdc(&format!("{c} 1.0 [get_ports a]\n")));
-        if UNKNOWN_TO_REFERENCE.contains(&c) {
+        if vyges_loom::sdc::BENIGN_FOR_TIMING.contains(&c) {
+            let s = r.unwrap_or_else(|e| panic!("{c}: {}", e.0));
+            assert!(s.ignored.iter().any(|i| i == c), "{c}: not recorded");
+        } else if UNKNOWN_TO_REFERENCE.contains(&c) {
             let e = r.err().unwrap_or_else(|| panic!("{c}: read on"));
             assert!(e.0.contains(&format!("invalid command name \"{c}\"")), "{c}: {}", e.0);
         } else {

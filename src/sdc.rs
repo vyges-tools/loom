@@ -710,6 +710,10 @@ const TIMING_AFFECTING: &[&str] = &[
 /// optimisation. Listed rather than merely omitted, so the distinction is a decision on record
 /// instead of an oversight — `set_max_area` and `set_driving_cell` are both "unmodelled", and
 /// only one of them can move a slack.
+///
+/// One of these that the reference does not know (`set_size_only` … `set_critical_range`) is read
+/// past rather than stopping the read, as an unknown command otherwise does — see [`Sdc::parse`].
+/// ⚠️ Membership is therefore also a decision to read past: add only what no timer consults.
 pub const BENIGN_FOR_TIMING: &[&str] = &[
     "set_max_area",
     "set_max_dynamic_power",
@@ -2267,6 +2271,16 @@ impl Sdc {
             if toks.is_empty() {
                 continue;
             }
+            // A SYNTHESIS-ONLY command the reference does not know (`set_size_only`,
+            // `set_critical_range`: [`BENIGN_FOR_TIMING`]) is READ PAST, whole, arguments not
+            // evaluated — a deliberate difference from the reference, which stops at it (user
+            // 2026-10-31): OpenTitan's constraint files use `set_size_only` 25 times and
+            // `set_critical_range` 24, and nothing a timer consults depends on either. Recorded in
+            // `ignored`, like any command not modelled.
+            if BENIGN_FOR_TIMING.contains(&toks[0].as_str()) && resolve_command(&toks[0]).is_err() {
+                sdc.ignored.push(toks[0].clone());
+                continue;
+            }
             // ⛔ A COMMAND THE REFERENCE DOES NOT KNOW STOPS THE READ, as it stops the reference's
             // `read_sdc` (user 2026-10-31): nothing after it is applied there, so nothing is
             // applied here either. Read on, this reader built constraints the reference never had
@@ -3102,6 +3116,22 @@ mod exception_check_tests {
             assert!(Sdc::parse(text).is_ok(), "{text}: {:?}", Sdc::parse(text).err());
         }
         assert_eq!(Sdc::parse("set_max_trans 0.5 [current_design]").unwrap().max_transition, Some(0.5));
+    }
+
+    /// Not the reference's rule (it stops here too): a synthesis-only command it does not know is
+    /// read past whole — its arguments not evaluated, so an unknown command inside them does not
+    /// stop the read either — and what follows it is applied (user 2026-10-31).
+    #[test]
+    fn a_synthesis_only_command_is_read_past() {
+        let s = Sdc::parse(
+            "set_size_only [remove_from_collection [get_cells *] u0]\nset_critical_range 0.2 [current_design]\n\
+             set_load 1 [get_ports dout]",
+        )
+        .unwrap();
+        assert_eq!(s.ignored, ["set_size_only", "set_critical_range"]);
+        assert_eq!(s.env.len(), 1);
+        // an abbreviation of one is not recognised: the reference's prefix rule finds no command
+        assert!(Sdc::parse("set_size_o [get_cells u0]").is_err());
     }
 
     #[test]
