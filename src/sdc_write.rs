@@ -331,8 +331,14 @@ impl Sdc {
                 }
                 let all = if cmd == "set_input_delay" { "all_inputs" } else { "all_outputs" };
                 let flags: String = d.accessor_flags.iter().map(|f| format!(" {f}")).collect();
-                // `[all_inputs]` minus the named ports, as the reader recognised it
+                // `[all_inputs]` minus the named port, in the one form the reference reads
+                // (`lsearch -not -exact` drops elements EQUAL to the pattern, so one port at most;
+                // `remove_from_collection` excluding several is not written)
                 if d.accessor.ends_with("_except") {
+                    if d.ports.len() > 1 {
+                        o.skip(format!("{cmd} on [{all}] but {}: no form the reference reads excludes more than one port", d.ports.join(" ")));
+                        continue;
+                    }
                     let line = brace(&d.ports).map(|p| format!("{head} [lsearch -inline -all -not -exact [{all}{flags}] {p}]"));
                     o.line_or(line, || cmd.to_string());
                     continue;

@@ -1059,9 +1059,26 @@ fn tokenize(line: &str) -> Vec<String> {
 /// `all_outputs_except`) naming the excluded port. Tcl's `lsearch -not -exact` drops the elements
 /// EQUAL to the pattern: one port is a one-element list equal to its element; a pattern of two or
 /// more ports equals no element, so it is not read here (`None`).
+///
+/// `[remove_from_collection [all_inputs] <ports>]` — a synthesis tool's spelling of the same, which
+/// the reference does NOT have — is read the same way, every named port excluded (a LOOM
+/// EXTENSION, user 2026-10-31: 23 of OpenTitan's 40 constraint files constrain their inputs so).
+/// Only that form: `-intersect`, or any other base collection, is not read (`None`). A name
+/// matching no port excludes nothing, as a collection removes nothing it does not hold.
 fn all_ports_except(tok: &str) -> Option<(String, Vec<String>)> {
     let inner = tok.strip_prefix('[')?.strip_suffix(']')?.trim();
     let parts = tokenize(inner);
+    if let [cmd, list, objects] = parts.as_slice() {
+        if cmd != "remove_from_collection" || objects.starts_with('-') {
+            return None;
+        }
+        let accessor = match resolve_objs(list).as_slice() {
+            [one] if one == "*INPUTS*" => "all_inputs_except",
+            [one] if one == "*OUTPUTS*" => "all_outputs_except",
+            _ => return None,
+        };
+        return Some((accessor.to_string(), resolve_objs(objects)));
+    }
     let [cmd, a, b, c, d, list, pattern] = parts.as_slice() else { return None };
     if cmd != "lsearch" {
         return None;
@@ -1271,6 +1288,11 @@ fn resolve_command(word: &str) -> Result<String, String> {
 /// them (a substitution in an argument runs before the command it is an argument of). A bus
 /// subscript (`[0]`, `[7:0]`, `[*]`) is the reference's literal, not a command.
 fn unknown_command(line: &str) -> Option<String> {
+    unknown_substituted_command(line).or_else(|| resolve_command(&tokenize(line.trim()).into_iter().next()?).err())
+}
+
+/// [`unknown_command`] in the `[...]` substitutions of `line` only, not its own command word.
+fn unknown_substituted_command(line: &str) -> Option<String> {
     let cs: Vec<char> = line.chars().collect();
     let is_subscript = |s: &str| {
         let s = s.trim();
@@ -1316,12 +1338,14 @@ fn unknown_command(line: &str) -> Option<String> {
         if is_subscript(inner) {
             continue;
         }
-        if let Some(why) = unknown_command(inner) {
+        // a query this reader adds to the reference's (see `all_ports_except`): its own
+        // arguments are still checked; a form it does not read is refused with its command
+        let own = tokenize(inner.trim()).first().is_some_and(|c| c == "remove_from_collection");
+        if let Some(why) = if own { unknown_substituted_command(inner) } else { unknown_command(inner) } {
             return Some(why);
         }
     }
-    let first = tokenize(line.trim()).into_iter().next()?;
-    resolve_command(&first).err()
+    None
 }
 
 /// Abbreviations, expanded as the reference expands them before a command runs: a command name
@@ -1378,7 +1402,7 @@ fn unevaluated_query(toks: &[String]) -> Option<String> {
         // {clk}]` (a synthesis tool's command, which the reference does not have either) was read as
         // a port called `remove_from_collection`: the delay went nowhere, and nothing said so.
         // `expr` is evaluated where it can be, and a value it leaves is reported where it is read.
-        let known = KNOWN_QUERIES.contains(&cmd.as_str()) || cmd == "expr" || (cmd == "lsearch" && all_ports_except(t).is_some());
+        let known = KNOWN_QUERIES.contains(&cmd.as_str()) || cmd == "expr" || (matches!(cmd.as_str(), "lsearch" | "remove_from_collection") && all_ports_except(t).is_some());
         if !known {
             return Some(format!("[{}] (a command this reader does not evaluate)", inner.trim()));
         }
@@ -1394,6 +1418,26 @@ fn unevaluated_query(toks: &[String]) -> Option<String> {
         }
     }
     None
+}
+
+/// An every-port-but collection ([`all_ports_except`]) anywhere but as the ports of
+/// `set_input_delay` / `set_output_delay`, the one place it is read: elsewhere its words were
+/// taken as object names (`-from [remove_from_collection [all_inputs] clk]` cut paths from a port
+/// called `remove_from_collection`).
+fn misplaced_except(toks: &[String]) -> Option<String> {
+    fn find(toks: &[String]) -> Option<String> {
+        toks.iter().find_map(|t| {
+            let inner = t.strip_prefix('[').and_then(|s| s.strip_suffix(']'))?;
+            if all_ports_except(t).is_some() {
+                return Some(format!("[{}] (an every-port-but collection, read only as the ports of set_input_delay / set_output_delay)", inner.trim()));
+            }
+            find(tokenize(inner.trim()).get(1..).unwrap_or_default())
+        })
+    }
+    if matches!(toks.first()?.as_str(), "set_input_delay" | "set_output_delay") {
+        return None;
+    }
+    find(&toks[1..])
 }
 
 /// The first option in `toks` (at any depth of `[...]`) that is not one of its command's options,
@@ -2436,7 +2480,7 @@ impl Sdc {
             // An object query this reader cannot evaluate: the command is NOT applied, and says
             // so (a `set` only stores the text; it is checked where the variable is used).
             if toks[0] != "set" {
-                if let Some(q) = unevaluated_query(&toks) {
+                if let Some(q) = unevaluated_query(&toks).or_else(|| misplaced_except(&toks)) {
                     sdc.rejected.push(format!("{}: {q} not evaluated; not applied", toks[0]));
                     sdc.unevaluated_queries.push(format!("{}: {q}", toks[0]));
                     continue;
@@ -3215,7 +3259,8 @@ mod exception_check_tests {
     fn a_command_the_reference_does_not_know_stops_the_read() {
         let stops = [
             ("create_clock -name clk -period 10 [get_ports clk]\nderive_pll_clocks\nset_input_delay 1 -clock clk [get_ports din]", "invalid command name \"derive_pll_clocks\""),
-            ("set_false_path -from [remove_from_collection [all_inputs] clk] -to [get_ports dout]", "invalid command name \"remove_from_collection\""),
+            ("set_false_path -from [append_to_collection x [all_inputs]] -to [get_ports dout]", "invalid command name \"append_to_collection\""),
+            ("remove_from_collection [all_inputs] clk", "invalid command name \"remove_from_collection\""),
             ("set x [derive_pll_clocks]", "invalid command name \"derive_pll_clocks\""),
             ("set_max 1", "Ambiguous command name \"set_max\""),
             ("set_clock_jitter 0.1 [get_clocks clk]", "invalid command name \"set_clock_jitter\""),
@@ -3294,6 +3339,43 @@ mod exception_check_tests {
             let s = Sdc::parse(&format!("{head}{cmd}\n")).unwrap();
             assert_eq!((s.env[0].objects.join(" "), s.env[0].value), (objects.to_string(), value), "{cmd}");
         }
+    }
+
+    /// A LOOM EXTENSION (the reference does not have the command; user 2026-10-31):
+    /// `[remove_from_collection [all_inputs] <ports>]` as the ports of an I/O delay is every input
+    /// but those, as `lsearch -not -exact` is. OpenTitan's form names the clock port in braces,
+    /// `{${MAIN_CLK_PIN}}`, which Tcl does not substitute: the literal name excludes no port. Any
+    /// other form, or the form anywhere else, is refused with its command; a bare command still
+    /// stops the read.
+    #[test]
+    fn remove_from_collection_is_every_port_but() {
+        let s = Sdc::parse(
+            "set MAIN_CLK_PIN clk_i\ncreate_clock -name clk_i -period 10 [get_ports clk_i]\n\
+             set_input_delay 1 [remove_from_collection [all_inputs] {${MAIN_CLK_PIN}}] -clock ${MAIN_CLK_PIN}\n\
+             set_input_delay 2 [remove_from_collection [all_inputs] [get_ports clk_i]] -clock clk_i\n\
+             set_output_delay 3 [remove_from_collection [all_outputs] {a b}] -clock clk_i\n\
+             set_input_delay 4 [remove_from_collection -intersect [all_inputs] {a}] -clock clk_i\n\
+             set_input_delay 5 [remove_from_collection [get_ports *] {a}] -clock clk_i\n\
+             set_false_path -from [remove_from_collection [all_inputs] clk_i]\n",
+        )
+        .unwrap();
+        let got: Vec<(f64, String, Vec<String>, Option<String>)> =
+            s.input_delays.iter().chain(&s.output_delays).map(|d| (d.value, d.accessor.clone(), d.ports.clone(), d.clock.clone())).collect();
+        let clk = Some("clk_i".to_string());
+        assert_eq!(
+            got,
+            [
+                (1.0, "all_inputs_except".into(), vec!["${MAIN_CLK_PIN}".to_string()], clk.clone()),
+                (2.0, "all_inputs_except".into(), vec!["clk_i".to_string()], clk.clone()),
+                (3.0, "all_outputs_except".into(), vec!["a".to_string(), "b".to_string()], clk.clone()),
+            ]
+        );
+        assert_eq!(s.unevaluated_queries.len(), 3, "{:?}", s.unevaluated_queries);
+        assert!(s.exceptions.is_empty());
+        // excluding two ports has no form the reference reads: not written, and said
+        let w = s.write(&crate::sdc_write::WriteOpts::default());
+        assert!(w.not_written.iter().any(|n| n.contains("more than one port")), "{:?}", w.not_written);
+        assert!(w.text.contains("[lsearch -inline -all -not -exact [all_inputs] {clk_i}]"), "{}", w.text);
     }
 
     /// Rule (`set_clock_uncertainty`, Sdc.tcl): -from and -to come together and take only the
@@ -4151,7 +4233,7 @@ mod unevaluable_is_refused {
     /// command is not applied and is listed with the queries not evaluated. Found reading
     /// OpenTitan's constraint files, written for a synthesis tool: `${DRIVING_CELL}` (set by the
     /// flow) became a lib cell `$`. (Its `remove_from_collection`, a command the reference does not
-    /// have, now stops the whole read: `a_command_the_reference_does_not_know_stops_the_read`.)
+    /// have, is read as a loom extension: `remove_from_collection_is_every_port_but`.)
     #[test]
     fn an_undefined_variable_refuses_its_command() {
         let s = Sdc::parse(
