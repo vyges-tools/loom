@@ -79,6 +79,8 @@ pub struct Exception {
     /// Every flag that takes no value, as written (`-setup`, `-hold`, `-start`, `-end`, `-rise`,
     /// `-fall`, …).
     pub flags: Vec<String>,
+    /// `-comment`, as written: the reference keeps it with the command and writes it back.
+    pub comment: Option<String>,
 }
 
 /// Is `name` in an exception endpoint set? An empty set, or one holding `*`, matches anything;
@@ -90,8 +92,35 @@ fn endpoint_matches(set: &[String], name: &str) -> bool {
 /// Does an SDC object name match `name` — itself, or as a `*` / `?` pattern the way the
 /// reference's object queries match one (`get_ports in*`)? For a consumer applying a per-object
 /// constraint: an exact-name lookup silently never applied `set_input_delay … [get_ports in*]`.
+///
+/// A bit of a bus port (`boot_addr_i[3]`) is also matched by its BUS: the reference matches a
+/// pattern against port names, a bus port's name being the bus (`boot_addr_i`), and a port
+/// query or an implicit object argument names every bit of a bus it matches. A pattern with a
+/// subscript matches the bus part as a pattern, then the bit: `[n]`, a `[a:b]` range, or `[*]`.
 pub fn object_matches(pattern: &str, name: &str) -> bool {
-    pattern == name || (pattern.contains(['*', '?']) && glob(pattern, name))
+    let named = |p: &str, n: &str| p == n || (p.contains(['*', '?']) && glob(p, n));
+    if named(pattern, name) {
+        return true;
+    }
+    let Some((base, bit)) = bus_bit(name) else { return false };
+    match pattern.strip_suffix(']').and_then(|p| p.rsplit_once('[')).filter(|(b, _)| !b.ends_with('\\')) {
+        None => named(pattern, base),
+        Some((pbase, sub)) => {
+            named(pbase, base)
+                && match sub.split_once(':') {
+                    _ if sub == "*" => true,
+                    Some((a, b)) => matches!((a.parse::<i64>(), b.parse::<i64>()), (Ok(a), Ok(b)) if (a.min(b)..=a.max(b)).contains(&bit)),
+                    None => sub.parse::<i64>() == Ok(bit),
+                }
+        }
+    }
+}
+
+/// `name[n]` as (`name`, n) — a bus bit, as the netlist names one; an escaped `\[` is part of a name.
+fn bus_bit(name: &str) -> Option<(&str, i64)> {
+    let (base, idx) = name.strip_suffix(']')?.rsplit_once('[')?;
+    (!base.is_empty() && !base.ends_with('\\')).then_some(())?;
+    Some((base, idx.parse().ok()?))
 }
 
 /// Tcl `string match` for `*` and `?` — what `get_ports in*` matches against.
@@ -162,6 +191,8 @@ pub struct SdcClock {
     /// For `create_generated_clock`, its definition as written — `period` and `waveform` are
     /// what it derives to. `None` for `create_clock`.
     pub generated: Option<GeneratedClock>,
+    /// `-comment`, as written: the reference keeps it with the command and writes it back.
+    pub comment: Option<String>,
 }
 
 impl SdcClock {
@@ -266,6 +297,8 @@ pub struct PathDelayCmd {
     pub value: f64,
     pub objects: Vec<(String, Objects)>,
     pub flags: Vec<String>,
+    /// `-comment`, as written: the reference keeps it with the command and writes it back.
+    pub comment: Option<String>,
 }
 
 /// A command's tokens split into flags with a value (from `valued`), flags without one, and
@@ -320,6 +353,8 @@ pub struct ClockGroups {
     pub kind: String,
     pub allow_paths: bool,
     pub groups: Vec<Vec<String>>,
+    /// `-comment`, as written: the reference keeps it with the command and writes it back.
+    pub comment: Option<String>,
 }
 
 /// Are clocks `a` and `b` separated by any `set_clock_groups` — the reference's rule: one
@@ -1857,6 +1892,13 @@ fn subst_vars(line: &str, vars: &HashMap<String, String>) -> String {
 }
 
 /// Pull a flag's value: `-flag value`. Returns the token after the flag.
+/// `-comment`'s text: its one word, without the braces or quotes that made it one.
+fn comment_of(toks: &[String]) -> Option<String> {
+    let v = flag_val(toks, "-comment")?;
+    let inner = v.strip_prefix('{').and_then(|x| x.strip_suffix('}')).or_else(|| v.strip_prefix('"').and_then(|x| x.strip_suffix('"')));
+    Some(inner.unwrap_or(v).to_string())
+}
+
 fn flag_val<'a>(toks: &'a [String], flag: &str) -> Option<&'a String> {
     toks.iter()
         .position(|t| t == flag)
@@ -2087,7 +2129,7 @@ impl Sdc {
                     if !add {
                         sdc.delete_pin_clocks(&name, &sources);
                     }
-                    let clock = SdcClock { name, source: src, sources, period, waveform, add, generated: None };
+                    let clock = SdcClock { name, source: src, sources, period, waveform, add, generated: None, comment: comment_of(&toks) };
                     match sdc.clocks.iter().position(|c| c.name == clock.name) {
                         Some(i) => sdc.superseded_clocks.push(std::mem::replace(&mut sdc.clocks[i], clock)),
                         None => sdc.clocks.push(clock),
@@ -2131,7 +2173,7 @@ impl Sdc {
                     };
                     let source = sources.first().cloned().unwrap_or_default();
                     // In DEFINITION order, as the reference keeps clocks.
-                    sdc.clocks.push(SdcClock { name, source, sources, period, waveform, add: has("-add"), generated: Some(spec) });
+                    sdc.clocks.push(SdcClock { name, source, sources, period, waveform, add: has("-add"), generated: Some(spec), comment: comment_of(&toks) });
                 }
                 "set_input_delay" | "set_output_delay" => {
                     // `-max` / `-min` take NO value: `delay_value port_pin_list` are the two
@@ -2305,6 +2347,7 @@ impl Sdc {
                         value,
                         objects: with.iter().filter(|(k, _)| *k != "-comment").map(|(k, v)| (k.to_string(), Objects::of(v))).collect(),
                         flags,
+                        comment: comment_of(&toks),
                     });
                     sdc.ignored.push(toks[0].clone());
                 }
@@ -2419,7 +2462,7 @@ impl Sdc {
                             if name.is_some() {
                                 sdc.clock_groups.retain(|g| g.name != name);
                             }
-                            sdc.clock_groups.push(ClockGroups { name, kind, allow_paths: has_flag(&toks, "-allow_paths"), groups: groups.clone() })
+                            sdc.clock_groups.push(ClockGroups { name, kind, allow_paths: has_flag(&toks, "-allow_paths"), groups: groups.clone(), comment: comment_of(&toks) })
                         }
                         // a type is required (the reference's STA-0400)
                         None => sdc.rejected.push("set_clock_groups without -asynchronous / -logically_exclusive / -physically_exclusive".into()),
@@ -2430,7 +2473,7 @@ impl Sdc {
                     let (from, to, refused) = from_to(&toks);
                     let (args, flags) = exception_args(&toks);
                     sdc.exception_objects.push(exception_sides(&toks));
-                    sdc.exceptions.push(Exception { kind: ExcKind::FalsePath, from, to, refused, args, flags, ..Default::default() });
+                    sdc.exceptions.push(Exception { kind: ExcKind::FalsePath, from, to, refused, args, flags, comment: comment_of(&toks), ..Default::default() });
                 }
                 "set_multicycle_path" => {
                     // The multiplier is THE positional left after the flags, wherever it is
@@ -2460,6 +2503,7 @@ impl Sdc {
                         refused,
                         args,
                         flags: written_flags,
+                        comment: comment_of(&toks),
                     });
                 }
                 other => sdc.ignored.push(other.to_string()),
@@ -2644,6 +2688,43 @@ mod async_group_tests {
                  set_clock_groups -asynchronous -group {a b}\n";
         let sdc = Sdc::parse(s).unwrap();
         assert_eq!(sdc.async_groups, vec![vec!["a".to_string(), "b".to_string()]]);
+    }
+}
+
+#[cfg(test)]
+mod bus_match_tests {
+    use super::*;
+    /// Rule (Network::findPortsMatching, find_port_pins_matching): a pattern is matched against
+    /// PORT names, a bus port's name being the bus, and a bus it matches names every bit. A
+    /// subscripted pattern matches the bus part as a pattern, then one bit, a range or `[*]`.
+    /// OpenTitan's ibex SDC writes `set_input_delay -clock clk_i 0.0 boot_addr_i`: the
+    /// reference constrains all 32 bits; an exact-name lookup constrained none.
+    #[test]
+    fn a_bus_name_matches_each_of_its_bits() {
+        for (p, n, hit) in [
+            ("boot_addr_i", "boot_addr_i[3]", true),
+            ("boot*", "boot_addr_i[3]", true),
+            ("*_i", "boot_addr_i[3]", true),
+            ("boot_addr", "boot_addr_i[3]", false),
+            ("boot_addr_i[3]", "boot_addr_i[3]", true),
+            ("boot_addr_i[4]", "boot_addr_i[3]", false),
+            ("boot_addr_i[*]", "boot_addr_i[3]", true),
+            ("b*[7:0]", "boot_addr_i[3]", true),
+            ("boot_addr_i[0:2]", "boot_addr_i[3]", false),
+            ("clk", "clk", true),
+            ("clk", "clk2", false),
+            // an escaped subscript is part of a scalar's name, not a bus bit
+            ("a", "a\\[3]", false),
+        ] {
+            assert_eq!(object_matches(p, n), hit, "{p} vs {n}");
+        }
+    }
+
+    #[test]
+    fn get_ports_against_the_design_names_each_bit_of_a_bus() {
+        let d = SdcDesign { ports: (0..3).map(|k| (format!("d[{k}]"), "input".into())).chain([("clk".into(), "input".into())]).collect(), ..Default::default() };
+        let parts: Vec<String> = ["get_ports", "-filter", "direction==input", "d"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(crate::sdc_query::eval(&parts, &d).unwrap(), ["d[0]", "d[1]", "d[2]"]);
     }
 }
 

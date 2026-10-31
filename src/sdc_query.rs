@@ -180,11 +180,11 @@ fn objects(parts: &[String], d: &SdcDesign) -> Result<Objs, String> {
 }
 
 fn by_pattern(cmd: &str, patterns: &[String], _hier: bool, d: &SdcDesign) -> Result<Objs, String> {
-    let pick = |n: usize, name: &dyn Fn(usize) -> String| -> Vec<usize> {
+    let pick = |n: usize, name: &dyn Fn(usize) -> String, hit: &dyn Fn(&str, &str) -> bool| -> Vec<usize> {
         let mut out = Vec::new();
         for p in patterns {
             for k in 0..n {
-                if glob(p, &name(k)) && !out.contains(&k) {
+                if hit(p, &name(k)) && !out.contains(&k) {
                     out.push(k);
                 }
             }
@@ -192,9 +192,10 @@ fn by_pattern(cmd: &str, patterns: &[String], _hier: bool, d: &SdcDesign) -> Res
         out
     };
     Ok(match cmd {
-        "get_ports" => Objs::Ports(pick(d.ports.len(), &|k| d.ports[k].0.clone())),
-        "get_cells" => Objs::Cells(pick(d.insts.len(), &|k| d.insts[k].0.clone())),
-        "get_pins" => Objs::Pins(pick(d.pins.len(), &|k| d.pin_name(k))),
+        // ports are the netlist's bits; a pattern naming a bus names each of them
+        "get_ports" => Objs::Ports(pick(d.ports.len(), &|k| d.ports[k].0.clone(), &crate::sdc::object_matches)),
+        "get_cells" => Objs::Cells(pick(d.insts.len(), &|k| d.insts[k].0.clone(), &glob)),
+        "get_pins" => Objs::Pins(pick(d.pins.len(), &|k| d.pin_name(k), &glob)),
         "get_nets" => {
             let all = d.nets();
             let mut out: Vec<String> = Vec::new();

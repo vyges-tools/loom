@@ -79,6 +79,14 @@ fn brace(names: &[String]) -> Option<String> {
     Some(format!("{{{}}}", names.join(" ")))
 }
 
+/// ` -comment {text}`, or nothing. A text a brace cannot hold is written quoted.
+fn comment(c: &Option<String>) -> String {
+    match c {
+        None => String::new(),
+        Some(c) => format!(" -comment {}", brace(std::slice::from_ref(c)).unwrap_or_else(|| format!("\"{}\"", c.replace(['"', '\\'], "")))),
+    }
+}
+
 /// The collection names the `all_*` accessors are kept under.
 fn sentinel_accessor(name: &str) -> Option<&'static str> {
     match name {
@@ -216,7 +224,7 @@ impl Sdc {
                         }
                         t += &format!(" -waveform {{{}}}", w.iter().map(|e| num(*e)).collect::<Vec<_>>().join(" "));
                     }
-                    o.line(t + &srcs);
+                    o.line(t + &comment(&c.comment) + &srcs);
                 }
                 Some(g) => {
                     let Some(source) = objects(&g.source) else {
@@ -248,7 +256,7 @@ impl Sdc {
                     if !g.edge_shift.is_empty() {
                         t += &format!(" -edge_shift {{{}}}", g.edge_shift.iter().map(|e| num(*e)).collect::<Vec<_>>().join(" "));
                     }
-                    o.line(t + &srcs);
+                    o.line(t + &comment(&c.comment) + &srcs);
                 }
             }
         }
@@ -299,7 +307,7 @@ impl Sdc {
                     None => ok = false,
                 }
             }
-            o.line_or(ok.then_some(t), || "set_clock_groups".into());
+            o.line_or(ok.then_some(t + &comment(&g.comment)), || "set_clock_groups".into());
         }
     }
 
@@ -371,7 +379,7 @@ impl Sdc {
                 ExcKind::Multicycle(n) => ("set_multicycle_path", format!(" {n}")),
             };
             let flags: String = e.flags.iter().map(|f| format!(" {f}")).collect();
-            o.line_or(sides(&e.args).map(|s| format!("{cmd}{value}{flags}{s}")), || cmd.to_string());
+            o.line_or(sides(&e.args).map(|s| format!("{cmd}{value}{flags}{s}{}", comment(&e.comment))), || cmd.to_string());
         }
         for p in &self.path_delays {
             let cmd = if p.max { "set_max_delay" } else { "set_min_delay" };
@@ -380,7 +388,7 @@ impl Sdc {
                 continue;
             }
             let flags: String = p.flags.iter().map(|f| format!(" {f}")).collect();
-            o.line_or(sides(&p.objects).map(|s| format!("{cmd}{flags}{s} {}", num(p.value))), || cmd.to_string());
+            o.line_or(sides(&p.objects).map(|s| format!("{cmd}{flags}{s} {}{}", num(p.value), comment(&p.comment))), || cmd.to_string());
         }
     }
 
@@ -535,6 +543,33 @@ set_dont_touch [get_cells u1]
             "set_multicycle_path 2 -setup -end -from [list [get_ports {a}] [get_pins {r/CK}]] -to [all_registers -data_pins -clock {clk}]",
         ] {
             assert!(w1.text.lines().any(|l| l == want), "missing `{want}` in\n{}", w1.text);
+        }
+    }
+
+    /// Rule (WriteSdc::writeCmdComment): a clock, generated clock, clock group and exception keep
+    /// their `-comment` and the reference writes it back. Dropped, the round trip of a file with
+    /// `set_clock_groups … -comment {Async Clock group}` differed.
+    #[test]
+    fn a_comment_is_kept_and_written() {
+        let text = "create_clock -name clk -period 10 -comment {main clock} [get_ports clk]
+create_generated_clock -name g -source [get_ports clk] -divide_by 2 -comment {div two} [get_pins r/Q]
+create_clock -name v -period 5
+set_clock_groups -name grp -asynchronous -group [get_clocks clk] -group [get_clocks v] -comment {Async Clock group}
+set_false_path -from [get_ports a] -comment \"cut it\"
+set_multicycle_path 2 -from [get_ports a] -comment {mcp}
+set_max_delay 3 -from [get_ports a] -comment {budget}
+";
+        let (w1, w2) = round_trip(text);
+        assert_eq!(w1.text, w2.text);
+        for want in [
+            "create_clock -name {clk} -period 10 -comment {main clock} [get_ports {clk}]",
+            "-divide_by 2 -comment {div two} [get_pins {r/Q}]",
+            "-group [get_clocks {v}] -comment {Async Clock group}",
+            "set_false_path -from [get_ports {a}] -comment {cut it}",
+            "set_multicycle_path 2 -from [get_ports {a}] -comment {mcp}",
+            "set_max_delay -from [get_ports {a}] 3 -comment {budget}",
+        ] {
+            assert!(w1.text.lines().any(|l| l.contains(want)), "missing `{want}` in\n{}", w1.text);
         }
     }
 
