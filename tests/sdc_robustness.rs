@@ -270,21 +270,24 @@ fn an_unresolved_variable_does_not_let_the_next_argument_become_the_value() {
     assert!(e.to_string().contains("$clk_period"), "{e}");
 }
 
-/// **Quartus and several board vendors write a unit suffix**: `-period 20.000ns`. A bare
-/// `parse::<f64>()` rejects it and takes the whole file down with it — 6 of our 154 files.
+/// Rule (standard SDC; the reference's `check_positive_float "period"`, Error 572): a period is
+/// a positive number in the file's time unit. Quartus also takes a unit suffix (`20.000ns`) and
+/// a frequency (`"100 MHz"`); the reference refuses both, and so does this reader, saying why.
+/// Accepted 2026-08 .. 2026-10; refused since (decided 2026-10-31: follow the standard).
 #[test]
-fn a_period_may_carry_a_unit_suffix() {
-    let cases = [("20.000ns", 20.0), ("20ns", 20.0), ("500ps", 0.5), ("1us", 1000.0)];
-    for (text, want) in cases {
-        let s = parse(&format!("create_clock -name c -period {text} [get_ports clk]\n"));
-        assert!(
-            (s.clocks[0].period - want).abs() < 1e-9,
-            "{text}: want {want} ns, got {}",
-            s.clocks[0].period
-        );
+fn a_period_is_a_positive_number_in_the_files_time_unit() {
+    for text in ["20.000ns", "20ns", "500ps", "1us", "\"100 MHz\"", "100MHz", "\"1 GHz\"", "0", "-5", "fast"] {
+        let e = Sdc::parse(&format!("create_clock -name c -period {text} [get_ports clk]\n"))
+            .expect_err(&format!("-period {text} must be refused"));
+        assert!(e.to_string().contains("not a positive float"), "{text}: {e}");
     }
-    // a bare number keeps its meaning — the file's own time unit
-    assert_eq!(parse("create_clock -name c -period 20 [get_ports clk]\n").clocks[0].period, 20.0);
+    // a bare number, and one level of Tcl quoting, is the period itself
+    for (text, want) in [("20", 20.0), ("2.5", 2.5), ("\"10\"", 10.0), ("{4}", 4.0), ("1e1", 10.0)] {
+        assert_eq!(parse(&format!("create_clock -name c -period {text} [get_ports clk]\n")).clocks[0].period, want, "{text}");
+    }
+    // a waveform edge is a plain number too (`check_float "-waveform edge"`): a suffix is unread
+    let s = parse("create_clock -name c -period 10 -waveform {0ns 5ns} [get_ports clk]\n");
+    assert_eq!(s.clocks[0].waveform.as_deref(), Some(&[][..]), "an edge with a unit is not an edge");
 }
 
 /// The design-rule constraints are timing findings, not synthesis directives: a `set_max_*`
@@ -369,46 +372,14 @@ fn singular_and_plural_command_spellings_are_equivalent() {
     assert!(!b.ignored.iter().any(|i| i == "set_unit"), "set_unit must be handled, not ignored");
 }
 
-/// **Quartus accepts a FREQUENCY where SDC asks for a period**, and Intel FPGA board files use
-/// it: `create_clock -period "100 MHz" -name {refclk} {pcie_refclk}`. Rejecting it fails the
-/// whole file and takes every other constraint with it.
-///
-/// Found by running this reader over a third-party constraint corpus. None of our own 154 files
-/// use the form, because they are all ASIC flows — which is exactly why a foreign corpus is
-/// worth running.
-#[test]
-fn a_period_may_be_given_as_a_frequency() {
-    let cases = [
-        ("\"100 MHz\"", 10.0),
-        ("\"1 MHz\"", 1000.0),
-        ("100MHz", 10.0),
-        ("\"1 GHz\"", 1.0),
-        ("\"500 kHz\"", 2000.0),
-        ("\"1000000 Hz\"", 1000.0),
-    ];
-    for (text, want) in cases {
-        let s = parse(&format!("create_clock -name c -period {text} [get_ports clk]\n"));
-        assert!(
-            (s.clocks[0].period - want).abs() < 1e-6,
-            "{text}: want {want} ns, got {}",
-            s.clocks[0].period
-        );
-    }
-    // a time is still a time — the frequency reading must not capture `20ns`
-    assert_eq!(parse("create_clock -name c -period 20ns [get_ports clk]\n").clocks[0].period, 20.0);
-    // and something that is neither says so
-    let e = Sdc::parse("create_clock -name c -period \"fast\" [get_ports clk]\n").unwrap_err();
-    assert!(e.to_string().contains("neither a time nor a frequency"), "{e}");
-}
-
 /// **Parsing is not extracting.** A file full of constraints that yields nothing at all has
 /// failed as completely as one that errored, and more quietly. Every construct below is one a
 /// third-party file actually used.
 #[test]
 fn a_file_of_constraints_never_yields_nothing() {
     let cases: &[(&str, &str)] = &[
-        ("Quartus hierarchical path", "create_clock -name c -period 16ns inst|pcie_ip|coreclkout\n"),
-        ("brace-quoted object", "create_clock -period \"100 MHz\" -name {refclk} {pcie_refclk}\n"),
+        ("Quartus hierarchical path", "create_clock -name c -period 16 inst|pcie_ip|coreclkout\n"),
+        ("brace-quoted object", "create_clock -period 10 -name {refclk} {pcie_refclk}\n"),
         ("exception only", "set_false_path -from [get_clocks a] -to [get_clocks b]\n"),
         ("groups only", "set_clock_groups -asynchronous -group {a} -group {b}\n"),
     ];

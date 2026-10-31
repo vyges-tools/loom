@@ -12,7 +12,7 @@
 //! contain the vendor forms we do not use — running against the constraint files in the
 //! Apache-2.0/MIT `sdcx` crate (`git clone https://github.com/dalance/sdcx`, then
 //! `VYGES_CORPUS=sdcx/testcase`) found `create_clock -period "100 MHz"`, a Quartus extension
-//! that failed two files outright and would never have appeared in ours. Nothing is vendored:
+//! that would never have appeared in ours (refused, as the reference refuses it, since 2026-10-31). Nothing is vendored:
 //! the files stay where they are and the corpus is pointed at them.
 //!
 //! **The waveform corpora are the same trade.** `wellen` (BSD-3-Clause), the reader Surfer loads

@@ -1097,60 +1097,15 @@ fn resolve_objs(tok: &str) -> Vec<String> {
     tok.split_whitespace().map(|s| s.to_string()).collect()
 }
 
-/// A clock period, accepting the two forms real tools write: a TIME, or a FREQUENCY.
-///
-/// Quartus documents `-period "100 MHz"` as an alternative to a time, and Intel FPGA board
-/// constraint files use it — `create_clock -period "100 MHz" -name {refclk} {pcie_refclk}`.
-/// Rejecting it fails the whole file, taking every other constraint with it. Found by running
-/// this reader over a third-party constraint corpus; none of our own 154 files use the form,
-/// because they are all ASIC flows.
+/// A clock period: a POSITIVE number, in the file's time unit — standard SDC, and the reference's
+/// rule (`create_clock`, Error 572 "is not a positive float"). A frequency (`"100 MHz"`) or a
+/// time with a unit (`20ns`) is a Quartus extension: the reference refuses it and so does this
+/// reader, with an error that says so (accepted 2026-08 .. 2026-10, a value no other tool
+/// would have timed). One level of Tcl quoting (`"10"`, `{10}`) is the number itself.
 fn parse_period(v: &str) -> Option<f64> {
-    if let Some(t) = parse_time(v) {
-        return Some(t);
-    }
-    // `<number> <unit>` with the unit naming a frequency; the space is optional.
-    let t = v.trim().trim_matches('"').trim();
-    let split = t
-        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-'))?;
-    let (num, unit) = t.split_at(split);
-    let hz = match unit.trim().to_ascii_lowercase().as_str() {
-        "hz" => 1.0,
-        "khz" => 1.0e3,
-        "mhz" => 1.0e6,
-        "ghz" => 1.0e9,
-        _ => return None,
-    };
-    let f: f64 = num.trim().parse().ok()?;
-    (f > 0.0).then(|| 1.0e9 / (f * hz)) // -> nanoseconds
-}
-
-/// A time value, with or without an SI suffix, normalised to the file's time unit.
-///
-/// Quartus and several board vendors write `-period 20.000ns`; a bare `parse::<f64>()` rejects
-/// that, and the whole constraint file went with it. Six of the 154 files in this organisation
-/// are of exactly that form. A bare number keeps its existing meaning — the file's own time
-/// unit — so this only ever adds cases that used to fail.
-fn parse_time(v: &str) -> Option<f64> {
     let t = v.trim();
-    if let Ok(x) = t.parse::<f64>() {
-        return Some(x);
-    }
-    // Longest suffix first, so `ps` is not read as `s`.
-    for (suf, scale) in [
-        ("fs", 1e-6),
-        ("ps", 1e-3),
-        ("ns", 1.0),
-        ("us", 1e3),
-        ("ms", 1e6),
-        ("s", 1e9),
-    ] {
-        if let Some(num) = t.strip_suffix(suf) {
-            if let Ok(x) = num.trim().parse::<f64>() {
-                return Some(x * scale);
-            }
-        }
-    }
-    None
+    let t = t.strip_prefix('"').and_then(|x| x.strip_suffix('"')).or_else(|| t.strip_prefix('{').and_then(|x| x.strip_suffix('}'))).unwrap_or(t);
+    t.trim().parse::<f64>().ok().filter(|p| p.is_finite() && *p > 0.0)
 }
 
 /// Apply `set var value` substitution to a logical line (`$var`, `${var}`, `$::env(NAME)`).
@@ -2089,9 +2044,11 @@ impl Sdc {
                                      variable (set it, or export it for $::env)",
                                     line.trim()
                                 ),
-                                Some(v) => {
-                                    format!("create_clock -period `{v}` is neither a time nor a frequency")
-                                }
+                                Some(v) => format!(
+                                    "create_clock -period `{v}` is not a positive float — SDC takes the period as a \
+                                     number in the file's time unit (a frequency such as `100 MHz` or a unit suffix \
+                                     such as `20ns` is a Quartus extension; the reference refuses it too, Error 572)"
+                                ),
                             })
                         })?;
                     let obj = trailing_obj(&toks, &["-name", "-period", "-waveform", "-comment"]);
@@ -2114,8 +2071,9 @@ impl Sdc {
                     let src = source;
                     // An edge that is not a time (an unresolved variable) leaves the list EMPTY
                     // rather than failing the file: a consumer modelling two edges refuses it.
+                    // each edge a plain number (`check_float "-waveform edge"`), no unit suffix
                     let waveform = flag_val(&toks, "-waveform").map(|w| {
-                        list_words(w).split_whitespace().map(parse_time).collect::<Option<Vec<f64>>>().unwrap_or_default()
+                        list_words(w).split_whitespace().map(|e| e.parse::<f64>().ok()).collect::<Option<Vec<f64>>>().unwrap_or_default()
                     });
                     // `-add` keeps the clocks already on these sources; without it a new clock
                     // REPLACES them there (each loses these sources, and one left with none is
