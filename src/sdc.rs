@@ -1057,8 +1057,12 @@ fn tokenize(line: &str) -> Vec<String> {
 /// `[lsearch -inline -all -not -exact [all_inputs] [get_ports P]]` — every input but P, the usual
 /// way to constrain every input except the clock's — as the accessor `all_inputs_except` (or
 /// `all_outputs_except`) naming the excluded port. Tcl's `lsearch -not -exact` drops the elements
-/// EQUAL to the pattern: one port is a one-element list equal to its element; a pattern of two or
-/// more ports equals no element, so it is not read here (`None`).
+/// EQUAL to the pattern, and the reference's collection elements are object HANDLES
+/// (`_e0ca…_p_Port`), not names (observed 2026-10-31): `[get_ports P]` of one port is a handle
+/// equal to its element, so P is excluded; a NAME (`clk`, `{clk}`) or a query of two or more ports
+/// equals no element, so nothing is excluded (an empty list); a wildcard query, whose port count
+/// needs the design, is not read here (`None`). ⛔ A bare name was read as excluding its port: the
+/// reference constrains it.
 ///
 /// `[remove_from_collection [all_inputs] <ports>]` — a synthesis tool's spelling of the same, which
 /// the reference does NOT have — is read the same way, every named port excluded (a LOOM
@@ -1093,8 +1097,12 @@ fn all_ports_except(tok: &str) -> Option<(String, Vec<String>)> {
         [one] if one == "*OUTPUTS*" => "all_outputs_except",
         _ => return None,
     };
-    let excluded = resolve_objs(pattern);
-    (excluded.len() == 1).then(|| (accessor.to_string(), excluded))
+    let one_port = pattern.strip_prefix("[get_ports").filter(|_| pattern.ends_with(']')).map(|_| resolve_objs(pattern));
+    match one_port {
+        Some(p) if p.iter().any(|n| n.contains(['*', '?'])) => None,
+        Some(p) if p.len() == 1 => Some((accessor.to_string(), p)),
+        _ => Some((accessor.to_string(), Vec::new())),
+    }
 }
 
 fn resolve_objs(tok: &str) -> Vec<String> {
@@ -3375,7 +3383,7 @@ mod exception_check_tests {
         // excluding two ports has no form the reference reads: not written, and said
         let w = s.write(&crate::sdc_write::WriteOpts::default());
         assert!(w.not_written.iter().any(|n| n.contains("more than one port")), "{:?}", w.not_written);
-        assert!(w.text.contains("[lsearch -inline -all -not -exact [all_inputs] {clk_i}]"), "{}", w.text);
+        assert!(w.text.contains("[lsearch -inline -all -not -exact [all_inputs] [get_ports {clk_i}]]"), "{}", w.text);
     }
 
     /// Rule (`set_clock_uncertainty`, Sdc.tcl): -from and -to come together and take only the
@@ -3507,8 +3515,9 @@ mod list_obj_tests {
         assert_eq!(resolve_objs("[all_inputs]"), vec!["*INPUTS*"]);
     }
 
-    // `lsearch -not -exact` drops the inputs EQUAL to the pattern: one port is removed; a pattern
-    // of two ports equals no element and is not read as an exclusion.
+    // `lsearch -not -exact` drops the inputs EQUAL to the pattern, and the reference's elements
+    // are handles (observed 2026-10-31): `[get_ports P]` of one port removes P; a name, or a query
+    // of two ports, equals no element and removes nothing; a wildcard query is not read.
     #[test]
     fn every_input_but_the_clock_port() {
         let t = "set clk_port [get_ports clk]\ncreate_clock -name clk -period 690 $clk_port\n\
@@ -3517,7 +3526,10 @@ mod list_obj_tests {
         let s = Sdc::parse(t).unwrap();
         let d = &s.input_delays[0];
         assert_eq!((d.accessor.as_str(), d.ports.clone(), d.default), ("all_inputs_except", vec!["clk".to_string()], false));
-        assert_eq!(all_ports_except("[lsearch -inline -all -not -exact [all_inputs] [get_ports {a b}]]"), None);
+        assert_eq!(all_ports_except("[lsearch -inline -all -not -exact [all_inputs] [get_ports {a b}]]"), Some(("all_inputs_except".into(), vec![])));
+        assert_eq!(all_ports_except("[lsearch -inline -all -not -exact [all_inputs] clk]"), Some(("all_inputs_except".into(), vec![])));
+        assert_eq!(all_ports_except("[lsearch -inline -all -not -exact [all_inputs] {clk}]"), Some(("all_inputs_except".into(), vec![])));
+        assert_eq!(all_ports_except("[lsearch -inline -all -not -exact [all_inputs] [get_ports c*]]"), None);
         assert_eq!(all_ports_except("[lsearch -inline -all -exact [all_inputs] [get_ports a]]"), None);
         assert_eq!(all_ports_except("[lsearch -all -inline -exact -not [all_outputs] [get_ports y]]"), Some(("all_outputs_except".into(), vec!["y".into()])));
     }

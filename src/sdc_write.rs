@@ -339,7 +339,14 @@ impl Sdc {
                         o.skip(format!("{cmd} on [{all}] but {}: no form the reference reads excludes more than one port", d.ports.join(" ")));
                         continue;
                     }
-                    let line = brace(&d.ports).map(|p| format!("{head} [lsearch -inline -all -not -exact [{all}{flags}] {p}]"));
+                    // the port as a QUERY: the reference's elements are handles, and a name
+                    // equals none of them (`{clk}` excludes nothing); excluding nothing is the
+                    // whole collection
+                    let line = if d.ports.is_empty() {
+                        Some(format!("{head} [{all}{flags}]"))
+                    } else {
+                        brace(&d.ports).map(|p| format!("{head} [lsearch -inline -all -not -exact [{all}{flags}] [get_ports {p}]]"))
+                    };
                     o.line_or(line, || cmd.to_string());
                     continue;
                 }
