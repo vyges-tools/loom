@@ -162,6 +162,24 @@ impl Exception {
     pub fn covers(&self, launch: &str, capture: &str) -> bool {
         self.refused.is_none() && self.from_matches(launch) && self.to_matches(capture)
     }
+    /// Does it apply to the HOLD check (`true`) or the SETUP check (`false`)?
+    ///
+    /// A false path: `-setup` / `-hold` scope it as the reference reads them (MinMaxAll: neither
+    /// or both is both) — `set_false_path -hold` leaves the setup check timed. A multicycle: a
+    /// `-hold` one does not move the setup check; any one moves the hold check (a setup
+    /// multiplier moves the hold edge with it).
+    ///
+    /// ⛔ A consumer that cuts both checks for every false path cuts the setup paths a `-hold`
+    /// false path left timed — optimistic and silent.
+    pub fn applies_to(&self, hold_check: bool) -> bool {
+        let has = |f: &str| self.flags.iter().any(|x| x == f);
+        match self.kind {
+            ExcKind::FalsePath => {
+                if hold_check { has("-hold") || !has("-setup") } else { has("-setup") || !has("-hold") }
+            }
+            ExcKind::Multicycle(_) => hold_check || !self.hold,
+        }
+    }
     /// Endpoint names that are not the `*` wildcard — what a linter can check for existence.
     pub fn named_endpoints(&self) -> impl Iterator<Item = (&'static str, &String)> {
         self.from
@@ -2550,6 +2568,14 @@ fn from_to(toks: &[String]) -> (Vec<String>, Vec<String>, Option<String>) {
     if ["-through", "-rise_through", "-fall_through"].iter().any(|f| has_flag(toks, f)) {
         refused = Some("a -through list, which an instance-level match cannot express".to_string());
     }
+    // The reference keeps an edge per side (`-rise_from` / `-fall_from`, `-rise_to` / `-fall_to`)
+    // and one at the endpoint (`-rise` / `-fall`): the exception holds on that edge only. Applied
+    // to both edges it cuts (or relaxes) the paths of the edge it left alone — optimistic, silent.
+    if refused.is_none() {
+        if let Some(f) = ["-rise_from", "-fall_from", "-rise_to", "-fall_to", "-rise", "-fall"].iter().find(|f| has_flag(toks, f)) {
+            refused = Some(format!("{f}: an exception on one edge only, which an instance-level match cannot express"));
+        }
+    }
     let (f, rf) = reduce_exception_objects(&from);
     let (t, rt) = reduce_exception_objects(&to);
     (f, t, refused.or(rf).or(rt))
@@ -2646,6 +2672,39 @@ mod async_group_tests {
                  set_clock_groups -asynchronous -group {a b}\n";
         let sdc = Sdc::parse(s).unwrap();
         assert_eq!(sdc.async_groups, vec![vec!["a".to_string(), "b".to_string()]]);
+    }
+}
+
+#[cfg(test)]
+mod exception_check_tests {
+    use super::*;
+    /// Rule (set_false_path / set_multicycle_path, `-setup` / `-hold` read as MinMaxAll): a false
+    /// path with neither flag, or both, cuts both checks; `-hold` cuts the hold check only and
+    /// `-setup` the setup check only. A `-hold` multicycle leaves setup alone; any multicycle
+    /// reaches the hold check.
+    /// Rule (parse_from_arg / parse_to_arg: `-rise_from` / `-fall_from` set the from edge,
+    /// `-rise_to` / `-fall_to` the to edge, `-rise` / `-fall` the endpoint edge): such an exception
+    /// holds on one edge only, so it is refused — never applied to both edges.
+    #[test]
+    fn an_exception_on_one_edge_is_refused() {
+        let s = Sdc::parse(
+            "set_false_path -rise_from a -to b\nset_false_path -from a -fall_to b\nset_multicycle_path 2 -rise -to b\n\
+             set_false_path -from a -to b\n",
+        )
+        .unwrap();
+        let refused: Vec<bool> = s.exceptions.iter().map(|e| e.refused.is_some()).collect();
+        assert_eq!(refused, [true, true, true, false]);
+        assert!(!s.exceptions[0].covers("a", "b"));
+    }
+    #[test]
+    fn a_false_path_cuts_only_the_check_it_names() {
+        let s = Sdc::parse(
+            "set_false_path -from a\nset_false_path -hold -from a\nset_false_path -setup -from a\n\
+             set_false_path -setup -hold -from a\nset_multicycle_path 2 -from a\nset_multicycle_path 1 -hold -from a\n",
+        )
+        .unwrap();
+        let got: Vec<(bool, bool)> = s.exceptions.iter().map(|e| (e.applies_to(false), e.applies_to(true))).collect();
+        assert_eq!(got, [(true, true), (false, true), (true, false), (true, true), (true, true), (false, true)]);
     }
 }
 
