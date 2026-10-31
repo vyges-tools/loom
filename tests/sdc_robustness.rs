@@ -50,6 +50,51 @@ const HANDLED: &[&str] = &[
     "set_unit",
 ];
 
+/// The mined commands the reference does NOT know (`invalid command name`; measured on the pinned
+/// reference's own command list, 2026-10-31). Each stops the reference's `read_sdc`, so each now
+/// stops this reader too (user 2026-10-31) — the whole file, not one command. Synthesis-tool and
+/// vendor commands, used in real constraint files: `set_size_only` 16 times, `set_critical_range`
+/// 15, `derive_pll_clocks` and `derive_clock_uncertainty` 8 each.
+const UNKNOWN_TO_REFERENCE: &[&str] = &[
+    "append_to_collection",
+    "axi_araddr_i",
+    "derive_clock_uncertainty",
+    "derive_pll_clocks",
+    "set_clock_gating_enable",
+    "set_clock_gating_style",
+    "set_clock_gating_verification",
+    "set_critical_range",
+    "set_dont_touch_network",
+    "set_min_porosity",
+    "set_optimize_design",
+    "set_scan_configuration",
+    "set_size_only",
+    "set_timing_enable_verification",
+];
+
+/// The mined commands the reference knows and this reader does not model: these must read on.
+fn known_unmodelled() -> Vec<&'static str> {
+    commands().into_iter().filter(|c| !HANDLED.contains(c) && !UNKNOWN_TO_REFERENCE.contains(c)).collect()
+}
+
+/// **Every mined command the reference does not know stops the read**, naming itself, as the
+/// reference's `read_sdc` stops at it; and no other mined command does.
+#[test]
+fn a_mined_command_the_reference_does_not_know_stops_the_read() {
+    for c in commands() {
+        if HANDLED.contains(&c) {
+            continue;
+        }
+        let r = Sdc::parse(&good_sdc(&format!("{c} 1.0 [get_ports a]\n")));
+        if UNKNOWN_TO_REFERENCE.contains(&c) {
+            let e = r.err().unwrap_or_else(|| panic!("{c}: read on"));
+            assert!(e.0.contains(&format!("invalid command name \"{c}\"")), "{c}: {}", e.0);
+        } else {
+            assert!(r.is_ok(), "{c}: {:?}", r.err());
+        }
+    }
+}
+
 /// A constraint file exercising everything this reader claims to read.
 fn good_sdc(extra: &str) -> String {
     format!(
@@ -117,16 +162,13 @@ fn the_known_good_file_reads_as_expected() {
     assert!(s.health().is_none(), "nothing ignored that matters: {:?}", s.health());
 }
 
-/// **The generated sweep.** Every command our constraint files use, injected into a known-good
-/// file. An unmodelled one must change nothing we parsed.
+/// **The generated sweep.** Every command our constraint files use that the reference knows,
+/// injected into a known-good file. An unmodelled one must change nothing we parsed.
 #[test]
 fn no_unmodelled_command_can_perturb_what_we_read() {
     let base = fingerprint(&parse(&good_sdc("")));
     let mut broke = Vec::new();
-    for c in commands() {
-        if HANDLED.contains(&c) {
-            continue;
-        }
+    for c in known_unmodelled() {
         for body in [
             format!("{c}\n"),
             format!("{c} 1.0\n"),
@@ -152,10 +194,7 @@ fn no_unmodelled_command_can_perturb_what_we_read() {
 #[test]
 fn every_unmodelled_command_is_recorded() {
     let mut missing = Vec::new();
-    for c in commands() {
-        if HANDLED.contains(&c) {
-            continue;
-        }
+    for c in known_unmodelled() {
         let s = parse(&good_sdc(&format!("{c} 1.0 [get_ports a]\n")));
         // an abbreviation is recorded under the command it expands to, as the reference runs it
         if !s.ignored.iter().any(|i| i == c || i.starts_with(c)) {
@@ -177,7 +216,7 @@ fn every_unmodelled_command_is_recorded() {
 #[test]
 fn timing_affecting_constraints_are_distinguished_from_benign_ones() {
     let benign = parse(&good_sdc(
-        "set_dont_touch [get_cells u1]\nset_max_area 0\nset_size_only [get_cells u2]\n",
+        "set_dont_touch [get_cells u1]\nset_max_area 0\nset_dont_use [get_lib_cells */BUF*]\n",
     ));
     assert!(!benign.ignored.is_empty(), "they are still recorded");
     assert!(
@@ -322,8 +361,8 @@ fn every_spec_command_is_either_modelled_or_classified() {
         "axi_araddr_i",
     ];
     let mut unreviewed = Vec::new();
-    for c in commands() {
-        if HANDLED.contains(&c) || NOT_A_CONSTRAINT.contains(&c) {
+    for c in known_unmodelled() {
+        if NOT_A_CONSTRAINT.contains(&c) {
             continue;
         }
         // A constraint is reviewed when injecting it produces a classification either way.

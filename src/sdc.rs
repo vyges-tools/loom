@@ -1228,23 +1228,112 @@ fn generate(master: &SdcClock, g: &GeneratedClock) -> Option<(f64, Vec<f64>)> {
     Some((period, wave))
 }
 
+/// The commands the reference knows where `read_sdc` evaluates a file, observed on the pinned
+/// reference (`info commands`, 2026-10-31): `resolve.txt` is what a command word resolves against
+/// (the file runs in namespace `sta`: its commands, then global), `global.txt` the global
+/// namespace alone, which is all the reference's abbreviation fallback searches. Regenerate on a
+/// repin.
+fn known_commands() -> &'static (std::collections::HashSet<&'static str>, Vec<&'static str>) {
+    static KNOWN: std::sync::OnceLock<(std::collections::HashSet<&'static str>, Vec<&'static str>)> =
+        std::sync::OnceLock::new();
+    KNOWN.get_or_init(|| {
+        let global: Vec<&'static str> = include_str!("sdc_known/global.txt").lines().filter(|l| !l.is_empty()).collect();
+        let all = include_str!("sdc_known/resolve.txt").lines().filter(|l| !l.is_empty()).chain(global.iter().copied()).collect();
+        (all, global)
+    })
+}
+
+/// The command a word names, by the reference's rule: a command it knows, else the ONE global
+/// command the word begins (`set_max_trans` is `set_max_transition`). None of them is `invalid
+/// command name`, several is `Ambiguous command name`, and either stops the reference's read.
+fn resolve_command(word: &str) -> Result<String, String> {
+    let (known, global) = known_commands();
+    if known.contains(word) {
+        return Ok(word.to_string());
+    }
+    let mut m: Vec<&str> = global.iter().copied().filter(|c| c.starts_with(word)).collect();
+    match m.len() {
+        1 => Ok(m[0].to_string()),
+        0 => Err(format!("invalid command name \"{word}\"")),
+        _ => {
+            m.sort_unstable();
+            Err(format!("Ambiguous command name \"{word}\": {}", m.join(" ")))
+        }
+    }
+}
+
+/// The first command word in `line` the reference does not know, with its error: the line's own
+/// command and every `[...]` substitution outside braces, at any depth, in the order Tcl evaluates
+/// them (a substitution in an argument runs before the command it is an argument of). A bus
+/// subscript (`[0]`, `[7:0]`, `[*]`) is the reference's literal, not a command.
+fn unknown_command(line: &str) -> Option<String> {
+    let cs: Vec<char> = line.chars().collect();
+    let is_subscript = |s: &str| {
+        let s = s.trim();
+        !s.is_empty() && (s.chars().all(|c| c.is_ascii_digit()) || s == "*" || {
+            let mut p = s.splitn(2, ':');
+            matches!((p.next(), p.next()), (Some(a), Some(b)) if !a.is_empty() && !b.is_empty()
+                && a.chars().all(|c| c.is_ascii_digit()) && b.chars().all(|c| c.is_ascii_digit()))
+        })
+    };
+    // the substitutions at this level, as (inner text), skipping braced words and escapes
+    let mut subs = Vec::new();
+    let (mut i, mut brace) = (0usize, 0i32);
+    while i < cs.len() {
+        match cs[i] {
+            '\\' => i += 1,
+            '{' => brace += 1,
+            '}' => brace -= 1,
+            '[' if brace == 0 => {
+                let (start, mut depth, mut b) = (i + 1, 0i32, 0i32);
+                while i < cs.len() {
+                    match cs[i] {
+                        '\\' => i += 1,
+                        '{' => b += 1,
+                        '}' => b -= 1,
+                        '[' if b == 0 => depth += 1,
+                        ']' if b == 0 => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                subs.push(cs[start..i.min(cs.len())].iter().collect::<String>());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    for inner in &subs {
+        if is_subscript(inner) {
+            continue;
+        }
+        if let Some(why) = unknown_command(inner) {
+            return Some(why);
+        }
+    }
+    let first = tokenize(line.trim()).into_iter().next()?;
+    resolve_command(&first).err()
+}
+
 /// Abbreviations, expanded as the reference expands them before a command runs: a command name
-/// that begins exactly one SDC command is that command (`set_max_trans`), and an argument that
-/// is not one of the command's keys or flags exactly is the FIRST key it begins, else the first
-/// flag, in the reference's order (`-per` is `-period`). Lists the reference parses on their own
-/// (`-through`, `-group`) are left as written.
+/// the reference does not know is the one global command it begins ([`resolve_command`]:
+/// `set_max_trans`), and an argument that is not one of the command's keys or flags exactly is
+/// the FIRST key it begins, else the first flag, in the reference's order (`-per` is `-period`).
+/// Lists the reference parses on their own (`-through`, `-group`) are left as written.
 ///
 /// ⛔ Unexpanded, `create_clock -per 10` failed the whole file, and `set_max_trans 0.5` was an
 /// unknown command whose limit was lost.
 fn expand_abbreviations(mut toks: Vec<String>) -> Vec<String> {
-    use crate::sdc_flags::{COMMANDS, FLAGS};
+    use crate::sdc_flags::FLAGS;
     const OWN: [&str; 4] = ["-through", "-rise_through", "-fall_through", "-group"];
     let Some(c) = toks.first() else { return toks };
-    if !COMMANDS.contains(&c.as_str()) && c.starts_with(|ch: char| ch.is_ascii_lowercase()) && c.contains('_') {
-        let m: Vec<&&str> = COMMANDS.iter().filter(|k| k.starts_with(c.as_str())).collect();
-        if m.len() == 1 {
-            toks[0] = m[0].to_string();
-        }
+    if let Ok(full) = resolve_command(c) {
+        toks[0] = full;
     }
     let Some((_, keys, flags)) = FLAGS.iter().find(|(n, _, _)| *n == toks[0]) else { return toks };
     let mut k = 1;
@@ -2178,6 +2267,16 @@ impl Sdc {
             if toks.is_empty() {
                 continue;
             }
+            // ⛔ A COMMAND THE REFERENCE DOES NOT KNOW STOPS THE READ, as it stops the reference's
+            // `read_sdc` (user 2026-10-31): nothing after it is applied there, so nothing is
+            // applied here either. Read on, this reader built constraints the reference never had
+            // (`derive_pll_clocks`, then a `set_input_delay` the reference never saw).
+            if let Some(why) = unknown_command(&line) {
+                return Err(SdcError(format!(
+                    "{why} in `{}`: the reference stops reading the file at a command it does not know, so this file is not read",
+                    line.trim()
+                )));
+            }
             // ⛔ An UNDEFINED VARIABLE is an error to Tcl, so to the reference; not applied here
             // either, and listed with the queries not evaluated — the list every consumer refuses
             // on. Kept as text, `-lib_cell ${DRIVING_CELL}` split into a lib cell `$` and a stray
@@ -2973,6 +3072,38 @@ mod exception_check_tests {
             assert!(s.rejected.iter().all(|r| !r.contains("is not an option of")), "{line}: {:?}", s.rejected);
         }
     }
+    /// The reference's `read_sdc` stops at a command it does not know (`invalid command name`)
+    /// or an abbreviation of several (`Ambiguous command name`): its unknown handler resolves a
+    /// word only to the ONE global command it begins. Measured 2026-10-31: `derive_pll_clocks`
+    /// stopped the read, and a `set_input_delay` after it was never applied. So the whole read
+    /// fails here (user 2026-10-31), wherever the command is evaluated, inside `[...]` and under
+    /// `set` too; a bus subscript is a literal, and an `if` branch not taken is not evaluated.
+    #[test]
+    fn a_command_the_reference_does_not_know_stops_the_read() {
+        let stops = [
+            ("create_clock -name clk -period 10 [get_ports clk]\nderive_pll_clocks\nset_input_delay 1 -clock clk [get_ports din]", "invalid command name \"derive_pll_clocks\""),
+            ("set_false_path -from [remove_from_collection [all_inputs] clk] -to [get_ports dout]", "invalid command name \"remove_from_collection\""),
+            ("set x [derive_pll_clocks]", "invalid command name \"derive_pll_clocks\""),
+            ("set_max 1", "Ambiguous command name \"set_max\""),
+            ("set_clock_jitter 0.1 [get_clocks clk]", "invalid command name \"set_clock_jitter\""),
+        ];
+        for (text, why) in stops {
+            let e = Sdc::parse(text).err().unwrap_or_else(|| panic!("{text}: read on"));
+            assert!(e.0.contains(why), "{text}: {}", e.0);
+        }
+        let reads = [
+            "set_max_trans 0.5",
+            "set_load 1 [get_ports d[0]]",
+            "set_load 1 [get_ports {d[7:0]}]",
+            "report_checks",
+            "if {0} {derive_pll_clocks}\nset_load 1 [get_ports dout]",
+        ];
+        for text in reads {
+            assert!(Sdc::parse(text).is_ok(), "{text}: {:?}", Sdc::parse(text).err());
+        }
+        assert_eq!(Sdc::parse("set_max_trans 0.5 [current_design]").unwrap().max_transition, Some(0.5));
+    }
+
     #[test]
     fn a_false_path_cuts_only_the_check_it_names() {
         let s = Sdc::parse(
@@ -3794,25 +3925,23 @@ mod clock_state_rules {
 mod unevaluable_is_refused {
     use super::*;
 
-    /// Rule (Tcl, so the reference): a command the interpreter does not have is an error, and so
-    /// is an undefined variable. Neither is a name or a value: the command is not applied and is
-    /// listed with the queries not evaluated. Found reading OpenTitan's constraint files, written
-    /// for a synthesis tool: `remove_from_collection` became a port of that name, and
-    /// `${DRIVING_CELL}` (set by the flow) a lib cell `$`.
+    /// Rule (Tcl, so the reference): an undefined variable is an error. It is not a value: the
+    /// command is not applied and is listed with the queries not evaluated. Found reading
+    /// OpenTitan's constraint files, written for a synthesis tool: `${DRIVING_CELL}` (set by the
+    /// flow) became a lib cell `$`. (Its `remove_from_collection`, a command the reference does not
+    /// have, now stops the whole read: `a_command_the_reference_does_not_know_stops_the_read`.)
     #[test]
-    fn an_unknown_command_or_undefined_variable_refuses_its_command() {
+    fn an_undefined_variable_refuses_its_command() {
         let s = Sdc::parse(
             "create_clock -name c -period 8 [get_ports clk_i]\n\
-             set_input_delay 1 [remove_from_collection [all_inputs] {clk_i}] -clock c\n\
-             set_load [load_of lib/BUF/A] [all_outputs]\n\
              set_driving_cell -lib_cell ${DRIVING_CELL} [all_inputs]\n\
              set_output_delay 1 [all_outputs] -clock c\n",
         )
         .unwrap();
-        assert!(s.input_delays.is_empty() && s.env.is_empty() && s.driving_cells.is_empty(), "{s:?}");
+        assert!(s.driving_cells.is_empty(), "{s:?}");
         assert_eq!(s.output_delays.len(), 1, "the rest of the file still applies");
-        assert_eq!(s.unevaluated_queries.len(), 3, "{:?}", s.unevaluated_queries);
-        assert!(s.unevaluated_queries[2].contains("$DRIVING_CELL"), "{:?}", s.unevaluated_queries);
+        assert_eq!(s.unevaluated_queries.len(), 1, "{:?}", s.unevaluated_queries);
+        assert!(s.unevaluated_queries[0].contains("$DRIVING_CELL"), "{:?}", s.unevaluated_queries);
     }
 
     /// Inside braces Tcl substitutes nothing: an escaped name's `$` is text, not a variable.
