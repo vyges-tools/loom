@@ -2135,6 +2135,64 @@ fn subst_exprs(line: &str, vars: &HashMap<String, String>) -> String {
     out
 }
 
+/// [`subst_vars`] as Tcl substitutes a command: NOT inside a braced word. A `{` that begins a word
+/// (after a space, `[`, `;` or at the start) opens a literal to its matching `}`, so
+/// `[get_ports {$P}]` names the port `$P`, as the reference reads it ("port '$P' not found"); a
+/// brace elsewhere, or inside quotes, is text, and `${name}` is the variable. `expr` substitutes
+/// its own braced arguments ([`subst_exprs`]). ⛔ Substituted, OpenTitan's
+/// `remove_from_collection [all_inputs] {${MAIN_CLK_PIN}}` removed the clock port the reference
+/// keeps.
+fn subst_command_vars(line: &str, vars: &HashMap<String, String>) -> String {
+    let cs: Vec<char> = line.chars().collect();
+    let (mut out, mut seg, mut quoted, mut i) = (String::new(), String::new(), false, 0usize);
+    let word_start = |out: &str, seg: &str| seg.chars().last().or_else(|| out.chars().last()).is_none_or(|c| c.is_whitespace() || c == '[' || c == ';');
+    while i < cs.len() {
+        let c = cs[i];
+        match c {
+            '\\' => {
+                seg.extend(cs[i..(i + 2).min(cs.len())].iter());
+                i += 2;
+                continue;
+            }
+            '$' if cs.get(i + 1) == Some(&'{') => {
+                let end = cs[i..].iter().position(|&x| x == '}').map_or(cs.len(), |p| i + p + 1);
+                seg.extend(cs[i..end].iter());
+                i = end;
+                continue;
+            }
+            '"' => quoted = !quoted,
+            '{' if !quoted && word_start(&out, &seg) => {
+                out.push_str(&subst_vars(&std::mem::take(&mut seg), vars));
+                let mut depth = 0i32;
+                while i < cs.len() {
+                    match cs[i] {
+                        '\\' => {
+                            out.push(cs[i]);
+                            i += 1;
+                        }
+                        '{' => depth += 1,
+                        '}' => depth -= 1,
+                        _ => {}
+                    }
+                    if let Some(&x) = cs.get(i) {
+                        out.push(x);
+                    }
+                    i += 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                continue;
+            }
+            _ => {}
+        }
+        seg.push(c);
+        i += 1;
+    }
+    out.push_str(&subst_vars(&seg, vars));
+    out
+}
+
 fn subst_vars(line: &str, vars: &HashMap<String, String>) -> String {
     if !line.contains('$') {
         return line.to_string();
@@ -2324,7 +2382,7 @@ impl Sdc {
                 }
                 Control::None => {}
             }
-            let line = subst_exprs(&subst_vars(&raw, &vars), &vars);
+            let line = subst_exprs(&subst_command_vars(&raw, &vars), &vars);
             let toks = expand_abbreviations(tokenize(&line));
             if toks.is_empty() {
                 continue;
@@ -3217,6 +3275,24 @@ mod exception_check_tests {
         ] {
             let s = Sdc::parse(&format!("{clk}{cmd}\n")).unwrap();
             assert!(s.rejected.is_empty(), "{cmd}: {:?}", s.rejected);
+        }
+    }
+
+    /// Rule (Tcl, so the reference, observed 2026-10-31): nothing is substituted inside a braced
+    /// word — `[get_ports {$P}]` is the port `$P` ("port '$P' not found") — while a bare or quoted
+    /// `$P` is the variable and `expr` substitutes its own braces.
+    #[test]
+    fn a_variable_inside_braces_is_text() {
+        let head = "set P dout\nset V 0.5\n";
+        for (cmd, objects, value) in [
+            ("set_load 1 [get_ports {$P}]", "$P", 1.0),
+            ("set_load 1 [get_ports {${P}}]", "${P}", 1.0),
+            ("set_load 1 [get_ports $P]", "dout", 1.0),
+            ("set_load 1 [get_ports \"$P\"]", "dout", 1.0),
+            ("set_load [expr {$V * 2}] [get_ports dout]", "dout", 1.0),
+        ] {
+            let s = Sdc::parse(&format!("{head}{cmd}\n")).unwrap();
+            assert_eq!((s.env[0].objects.join(" "), s.env[0].value), (objects.to_string(), value), "{cmd}");
         }
     }
 
