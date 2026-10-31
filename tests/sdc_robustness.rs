@@ -32,6 +32,7 @@ fn commands() -> Vec<&'static str> {
 
 /// Commands this reader models — injecting one of these legitimately changes the result.
 const HANDLED: &[&str] = &[
+    "current_design",
     "create_clock",
     "create_generated_clock",
     "set_input_delay",

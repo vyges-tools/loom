@@ -72,6 +72,13 @@ pub struct Exception {
     /// cut EVERY path in the design. Not applying an exception is pessimistic and visible;
     /// applying it to everything is optimistic and silent.
     pub refused: Option<String>,
+    /// Every object-valued flag as written, in order (`-from`, `-rise_through`, `-to`, …), with
+    /// its objects — `-through` included, which [`Exception::from`] / [`Exception::to`] cannot
+    /// carry. What a writer writes back; a timer reads `from` / `to` / `refused`.
+    pub args: Vec<(String, Objects)>,
+    /// Every flag that takes no value, as written (`-setup`, `-hold`, `-start`, `-end`, `-rise`,
+    /// `-fall`, …).
+    pub flags: Vec<String>,
 }
 
 /// Is `name` in an exception endpoint set? An empty set, or one holding `*`, matches anything;
@@ -137,7 +144,7 @@ impl Exception {
 }
 
 /// A parsed clock (regular or fully-resolved generated).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SdcClock {
     pub name: String,
     /// Port name or `inst/pin`. **Empty for a virtual clock** — see [`SdcClock::is_virtual`].
@@ -150,6 +157,11 @@ pub struct SdcClock {
     /// flag (the default `{0, period/2}`). Every edge is kept — a consumer that models two must
     /// refuse any other count, including the empty list an unreadable edge leaves.
     pub waveform: Option<Vec<f64>>,
+    /// `-add`: defined alongside the clocks already on its sources rather than replacing them.
+    pub add: bool,
+    /// For `create_generated_clock`, its definition as written — `period` and `waveform` are
+    /// what it derives to. `None` for `create_clock`.
+    pub generated: Option<GeneratedClock>,
 }
 
 impl SdcClock {
@@ -183,20 +195,62 @@ pub struct IoDelay {
     pub reference_pin: Option<String>,
     /// The accessor that named the objects (`get_ports`, `get_pins`, `all_inputs`, … or `""`).
     pub accessor: String,
+    /// The accessor's own flags (`-no_clocks` in `[all_inputs -no_clocks]`) — see [`Objects::flags`].
+    pub accessor_flags: Vec<String>,
 }
 
 /// An object list as written: the accessor that named it (`get_clocks`, `get_pins`, … `list`, or
 /// `""` for a bare name or brace list) and the names it resolves to.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Objects {
     pub accessor: String,
     pub names: Vec<String>,
+    /// The accessor's flags that take no value, as written (`-hierarchical`, `-nocase`,
+    /// `-no_clocks`, `-clock_pins`, …). They change what the names match, so writing the names
+    /// back without them names different objects. Empty for a query evaluated against the design
+    /// (`-filter`, `-of_objects`): its names are then the objects it resolved to.
+    pub flags: Vec<String>,
+    /// The accessor's keys with their values, as written (`-clock` in `[all_registers -clock c]`,
+    /// `-hsc`). Empty for an evaluated query, as [`Objects::flags`].
+    pub keys: Vec<(String, String)>,
+    /// For `[list …]` / `[concat …]`: each element as written, with its own accessor; `names` is
+    /// theirs concatenated. A list of ports and pins written back as one accessor would name only
+    /// one kind.
+    pub items: Vec<Objects>,
 }
 
 impl Objects {
-    fn of(tok: &str) -> Objects {
+    pub(crate) fn of(tok: &str) -> Objects {
         let accessor = tok.strip_prefix('[').and_then(|i| tokenize(i.trim_end_matches(']').trim()).into_iter().next()).unwrap_or_default();
-        Objects { accessor, names: resolve_objs(tok) }
+        let parts = tok
+            .strip_prefix('[')
+            .and_then(|i| i.strip_suffix(']'))
+            .map(|i| expand_abbreviations(tokenize(i.trim())))
+            .unwrap_or_default();
+        let (mut flags, mut keys_written, mut items) = (Vec::new(), Vec::new(), Vec::new());
+        match accessor.as_str() {
+            "list" | "concat" => items = parts.iter().skip(1).map(|p| Objects::of(p)).collect(),
+            _ if parts.iter().any(|p| p == "-filter" || p == "-of_objects") => {}
+            _ => {
+                let keys = crate::sdc_flags::FLAGS.iter().find(|(n, _, _)| *n == accessor).map_or(&[][..], |(_, k, _)| *k);
+                let mut k = 1;
+                while k < parts.len() {
+                    let p = &parts[k];
+                    if keys.contains(&p.as_str()) {
+                        if let Some(v) = parts.get(k + 1) {
+                            keys_written.push((p.clone(), v.clone()));
+                        }
+                        k += 2;
+                        continue;
+                    }
+                    if p.starts_with('-') && p.parse::<f64>().is_err() {
+                        flags.push(p.clone());
+                    }
+                    k += 1;
+                }
+            }
+        }
+        Objects { accessor, names: resolve_objs(tok), flags, keys: keys_written, items }
     }
 }
 
@@ -253,12 +307,16 @@ pub struct EnvCmd {
     /// `[all_inputs -no_clocks]`. The `*INPUTS*` sentinel alone cannot carry it.
     pub accessor_flags: Vec<String>,
     pub objects: Vec<String>,
+    /// The objects as written (`None` for a command that named none) — see [`Objects::flags`].
+    pub written: Option<Objects>,
 }
 
 /// One `set_clock_groups` command: its kind (`asynchronous`, `logically_exclusive`,
 /// `physically_exclusive`), `-allow_paths`, and its `-group`s of clock names.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ClockGroups {
+    /// `-name`; `None` for an unnamed command, which the reference names `group<n>`.
+    pub name: Option<String>,
     pub kind: String,
     pub allow_paths: bool,
     pub groups: Vec<Vec<String>>,
@@ -295,6 +353,12 @@ pub struct ClockUncertainty {
     pub objects: Vec<String>,
     pub from: Vec<String>,
     pub to: Vec<String>,
+    /// As written: the object lists (`objects` is theirs concatenated) and every `-from` / `-to`
+    /// form with its clocks, in order — `-rise_from` and `-fall_to` say which edges.
+    pub written: Vec<Objects>,
+    pub written_sides: Vec<(String, Objects)>,
+    /// Every flag without a value, as written (`-setup`, `-hold`, `-rise`, `-fall`).
+    pub flags: Vec<String>,
 }
 
 /// One `set_case_analysis` / `set_logic_zero` / `set_logic_one` / `set_logic_dc`: the value as
@@ -306,6 +370,8 @@ pub struct LogicValueCmd {
     pub value: String,
     pub accessor: String,
     pub objects: Vec<String>,
+    /// The objects as written — see [`Objects::flags`].
+    pub written: Objects,
 }
 
 impl LogicValueCmd {
@@ -330,13 +396,17 @@ pub struct DrivingCell {
     pub pin: Option<String>,
     pub from_pin: Option<String>,
     pub input_transition: [f64; 2],
+    /// `-multiply_by`: the drive's resistance scale, as written.
+    pub multiply_by: Option<f64>,
     pub flags: Vec<String>,
     pub objects: Vec<String>,
+    /// The object lists as written — see [`Objects::flags`].
+    pub written: Vec<Objects>,
 }
 
 fn driving_cell(toks: &[String]) -> DrivingCell {
     let valued = ["-lib_cell", "-library", "-pin", "-from_pin", "-input_transition_rise", "-input_transition_fall", "-multiply_by"];
-    let mut d = DrivingCell { lib_cell: None, library: None, pin: None, from_pin: None, input_transition: [0.0; 2], flags: Vec::new(), objects: Vec::new() };
+    let mut d = DrivingCell { lib_cell: None, library: None, pin: None, from_pin: None, input_transition: [0.0; 2], multiply_by: None, flags: Vec::new(), objects: Vec::new(), written: Vec::new() };
     let mut k = 1;
     while k < toks.len() {
         let t = &toks[k];
@@ -349,6 +419,7 @@ fn driving_cell(toks: &[String]) -> DrivingCell {
                 "-from_pin" => d.from_pin = v,
                 "-input_transition_rise" => d.input_transition[0] = v.and_then(|v| v.parse().ok()).unwrap_or(0.0),
                 "-input_transition_fall" => d.input_transition[1] = v.and_then(|v| v.parse().ok()).unwrap_or(0.0),
+                "-multiply_by" => d.multiply_by = v.and_then(|v| v.parse().ok()),
                 other => d.flags.push(other.to_string()),
             }
             k += 2;
@@ -358,6 +429,7 @@ fn driving_cell(toks: &[String]) -> DrivingCell {
             d.flags.push(t.clone());
         } else {
             d.objects.extend(resolve_objs(t));
+            d.written.push(Objects::of(t));
         }
         k += 1;
     }
@@ -389,11 +461,13 @@ fn env_cmd(toks: &[String]) -> Option<EnvCmd> {
     let inner = obj.strip_prefix('[').map(|i| tokenize(i.trim_end_matches(']').trim())).unwrap_or_default();
     let accessor = inner.first().cloned().unwrap_or_default();
     let accessor_flags = inner.iter().skip(1).filter(|t| t.starts_with('-')).cloned().collect();
-    Some(EnvCmd { cmd: toks[0].clone(), value, flags, clock, accessor, accessor_flags, objects: resolve_objs(obj) })
+    Some(EnvCmd { cmd: toks[0].clone(), value, flags, clock, accessor, accessor_flags, objects: resolve_objs(obj), written: Some(Objects::of(obj)) })
 }
 
 #[derive(Debug, Default)]
 pub struct Sdc {
+    /// `current_design <name>`: the design the constraints were written for (the last one named).
+    pub current_design: Option<String>,
     pub clocks: Vec<SdcClock>,
     /// Each clock definition a later `create_clock` overwrote (same name) or removed (its sources
     /// taken without `-add`), as it stood, in file order — not timed; for a linter to report.
@@ -1052,14 +1126,20 @@ fn parse_time(v: &str) -> Option<f64> {
 /// empty, which failed the whole file — every other constraint in it lost along with the clock.
 /// Tcl reads `::env` from the process environment and so do we, falling back to `set` for a
 /// variable of that name.
-/// What `create_generated_clock` asks of its master.
-struct GenSpec {
-    divide_by: Option<i64>,
-    multiply_by: Option<i64>,
-    duty_cycle: Option<f64>,
-    edges: Vec<i64>,
-    edge_shift: Vec<f64>,
-    invert: bool,
+/// What `create_generated_clock` asks of its master, as written.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GeneratedClock {
+    /// `-source`: the master's pin, as written.
+    pub source: Objects,
+    /// `-master_clock`, when given (else the master is the clock on `source`).
+    pub master_clock: Option<String>,
+    pub divide_by: Option<i64>,
+    pub multiply_by: Option<i64>,
+    pub duty_cycle: Option<f64>,
+    pub edges: Vec<i64>,
+    pub edge_shift: Vec<f64>,
+    pub invert: bool,
+    pub combinational: bool,
 }
 
 /// A generated clock's period and waveform from its master — the reference's `Clock::generate`:
@@ -1067,7 +1147,7 @@ struct GenSpec {
 /// a multiply SCALES the master's waveform (or applies `-duty_cycle`); `-edges` picks master edges
 /// (1-based, counting through the master's edge list cycle after cycle), shifted by `-edge_shift`;
 /// `-invert` then rotates the edges by one. `None` when the request cannot be built.
-fn generate(master: &SdcClock, g: &GenSpec) -> Option<(f64, Vec<f64>)> {
+fn generate(master: &SdcClock, g: &GeneratedClock) -> Option<(f64, Vec<f64>)> {
     let mp = master.period;
     let mw: Vec<f64> = match &master.waveform {
         Some(w) if w.len() >= 2 => w.clone(),
@@ -1173,6 +1253,14 @@ fn unevaluated_query(toks: &[String]) -> Option<String> {
         let Some(inner) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else { continue };
         let parts = expand_abbreviations(tokenize(inner.trim()));
         let Some(cmd) = parts.first() else { continue };
+        // ⛔ A COMMAND THIS READER DOES NOT KNOW is not a name. `[remove_from_collection [all_inputs]
+        // {clk}]` (a synthesis tool's command, which the reference does not have either) was read as
+        // a port called `remove_from_collection`: the delay went nowhere, and nothing said so.
+        // `expr` is evaluated where it can be, and a value it leaves is reported where it is read.
+        let known = KNOWN_QUERIES.contains(&cmd.as_str()) || cmd == "expr" || (cmd == "lsearch" && all_ports_except(t).is_some());
+        if !known {
+            return Some(format!("[{}] (a command this reader does not evaluate)", inner.trim()));
+        }
         if cmd.starts_with("get_") && parts.iter().any(|p| NEEDS_DESIGN.contains(&p.as_str())) {
             match with_design(|d| crate::sdc_query::eval(&parts, d)) {
                 Some(Ok(_)) => continue,
@@ -1185,6 +1273,82 @@ fn unevaluated_query(toks: &[String]) -> Option<String> {
         }
     }
     None
+}
+
+/// The commands an object list or a value may be written with, which this reader evaluates.
+const KNOWN_QUERIES: [&str; 15] = [
+    "get_ports", "get_pins", "get_cells", "get_nets", "get_clocks", "get_lib_cells", "get_lib_pins", "get_libs",
+    "all_inputs", "all_outputs", "all_clocks", "all_registers", "list", "concat", "current_design",
+];
+
+/// The first variable read OUTSIDE braces that is not defined — `$name`, `${name}`, `$::env(NAME)`.
+/// Tcl substitutes nothing inside `{…}`, so a `$` there is text (an escaped name's `$_DFF_P_`).
+fn unresolved_var(raw: &str, vars: &HashMap<String, String>) -> Option<String> {
+    let cs: Vec<char> = raw.chars().collect();
+    let (mut depth, mut i) = (0usize, 0usize);
+    while i < cs.len() {
+        match cs[i] {
+            '\\' => i += 1,
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            '$' if depth == 0 => {
+                let rest: String = cs[i + 1..].iter().collect();
+                let env = ["::env(", "env("].iter().find(|p| rest.starts_with(**p)).and_then(|p| rest[p.len()..].split(')').next().map(str::to_string));
+                let name = match env {
+                    Some(n) => {
+                        if vars.contains_key(&n) || std::env::var(&n).is_ok() {
+                            i += 1;
+                            continue;
+                        }
+                        return Some(format!("$::env({n})"));
+                    }
+                    None if rest.starts_with('{') => rest[1..].split('}').next().unwrap_or("").to_string(),
+                    None => rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':').collect(),
+                };
+                if !name.is_empty() && !vars.contains_key(name.trim_start_matches("::")) {
+                    return Some(format!("${name}"));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `[info exists NAME]` in a condition as Tcl answers it: 1 when the variable is set (`::env(X)`
+/// from the process environment, as Tcl reads it), else 0. A flow's `if {[info exists
+/// ::env(CLK_PERIOD_PS)]}` override was refused as undecidable, though nothing in it needs a design.
+fn subst_info_exists(cond: &str, vars: &HashMap<String, String>) -> String {
+    let mut out = String::new();
+    let mut rest = cond;
+    while let Some(k) = rest.find("[info exists ") {
+        out.push_str(&rest[..k]);
+        let tail = &rest[k + "[info exists ".len()..];
+        let Some(e) = tail.find(']') else {
+            out.push_str(&rest[k..]);
+            return out;
+        };
+        let name = tail[..e].trim();
+        let env = ["::env(", "env("].iter().find_map(|p| name.strip_prefix(p)).and_then(|n| n.strip_suffix(')'));
+        let set = match env {
+            Some(n) => vars.contains_key(n) || std::env::var(n).is_ok(),
+            None => vars.contains_key(name.trim_start_matches("::")),
+        };
+        out.push_str(if set { "1" } else { "0" });
+        rest = &tail[e + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A value list as words: `{0 5}` arrives braces stripped; `[list 0 5]` — Tcl's list command, as
+/// `-waveform [list 0 [expr $p/2]]` writes it — is its elements.
+fn list_words(v: &str) -> String {
+    match v.trim().strip_prefix("[list").and_then(|i| i.strip_suffix(']')) {
+        Some(inner) => tokenize(inner.trim()).join(" "),
+        None => v.to_string(),
+    }
 }
 
 /// What a control command asks for: its chosen commands, a refusal (it cannot be evaluated
@@ -1209,7 +1373,7 @@ fn control(raw: &str, vars: &HashMap<String, String>) -> Control {
             let toks = tokenize(raw);
             let mut k = 1;
             while k + 1 < toks.len() {
-                let cond = subst_vars(&toks[k], vars);
+                let cond = subst_vars(&subst_info_exists(&toks[k], vars), vars);
                 let mut body = k + 1;
                 if toks.get(body).map(String::as_str) == Some("then") {
                     body += 1;
@@ -1728,6 +1892,62 @@ fn trailing_obj(toks: &[String], valued_flags: &[&str]) -> Option<String> {
 // ---- unit scaling --------------------------------------------------------
 
 
+/// What an object list names, each as `(is_clock, name)`: `get_clocks` / `all_clocks` name clocks,
+/// `get_pins` / `get_ports` pins, and a bare name is a clock when a clock has that name.
+fn object_targets(o: &Objects, clocks: &[SdcClock], out: &mut std::collections::HashSet<(bool, String)>) {
+    if !o.items.is_empty() {
+        for i in &o.items {
+            object_targets(i, clocks, out);
+        }
+        return;
+    }
+    for n in &o.names {
+        let clock = match o.accessor.as_str() {
+            "get_clocks" | "all_clocks" => true,
+            "get_pins" | "get_ports" => false,
+            _ => clocks.iter().any(|c| &c.name == n),
+        };
+        out.insert((clock, n.clone()));
+    }
+}
+
+/// `o` without the objects in `targets` (an element of a `[list …]` left empty is dropped).
+fn drop_targets(o: &mut Objects, targets: &std::collections::HashSet<(bool, String)>, clocks: &[SdcClock]) {
+    if !o.items.is_empty() {
+        for i in &mut o.items {
+            drop_targets(i, targets, clocks);
+        }
+        o.items.retain(|i| !i.names.is_empty());
+        o.names = o.items.iter().flat_map(|i| i.names.iter().cloned()).collect();
+        return;
+    }
+    let acc = o.accessor.clone();
+    o.names.retain(|n| {
+        let mut one = std::collections::HashSet::new();
+        object_targets(&Objects { accessor: acc.clone(), names: vec![n.clone()], ..Default::default() }, clocks, &mut one);
+        one.is_disjoint(targets)
+    });
+}
+
+impl Sdc {
+    fn targets(&self, o: &Objects) -> std::collections::HashSet<(bool, String)> {
+        let mut t = std::collections::HashSet::new();
+        object_targets(o, &self.clocks, &mut t);
+        t
+    }
+
+    /// A clock command's `[all_clocks]` as the clocks defined so far — what it names when it runs.
+    fn clocks_now(&self, mut e: EnvCmd) -> EnvCmd {
+        if e.accessor == "all_clocks" {
+            e.objects = self.clocks.iter().map(|c| c.name.clone()).collect();
+            if let Some(w) = &mut e.written {
+                w.names = e.objects.clone();
+            }
+        }
+        e
+    }
+}
+
 // ---- parse ---------------------------------------------------------------
 
 impl Sdc {
@@ -1758,6 +1978,18 @@ impl Sdc {
             if toks.is_empty() {
                 continue;
             }
+            // ⛔ An UNDEFINED VARIABLE is an error to Tcl, so to the reference; not applied here
+            // either, and listed with the queries not evaluated — the list every consumer refuses
+            // on. Kept as text, `-lib_cell ${DRIVING_CELL}` split into a lib cell `$` and a stray
+            // word, and an unread delay was applied as 0 by a consumer that did not check
+            // `value_read`. `create_clock` reports its own, naming the variable; `set` stores text.
+            if !matches!(toks[0].as_str(), "set" | "create_clock") {
+                if let Some(v) = unresolved_var(&raw, &vars) {
+                    sdc.rejected.push(format!("{}: the variable {v} is not defined; not applied", toks[0]));
+                    sdc.unevaluated_queries.push(format!("{}: {v} (not defined)", toks[0]));
+                    continue;
+                }
+            }
             // An object query this reader cannot evaluate: the command is NOT applied, and says
             // so (a `set` only stores the text; it is checked where the variable is used).
             if toks[0] != "set" {
@@ -1778,6 +2010,11 @@ impl Sdc {
                 // `set_clock_group` that means losing an asynchronous-clock declaration, so
                 // paths between clocks that never relate get checked and report false
                 // violations. Found by diffing our command inventory against SDC 2.1.
+                "current_design" => {
+                    if let Some(n) = toks.get(1) {
+                        sdc.current_design = resolve_objs(n).into_iter().next();
+                    }
+                }
                 "set_units" | "set_unit" => {
                     // ⛔ CHECKED, NOT APPLIED — the reference's rule. `set_units` only asserts what
                     // the library's units are (it warns when they differ); every value in the file
@@ -1836,7 +2073,7 @@ impl Sdc {
                     // An edge that is not a time (an unresolved variable) leaves the list EMPTY
                     // rather than failing the file: a consumer modelling two edges refuses it.
                     let waveform = flag_val(&toks, "-waveform").map(|w| {
-                        w.split_whitespace().map(parse_time).collect::<Option<Vec<f64>>>().unwrap_or_default()
+                        list_words(w).split_whitespace().map(parse_time).collect::<Option<Vec<f64>>>().unwrap_or_default()
                     });
                     // `-add` keeps the clocks already on these sources; without it a new clock
                     // REPLACES them there (each loses these sources, and one left with none is
@@ -1850,7 +2087,7 @@ impl Sdc {
                     if !add {
                         sdc.delete_pin_clocks(&name, &sources);
                     }
-                    let clock = SdcClock { name, source: src, sources, period, waveform };
+                    let clock = SdcClock { name, source: src, sources, period, waveform, add, generated: None };
                     match sdc.clocks.iter().position(|c| c.name == clock.name) {
                         Some(i) => sdc.superseded_clocks.push(std::mem::replace(&mut sdc.clocks[i], clock)),
                         None => sdc.clocks.push(clock),
@@ -1874,9 +2111,12 @@ impl Sdc {
                         None => src_obj.as_ref().and_then(|s| sdc.clocks.iter().find(|c| c.sources.iter().any(|x| x == s))),
                     };
                     let nums = |f: &str| -> Option<Vec<f64>> {
-                        val(f).map(|v| v.split_whitespace().filter_map(|x| x.parse::<f64>().ok()).collect())
+                        val(f).map(|v| list_words(v).split_whitespace().filter_map(|x| x.parse::<f64>().ok()).collect())
                     };
-                    let spec = GenSpec {
+                    let spec = GeneratedClock {
+                        source: val("-source").map(Objects::of).unwrap_or_default(),
+                        master_clock: val("-master_clock").and_then(|m| resolve_objs(m).into_iter().next()),
+                        combinational: has("-combinational"),
                         divide_by: val("-divide_by").and_then(|v| v.parse::<f64>().ok()).filter(|d| d.fract() == 0.0).map(|d| d as i64),
                         multiply_by: val("-multiply_by").and_then(|v| v.parse::<f64>().ok()).filter(|d| d.fract() == 0.0).map(|d| d as i64),
                         duty_cycle: val("-duty_cycle").and_then(|v| v.parse().ok()),
@@ -1891,7 +2131,7 @@ impl Sdc {
                     };
                     let source = sources.first().cloned().unwrap_or_default();
                     // In DEFINITION order, as the reference keeps clocks.
-                    sdc.clocks.push(SdcClock { name, source, sources, period, waveform });
+                    sdc.clocks.push(SdcClock { name, source, sources, period, waveform, add: has("-add"), generated: Some(spec) });
                 }
                 "set_input_delay" | "set_output_delay" => {
                     // `-max` / `-min` take NO value: `delay_value port_pin_list` are the two
@@ -1906,8 +2146,14 @@ impl Sdc {
                         sdc.rejected.push(format!("{} without a port list", toks[0]));
                         continue;
                     };
+                    let mut accessor_flags = named.flags.clone();
                     let (accessor, objs) = match pos.get(1).and_then(|o| all_ports_except(o)) {
-                        Some(except) => except,
+                        Some(except) => {
+                            // the flags of the `[all_inputs …]` inside the `lsearch`
+                            let inner = pos[1].strip_prefix('[').and_then(|i| i.strip_suffix(']')).map(tokenize).unwrap_or_default();
+                            accessor_flags = inner.iter().find(|t| t.starts_with("[all_")).map(|t| Objects::of(t).flags).unwrap_or_default();
+                            except
+                        }
                         None => (named.accessor, named.names),
                     };
                     // the `all_*` collections, by exact name — a pattern like `*_in` is a name
@@ -1923,6 +2169,7 @@ impl Sdc {
                         flags,
                         reference_pin: valued("-reference_pin"),
                         accessor,
+                        accessor_flags,
                     };
                     if toks[0] == "set_input_delay" {
                         sdc.input_delays.push(d);
@@ -1947,7 +2194,9 @@ impl Sdc {
                         sdc.rejected.push("set_clock_uncertainty without a value".into());
                         continue;
                     };
-                    let u = ClockUncertainty { value, setup, hold, objects, from: side(&["-from", "-rise_from", "-fall_from"]), to: side(&["-to", "-rise_to", "-fall_to"]) };
+                    let written = pos.iter().skip(1).map(|o| Objects::of(o)).collect();
+                    let written_sides = with.iter().map(|(k, v)| (k.to_string(), Objects::of(v))).collect();
+                    let u = ClockUncertainty { value, setup, hold, objects, from: side(&["-from", "-rise_from", "-fall_from"]), to: side(&["-to", "-rise_to", "-fall_to"]), written, written_sides, flags: flags.clone() };
                     if u.objects.is_empty() && u.from.is_empty() && u.to.is_empty() {
                         sdc.rejected.push("set_clock_uncertainty without objects (the reference requires them)".into());
                         continue;
@@ -1968,11 +2217,24 @@ impl Sdc {
                     sdc.hold_uncertainty = fold(true);
                 }
                 "set_clock_transition" => {
-                    sdc.clock_transitions.extend(env_cmd(&toks));
+                    sdc.clock_transitions.extend(env_cmd(&toks).map(|e| sdc.clocks_now(e)));
                     sdc.ignored.push("set_clock_transition".to_string());
                 }
                 "set_clock_latency" => {
-                    sdc.clock_latencies.extend(env_cmd(&toks));
+                    if let Some(e) = env_cmd(&toks).map(|e| sdc.clocks_now(e)) {
+                        // `Sdc::setClockLatency`: a NETWORK latency (not `-source`) removes
+                        // `set_propagated_clock` on the same clock or pin — the later one wins
+                        if !e.flags.iter().any(|f| f == "-source") {
+                            if let Some(w) = &e.written {
+                                let targets = sdc.targets(w);
+                                for p in &mut sdc.propagated {
+                                    drop_targets(p, &targets, &sdc.clocks);
+                                }
+                                sdc.propagated.retain(|p| !p.names.is_empty());
+                            }
+                        }
+                        sdc.clock_latencies.push(e);
+                    }
                     if let Some(v) = toks.iter().skip(1).find_map(|t| {
                         if t.starts_with('-') || t.starts_with('[') {
                             None
@@ -2015,7 +2277,22 @@ impl Sdc {
                 }
                 "set_propagated_clock" => {
                     if let Some(o) = toks.get(1) {
-                        sdc.propagated.push(Objects::of(o));
+                        let mut o = Objects::of(o);
+                        // `[all_clocks]` is the clocks defined so far, not those defined later
+                        if o.accessor == "all_clocks" {
+                            o.names = sdc.clocks.iter().map(|c| c.name.clone()).collect();
+                        }
+                        // `Sdc::setPropagatedClock`: the clock or pin loses its NETWORK latency
+                        // (`removeClockLatency`; a `-source` latency is an insertion, kept)
+                        let targets = sdc.targets(&o);
+                        for e in sdc.clock_latencies.iter_mut().filter(|e| !e.flags.iter().any(|f| f == "-source")) {
+                            if let Some(w) = &mut e.written {
+                                drop_targets(w, &targets, &sdc.clocks);
+                                e.objects = w.names.clone();
+                            }
+                        }
+                        sdc.clock_latencies.retain(|e| e.written.is_none() || !e.objects.is_empty());
+                        sdc.propagated.push(o);
                     }
                     sdc.ignored.push("set_propagated_clock".to_string());
                 }
@@ -2049,7 +2326,7 @@ impl Sdc {
                     match (value, obj) {
                         (Some(value), Some(obj)) => {
                             let inner = obj.strip_prefix('[').map(|i| tokenize(i.trim_end_matches(']').trim())).unwrap_or_default();
-                            let c = LogicValueCmd { cmd: toks[0].clone(), value, accessor: inner.first().cloned().unwrap_or_default(), objects: resolve_objs(obj) };
+                            let c = LogicValueCmd { cmd: toks[0].clone(), value, accessor: inner.first().cloned().unwrap_or_default(), objects: resolve_objs(obj), written: Objects::of(obj) };
                             if toks[0] == "set_case_analysis" { sdc.case_values.push(c) } else { sdc.logic_values.push(c) }
                         }
                         _ => sdc.rejected.push(format!("{} without a value and objects", toks[0])),
@@ -2087,6 +2364,7 @@ impl Sdc {
                         continue;
                     };
                     let objects: Vec<String> = pos.iter().skip(1).flat_map(|o| resolve_objs(o)).collect();
+                    let written = pos.get(1).map(|o| Objects::of(o));
                     let scoped = !objects.is_empty()
                         || ["-cell_delay", "-net_delay", "-cell_check", "-data", "-clock", "-rise", "-fall"].iter().any(|f| has(f));
                     if scoped {
@@ -2100,7 +2378,7 @@ impl Sdc {
                             sdc.early_derate = Some(value);
                         }
                     }
-                    sdc.derates.push(EnvCmd { cmd: toks[0].clone(), value, flags, clock: None, accessor: String::new(), accessor_flags: Vec::new(), objects });
+                    sdc.derates.push(EnvCmd { cmd: toks[0].clone(), value, flags, clock: None, accessor: String::new(), accessor_flags: Vec::new(), objects, written });
                 }
                 "set_clock_groups" | "set_clock_group" => {
                     // -asynchronous / -exclusive: clocks in different -group blocks are
@@ -2135,7 +2413,14 @@ impl Sdc {
                         .find(|f| has_flag(&toks, f))
                         .map(|f| f.trim_start_matches('-').to_string());
                     match kind {
-                        Some(kind) => sdc.clock_groups.push(ClockGroups { kind, allow_paths: has_flag(&toks, "-allow_paths"), groups: groups.clone() }),
+                        Some(kind) => {
+                            let name = flag_val(&toks, "-name").and_then(|n| resolve_objs(n).into_iter().next());
+                            // `Sdc::makeClockGroups`: a name already defined is REPLACED
+                            if name.is_some() {
+                                sdc.clock_groups.retain(|g| g.name != name);
+                            }
+                            sdc.clock_groups.push(ClockGroups { name, kind, allow_paths: has_flag(&toks, "-allow_paths"), groups: groups.clone() })
+                        }
                         // a type is required (the reference's STA-0400)
                         None => sdc.rejected.push("set_clock_groups without -asynchronous / -logically_exclusive / -physically_exclusive".into()),
                     }
@@ -2143,8 +2428,9 @@ impl Sdc {
                 }
                 "set_false_path" => {
                     let (from, to, refused) = from_to(&toks);
+                    let (args, flags) = exception_args(&toks);
                     sdc.exception_objects.push(exception_sides(&toks));
-                    sdc.exceptions.push(Exception { kind: ExcKind::FalsePath, from, to, refused, ..Default::default() });
+                    sdc.exceptions.push(Exception { kind: ExcKind::FalsePath, from, to, refused, args, flags, ..Default::default() });
                 }
                 "set_multicycle_path" => {
                     // The multiplier is THE positional left after the flags, wherever it is
@@ -2163,6 +2449,7 @@ impl Sdc {
                     }
                     let has = |f: &str| flags.iter().any(|x| x == f);
                     let hold = has("-hold");
+                    let (args, written_flags) = exception_args(&toks);
                     sdc.exception_objects.push(exception_sides(&toks));
                     sdc.exceptions.push(Exception {
                         kind: ExcKind::Multicycle(n.unwrap_or(1)),
@@ -2171,6 +2458,8 @@ impl Sdc {
                         hold,
                         start: has("-start") || (hold && !has("-end")),
                         refused,
+                        args,
+                        flags: written_flags,
                     });
                 }
                 other => sdc.ignored.push(other.to_string()),
@@ -2262,6 +2551,12 @@ fn from_to(toks: &[String]) -> (Vec<String>, Vec<String>, Option<String>) {
     let (f, rf) = reduce_exception_objects(&from);
     let (t, rt) = reduce_exception_objects(&to);
     (f, t, refused.or(rf).or(rt))
+}
+
+/// An exception's object-valued flags as written, in order, and its flags without a value.
+fn exception_args(toks: &[String]) -> (Vec<(String, Objects)>, Vec<String>) {
+    let (with, flags, _) = split_args(toks, &EXC_VALUED);
+    (with.into_iter().filter(|(k, _)| *k != "-comment").map(|(k, v)| (k.to_string(), Objects::of(v))).collect(), flags)
 }
 
 /// An exception's objects per side: every `-from` / `-rise_from` / `-fall_from`, then every `-to`
@@ -2509,8 +2804,13 @@ mod lossless_tests {
         let d = &s.output_delays[0];
         assert_eq!((d.reference_pin.as_deref(), d.ports.clone(), d.accessor.as_str()), (Some("r1/CK"), vec!["out".to_string()], "get_ports"));
         // no port list is rejected (the reference's STA-0567), not read as every input
+        // and an undefined variable is an error (Tcl's), not a value of 0: rejected, and listed
+        // with the queries not evaluated, which every consumer refuses on
         let d = Sdc::parse("set_input_delay 1 -clock clk\nset_input_delay $undefined -clock clk [get_ports a]\n").unwrap();
-        assert_eq!(d.rejected.len(), 1);
+        assert_eq!(d.rejected.len(), 2);
+        assert!(d.input_delays.is_empty() && d.unevaluated_queries == ["set_input_delay: $undefined (not defined)"]);
+        // a value that is not a number is still kept as unread
+        let d = Sdc::parse("set_input_delay abc -clock clk [get_ports a]\n").unwrap();
         assert!(!d.input_delays[0].value_read && d.input_delays[0].value == 0.0);
     }
 
@@ -2535,13 +2835,15 @@ mod lossless_tests {
     -ignore_clock_latency\\
     -from [get_pins {r1/CK}]\\
     -to [get_clocks {clk}] 0.5000\nset_min_delay -from [get_pins {a/Z}] $undefined\n").unwrap();
-        assert_eq!(s.propagated, vec![Objects { accessor: "get_clocks".into(), names: vec!["clk".into()] }]);
+        assert_eq!(s.propagated, vec![Objects { accessor: "get_clocks".into(), names: vec!["clk".into()], ..Default::default() }]);
         assert_eq!((s.clock_latencies.len(), s.clock_latencies[0].flags.clone(), s.clock_latency), (1, vec!["-source".to_string()], 0.2));
         let p = &s.path_delays[0];
         assert_eq!((p.max, p.value, p.flags.clone()), (true, 0.5, vec!["-ignore_clock_latency".to_string()]));
-        assert_eq!(p.objects, vec![("-from".to_string(), Objects { accessor: "get_pins".into(), names: vec!["r1/CK".into()] }), ("-to".to_string(), Objects { accessor: "get_clocks".into(), names: vec!["clk".into()] })]);
-        assert!(!s.path_delays[1].max && s.path_delays[1].value.is_nan());
-        assert!(s.ignored.iter().any(|c| c == "set_propagated_clock") && s.ignored.iter().filter(|c| c.ends_with("_delay")).count() == 2);
+        assert_eq!(p.objects, vec![("-from".to_string(), Objects { accessor: "get_pins".into(), names: vec!["r1/CK".into()], ..Default::default() }), ("-to".to_string(), Objects { accessor: "get_clocks".into(), names: vec!["clk".into()], ..Default::default() })]);
+        // `$undefined` is not a value: the command is not kept (see `unresolved_var`)
+        assert_eq!(s.path_delays.len(), 1);
+        assert_eq!(s.unevaluated_queries, ["set_min_delay: $undefined (not defined)"]);
+        assert!(s.ignored.iter().any(|c| c == "set_propagated_clock") && s.ignored.iter().filter(|c| c.ends_with("_delay")).count() == 1);
     }
 }
 
@@ -3044,5 +3346,113 @@ mod clock_transition_kept {
         let with = Sdc::load_with(p.to_str().unwrap(), &SdcDesign::default()).unwrap();
         assert_eq!(with.clocks.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod clock_state_rules {
+    use super::*;
+
+    /// Rule (`Sdc::setPropagatedClock` → `removeClockLatency`; `Sdc::setClockLatency` →
+    /// `removePropagatedClock`): a network latency and propagation on the SAME clock or pin cancel —
+    /// the later command wins. A `-source` latency is an insertion and survives both. Kept both, a
+    /// writer emitting them in kind order flipped which one won.
+    #[test]
+    fn propagation_and_network_latency_on_one_object_cancel_last_wins() {
+        let s = Sdc::parse(
+            "create_clock -name c -period 1 [get_ports clk]\n\
+             set_clock_latency 0.1 [get_clocks c]\n\
+             set_clock_latency -source 0.2 [get_clocks c]\n\
+             set_clock_latency 0.3 [get_pins r/CK]\n\
+             set_propagated_clock [get_clocks c]\n",
+        )
+        .unwrap();
+        let left: Vec<(f64, Vec<String>)> = s.clock_latencies.iter().map(|e| (e.value, e.objects.clone())).collect();
+        assert_eq!(left, vec![(0.2, vec!["c".to_string()]), (0.3, vec!["r/CK".to_string()])], "the clock's network latency went");
+        let s = Sdc::parse("create_clock -name c -period 1 [get_ports clk]\nset_propagated_clock [get_clocks c]\nset_clock_latency 0.1 [get_clocks c]\n").unwrap();
+        assert!(s.propagated.is_empty(), "a later network latency makes the clock ideal again");
+        let s = Sdc::parse("create_clock -name c -period 1 [get_ports clk]\nset_propagated_clock [get_clocks c]\nset_clock_latency -source 0.1 [get_clocks c]\n").unwrap();
+        assert_eq!(s.propagated.len(), 1, "a source latency leaves propagation alone");
+    }
+
+    /// Rule (Tcl: the command's argument is evaluated when the command runs): `[all_clocks]` names
+    /// the clocks defined SO FAR. Written back after every clock, it named later clocks too.
+    #[test]
+    fn all_clocks_names_the_clocks_defined_so_far() {
+        let s = Sdc::parse("create_clock -name a -period 1 [get_ports x]\nset_propagated_clock [all_clocks]\ncreate_clock -name b -period 2 [get_ports y]\n").unwrap();
+        assert_eq!(s.propagated[0].names, vec!["a".to_string()]);
+        assert_eq!(s.propagated[0].accessor, "all_clocks", "the accessor stays as written");
+    }
+
+    /// Rule (`Sdc::makeClockGroups`): a group of a name already defined REPLACES it; an unnamed one
+    /// is named `group<n>` by the reference, so it is kept unnamed and in order.
+    #[test]
+    fn a_named_clock_group_replaces_its_namesake() {
+        let s = Sdc::parse(
+            "create_clock -name a -period 1 [get_ports x]\ncreate_clock -name b -period 2 [get_ports y]\n\
+             set_clock_groups -name g -asynchronous -group a -group b\n\
+             set_clock_groups -asynchronous -group a\n\
+             set_clock_groups -name g -logically_exclusive -group a -group b\n",
+        )
+        .unwrap();
+        let got: Vec<(Option<String>, String)> = s.clock_groups.iter().map(|g| (g.name.clone(), g.kind.clone())).collect();
+        assert_eq!(got, vec![(None, "asynchronous".to_string()), (Some("g".to_string()), "logically_exclusive".to_string())]);
+    }
+
+    /// The `[all_inputs …]` inside the `lsearch … -not -exact` form keeps ITS flags, not lsearch's.
+    #[test]
+    fn all_inputs_except_keeps_the_inner_flags() {
+        let s = Sdc::parse("create_clock -name c -period 1 [get_ports clk]\nset_input_delay 1 -clock c [lsearch -inline -all -not -exact [all_inputs -no_clocks] clk]\n").unwrap();
+        assert_eq!(s.input_delays[0].accessor_flags, vec!["-no_clocks".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod unevaluable_is_refused {
+    use super::*;
+
+    /// Rule (Tcl, so the reference): a command the interpreter does not have is an error, and so
+    /// is an undefined variable. Neither is a name or a value: the command is not applied and is
+    /// listed with the queries not evaluated. Found reading OpenTitan's constraint files, written
+    /// for a synthesis tool: `remove_from_collection` became a port of that name, and
+    /// `${DRIVING_CELL}` (set by the flow) a lib cell `$`.
+    #[test]
+    fn an_unknown_command_or_undefined_variable_refuses_its_command() {
+        let s = Sdc::parse(
+            "create_clock -name c -period 8 [get_ports clk_i]\n\
+             set_input_delay 1 [remove_from_collection [all_inputs] {clk_i}] -clock c\n\
+             set_load [load_of lib/BUF/A] [all_outputs]\n\
+             set_driving_cell -lib_cell ${DRIVING_CELL} [all_inputs]\n\
+             set_output_delay 1 [all_outputs] -clock c\n",
+        )
+        .unwrap();
+        assert!(s.input_delays.is_empty() && s.env.is_empty() && s.driving_cells.is_empty(), "{s:?}");
+        assert_eq!(s.output_delays.len(), 1, "the rest of the file still applies");
+        assert_eq!(s.unevaluated_queries.len(), 3, "{:?}", s.unevaluated_queries);
+        assert!(s.unevaluated_queries[2].contains("$DRIVING_CELL"), "{:?}", s.unevaluated_queries);
+    }
+
+    /// Inside braces Tcl substitutes nothing: an escaped name's `$` is text, not a variable.
+    #[test]
+    fn a_dollar_inside_braces_is_text() {
+        let s = Sdc::parse("set_false_path -to [get_pins {ctrl.state.out[0]$_DFF_P_/D}]\n").unwrap();
+        assert!(s.unevaluated_queries.is_empty() && s.exceptions.len() == 1, "{:?}", s.rejected);
+    }
+}
+
+#[cfg(test)]
+mod tcl_values {
+    use super::*;
+
+    /// Rule (Tcl): `[list a b]` is the list `a b`, and `[info exists ::env(X)]` is 1 exactly when
+    /// the environment has X. Both from public constraint files (a RISC-V core's
+    /// `-waveform [list 0 [expr $p/2]]`, an accelerator flow's period override).
+    #[test]
+    fn list_values_and_info_exists_are_evaluated() {
+        let s = Sdc::parse("set p 1000\ncreate_clock -name c -period $p -waveform [list 0 [expr $p/2]] [get_ports clk]\n").unwrap();
+        assert_eq!(s.clocks[0].waveform, Some(vec![0.0, 500.0]));
+        let s = Sdc::parse("set p 5\nif {[info exists ::env(VYGES_SDC_TEST_UNSET_VAR)]} {\n  set p 7\n}\nif {[info exists p]} {\n  create_clock -name c -period $p [get_ports clk]\n}\n").unwrap();
+        assert!(s.ignored.is_empty(), "{:?}", s.ignored);
+        assert_eq!(s.clocks[0].period, 5.0);
     }
 }
