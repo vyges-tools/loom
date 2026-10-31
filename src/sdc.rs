@@ -1303,6 +1303,137 @@ fn unevaluated_query(toks: &[String]) -> Option<String> {
     None
 }
 
+/// The first WORD of a command that cannot name what it appears to, by Tcl's word rules, with why.
+///
+/// A Tcl word is a CONCATENATION of parts — literal text, `[command]` substitutions, `$variables` —
+/// so `[get_ports a]0` is the collection's text with `0` after it, not port `a`; and a braced word is
+/// literal, so `{[get_ports a]}` is the two names `[get_ports` and `a]`, not a query. The tokenizer
+/// keeps a word's groups apart (and strips braces), which read the first as port `a` plus a stray
+/// `0` and the second as the query. The reference (OpenSTA reading through Tcl, measured on the
+/// spec-matrix probes 2026-10-31): `-from [get_ports din]0` and `[get_ports dout][get_ports din]`
+/// are Error 100 "unsupported object type"; `x[get_ports dout]` and `{[get_ports dout]}` name
+/// objects that are not found (Warning 101), so nothing is applied. Either way no constraint is
+/// built; here the command is refused, saying which word and why.
+///
+/// A bus index is literal, as before: `a[0]`, `d[7:0]` (the reference's unknown-command handler
+/// gives `[0]` back as written). `{*}` expansion and variables (substituted before this runs) are
+/// not faults.
+fn word_fault(line: &str) -> Option<String> {
+    let cs: Vec<char> = line.chars().collect();
+    // the end of a `[...]` group starting at `i` (the index past its `]`), nesting- and brace-aware
+    let close_bracket = |mut i: usize| -> usize {
+        let (mut depth, mut brace) = (0i32, 0i32);
+        while i < cs.len() {
+            match cs[i] {
+                '\\' => i += 1,
+                '{' => brace += 1,
+                '}' => brace -= 1,
+                '[' if brace == 0 => depth += 1,
+                ']' if brace == 0 => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i + 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        cs.len()
+    };
+    let is_index = |inner: &str| !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit() || c == ':');
+    let mut i = 0;
+    while i < cs.len() {
+        while i < cs.len() && cs[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= cs.len() || cs[i] == '#' {
+            break; // the tokenizer's trailing comment
+        }
+        let start = i;
+        if cs[i..].starts_with(&['{', '*', '}']) {
+            i += 3; // `{*}` expansion: the word that follows is an ordinary word
+            continue;
+        }
+        if cs[i] == '{' {
+            let mut depth = 0i32;
+            while i < cs.len() {
+                match cs[i] {
+                    '\\' => i += 1,
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            let word: String = cs[start..i.min(cs.len())].iter().collect();
+            if i < cs.len() && !cs[i].is_whitespace() {
+                return Some(format!("`{word}…`: extra characters after a close-brace (a Tcl error)"));
+            }
+            let inner = &word[1..word.len().saturating_sub(1)];
+            if inner.split_whitespace().any(|e| e.starts_with('[') && e[1..].starts_with(|c: char| c.is_ascii_alphabetic())) {
+                return Some(format!("`{word}`: braces stop substitution, so this is the literal names {:?}, not a query", inner.split_whitespace().collect::<Vec<_>>()));
+            }
+            continue;
+        }
+        // a quoted or bare word: count its parts
+        let quoted = cs[i] == '"';
+        if quoted {
+            i += 1;
+        }
+        let (mut subs, mut text) = (Vec::new(), false);
+        while i < cs.len() {
+            let c = cs[i];
+            if quoted && c == '"' {
+                i += 1;
+                break;
+            }
+            if !quoted && c.is_whitespace() {
+                break;
+            }
+            if c == '\\' {
+                text = true;
+                i += 2;
+                continue;
+            }
+            if c == '[' {
+                let end = close_bracket(i);
+                let inner: String = cs[i + 1..end.saturating_sub(1).max(i + 1)].iter().collect();
+                if text && is_index(&inner) {
+                    i = end; // a bus index, part of the name
+                    continue;
+                }
+                subs.push(inner);
+                i = end;
+                continue;
+            }
+            text = true;
+            i += 1;
+        }
+        let word: String = cs[start..i.min(cs.len())].iter().collect();
+        if quoted && i < cs.len() && !cs[i].is_whitespace() {
+            return Some(format!("`{word}…`: extra characters after a close-quote (a Tcl error)"));
+        }
+        if !subs.is_empty() && (subs.len() > 1 || text) {
+            return Some(format!(
+                "`{word}`: a word joining a [command] to other text is that text concatenated (a string), not the command's objects"
+            ));
+        }
+        for s in &subs {
+            if let Some(f) = word_fault(s) {
+                return Some(f);
+            }
+        }
+    }
+    None
+}
+
 /// The commands an object list or a value may be written with, which this reader evaluates.
 const KNOWN_QUERIES: [&str; 15] = [
     "get_ports", "get_pins", "get_cells", "get_nets", "get_clocks", "get_lib_cells", "get_lib_pins", "get_libs",
@@ -2025,6 +2156,15 @@ impl Sdc {
                     continue;
                 }
             }
+            // A word that cannot name what it appears to (`[get_ports a]0`, `{[get_ports a]}`): the
+            // reference builds no constraint from it, so neither does this reader — said, not
+            // approximated. A `set` stores its text; it is checked where the variable is used.
+            if toks[0] != "set" {
+                if let Some(why) = word_fault(&line) {
+                    sdc.rejected.push(format!("{}: {why}; not applied", toks[0]));
+                    continue;
+                }
+            }
             // An object query this reader cannot evaluate: the command is NOT applied, and says
             // so (a `set` only stores the text; it is checked where the variable is used).
             if toks[0] != "set" {
@@ -2715,6 +2855,44 @@ mod exception_check_tests {
         let refused: Vec<bool> = s.exceptions.iter().map(|e| e.refused.is_some()).collect();
         assert_eq!(refused, [true, true, true, false]);
         assert!(!s.exceptions[0].covers("a", "b"));
+    }
+
+    /// Tcl's word rule: a word is the CONCATENATION of its parts and a braced word is literal. The
+    /// reference builds nothing from these (measured 2026-10-31, spec-matrix `word:*` probes):
+    /// `[get_ports din]0` and `[get_ports a][get_ports b]` are Error 100 "unsupported object type";
+    /// `x[get_ports dout]` and `{[get_ports dout]}` name objects not found (Warning 101). Each was
+    /// read here as a constraint on a real port. Now each is refused, and nothing else is.
+    #[test]
+    fn a_word_that_is_not_its_query_is_refused() {
+        let bad = [
+            "set_false_path -from [get_ports din]0 -to [get_ports dout]",
+            "set_load 1 x[get_ports dout]",
+            "set_load 1 [get_ports dout][get_ports din]",
+            "set_load 1 {[get_ports dout]}",
+            "set_load 1 \"x[get_ports dout]\"",
+            "set_load 1 [get_ports [get_ports a]0]",
+            "set_load 1 {dout}x",
+        ];
+        for line in bad {
+            let s = Sdc::parse(line).unwrap();
+            assert_eq!(s.rejected.len(), 1, "{line}: {:?}", s.rejected);
+            assert!(s.exceptions.is_empty() && s.env.is_empty() && s.load.is_none(), "{line} was applied");
+        }
+        // what stays: one substitution as the whole word (quoted too), a bus index, a brace list
+        // of names (bus bits included), `[list …]`, `{*}` expansion
+        let good = [
+            "set_load 1 [get_ports dout]",
+            "set_load 1 \"[get_ports dout]\"",
+            "set_load 1 [get_ports d[0]]",
+            "set_load 1 {d[0] d[1]}",
+            "set_load 1 [get_ports {d[7:0]}]",
+            "set_false_path -from [list [get_ports a] [get_ports b]] -to [get_ports c]",
+            "set_load 1 {*}[get_ports dout]",
+        ];
+        for line in good {
+            let s = Sdc::parse(line).unwrap();
+            assert!(s.rejected.is_empty(), "{line}: {:?}", s.rejected);
+        }
     }
     #[test]
     fn a_false_path_cuts_only_the_check_it_names() {
