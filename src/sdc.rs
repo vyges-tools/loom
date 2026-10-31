@@ -1430,6 +1430,28 @@ fn unknown_option(toks: &[String]) -> Option<String> {
     })
 }
 
+/// Why the reference's `set_clock_uncertainty` fails on these arguments, in the order it checks:
+/// no value (Error 420); a value that is not a float (571); a `-from` side without a `-to` side or
+/// the reverse (421); with both, a positional besides the value (565); with neither, not exactly
+/// the value and the objects (567), or `-rise`/`-fall`, which only edge a `-to` (422). Without
+/// these the reader applied an uncertainty the reference never set, from `-from` alone onto no
+/// clock pair, or a single-clock one the reference refused for its `-rise`.
+fn clock_uncertainty_fault(with: &[(&str, &String)], flags: &[String], pos: &[&String]) -> Option<String> {
+    let has = |f: &str| flags.iter().any(|x| x == f);
+    let side = |ks: [&str; 3]| with.iter().any(|(k, _)| ks.contains(k));
+    let Some(value) = pos.first() else { return Some("missing uncertainty value (Error 420)".into()) };
+    if value.parse::<f64>().is_err() {
+        return Some(format!("uncertainty '{value}' is not a float (Error 571)"));
+    }
+    match (side(["-from", "-rise_from", "-fall_from"]), side(["-to", "-rise_to", "-fall_to"])) {
+        (true, false) | (false, true) => Some("-from/-to must be used together (Error 421)".into()),
+        (true, true) => (pos.len() != 1).then(|| "-from/-to requires one positional argument (Error 565)".into()),
+        (false, false) if pos.len() != 2 => Some("requires two positional arguments (Error 567)".into()),
+        (false, false) => (has("-rise") || has("-fall"))
+            .then(|| "-rise, -fall options not allowed for single clock uncertainty (Error 422)".into()),
+    }
+}
+
 /// The first WORD of a command that cannot name what it appears to, by Tcl's word rules, with why.
 ///
 /// A Tcl word is a CONCATENATION of parts — literal text, `[command]` substitutions, `$variables` —
@@ -2520,8 +2542,11 @@ impl Sdc {
                     };
                     let has = |f: &str| flags.iter().any(|x| x == f);
                     let (setup, hold) = (has("-setup") || !has("-hold"), has("-hold") || !has("-setup"));
+                    if let Some(why) = clock_uncertainty_fault(&with, &flags, &pos) {
+                        sdc.rejected.push(format!("set_clock_uncertainty: {why}; not applied"));
+                        continue;
+                    }
                     let (Some(value), objects) = (pos.first().and_then(|v| v.parse::<f64>().ok()), pos.iter().skip(1).flat_map(|o| resolve_objs(o)).collect::<Vec<_>>()) else {
-                        sdc.rejected.push("set_clock_uncertainty without a value".into());
                         continue;
                     };
                     let written = pos.iter().skip(1).map(|o| Objects::of(o)).collect();
@@ -3132,6 +3157,36 @@ mod exception_check_tests {
         assert_eq!(s.env.len(), 1);
         // an abbreviation of one is not recognised: the reference's prefix rule finds no command
         assert!(Sdc::parse("set_size_o [get_cells u0]").is_err());
+    }
+
+    /// Rule (`set_clock_uncertainty`, Sdc.tcl): -from and -to come together and take only the
+    /// value; without them, exactly the value and the objects, and no -rise/-fall. Each failure
+    /// builds no uncertainty (Errors 420, 571, 421, 565, 567, 422).
+    #[test]
+    fn a_clock_uncertainty_the_reference_refuses_is_not_applied() {
+        let clk = "create_clock -name a -period 10 [get_ports clk]\ncreate_clock -name b -period 5 [get_ports clk2]\n";
+        for (cmd, why) in [
+            ("set_clock_uncertainty", "Error 420"),
+            ("set_clock_uncertainty x [get_clocks a]", "Error 571"),
+            ("set_clock_uncertainty -from [get_clocks a] 0.1", "Error 421"),
+            ("set_clock_uncertainty -rise_to [get_clocks a] 0.1", "Error 421"),
+            ("set_clock_uncertainty -from [get_clocks a] -to [get_clocks b] 0.1 [get_clocks a]", "Error 565"),
+            ("set_clock_uncertainty 0.1", "Error 567"),
+            ("set_clock_uncertainty -rise 0.1 [get_clocks a]", "Error 422"),
+            ("set_clock_uncertainty -fall -setup 0.1 [get_clocks a]", "Error 422"),
+        ] {
+            let s = Sdc::parse(&format!("{clk}{cmd}\n")).unwrap();
+            assert!(s.uncertainties.is_empty(), "{cmd}: applied");
+            assert!(s.rejected.iter().any(|r| r.contains(why)), "{cmd}: {:?}", s.rejected);
+        }
+        for cmd in [
+            "set_clock_uncertainty 0.1 [get_clocks a]",
+            "set_clock_uncertainty -from [get_clocks a] -to [get_clocks b] -rise 0.1",
+            "set_clock_uncertainty -rise_from [get_clocks a] -fall_to [get_clocks b] -hold 0.1",
+        ] {
+            let s = Sdc::parse(&format!("{clk}{cmd}\n")).unwrap();
+            assert_eq!(s.uncertainties.len(), 1, "{cmd}: {:?}", s.rejected);
+        }
     }
 
     #[test]
