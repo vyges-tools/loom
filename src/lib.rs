@@ -50,6 +50,11 @@ pub mod yosys_json;
 pub mod spice;
 pub mod sdc;
 pub mod sdc_write;
+/// SDC constraint linter — completeness and consistency of a design's constraints, from the
+/// same SDC + netlist (+ Liberty) a timer loads (`vyges sdc check`; moved from `vyges-sta-si`).
+pub mod sdc_lint;
+/// The `clock_domains` slice of `vyges-metadata.json` the constraint linter reads.
+pub mod ipmeta;
 mod sdc_query;
 pub mod threads;
 mod sdc_flags;
