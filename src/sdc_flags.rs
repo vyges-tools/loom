@@ -3,6 +3,24 @@
 //! exactly is the FIRST key it begins, else the first flag — not the unique one. Generated from
 //! the reference's command definitions; regenerate on a repin.
 
+/// The commands of [`FLAGS`] whose reference parse passes an option it does not know through to
+/// the command (`unknown_key_is_error` 0) rather than failing on it: they parse their own lists
+/// (`-through`, `-group`) after it. Every OTHER command of [`FLAGS`] fails on an option that is
+/// neither one of its keys or flags nor the beginning of one (the reference's Error 562). Observed
+/// on the reference's own parser, 2026-10-31.
+pub(crate) const PASSES_UNKNOWN: &[&str] = &[
+    "group_path",
+    "set_clock_groups",
+    "set_clock_sense",
+    "set_false_path",
+    "set_max_delay",
+    "set_min_delay",
+    "set_multicycle_path",
+    "set_path_margin",
+    "set_sense",
+    "unset_path_exceptions",
+];
+
 /// `(command, keys, flags)`.
 pub(crate) const FLAGS: &[(&str, &[&str], &[&str])] = &[
     ("all_inputs", &[], &["-no_clocks"]),

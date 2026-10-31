@@ -1303,6 +1303,40 @@ fn unevaluated_query(toks: &[String]) -> Option<String> {
     None
 }
 
+/// The first option in `toks` (at any depth of `[...]`) that is not one of its command's options,
+/// as the reference's argument parser decides it: a word is an option when it is `-` and a letter
+/// (`-0.5` is a value); it is one of the command's keys (which takes the next word as its value)
+/// or flags exactly, or else the beginning of one. Anything else fails the command in the
+/// reference (Error 562, "not a known keyword or flag": `all_inputs -edge_triggered`,
+/// `set_driving_cell -clock`, `get_ports -hierarchical`, SDC options it does not implement), so
+/// it builds no constraint; read as a constraint here it ignored the option. A command whose parse
+/// passes unknown options on ([`PASSES_UNKNOWN`]), or that this table does not list, is not judged.
+fn unknown_option(toks: &[String]) -> Option<String> {
+    use crate::sdc_flags::{FLAGS, PASSES_UNKNOWN};
+    let is_option = |t: &str| t.len() >= 2 && t.starts_with('-') && t[1..].starts_with(|c: char| c.is_ascii_alphabetic());
+    let cmd = toks.first()?.as_str();
+    if let Some((_, keys, flags)) = FLAGS.iter().find(|(n, _, _)| *n == cmd).filter(|_| !PASSES_UNKNOWN.contains(&cmd)) {
+        let mut k = 1;
+        while k < toks.len() {
+            let t = toks[k].as_str();
+            if is_option(t) {
+                if keys.contains(&t) || (!flags.contains(&t) && keys.iter().any(|x| x.starts_with(t))) {
+                    k += 2;
+                    continue;
+                }
+                if !flags.iter().any(|x| x.starts_with(t)) {
+                    return Some(format!("`{cmd} {t}`: {t} is not an option of {cmd}"));
+                }
+            }
+            k += 1;
+        }
+    }
+    toks[1..].iter().find_map(|t| {
+        let inner = t.strip_prefix('[').and_then(|s| s.strip_suffix(']'))?;
+        unknown_option(&expand_abbreviations(tokenize(inner.trim())))
+    })
+}
+
 /// The first WORD of a command that cannot name what it appears to, by Tcl's word rules, with why.
 ///
 /// A Tcl word is a CONCATENATION of parts — literal text, `[command]` substitutions, `$variables` —
@@ -2164,6 +2198,11 @@ impl Sdc {
                     sdc.rejected.push(format!("{}: {why}; not applied", toks[0]));
                     continue;
                 }
+                // An option the command does not have fails it in the reference; so here.
+                if let Some(why) = unknown_option(&toks) {
+                    sdc.rejected.push(format!("{}: {why}; not applied", toks[0]));
+                    continue;
+                }
             }
             // An object query this reader cannot evaluate: the command is NOT applied, and says
             // so (a `set` only stores the text; it is checked where the variable is used).
@@ -2892,6 +2931,46 @@ mod exception_check_tests {
         for line in good {
             let s = Sdc::parse(line).unwrap();
             assert!(s.rejected.is_empty(), "{line}: {:?}", s.rejected);
+        }
+    }
+
+    /// The reference's argument parser: a word is an option when it is `-` and a letter; it must be
+    /// one of the command's keys or flags exactly, or the beginning of one (first key, then first
+    /// flag), or the command fails (Error 562, measured 2026-10-31 on the spec-matrix probes and on
+    /// the parser itself). An SDC option it does not implement is such an option. A command whose
+    /// parse passes unknown options on (the exception commands) is not judged here.
+    #[test]
+    fn an_option_the_command_does_not_have_is_refused() {
+        let bad = [
+            "set_input_delay 1 -clock clk [all_inputs -edge_triggered]",
+            "set_input_delay 1 -clock clk [all_inputs -clock clk]",
+            "set_load 1 [get_ports -hierarchical dout]",
+            "set_driving_cell -lib_cell BUF -clock clk [get_ports din]",
+            "set_clock_latency -dynamic 1 [get_clocks clk]",
+            "set_timing_derate -increment 1.05",
+            "set_input_delay -level_sensitive 1 -clock clk [get_ports din]",
+        ];
+        for line in bad {
+            let s = Sdc::parse(line).unwrap();
+            assert_eq!(s.rejected.len(), 1, "{line}: {:?}", s.rejected);
+            assert!(s.rejected[0].contains("is not an option of"), "{line}: {:?}", s.rejected);
+            let applied = !s.input_delays.is_empty() || !s.driving_cells.is_empty() || !s.clock_latencies.is_empty()
+                || !s.derates.is_empty() || s.late_derate.is_some() || s.early_derate.is_some() || !s.env.is_empty() || s.load.is_some();
+            assert!(!applied, "{line} was applied");
+        }
+        let good = [
+            "create_clock -per 10 -name clk [get_ports clk]",
+            "set_input_delay -0.5 -clock clk [get_ports din]",
+            "set_input_delay 1 -clock clk -add_delay -max [get_ports din]",
+            "set_clock_uncertainty -setup 0.1 [get_clocks clk]",
+            "set_load 1 [all_outputs]",
+            "set_input_delay 1 -clock clk [all_inputs -no_clocks]",
+            "set_false_path -through [get_pins r/Q] -to [get_ports dout]",
+            "set_multicycle_path 2 -setup -from [get_ports din] -to [get_ports dout]",
+        ];
+        for line in good {
+            let s = Sdc::parse(line).unwrap();
+            assert!(s.rejected.iter().all(|r| !r.contains("is not an option of")), "{line}: {:?}", s.rejected);
         }
     }
     #[test]
