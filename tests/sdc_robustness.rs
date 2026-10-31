@@ -201,8 +201,9 @@ fn every_unmodelled_command_is_recorded() {
     let mut missing = Vec::new();
     for c in known_unmodelled() {
         let s = parse(&good_sdc(&format!("{c} 1.0 [get_ports a]\n")));
-        // an abbreviation is recorded under the command it expands to, as the reference runs it
-        if !s.ignored.iter().any(|i| i == c || i.starts_with(c)) {
+        // an abbreviation is recorded under the command it expands to, as the reference runs it;
+        // one the reference refuses on these arguments (`all_outputs 1.0`) is recorded as refused
+        if !s.ignored.iter().any(|i| i == c || i.starts_with(c)) && !s.rejected.iter().any(|r| r.starts_with(&format!("{c}:"))) {
             missing.push(c);
         }
     }

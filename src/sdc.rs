@@ -1430,6 +1430,42 @@ fn unknown_option(toks: &[String]) -> Option<String> {
     })
 }
 
+/// The first query in `toks` (at any depth of `[...]`) given positional arguments its reference
+/// definition refuses: `all_outputs` takes no argument at all, not even an option (Error 564,
+/// "positional arguments not supported"), `all_clocks` none either (Tcl: wrong # args), and
+/// `all_registers` options only (Error 564). `all_inputs` ignores a stray word, as the reference
+/// does. Read as the query, `[all_outputs -clock clk]` constrained every output; the reference
+/// fails the command.
+fn argument_fault(toks: &[String]) -> Option<String> {
+    use crate::sdc_flags::FLAGS;
+    let cmd = toks.first()?.as_str();
+    let fault = match cmd {
+        "all_outputs" | "all_clocks" => toks.len() > 1,
+        "all_registers" => {
+            let keys = FLAGS.iter().find(|(n, _, _)| *n == cmd).map_or(&[][..], |(_, k, _)| *k);
+            let mut k = 1;
+            let mut positional = false;
+            while k < toks.len() {
+                let t = toks[k].as_str();
+                if !t.starts_with('-') {
+                    positional = true;
+                    break;
+                }
+                k += if keys.iter().any(|x| x.starts_with(t)) { 2 } else { 1 };
+            }
+            positional
+        }
+        _ => false,
+    };
+    if fault {
+        return Some(format!("`{}`: {cmd} takes no positional argument{}", toks.join(" "), if cmd == "all_registers" { "" } else { " or option" }));
+    }
+    toks[1..].iter().find_map(|t| {
+        let inner = t.strip_prefix('[').and_then(|s| s.strip_suffix(']'))?;
+        argument_fault(&expand_abbreviations(tokenize(inner.trim())))
+    })
+}
+
 /// Why the reference's `set_clock_uncertainty` fails on these arguments, in the order it checks:
 /// no value (Error 420); a value that is not a float (571); a `-from` side without a `-to` side or
 /// the reverse (421); with both, a positional besides the value (565); with neither, not exactly
@@ -2334,7 +2370,7 @@ impl Sdc {
                     continue;
                 }
                 // An option the command does not have fails it in the reference; so here.
-                if let Some(why) = unknown_option(&toks) {
+                if let Some(why) = unknown_option(&toks).or_else(|| argument_fault(&toks)) {
                     sdc.rejected.push(format!("{}: {why}; not applied", toks[0]));
                     continue;
                 }
@@ -3157,6 +3193,31 @@ mod exception_check_tests {
         assert_eq!(s.env.len(), 1);
         // an abbreviation of one is not recognised: the reference's prefix rule finds no command
         assert!(Sdc::parse("set_size_o [get_cells u0]").is_err());
+    }
+
+    /// Rule (`all_outputs`, `all_clocks`, `all_registers`, Sdc.tcl, observed 2026-10-31): the
+    /// first two take no argument, the third options only; `all_inputs` ignores a stray word.
+    #[test]
+    fn a_query_given_arguments_it_does_not_take_fails_its_command() {
+        let clk = "create_clock -name clk -period 10 [get_ports clk]\n";
+        for cmd in [
+            "set_output_delay 1 -clock clk [all_outputs dout]",
+            "set_output_delay 1 -clock clk [all_outputs -clock clk]",
+            "set_load 1 [all_outputs {}]",
+            "set_clock_latency 1 [all_clocks x]",
+            "set_false_path -to [all_registers foo]",
+        ] {
+            let s = Sdc::parse(&format!("{clk}{cmd}\n")).unwrap();
+            assert!(s.rejected.iter().any(|r| r.contains("takes no positional")), "{cmd}: {:?}", s.rejected);
+        }
+        for cmd in [
+            "set_output_delay 1 -clock clk [all_outputs]",
+            "set_input_delay 1 -clock clk [all_inputs din]",
+            "set_false_path -to [all_registers -clock clk -edge_triggered]",
+        ] {
+            let s = Sdc::parse(&format!("{clk}{cmd}\n")).unwrap();
+            assert!(s.rejected.is_empty(), "{cmd}: {:?}", s.rejected);
+        }
     }
 
     /// Rule (`set_clock_uncertainty`, Sdc.tcl): -from and -to come together and take only the
