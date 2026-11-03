@@ -460,3 +460,14 @@ fn a_file_of_constraints_never_yields_nothing() {
         assert!(got > 0, "{label}: parsed cleanly and extracted nothing from:\n{text}");
     }
 }
+
+/// A line a script's own splitter hands over with its brace still open (`… ignored {`, the body
+/// on the lines after), or a brace word ending in a multibyte character, is read or refused —
+/// never a panic. The word scanner sliced `{` by byte offset and panicked on both (a sta-si
+/// sweep script, 2026-11-03).
+#[test]
+fn an_unclosed_or_multibyte_brace_word_does_not_panic() {
+    for text in ["with_output_to_variable ignored {\n", "set_false_path -to {é\n", "set_false_path -to {r1/D é}\n"] {
+        let _ = std::panic::catch_unwind(|| Sdc::parse(text)).unwrap_or_else(|_| panic!("panicked on {text:?}"));
+    }
+}

@@ -2007,7 +2007,9 @@ fn word_fault(line: &str) -> Option<String> {
             if i < cs.len() && !cs[i].is_whitespace() {
                 return Some(format!("`{word}…`: extra characters after a close-brace (a Tcl error)"));
             }
-            let inner = &word[1..word.len().saturating_sub(1)];
+            // an unclosed brace (`… ignored {` at the end of a line) is the word `{` alone, and the
+            // last character may be any character: strip by character, never by byte offset
+            let inner = word.strip_prefix('{').map_or(word.as_str(), |w| w.strip_suffix('}').unwrap_or(w));
             if inner.split_whitespace().any(|e| e.starts_with('[') && e[1..].starts_with(|c: char| c.is_ascii_alphabetic())) {
                 return Some(format!("`{word}`: braces stop substitution, so this is the literal names {:?}, not a query", inner.split_whitespace().collect::<Vec<_>>()));
             }
