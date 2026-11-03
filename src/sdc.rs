@@ -2717,6 +2717,7 @@ impl Sdc {
         // the variables of each proc call in progress, restored when it returns
         let mut frames: Vec<(HashMap<String, String>, Vec<String>)> = Vec::new();
         let mut sourced = 0usize;
+        let mut loops: Vec<TclLoop> = Vec::new();
 
         // A QUEUE of commands, not a list: a chosen `if` branch or a `foreach` body is put back at
         // its front, so it runs in place and in order — and its variables are substituted when
@@ -2736,7 +2737,27 @@ impl Sdc {
                 }
                 continue;
             }
-            match dialect(&raw, &vars, &mut procs, &mut frames, opts)? {
+            // A loop's test, queued after each pass of its body: run the body again while it holds.
+            if let Some(id) = raw.strip_prefix(LOOP_TEST) {
+                let Some(l) = id.parse::<usize>().ok().and_then(|i| loops.get_mut(i)) else { continue };
+                let cond = subst_vars(&subst_info_exists(&l.cond, &vars), &as_operands(&vars));
+                match eval_expr(&cond, &vars).and_then(|v| v.truthy()) {
+                    Some(true) => {
+                        l.passes += 1;
+                        if l.passes > MAX_LOOP_PASSES {
+                            return Err(SdcError(format!("`{} {}`: more than {MAX_LOOP_PASSES} passes; not read as a loop that ends", l.cmd, l.cond)));
+                        }
+                        queue.push_front(raw.clone());
+                        for c in l.next.iter().rev().chain(l.body.iter().rev()) {
+                            queue.push_front(c.clone());
+                        }
+                    }
+                    Some(false) => {}
+                    None => sdc.rejected.push(format!("{}: the condition `{}` is not evaluated; the loop is not run (on)", l.cmd, l.cond)),
+                }
+                continue;
+            }
+            match dialect(&raw, &vars, &mut procs, &mut frames, &mut loops, opts)? {
                 Dialect::Sourced(cmds) => {
                     sourced += 1;
                     if sourced > MAX_SOURCED {
@@ -3418,6 +3439,20 @@ struct TclProc {
     body: Vec<String>,
 }
 
+/// A `for` / `while` loop being run: its test, the `for` step, its body, and the passes so far.
+#[derive(Debug, Clone)]
+struct TclLoop {
+    cmd: String,
+    cond: String,
+    next: Vec<String>,
+    body: Vec<String>,
+    passes: usize,
+}
+
+/// The line the reader queues before each pass of a loop: `LOOP_TEST` and the loop's index.
+const LOOP_TEST: &str = "\u{2}loop-test ";
+const MAX_LOOP_PASSES: usize = 100_000;
+
 /// The line the reader queues after a proc's body: its call has returned.
 const PROC_RETURN: &str = "\u{1}proc-return";
 const MAX_PROC_DEPTH: usize = 64;
@@ -3455,6 +3490,7 @@ fn dialect(
     vars: &HashMap<String, String>,
     procs: &mut HashMap<String, TclProc>,
     frames: &mut Vec<(HashMap<String, String>, Vec<String>)>,
+    loops: &mut Vec<TclLoop>,
     opts: &ReadOpts,
 ) -> Result<Dialect, SdcError> {
     let Some(head) = raw.split_whitespace().next() else { return Ok(Dialect::None) };
@@ -3477,6 +3513,82 @@ fn dialect(
             Ok(Dialect::Done)
         }
         "puts" | "echo" => Ok(Dialect::Done),
+        // Tcl `for {init} {test} {next} {body}` and `while {test} {body}`: the test is evaluated
+        // before each pass, with the variables as they are then (a queued test line, see the
+        // read loop). A body that would `break` or `continue` is refused, unrun.
+        "for" | "while" => {
+            let toks = tokenize(raw);
+            let (init, cond, next, body) = match (head, toks.as_slice()) {
+                ("for", [_, i, c, n, b]) => (logical_lines(i), c.clone(), logical_lines(n), b),
+                ("while", [_, c, b]) => (Vec::new(), c.clone(), Vec::new(), b),
+                _ => return Ok(Dialect::Refuse(format!("{head}: `{}` is not the {head} form; not run", raw.trim()))),
+            };
+            if tokenize(body).iter().chain(&next).any(|w| w.split_whitespace().any(|x| x == "break" || x == "continue")) {
+                return Ok(Dialect::Refuse(format!("{head}: a body that breaks or continues; not run")));
+            }
+            loops.push(TclLoop { cmd: head.to_string(), cond, next, body: logical_lines(body), passes: 0 });
+            let mut cmds = init;
+            cmds.push(format!("{LOOP_TEST}{}", loops.len() - 1));
+            Ok(Dialect::Run(cmds))
+        }
+        // Tcl `switch ?-exact|-glob? ?--? value {pattern body …}` (or the pairs inline): the first
+        // matching pattern's body runs, `default` matching anything; a body `-` falls through to
+        // the next one. `-regexp` is not evaluated, so the switch is refused.
+        "switch" => {
+            let line = subst_command_vars(raw, vars);
+            let toks = tokenize(&line);
+            let mut k = 1;
+            let mut glob_mode = false;
+            while let Some(t) = toks.get(k).filter(|t| t.starts_with('-')) {
+                match t.as_str() {
+                    "-exact" => {}
+                    "-glob" => glob_mode = true,
+                    "--" => {
+                        k += 1;
+                        break;
+                    }
+                    other => return Ok(Dialect::Refuse(format!("switch {other}: not evaluated; not run"))),
+                }
+                k += 1;
+            }
+            let Some(value) = toks.get(k) else { return Ok(Dialect::Refuse("switch: no value; not run".into())) };
+            let pairs: Vec<String> = match &toks[k + 1..] {
+                [one] => tokenize(one),
+                many => many.to_vec(),
+            };
+            if !pairs.len().is_multiple_of(2) {
+                return Ok(Dialect::Refuse("switch: patterns and bodies do not pair; not run".into()));
+            }
+            let mut hit = false;
+            for pb in pairs.chunks(2) {
+                let (pat, body) = (&pb[0], &pb[1]);
+                hit = hit || pat == "default" || if glob_mode { glob(pat, value) } else { pat == value };
+                if hit && body != "-" {
+                    return Ok(Dialect::Run(logical_lines(body)));
+                }
+            }
+            Ok(Dialect::Done)
+        }
+        // Tcl `lappend v ?elem …?`: the variable's list with each element appended, as one word.
+        "lappend" => {
+            let line = subst_command_vars(raw, vars);
+            let toks = tokenize(&line);
+            let Some(var) = toks.get(1) else { return Ok(Dialect::Refuse("lappend: no variable; not applied".into())) };
+            let mut list: Vec<String> = vars.get(var.as_str()).filter(|v| !v.trim().is_empty()).map(|v| vec![v.trim().to_string()]).unwrap_or_default();
+            list.extend(toks[2..].iter().map(|e| brace_word(e)));
+            Ok(Dialect::Run(vec![format!("set {var} {{{}}}", list.join(" "))]))
+        }
+        // Tcl `incr v ?n?`: an unset variable counts from 0, as in Tcl 8.5+.
+        "incr" => {
+            let toks = tokenize(&subst_command_vars(raw, vars));
+            let Some(var) = toks.get(1) else { return Ok(Dialect::Refuse("incr: no variable; not applied".into())) };
+            let by = toks.get(2).map_or(Some(1), |n| n.parse::<i64>().ok());
+            let now = vars.get(var.as_str()).map_or(Some(0), |v| v.trim().parse::<i64>().ok());
+            match (now, by) {
+                (Some(a), Some(b)) => Ok(Dialect::Run(vec![format!("set {var} {}", a + b)])),
+                _ => Ok(Dialect::Refuse(format!("incr {var}: not an integer; not applied"))),
+            }
+        }
         // its body runs once per object of a collection this reader does not enumerate
         "foreach_in_collection" => Ok(Dialect::Refuse(format!(
             "foreach_in_collection: `{}` iterates a collection this reader does not enumerate; not applied",
@@ -5001,6 +5113,38 @@ if {$dir == \"in\"} { set_load 1 [get_ports a] } else { set_load 2 [get_ports b]
         assert_eq!(s.env.len(), 1);
         assert_eq!(s.env[0].objects, ["a"]);
         assert!(s.ignored.iter().all(|i| i != "if"), "{:?}", s.ignored);
+    }
+
+    /// Tcl `for` / `while` / `incr`: the test before each pass with the variables as they are
+    /// then; `switch` exact, glob, `default` and `-` fall-through; `lappend` builds a list. A loop
+    /// that never ends stops the read rather than hanging it.
+    #[test]
+    fn loops_switch_and_lappend_run_as_tcl_runs_them() {
+        let s = Sdc::parse(
+            "create_clock -name c -period 10 [get_ports clk]
+             for {set i 0} {$i < 3} {incr i} { set_input_delay $i -clock c [get_ports d$i] }
+             set n 2
+while {$n > 0} { set_output_delay $n -clock c [get_ports q$n]
+ incr n -1 }
+             set mode fast
+switch -glob $mode { slow { set_load 1 [get_ports a] } f* - x { set_load 2 [get_ports b] } default { set_load 3 [get_ports c] } }
+             switch $mode { slow { set_load 4 [get_ports e] } }
+             lappend L x
+lappend L {y z}
+set_load 5 [get_ports $L]
+",
+        )
+        .unwrap();
+        let ins: Vec<(f64, Vec<String>)> = s.input_delays.iter().map(|d| (d.value, d.ports.clone())).collect();
+        assert_eq!(ins, [(0.0, vec!["d0".to_string()]), (1.0, vec!["d1".into()]), (2.0, vec!["d2".into()])]);
+        let outs: Vec<f64> = s.output_delays.iter().map(|d| d.value).collect();
+        assert_eq!(outs, [2.0, 1.0]);
+        let env: Vec<Vec<String>> = s.env.iter().map(|e| e.objects.clone()).collect();
+        assert_eq!(env, [vec!["b".to_string()], vec!["x".into(), "y".into(), "z".into()]]);
+        assert!(Sdc::parse("while {1} { set x 1 }
+").is_err());
+        assert!(Sdc::parse("for {set i 0} {$i < 3} {incr i} { if {$i} { break } }
+").unwrap().rejected.iter().any(|r| r.starts_with("for")));
     }
 
     /// What a proc call cannot be read as is refused, and the read goes on; a recursive proc
