@@ -501,6 +501,10 @@ pub fn lint_with_meta(
         }
     }
 
+    // `-through` points, and `set_max_delay` / `set_min_delay`: the same two questions — does
+    // each named object exist, and does it lie on a path between the sides around it.
+    path_point_findings(sdc, &g, &mut f);
+
     // Endpoint coverage, as one number.
     let seq_total = clocked + unclocked.len();
     let out_covered = nl
@@ -532,6 +536,128 @@ pub fn lint_with_meta(
     not_applied_findings(sdc, &mut f);
     f.sort_by(|a, b| (a.severity as u8, a.code).cmp(&(b.severity as u8, b.code)));
     LintReport { findings: f }
+}
+
+/// The checkable names in an object list: no wildcard (a pattern is not one object), no
+/// `all_*` sentinel (`*INPUTS*` is every input, which cuts something whenever the design has one).
+/// A clock name stands for its source.
+fn checkable_names(objs: &[&crate::sdc::Objects], sdc: &Sdc) -> Vec<String> {
+    let mut out = Vec::new();
+    for o in objs {
+        for n in &o.names {
+            if n.is_empty() || n.contains(['*', '?']) {
+                continue;
+            }
+            if o.accessor == "get_clocks" {
+                if let Some(c) = sdc.clocks.iter().find(|c| &c.name == n).filter(|c| !c.source.is_empty()) {
+                    out.push(c.source.clone());
+                }
+                continue;
+            }
+            out.push(n.clone());
+        }
+    }
+    out
+}
+
+/// Which side of a path an object-valued flag names: 0 from, 1 through, 2 to.
+fn side_of(flag: &str) -> Option<usize> {
+    let f = flag.trim_start_matches('-').trim_start_matches("rise_").trim_start_matches("fall_");
+    match f {
+        "from" => Some(0),
+        "through" => Some(1),
+        "to" => Some(2),
+        _ => None,
+    }
+}
+
+/// `-through` on false and multicycle paths, and every side of `set_max_delay` / `set_min_delay`.
+///
+/// The exception check above judges `-from` / `-to` alone; a `-through` list narrows the
+/// exception to paths through those points, and a point that is on no such path makes the whole
+/// exception dead — the path the author meant stays timed (a false path) or keeps its old
+/// requirement (a path delay). Per point: it must exist, and it must be reachable from the side
+/// before it and reach the side after it (a register or a port when that side is open).
+fn path_point_findings(sdc: &Sdc, g: &Graph, f: &mut Vec<Finding>) {
+    // (command label, is an exception, [from, through..., to] as written). An exception's
+    // `-from` / `-to` objects are already checked for existence above; only its `-through` here.
+    let mut cmds: Vec<(&'static str, bool, Vec<(usize, &crate::sdc::Objects)>)> = Vec::new();
+    for e in &sdc.exceptions {
+        let kind = match e.kind {
+            crate::sdc::ExcKind::FalsePath => "set_false_path",
+            crate::sdc::ExcKind::Multicycle(_) => "set_multicycle_path",
+        };
+        if e.args.iter().any(|(k, _)| side_of(k) == Some(1)) {
+            cmds.push((kind, true, e.args.iter().filter_map(|(k, o)| side_of(k).map(|s| (s, o))).collect()));
+        }
+    }
+    for p in &sdc.path_delays {
+        let kind = if p.max { "set_max_delay" } else { "set_min_delay" };
+        cmds.push((kind, false, p.objects.iter().filter_map(|(k, o)| side_of(k).map(|s| (s, o))).collect()));
+    }
+    let mut dead = Vec::new();
+    for (kind, exception, sides) in &cmds {
+        let of = |want: usize| -> Vec<&crate::sdc::Objects> { sides.iter().filter(|(s, _)| *s == want).map(|(_, o)| *o).collect() };
+        let from = checkable_names(&of(0), sdc);
+        let to = checkable_names(&of(2), sdc);
+        // each `-through` is its own stage, in order
+        let throughs: Vec<Vec<String>> = sides
+            .iter()
+            .filter(|(s, _)| *s == 1)
+            .map(|(_, o)| checkable_names(&[*o], sdc))
+            .collect();
+        let mut stages: Vec<(&str, Vec<String>)> = vec![("-from", from)];
+        stages.extend(throughs.into_iter().map(|t| ("-through", t)));
+        stages.push(("-to", to));
+        let mut unknown = false;
+        for (flag, names) in &stages {
+            if *exception && *flag != "-through" {
+                unknown |= names.iter().any(|n| !g.knows(n));
+                continue;
+            }
+            for n in names.iter().filter(|n| !g.knows(n)) {
+                unknown = true;
+                f.push(Finding::warn(
+                    "exception-unknown-object",
+                    format!("{kind} {flag} `{n}` names nothing in the design — that part of the command does nothing"),
+                ));
+            }
+        }
+        if unknown {
+            continue;
+        }
+        // every adjacent pair of named stages must connect; an open first or last stage needs the
+        // named point to reach a register or a port in that direction
+        let named: Vec<&(&str, Vec<String>)> = stages.iter().filter(|(_, n)| !n.is_empty()).collect();
+        for w in named.windows(2) {
+            let (a, b) = (&w[0].1, &w[1].1);
+            if !a.iter().any(|x| b.iter().any(|y| g.reaches(x, y))) {
+                dead.push(format!("{kind}: no structural path from {} `{}` to {} `{}`", w[0].0, a.join(" "), w[1].0, b.join(" ")));
+            }
+        }
+        if let (Some(first), true) = (named.first(), stages[0].1.is_empty()) {
+            if !first.1.iter().any(|x| g.captures_anything(x)) {
+                dead.push(format!("{kind}: {} `{}` is reached by no timing path", first.0, first.1.join(" ")));
+            }
+        }
+        if let (Some(last), true) = (named.last(), stages[stages.len() - 1].1.is_empty()) {
+            if !last.1.iter().any(|x| g.launches_anything(x)) {
+                dead.push(format!("{kind}: {} `{}` reaches no timing endpoint", last.0, last.1.join(" ")));
+            }
+        }
+    }
+    for what in dead.iter().take(PORT_LIST_CAP) {
+        f.push(Finding::warn(
+            "exception-unreachable",
+            format!("{what} — the command applies to no path, and any path the author meant keeps its old timing"),
+        ));
+    }
+    if dead.len() > PORT_LIST_CAP {
+        f.push(Finding::warn(
+            "exception-unreachable",
+            format!("... and {} more dead path commands ({} in total)", dead.len() - PORT_LIST_CAP, dead.len()),
+        ));
+    }
 }
 
 /// One finding per kind of command the model does not carry ([`Sdc::not_applied`]): an ERROR when
@@ -1006,6 +1132,62 @@ mod depth_tests {
             "rb -> ra does not exist and the exception is dead: {:?}",
             r.findings
         );
+    }
+
+    /// `-through` was invisible to the reachability check: an exception was judged on `-from` /
+    /// `-to` alone, so a `-through` on no path between them passed.
+    #[test]
+    fn a_through_point_on_the_path_is_quiet() {
+        let sdc = Sdc::parse(&format!("{}set_false_path -from ra -through mid -to rb\n", base_sdc())).unwrap();
+        let r = lint(&chain(), &sdc, &lib());
+        assert!(!has(&r, "exception-unreachable") && !has(&r, "exception-unknown-object"), "{:?}", r.findings);
+    }
+
+    #[test]
+    fn a_through_point_off_the_path_is_reported() {
+        // rb -> dout exists, but `mid` is before rb, not between rb and dout
+        let sdc = Sdc::parse(&format!("{}set_false_path -from rb -through mid -to dout\n", base_sdc())).unwrap();
+        let r = lint(&chain(), &sdc, &lib());
+        assert!(has(&r, "exception-unreachable"), "{:?}", r.findings);
+    }
+
+    #[test]
+    fn a_through_point_naming_nothing_is_reported_once() {
+        let sdc = Sdc::parse(&format!("{}set_false_path -from ra -through nope -to rb\n", base_sdc())).unwrap();
+        let r = lint(&chain(), &sdc, &lib());
+        let n = r.findings.iter().filter(|f| f.code == "exception-unknown-object").count();
+        assert_eq!(n, 1, "{:?}", r.findings);
+    }
+
+    /// `set_max_delay` / `set_min_delay` were never linted at all.
+    #[test]
+    fn a_path_delay_on_a_real_path_is_quiet() {
+        let sdc = Sdc::parse(&format!("{}set_max_delay 2 -from ra -to rb\nset_min_delay 0 -from ra -to rb\n", base_sdc())).unwrap();
+        let r = lint(&chain(), &sdc, &lib());
+        assert!(!has(&r, "exception-unreachable") && !has(&r, "exception-unknown-object"), "{:?}", r.findings);
+    }
+
+    #[test]
+    fn a_path_delay_with_no_path_or_a_typo_is_reported() {
+        let sdc = Sdc::parse(&format!("{}set_max_delay 2 -from rb -to ra\n", base_sdc())).unwrap();
+        assert!(has(&lint(&chain(), &sdc, &lib()), "exception-unreachable"));
+        let sdc = Sdc::parse(&format!("{}set_max_delay 2 -to no_such_reg\n", base_sdc())).unwrap();
+        assert!(has(&lint(&chain(), &sdc, &lib()), "exception-unknown-object"));
+    }
+
+    /// An open side is any register or port: a one-sided path delay on a point that captures
+    /// nothing is dead.
+    #[test]
+    fn a_one_sided_path_delay_is_checked() {
+        let n = crate::netlist::parse(
+            "module t(clk,din,dout,x);\ninput clk,din; output dout,x;\n\
+             DFF ra(.CK(clk),.D(din),.Q(dout));\nendmodule\n",
+        )
+        .unwrap();
+        let sdc = Sdc::parse(&format!("{}set_max_delay 2 -to x\n", base_sdc())).unwrap();
+        assert!(has(&lint(&n, &sdc, &lib()), "exception-unreachable"));
+        let sdc = Sdc::parse(&format!("{}set_max_delay 2 -to dout\n", base_sdc())).unwrap();
+        assert!(!has(&lint(&n, &sdc, &lib()), "exception-unreachable"));
     }
 
     #[test]
