@@ -11,7 +11,7 @@
 //!
 //! Format: a hand-rolled little-endian binary codec (loom is std-only — no serde),
 //! magic-tagged and versioned so a format change invalidates rather than misreads.
-//! Content-addressed filenames `{hash}-{len}-{ccs}.vlc` (the same key as the
+//! Content-addressed filenames `{hash}-{len}-{ccs}-{format}.vlc` (the same key as the
 //! in-process cache) mean a changed library is a different entry — never a stale read.
 
 use crate::ccs::{CcsArc, CcsWaveform};
@@ -741,8 +741,12 @@ fn prune_in(dir: &Path, cap_bytes: u64) {
     }
 }
 
+/// The entry's file, named with the format tag: two loom versions sharing the cache keep one
+/// entry each instead of overwriting each other's (each then read the other's as a miss, so both
+/// re-parsed on every alternate run). An old version's entries are evicted by the size cap.
 fn entry_path(dir: &Path, key: (u64, u64, bool)) -> PathBuf {
-    dir.join(format!("{:016x}-{}-{}.vlc", key.0, key.1, key.2 as u8))
+    let tag = String::from_utf8_lossy(MAGIC);
+    dir.join(format!("{:016x}-{}-{}-{tag}.vlc", key.0, key.1, key.2 as u8))
 }
 
 /// Look up a cached `Lib` for `key` in `dir`. `None` = miss (or corrupt/old-format).
@@ -1014,6 +1018,23 @@ library (neg) {
         );
         assert!(disk_get_in(&dir, nldm_key).is_some());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An older loom's entry for the same library sits beside this version's, under its own
+    /// tag: neither overwrites the other, and an old-format file is never read as this one.
+    #[test]
+    fn another_format_version_keeps_its_own_entry() {
+        let lib = Lib::parse(LIB).unwrap();
+        let key = (0xdef_5678u64, LIB.len() as u64, false);
+        let dir = std::env::temp_dir().join(format!("vyges_libcache_tag_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join(format!("{:016x}-{}-0-VLCL.vlc", key.0, key.1));
+        std::fs::write(&old, b"VLCLold-format-bytes").unwrap();
+        assert!(disk_get_in(&dir, key).is_none());
+        disk_put_in(&dir, key, &lib);
+        assert!(disk_get_in(&dir, key).is_some());
+        assert_eq!(std::fs::read(&old).unwrap(), b"VLCLold-format-bytes");
         std::fs::remove_dir_all(&dir).ok();
     }
 
