@@ -235,8 +235,11 @@ fn every_sdc_parses_and_names_what_it_drops() {
     let mut bad = Vec::new();
     let mut affecting: std::collections::BTreeMap<String, usize> = Default::default();
     for f in &files {
-        let Ok(text) = std::fs::read_to_string(f) else { continue };
-        match Sdc::parse(&text) {
+        // read as a file, so a relative `source` resolves against the file's own directory
+        if std::fs::metadata(f).is_err() {
+            continue;
+        }
+        match Sdc::load(&f.to_string_lossy()) {
             // A file that genuinely cannot be read without the flow's environment (an unset
             // `$::env`, an unevaluated `[expr]`) is a legitimate error — provided the message
             // NAMES the offending token, which is the difference between "fix this variable"

@@ -3506,7 +3506,7 @@ fn dialect(
                 opts.base_dir.as_ref().map(|b| b.join(path)).filter(|p| p.exists())
             };
             let Some(found) = found else {
-                return Err(SdcError(format!("source {file}: no such file; the reference stops reading at an error, so this file is not read")));
+                return Err(SdcError(format!("`source {file}`: no such file; the reference stops reading at an error, so this file is not read")));
             };
             let text = read_lossy(&found.to_string_lossy())?;
             Ok(Dialect::Sourced(logical_lines(&text)))

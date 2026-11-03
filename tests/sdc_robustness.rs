@@ -48,6 +48,14 @@ const HANDLED: &[&str] = &[
     "set_clock_group",
     "set_units",
     "set_unit",
+    // A changed instance scope STOPS the read (names after it would resolve from the top):
+    // modelled as a refusal, so injecting one legitimately changes the result.
+    "current_instance",
+    // likewise a separator other than `/`
+    "set_hierarchy_separator",
+    // A LOOM EXTENSION (synthesis-tool dialect, 2026-11-02): grows a collection variable, read
+    // where the reference stops; it sets a variable, so it records nothing as dropped.
+    "append_to_collection",
 ];
 
 /// The mined commands the reference does NOT know (`invalid command name`; measured on the pinned
@@ -57,7 +65,6 @@ const HANDLED: &[&str] = &[
 /// 2026-10-31). Used in real constraint files: `set_size_only` 16 times, `set_critical_range` 15,
 /// `derive_pll_clocks` and `derive_clock_uncertainty` 8 each.
 const UNKNOWN_TO_REFERENCE: &[&str] = &[
-    "append_to_collection",
     "axi_araddr_i",
     "derive_clock_uncertainty",
     "derive_pll_clocks",
