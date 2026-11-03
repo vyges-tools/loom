@@ -578,10 +578,14 @@ fn side_of(flag: &str) -> Option<usize> {
 /// exception dead — the path the author meant stays timed (a false path) or keeps its old
 /// requirement (a path delay). Per point: it must exist, and it must be reachable from the side
 /// before it and reach the side after it (a register or a port when that side is open).
+/// One command's path points: its label, whether it is an exception, and its sides in order
+/// (`0` from, `1` through, `2` to) with their objects as written.
+type PathPoints<'s> = (&'static str, bool, Vec<(usize, &'s crate::sdc::Objects)>);
+
 fn path_point_findings(sdc: &Sdc, g: &Graph, f: &mut Vec<Finding>) {
     // (command label, is an exception, [from, through..., to] as written). An exception's
     // `-from` / `-to` objects are already checked for existence above; only its `-through` here.
-    let mut cmds: Vec<(&'static str, bool, Vec<(usize, &crate::sdc::Objects)>)> = Vec::new();
+    let mut cmds: Vec<PathPoints> = Vec::new();
     for e in &sdc.exceptions {
         let kind = match e.kind {
             crate::sdc::ExcKind::FalsePath => "set_false_path",

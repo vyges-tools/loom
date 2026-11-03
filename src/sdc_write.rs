@@ -175,6 +175,7 @@ impl Sdc {
         self.write_clock_properties(&mut o);
         self.write_io_delays(&mut o);
         self.write_constants(&mut o);
+        self.write_arcs(&mut o);
         self.write_exceptions(&mut o);
 
         o.section("Environment");
@@ -354,6 +355,35 @@ impl Sdc {
         for c in self.case_values.iter().chain(&self.logic_values) {
             let value = if c.cmd == "set_case_analysis" { format!(" {}", c.value) } else { String::new() };
             o.line_or(objects(&c.written).map(|x| format!("{}{value} {x}", c.cmd)), || c.cmd.clone());
+        }
+    }
+
+    /// `set_disable_timing`, the clock senses, then `set_disable_clock_gating_check` (and their
+    /// `unset_` forms), each in file order. A `-clock`/`-clocks` value is written as the clocks.
+    fn write_arcs(&self, o: &mut Out) {
+        for c in self.disabled_timing.iter().chain(&self.senses).chain(&self.disabled_gating_checks) {
+            let mut head = c.cmd.clone();
+            if c.cmd == "set_sense" {
+                head += " -type clock";
+            }
+            let mut ok = true;
+            for (k, v) in &c.keys {
+                let w = if k.starts_with("-clock") {
+                    let names: Vec<String> = v.split_whitespace().map(str::to_string).collect();
+                    named("get_clocks", &names)
+                } else {
+                    brace(std::slice::from_ref(v))
+                };
+                match w {
+                    Some(w) => head += &format!(" {k} {w}"),
+                    None => ok = false,
+                }
+            }
+            for f in &c.flags {
+                head += &format!(" {f}");
+            }
+            let line = objects(&c.written).filter(|_| ok).map(|x| format!("{head} {x}"));
+            o.line_or(line, || c.cmd.clone());
         }
     }
 

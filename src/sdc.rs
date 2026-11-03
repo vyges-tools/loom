@@ -363,6 +363,65 @@ fn split_args<'t>(toks: &'t [String], valued: &[&str]) -> (Vec<(&'t str, &'t Str
     (with, flags, pos)
 }
 
+/// `toks` read as the reference's `parse_key_args` reads them for a command with these keys and
+/// flags, then `check_argc_eq1`: exactly ONE word is left, the objects (Tcl's "wrong # args"
+/// otherwise — an option the command does not know is left as a word, and so fails it).
+fn arc_cmd(toks: &[String], keys: &[&str], flags: &[&str]) -> Result<ArcCmd, String> {
+    let (mut kv, mut fl, mut pos) = (Vec::new(), Vec::new(), Vec::new());
+    let mut k = 1;
+    while k < toks.len() {
+        let t = toks[k].as_str();
+        if keys.contains(&t) {
+            let Some(v) = toks.get(k + 1) else { return Err(format!("{}: {t} without a value; not applied", toks[0])) };
+            let v = if t.starts_with("-clock") { resolve_objs(v).join(" ") } else { v.clone() };
+            kv.push((t.to_string(), v));
+            k += 2;
+            continue;
+        }
+        if flags.contains(&t) {
+            fl.push(t.to_string());
+        } else {
+            pos.push(&toks[k]);
+        }
+        k += 1;
+    }
+    let [obj] = pos.as_slice() else {
+        return Err(format!("{}: {} words where the objects are one (the reference's wrong # args); not applied", toks[0], pos.len()));
+    };
+    Ok(ArcCmd { cmd: toks[0].clone(), keys: kv, flags: fl, objects: resolve_objs(obj), written: Objects::of(obj) })
+}
+
+/// A clock sense, as the reference applies one (`set_sense`, `set_clock_sense_cmd1` in its SDC
+/// Tcl): `set_clock_sense …` always; `set_sense` ONLY with `-type clock` — without `-type` the
+/// reference applies nothing, and `-type data` it does not support (Warning 413). `-clocks`
+/// replaces `-clock` when both are given; `-pulse` is read and not supported (Warning 416), and
+/// the three senses together only warn (417): each is kept as written for a consumer to refuse.
+fn sense_cmd(toks: &[String]) -> Result<ArcCmd, String> {
+    const KEYS: [&str; 3] = ["-clock", "-clocks", "-pulse"];
+    const FLAGS: [&str; 3] = ["-positive", "-negative", "-stop_propagation"];
+    let rest: Vec<String> = if toks[0] == "set_sense" {
+        let ty = toks.iter().position(|t| t == "-type").and_then(|i| toks.get(i + 1).map(|v| (i, v.as_str())));
+        match ty {
+            Some((i, "clock")) => toks.iter().enumerate().filter(|(j, _)| *j != i && *j != i + 1).map(|(_, t)| t.clone()).collect(),
+            Some((_, "data")) => return Err("set_sense: -type data is not supported by the reference (Warning 413); not applied".into()),
+            Some((_, other)) => return Err(format!("set_sense: -type {other} is not clock or data (the reference's Error 414); not applied")),
+            None => return Err("set_sense: without -type the reference applies no sense (it applies one only with -type clock); not applied".into()),
+        }
+    } else {
+        toks.to_vec()
+    };
+    // abbreviations expand as `set_clock_sense_cmd1`'s own parse expands them
+    let mut as_cmd1 = rest;
+    let name = std::mem::replace(&mut as_cmd1[0], "set_clock_sense".into());
+    let mut as_cmd1 = expand_abbreviations(as_cmd1);
+    as_cmd1[0] = name;
+    let mut c = arc_cmd(&as_cmd1, &KEYS, &FLAGS)?;
+    if c.keys.iter().any(|(k, _)| k == "-clocks") {
+        c.keys.retain(|(k, _)| k != "-clock");
+    }
+    Ok(c)
+}
+
 /// One `set_load` / `set_input_transition` as written: its value in the SDC's user unit (NOT
 /// scaled by `set_units` — the reference's `set_units` only checks, values stay in the library
 /// unit), its flags (`-min`, `-rise`, `-pin_load`, …), the valued `-clock` if any, and its objects
@@ -442,6 +501,20 @@ pub struct LogicValueCmd {
     pub cmd: String,
     pub value: String,
     pub accessor: String,
+    pub objects: Vec<String>,
+    /// The objects as written — see [`Objects::flags`].
+    pub written: Objects,
+}
+
+/// One `set_disable_timing` / `unset_disable_timing`, `set_sense -type clock` / `set_clock_sense`,
+/// or `set_disable_clock_gating_check` / `unset_…`, as the reference reads it: its keys with their
+/// values as written (`-from`/`-to` are a cell's port NAMES; `-clock`/`-clocks` hold clocks), its
+/// flags (`-positive`, `-negative`, `-stop_propagation`), and its one object list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArcCmd {
+    pub cmd: String,
+    pub keys: Vec<(String, String)>,
+    pub flags: Vec<String>,
     pub objects: Vec<String>,
     /// The objects as written — see [`Objects::flags`].
     pub written: Objects,
@@ -615,6 +688,15 @@ pub struct Sdc {
     /// [`Sdc::ignored`] for a consumer that does not model constants).
     pub case_values: Vec<LogicValueCmd>,
     pub logic_values: Vec<LogicValueCmd>,
+    /// Every `set_disable_timing` and `unset_disable_timing`, in file order (still in
+    /// [`Sdc::ignored`] for a consumer that does not model them).
+    pub disabled_timing: Vec<ArcCmd>,
+    /// Every clock sense the reference applies — `set_sense -type clock`, `set_clock_sense` — in
+    /// file order (still in [`Sdc::ignored`]).
+    pub senses: Vec<ArcCmd>,
+    /// Every `set_disable_clock_gating_check` and `unset_…`, in file order (still in
+    /// [`Sdc::ignored`]).
+    pub disabled_gating_checks: Vec<ArcCmd>,
     /// Every `set_load` and `set_input_transition`, per command, for a consumer that models
     /// them per object ([`Sdc::load`] / [`Sdc::input_transition`] keep one design-wide value).
     pub env: Vec<EnvCmd>,
@@ -940,6 +1022,12 @@ pub const MODELLED_BUT_LISTED: &[&str] = &[
     "set_logic_dc",
     "set_driving_cell",
     "set_timing_derate",
+    "set_disable_timing",
+    "unset_disable_timing",
+    "set_sense",
+    "set_clock_sense",
+    "set_disable_clock_gating_check",
+    "unset_disable_clock_gating_check",
 ];
 
 /// One kind of command the model does not carry — see [`Sdc::not_applied`].
@@ -3114,6 +3202,27 @@ impl Sdc {
                     }
                     sdc.ignored.push(toks[0].clone());
                 }
+                "set_disable_timing" | "unset_disable_timing" => {
+                    match arc_cmd(&toks, &["-from", "-to"], &[]) {
+                        Ok(c) => sdc.disabled_timing.push(c),
+                        Err(why) => sdc.rejected.push(why),
+                    }
+                    sdc.ignored.push(toks[0].clone());
+                }
+                "set_sense" | "set_clock_sense" => {
+                    match sense_cmd(&toks) {
+                        Ok(c) => sdc.senses.push(c),
+                        Err(why) => sdc.rejected.push(why),
+                    }
+                    sdc.ignored.push(toks[0].clone());
+                }
+                "set_disable_clock_gating_check" | "unset_disable_clock_gating_check" => {
+                    match arc_cmd(&toks, &[], &[]) {
+                        Ok(c) => sdc.disabled_gating_checks.push(c),
+                        Err(why) => sdc.rejected.push(why),
+                    }
+                    sdc.ignored.push(toks[0].clone());
+                }
                 "set_driving_cell" => {
                     sdc.driving_cells.push(driving_cell(&toks));
                     sdc.ignored.push("set_driving_cell".to_string());
@@ -4929,5 +5038,80 @@ mod dialect_tests {
         assert!(s.rejected.iter().any(|r| r.starts_with("foreach_in_collection")), "{:?}", s.rejected);
         // inside braces nothing is a command, so nothing is rewritten
         assert_eq!(dialect_queries("x {[add_to_collection a b]} [add_to_collection -unique a b]"), "x {[add_to_collection a b]} [list a b]");
+    }
+}
+
+/// Tier-3 field item: arcs and senses the reference models, read as its SDC / search Tcl reads
+/// them (`set_disable_timing`, `set_sense` / `set_clock_sense_cmd1`, `set_disable_clock_gating_check`).
+#[cfg(test)]
+mod arc_tests {
+    use super::*;
+
+    type Keys = Vec<(String, String)>;
+
+    /// Rule (`set_disable_timing`): keys `-from`/`-to`, no flags, exactly one object list
+    /// (`check_argc_eq1`); `unset_` the same, kept in order with the sets.
+    #[test]
+    fn disable_timing_keeps_from_to_and_one_object_list() {
+        let s = Sdc::parse(
+            "set_disable_timing -from A -to Y [get_cells u1]\nset_disable_timing [get_pins u2/A]\n\
+             set_disable_timing [get_pins u3/A] [get_pins u4/A]\nunset_disable_timing [get_pins u2/A]\n",
+        )
+        .unwrap();
+        let got: Vec<(&str, Keys, Vec<String>)> =
+            s.disabled_timing.iter().map(|c| (c.cmd.as_str(), c.keys.clone(), c.objects.clone())).collect();
+        assert_eq!(
+            got,
+            [
+                ("set_disable_timing", vec![("-from".into(), "A".into()), ("-to".into(), "Y".into())], vec!["u1".to_string()]),
+                ("set_disable_timing", vec![], vec!["u2/A".to_string()]),
+                ("unset_disable_timing", vec![], vec!["u2/A".to_string()]),
+            ]
+        );
+        assert_eq!(s.rejected.len(), 1, "{:?}", s.rejected);
+        // only the refused one is reported as not applied; the three read are modelled
+        let na: Vec<usize> = s.not_applied().iter().filter(|n| n.command.ends_with("disable_timing")).map(|n| n.count).collect();
+        assert_eq!(na, [1]);
+        let w = s.write(&crate::sdc_write::WriteOpts::default()).text;
+        assert!(w.contains("set_disable_timing -from {A} -to {Y} [get_cells {u1}]"), "{w}");
+        assert!(w.contains("unset_disable_timing [get_pins {u2/A}]"), "{w}");
+    }
+
+    /// Rule (`set_sense`): a sense only with `-type clock`; without `-type` the reference applies
+    /// nothing, `-type data` is not supported (413). `set_clock_sense` always applies;
+    /// `-clocks` wins over `-clock`; a word it does not know fails it (wrong # args).
+    #[test]
+    fn a_sense_is_applied_as_the_reference_applies_it() {
+        let s = Sdc::parse(
+            "create_clock -name c -period 10 [get_ports clk]\ncreate_clock -name d -period 10 [get_ports clk2]\n\
+             set_sense -type clock -stop_propagation -clocks [get_clocks c] [get_pins u1/Y]\n\
+             set_sense -stop_propagation [get_pins u2/Y]\nset_sense -type data -positive [get_pins u3/Y]\n\
+             set_clock_sense -neg -clock [get_clocks d] -clocks c [get_pins u4/Y]\n\
+             set_clock_sense -logical_stop_propagation [get_pins u5/Y]\n",
+        )
+        .unwrap();
+        let got: Vec<(&str, Keys, Vec<String>, Vec<String>)> =
+            s.senses.iter().map(|c| (c.cmd.as_str(), c.keys.clone(), c.flags.clone(), c.objects.clone())).collect();
+        assert_eq!(
+            got,
+            [
+                ("set_sense", vec![("-clocks".into(), "c".into())], vec!["-stop_propagation".to_string()], vec!["u1/Y".to_string()]),
+                ("set_clock_sense", vec![("-clocks".into(), "c".into())], vec!["-negative".to_string()], vec!["u4/Y".to_string()]),
+            ]
+        );
+        assert_eq!(s.rejected.len(), 3, "{:?}", s.rejected);
+        let w = s.write(&crate::sdc_write::WriteOpts::default()).text;
+        assert!(w.contains("set_sense -type clock -clocks [get_clocks {c}] -stop_propagation [get_pins {u1/Y}]"), "{w}");
+    }
+
+    /// Rule (`set_disable_clock_gating_check { objects }`): one object list, Tcl's own arity.
+    #[test]
+    fn a_gating_check_disable_names_its_objects() {
+        let s = Sdc::parse("set_disable_clock_gating_check [get_pins cg1/B]\nset_disable_clock_gating_check a b\nunset_disable_clock_gating_check [get_cells cg2]\n").unwrap();
+        let got: Vec<(&str, Vec<String>)> = s.disabled_gating_checks.iter().map(|c| (c.cmd.as_str(), c.objects.clone())).collect();
+        assert_eq!(got, [("set_disable_clock_gating_check", vec!["cg1/B".to_string()]), ("unset_disable_clock_gating_check", vec!["cg2".to_string()])]);
+        assert_eq!(s.rejected.len(), 1);
+        let w = s.write(&crate::sdc_write::WriteOpts::default()).text;
+        assert!(w.contains("set_disable_clock_gating_check [get_pins {cg1/B}]"), "{w}");
     }
 }
