@@ -529,6 +529,68 @@ pub fn lint_with_meta(
         ),
     });
 
+    not_applied_findings(sdc, &mut f);
+    f.sort_by(|a, b| (a.severity as u8, a.code).cmp(&(b.severity as u8, b.code)));
+    LintReport { findings: f }
+}
+
+/// One finding per kind of command the model does not carry ([`Sdc::not_applied`]): an ERROR when
+/// leaving it out can move a slack, INFO when it cannot (a synthesis-only directive).
+///
+/// Without these, every check above runs on what was read and says nothing about what was not, so
+/// a file whose `set_disable_timing` or design-dependent queries were all skipped could come back
+/// clean. A clean report must mean the whole file was looked at.
+fn not_applied_findings(sdc: &Sdc, f: &mut Vec<Finding>) {
+    for n in sdc.not_applied() {
+        let times = if n.count == 1 { String::new() } else { format!(" ({} commands)", n.count) };
+        if n.affects_timing {
+            f.push(Finding::err(
+                "sdc-not-applied",
+                format!(
+                    "`{}`{times}: {} — it can change timing and nothing here checked it",
+                    n.command, n.why
+                ),
+            ));
+        } else {
+            f.push(Finding {
+                severity: Severity::Info,
+                code: "sdc-not-applied",
+                message: format!("`{}`{times}: {} (no effect on timing)", n.command, n.why),
+            });
+        }
+    }
+}
+
+/// The checks that need no design: what the reader could not apply ([`Sdc::not_applied`]) and
+/// the clock definitions themselves (a non-positive period, one name defined twice). Every
+/// structural check — I/O coverage, clock reach, exception reachability, endpoint coverage —
+/// needs the netlist, and an INFO finding says they did not run, so the report cannot be read as
+/// a full check.
+pub fn lint_without_design(sdc: &Sdc) -> LintReport {
+    let mut f = Vec::new();
+    let mut by_name: BTreeMap<&str, u32> = BTreeMap::new();
+    for c in sdc.clocks.iter().chain(&sdc.superseded_clocks) {
+        *by_name.entry(c.name.as_str()).or_default() += 1;
+        if c.period <= 0.0 {
+            f.push(Finding::err(
+                "clock-period",
+                format!("clock `{}` has a non-positive period ({} ns)", c.name, c.period),
+            ));
+        }
+    }
+    for (name, n) in by_name {
+        if n > 1 {
+            f.push(Finding::err("dup-clock-name", format!("clock `{name}` is defined {n} times")));
+        }
+    }
+    not_applied_findings(sdc, &mut f);
+    f.push(Finding {
+        severity: Severity::Info,
+        code: "design-checks-not-run",
+        message: "no netlist: I/O coverage, clock reach, exception reachability and endpoint \
+                  coverage were not checked"
+            .into(),
+    });
     f.sort_by(|a, b| (a.severity as u8, a.code).cmp(&(b.severity as u8, b.code)));
     LintReport { findings: f }
 }
@@ -816,6 +878,62 @@ mod tests {
         let sdc = Sdc::parse("create_clock -name clk -period 10 [get_ports nope]\n").unwrap();
         let r = lint(&nl(), &sdc, &lib());
         assert!(r.findings.iter().any(|f| f.code == "clock-source"));
+    }
+
+    const CLEAN: &str = "create_clock -name clk -period 10 [get_ports clk]\n\
+                         set_input_delay 1 -clock clk [all_inputs]\n\
+                         set_output_delay 1 -clock clk [all_outputs]\n";
+
+    /// A command the model does not carry and that can move a slack makes the check FAIL: a clean
+    /// report has to mean every constraint was looked at.
+    #[test]
+    fn an_unmodelled_timing_command_is_an_error_not_silence() {
+        let sdc = Sdc::parse(&format!("{CLEAN}set_data_check -from r/CK -to r/D 0.1\n")).unwrap();
+        let r = lint(&nl(), &sdc, &lib());
+        let f: Vec<_> = r.findings.iter().filter(|f| f.code == "sdc-not-applied").collect();
+        assert_eq!(f.len(), 1, "{:?}", r.findings);
+        assert_eq!(f[0].severity, Severity::Error);
+        assert!(f[0].message.contains("set_data_check"), "{}", f[0].message);
+    }
+
+    /// A query that needs the design and was not evaluated is a rejected command: an error too.
+    #[test]
+    fn an_unevaluated_query_is_an_error() {
+        let sdc = Sdc::parse(&format!("{CLEAN}set_false_path -to [get_pins -filter {{x==1}} *]\n")).unwrap();
+        assert!(!sdc.unevaluated_queries.is_empty(), "{:?}", sdc.rejected);
+        let r = lint(&nl(), &sdc, &lib());
+        assert!(r.findings.iter().any(|f| f.code == "sdc-not-applied" && f.severity == Severity::Error), "{:?}", r.findings);
+    }
+
+    /// A synthesis-only directive is reported, but as INFO: it cannot move a slack, so it must
+    /// not fail the check.
+    #[test]
+    fn a_benign_command_is_info_and_does_not_fail() {
+        let sdc = Sdc::parse(&format!("{CLEAN}set_max_area 0\nset_max_area 0\n")).unwrap();
+        let r = lint(&nl(), &sdc, &lib());
+        assert_eq!(r.errors(), 0, "{:?}", r.findings);
+        let f: Vec<_> = r.findings.iter().filter(|f| f.code == "sdc-not-applied").collect();
+        assert_eq!(f.len(), 1, "grouped, not one per command: {:?}", r.findings);
+        assert_eq!(f[0].severity, Severity::Info);
+        assert!(f[0].message.contains("(2 commands)"), "{}", f[0].message);
+    }
+
+    /// Kinds that are modelled in their own records are not reported as not applied.
+    #[test]
+    fn modelled_kinds_are_not_reported() {
+        let sdc = Sdc::parse(&format!("{CLEAN}set_max_delay 2 -from [get_ports din]\nset_case_analysis 0 din\n")).unwrap();
+        let r = lint(&nl(), &sdc, &lib());
+        assert!(!r.findings.iter().any(|f| f.code == "sdc-not-applied"), "{:?}", r.findings);
+    }
+
+    /// Without a design the report says the structural checks did not run, and still reports
+    /// what was not applied.
+    #[test]
+    fn without_a_design_the_report_says_what_did_not_run() {
+        let sdc = Sdc::parse(&format!("{CLEAN}set_data_check -from r/CK -to r/D 0.1\n")).unwrap();
+        let r = lint_without_design(&sdc);
+        assert!(r.findings.iter().any(|f| f.code == "design-checks-not-run" && f.severity == Severity::Info));
+        assert_eq!(r.errors(), 1, "{:?}", r.findings);
     }
 }
 

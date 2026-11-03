@@ -886,6 +886,68 @@ impl Sdc {
         }
         (!notes.is_empty()).then(|| notes.join("; "))
     }
+
+    /// Every command the model does NOT carry, grouped by command and reason, in first-seen
+    /// order: each [`Sdc::rejected`] entry (which includes every unevaluated query) and each
+    /// [`Sdc::ignored`] command that is not modelled elsewhere ([`MODELLED_BUT_LISTED`]).
+    ///
+    /// This is exactly what [`Sdc::write`] refuses on, seen from a checker's side: a constraint
+    /// checker that does not report these can say "clean" about a file whose constraints it never
+    /// looked at. `affects_timing` is false only for [`BENIGN_FOR_TIMING`] commands — a command
+    /// that is unknown to that list is treated as able to move a slack.
+    pub fn not_applied(&self) -> Vec<NotApplied> {
+        let mut out: Vec<NotApplied> = Vec::new();
+        let mut add = |command: String, why: String| {
+            if let Some(n) = out.iter_mut().find(|n| n.command == command && n.why == why) {
+                n.count += 1;
+                return;
+            }
+            let affects_timing = !BENIGN_FOR_TIMING.contains(&command.as_str());
+            out.push(NotApplied { command, why, count: 1, affects_timing });
+        };
+        for r in &self.rejected {
+            // `<command>: <why>` or `<command> without …`
+            let cut = r.find([':', ' ']).unwrap_or(r.len());
+            let why = r[cut..].trim_start_matches(':').trim().to_string();
+            add(r[..cut].to_string(), if why.is_empty() { "rejected".into() } else { format!("rejected: {why}") });
+        }
+        for c in self.ignored.iter().filter(|c| !MODELLED_BUT_LISTED.contains(&c.as_str())) {
+            add(c.clone(), "not modelled; read past".into());
+        }
+        out
+    }
+}
+
+/// Kinds the reader models but ALSO lists in [`Sdc::ignored`], for a consumer that does not model
+/// them: they are carried in their own records ([`Sdc::path_delays`], [`Sdc::case_values`], …),
+/// so neither the writer nor [`Sdc::not_applied`] reports them as dropped.
+pub const MODELLED_BUT_LISTED: &[&str] = &[
+    "set_clock_transition",
+    "set_max_fanout",
+    "set_max_capacitance",
+    "set_propagated_clock",
+    "set_max_delay",
+    "set_min_delay",
+    "set_max_transition",
+    "set_case_analysis",
+    "set_logic_zero",
+    "set_logic_one",
+    "set_logic_dc",
+    "set_driving_cell",
+    "set_timing_derate",
+];
+
+/// One kind of command the model does not carry — see [`Sdc::not_applied`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotApplied {
+    /// The command, as written (`set_disable_timing`, `remove_from_collection`, …).
+    pub command: String,
+    /// Why: `rejected: <reason>` or `not modelled; read past`.
+    pub why: String,
+    /// How many commands of this kind, for this reason.
+    pub count: usize,
+    /// Whether leaving it out can move a slack (everything not in [`BENIGN_FOR_TIMING`]).
+    pub affects_timing: bool,
 }
 
 #[derive(Debug)]

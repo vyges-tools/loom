@@ -21,7 +21,7 @@
 //! appears in the file as a `# not written:` comment. A consumer that needs the whole file
 //! refuses on a non-empty list rather than ship constraints with a hole in them.
 
-use crate::sdc::{ExcKind, Objects, Sdc, SdcClock};
+use crate::sdc::{ExcKind, Objects, Sdc, SdcClock, MODELLED_BUT_LISTED};
 
 /// What [`Sdc::write`] produced.
 #[derive(Debug, Clone, Default)]
@@ -41,24 +41,6 @@ pub struct WriteOpts {
     /// The first comment line (`# <header>`); `None` writes `# SDC written by vyges-loom`.
     pub header: Option<String>,
 }
-
-/// Kinds the reader models but also lists in [`Sdc::ignored`] (for a consumer that does not model
-/// them): written from their own records, so not reported as unwritten.
-const MODELLED_BUT_LISTED: &[&str] = &[
-    "set_clock_transition",
-    "set_max_fanout",
-    "set_max_capacitance",
-    "set_propagated_clock",
-    "set_max_delay",
-    "set_min_delay",
-    "set_max_transition",
-    "set_case_analysis",
-    "set_logic_zero",
-    "set_logic_one",
-    "set_logic_dc",
-    "set_driving_cell",
-    "set_timing_derate",
-];
 
 /// A number, in the shortest form that reads back to the same value.
 fn num(v: f64) -> String {
