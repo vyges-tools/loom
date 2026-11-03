@@ -2049,7 +2049,7 @@ fn control(raw: &str, vars: &HashMap<String, String>) -> Control {
             let toks = tokenize(raw);
             let mut k = 1;
             while k + 1 < toks.len() {
-                let cond = subst_vars(&subst_info_exists(&toks[k], vars), vars);
+                let cond = subst_vars(&subst_info_exists(&toks[k], vars), &as_operands(vars));
                 let mut body = k + 1;
                 if toks.get(body).map(String::as_str) == Some("then") {
                     body += 1;
@@ -2086,6 +2086,18 @@ fn control(raw: &str, vars: &HashMap<String, String>) -> Control {
         }
         _ => Control::None,
     }
+}
+
+/// The variables as `expr` reads them in a BRACED condition: each value one operand, so a string
+/// value is a string (`{$dir == "in"}` compares the string `in`), not words to parse. A number
+/// stays bare; a value holding a `"` is left as text, which the expression then refuses.
+fn as_operands(vars: &HashMap<String, String>) -> HashMap<String, String> {
+    vars.iter()
+        .map(|(k, v)| {
+            let v = if Val::of(v) != Val::Str(v.trim().to_string()) || v.contains('"') { v.clone() } else { format!("\"{v}\"") };
+            (k.clone(), v)
+        })
+        .collect()
 }
 
 /// A Tcl `expr` value: integer, double, or string — Tcl keeps the three apart, and integer
@@ -4977,6 +4989,18 @@ mod dialect_tests {
         // a call's local is gone after it returns: Tcl's error, so not applied here
         let s = Sdc::parse("proc f {} { set local 1 }\nf\nset_load $local [get_ports x]\n").unwrap();
         assert!(s.env.is_empty() && s.rejected.iter().any(|r| r.contains("$local")), "{:?}", s.rejected);
+    }
+
+    /// Tcl: a variable in a braced `if` condition is one operand, so a string value compares as
+    /// a string; substituted as text, `{$dir == "in"}` became the bare word `in` and was refused.
+    #[test]
+    fn a_string_variable_in_a_condition_is_an_operand() {
+        let s = Sdc::parse("set dir in
+if {$dir == \"in\"} { set_load 1 [get_ports a] } else { set_load 2 [get_ports b] }
+").unwrap();
+        assert_eq!(s.env.len(), 1);
+        assert_eq!(s.env[0].objects, ["a"]);
+        assert!(s.ignored.iter().all(|i| i != "if"), "{:?}", s.ignored);
     }
 
     /// What a proc call cannot be read as is refused, and the read goes on; a recursive proc
