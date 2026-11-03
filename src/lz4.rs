@@ -55,11 +55,11 @@ pub(crate) fn decompress(input: &[u8], expected: usize) -> Result<Vec<u8>, Strin
         }
         mlen += 4; // minmatch
 
-        let mut src = out.len() - offset;
-        for _ in 0..mlen {
+        // byte by byte: a match may overlap the bytes it is still writing
+        let start = out.len() - offset;
+        for src in start..start + mlen {
             let b = out[src];
             out.push(b);
-            src += 1;
         }
     }
 
