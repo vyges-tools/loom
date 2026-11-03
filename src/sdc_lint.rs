@@ -534,6 +534,7 @@ pub fn lint_with_meta(
     });
 
     not_applied_findings(sdc, &mut f);
+    braced_variable_findings(sdc, &mut f);
     f.sort_by(|a, b| (a.severity as u8, a.code).cmp(&(b.severity as u8, b.code)));
     LintReport { findings: f }
 }
@@ -696,6 +697,35 @@ fn not_applied_findings(sdc: &Sdc, f: &mut Vec<Finding>) {
 /// structural check — I/O coverage, clock reach, exception reachability, endpoint coverage —
 /// needs the netlist, and an INFO finding says they did not run, so the report cannot be read as
 /// a full check.
+/// An object name that is a variable reference left whole (`${MAIN_CLK_PIN}`): Tcl substitutes
+/// nothing inside braces, so `remove_from_collection [all_inputs] {${MAIN_CLK_PIN}}` names a port
+/// literally called `${MAIN_CLK_PIN}` and removes nothing — the clock port keeps its input delay.
+/// A warning: the file reads as Tcl reads it, which is almost never what its author meant.
+fn braced_variable_findings(sdc: &Sdc, f: &mut Vec<Finding>) {
+    let looks_like_var = |n: &str| {
+        let n = n.strip_prefix('$').unwrap_or("");
+        let n = n.strip_prefix('{').and_then(|x| x.strip_suffix('}')).unwrap_or(n);
+        !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+    };
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    let delays = sdc.input_delays.iter().map(|d| ("set_input_delay", &d.ports)).chain(sdc.output_delays.iter().map(|d| ("set_output_delay", &d.ports)));
+    let exceptions = sdc.exceptions.iter().flat_map(|e| [("exception", &e.from), ("exception", &e.to)]);
+    for (cmd, names) in delays.chain(exceptions) {
+        for n in names.iter().filter(|n| looks_like_var(n)) {
+            seen.entry(n.clone()).or_insert(cmd);
+        }
+    }
+    for (n, cmd) in seen {
+        f.push(Finding::warn(
+            "braced-variable",
+            format!(
+                "{cmd} names the object `{n}`: Tcl does not substitute a variable inside braces, so this is \
+                 the literal name, not the variable's value"
+            ),
+        ));
+    }
+}
+
 pub fn lint_without_design(sdc: &Sdc) -> LintReport {
     let mut f = Vec::new();
     let mut by_name: BTreeMap<&str, u32> = BTreeMap::new();
@@ -714,6 +744,7 @@ pub fn lint_without_design(sdc: &Sdc) -> LintReport {
         }
     }
     not_applied_findings(sdc, &mut f);
+    braced_variable_findings(sdc, &mut f);
     f.push(Finding {
         severity: Severity::Info,
         code: "design-checks-not-run",
@@ -1582,5 +1613,26 @@ mod declared_domain_tests {
             .findings
             .iter()
             .any(|f| f.code == "domain-not-constrained"));
+    }
+}
+
+#[cfg(test)]
+mod braced_variable_tests {
+    use super::*;
+
+    /// OpenTitan's form: the clock port in braces is not substituted, so it is never removed;
+    /// the same name written without braces is the variable's value and is not reported.
+    #[test]
+    fn a_variable_left_in_braces_is_a_warning() {
+        let s = Sdc::parse(
+            "set P clk_i\ncreate_clock -name clk_i -period 10 [get_ports clk_i]\n\
+             set_input_delay 1 [remove_from_collection [all_inputs] {${P}}] -clock clk_i\n\
+             set_input_delay 2 [remove_from_collection [all_inputs] $P] -clock clk_i\n",
+        )
+        .unwrap();
+        let r = lint_without_design(&s);
+        let w: Vec<&Finding> = r.findings.iter().filter(|f| f.code == "braced-variable").collect();
+        assert_eq!(w.len(), 1, "{:?}", r.findings);
+        assert!(w[0].message.contains("${P}") && w[0].severity == Severity::Warning);
     }
 }
