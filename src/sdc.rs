@@ -1554,6 +1554,13 @@ fn known_commands() -> &'static (std::collections::HashSet<&'static str>, Vec<&'
     })
 }
 
+/// Whether `word` names a command the reference runs where `read_sdc` evaluates a file — itself
+/// or the one global command it abbreviates. A consumer that splits a script into its own commands
+/// and constraints sends every such word to [`Sdc::parse`], which keeps, applies or lists it.
+pub fn is_command(word: &str) -> bool {
+    resolve_command(word).is_ok()
+}
+
 /// The command a word names, by the reference's rule: a command it knows, else the ONE global
 /// command the word begins (`set_max_trans` is `set_max_transition`). None of them is `invalid
 /// command name`, several is `Ambiguous command name`, and either stops the reference's read.
