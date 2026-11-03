@@ -9,18 +9,19 @@ homepage = "https://vyges.com"
 repository = "https://github.com/vyges-tools/loom"
 build = "build.rs"
 
-# std-only by default (no external dependencies) so the core builds/tests offline.
-# The optional `fst` feature adds the FST binary-waveform reader, which needs a zlib
-# decoder — miniz_oxide (pure-Rust, already used in the suite by vyges-layout). LZ4 is
-# clean-roomed in-tree, so `fst` pulls exactly one third-party crate, and only for
-# consumers that enable it (vyges-power). Default consumers stay std-only.
+# One third-party crate at most: miniz_oxide (pure-Rust inflate, already used in the suite by
+# vyges-layout). The `fst` feature adds the FST binary-waveform reader, which needs it; LZ4 is
+# clean-roomed in-tree. `gzip` is ON by default: netlists, Liberty and parasitics are shipped
+# gzipped, and a reader that refuses `.v.gz` unless a feature was remembered at build time is a
+# reader that fails in the field. `default-features = false` gives a std-only build.
 [features]
 # The command-line entry built into the library too (`cli_main`), for the suite binaries
 # that link every engine and run the one they are invoked as.
 suite = []
-default = []
+default = ["gzip"]
 fst = ["dep:miniz_oxide"]
-# `netlist::load`/`load_all` read gzipped netlists (the same pure-Rust inflater).
+# `netlist::load`/`load_all`, `Lib::load` and `Design::load` read gzipped files (the same
+# pure-Rust inflater).
 gzip = ["dep:miniz_oxide"]
 
 [dependencies]

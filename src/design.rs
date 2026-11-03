@@ -109,6 +109,11 @@ impl Design {
     /// like [`Design::load_netlist`] but from Yosys's JSON instead of Verilog.
     pub fn load_netlist_json(&mut self, path: &str) -> Result<(), DesignError> {
         let nl = yosys_json::load(path).map_err(|e| DesignError(e.to_string()))?;
+        self.set_netlist_json(path, nl);
+        Ok(())
+    }
+
+    fn set_netlist_json(&mut self, path: &str, nl: netlist::Netlist) {
         let summary = format!(
             "module {} — {} inputs, {} outputs, {} instances",
             nl.module,
@@ -119,7 +124,6 @@ impl Design {
         self.steps.push(Step { kind: "netlist", path: path.into(), summary });
         self.netlist = Some(nl);
         self.hierarchy = None;
-        Ok(())
     }
 
     /// Load a Liberty timing library (`.lib`). Appends — call once per corner.
@@ -134,6 +138,11 @@ impl Design {
     /// Load SDC constraints (`.sdc`).
     pub fn load_sdc(&mut self, path: &str) -> Result<(), DesignError> {
         let s = sdc::Sdc::load(path).map_err(|e| DesignError(e.to_string()))?;
+        self.set_sdc(path, s);
+        Ok(())
+    }
+
+    fn set_sdc(&mut self, path: &str, s: sdc::Sdc) {
         let summary = format!(
             "{} clocks, {} input-delays, {} output-delays, {} exceptions",
             s.clocks.len(),
@@ -143,30 +152,42 @@ impl Design {
         );
         self.steps.push(Step { kind: "sdc", path: path.into(), summary });
         self.sdc = Some(s);
-        Ok(())
     }
 
     /// Load SPEF parasitics (`.spef`).
     pub fn load_spef(&mut self, path: &str) -> Result<(), DesignError> {
         let sp = spef::Spef::load(path).map_err(|e| DesignError(e.to_string()))?;
+        self.set_spef(path, sp);
+        Ok(())
+    }
+
+    fn set_spef(&mut self, path: &str, sp: spef::Spef) {
         let summary = format!("{} nets", sp.nets.len());
         self.steps.push(Step { kind: "spef", path: path.into(), summary });
         self.spef = Some(sp);
-        Ok(())
     }
 
     /// Load a tech-LEF (`.lef`/`.tlef`).
     pub fn load_lef(&mut self, path: &str) -> Result<(), DesignError> {
         let lf = lef::Lef::load(path).map_err(|e| DesignError(e.to_string()))?;
+        self.set_lef(path, lf);
+        Ok(())
+    }
+
+    fn set_lef(&mut self, path: &str, lf: lef::Lef) {
         let summary = format!("{} layers", lf.layers.len());
         self.steps.push(Step { kind: "lef", path: path.into(), summary });
         self.lef = Some(lf);
-        Ok(())
     }
 
     /// Load a DEF (`.def`).
     pub fn load_def(&mut self, path: &str) -> Result<(), DesignError> {
         let d = def::Def::load(path).map_err(|e| DesignError(e.to_string()))?;
+        self.set_def(path, d);
+        Ok(())
+    }
+
+    fn set_def(&mut self, path: &str, d: def::Def) {
         let summary = format!(
             "{} signal nets, {} power nets, {} components",
             d.nets.len(),
@@ -175,27 +196,61 @@ impl Design {
         );
         self.steps.push(Step { kind: "def", path: path.into(), summary });
         self.def = Some(d);
-        Ok(())
     }
 
     /// Dispatch a file to the right reader by extension. Returns the `kind`
     /// loaded. Unknown extensions are an error (loom is explicit, no silent skip).
+    ///
+    /// A trailing `.gz` is stripped before the dispatch, and the file is inflated as it is read:
+    /// `.v.gz`, `.lib.gz`, `.spef.gz`, `.json.gz`, `.sdc.gz`, `.lef.gz`, `.def.gz`. Field
+    /// netlists, parasitics and advanced-node Liberty are shipped that way.
     pub fn load(&mut self, path: &str) -> Result<&'static str, DesignError> {
-        let ext = std::path::Path::new(path)
+        let lower = path.to_ascii_lowercase();
+        let gz = lower.ends_with(".gz");
+        let inner = if gz { &path[..path.len() - 3] } else { path };
+        let ext = std::path::Path::new(inner)
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
+        // the readers that take a path and read it whole; given a `.gz`, the inflated text
+        let text = || netlist::read_text(path).map_err(|e| DesignError(e.to_string()));
         match ext.as_str() {
+            // the netlist and Liberty readers inflate a gzip stream themselves
             "v" | "sv" | "vg" => self.load_netlist(path).map(|_| "netlist"),
-            "json" => self.load_netlist_json(path).map(|_| "netlist"),
             "lib" => self.load_liberty(path).map(|_| "liberty"),
+            "json" if gz => {
+                let nl = yosys_json::parse(&text()?).map_err(|e| DesignError(format!("{path}: {e}")))?;
+                self.set_netlist_json(path, nl);
+                Ok("netlist")
+            }
+            "json" => self.load_netlist_json(path).map(|_| "netlist"),
+            "sdc" if gz => {
+                let s = sdc::Sdc::parse(&text()?).map_err(|e| DesignError(format!("{path}: {e}")))?;
+                self.set_sdc(path, s);
+                Ok("sdc")
+            }
             "sdc" => self.load_sdc(path).map(|_| "sdc"),
+            "spef" if gz => {
+                self.set_spef(path, spef::Spef::parse(&text()?));
+                Ok("spef")
+            }
             "spef" => self.load_spef(path).map(|_| "spef"),
+            "lef" | "tlef" if gz => {
+                let lf = lef::Lef::parse(&text()?).map_err(|e| DesignError(format!("{path}: {e}")))?;
+                self.set_lef(path, lf);
+                Ok("lef")
+            }
             "lef" | "tlef" => self.load_lef(path).map(|_| "lef"),
+            "def" if gz => {
+                let d = def::Def::parse(&text()?).map_err(|e| DesignError(format!("{path}: {e}")))?;
+                self.set_def(path, d);
+                Ok("def")
+            }
             "def" => self.load_def(path).map(|_| "def"),
             other => Err(DesignError(format!(
-                "{path}: unknown extension '.{other}' (expected .v/.sv, .json, .lib, .sdc, .spef, .lef, .def)"
+                "{path}: unknown extension '.{other}' (expected .v/.sv, .json, .lib, .sdc, .spef, .lef, \
+                 .def, each optionally .gz)"
             ))),
         }
     }
@@ -373,6 +428,43 @@ mod tests {
         assert_eq!(names, ["s0/u", "s1/u"]);
         assert_eq!(d.hierarchy.as_ref().unwrap().modules.len(), 1, "the flat design");
         assert_eq!(d.steps.last().unwrap().kind, "flatten");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A trailing `.gz` is stripped before the dispatch, and the file inflated as it is read —
+    /// on by default. (`design.v.gz` was "unknown extension '.gz'".)
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn a_gzipped_file_dispatches_on_the_extension_under_gz() {
+        fn gz(text: &str) -> Vec<u8> {
+            let mut g = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+            g.extend(miniz_oxide::deflate::compress_to_vec(text.as_bytes(), 6));
+            g.extend_from_slice(&[0; 4]); // CRC-32 (not checked)
+            g.extend_from_slice(&(text.len() as u32).to_le_bytes());
+            g
+        }
+        let dir = std::env::temp_dir().join(format!("loom-design-gz-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, text: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, gz(text)).unwrap();
+            p.to_str().unwrap().to_string()
+        };
+        let mut d = Design::new();
+        let v = write("top.v.gz", "module top (a, y); input a; output y; INV u (.A(a), .Y(y)); endmodule\n");
+        assert_eq!(d.load(&v).unwrap(), "netlist");
+        assert_eq!(d.netlist.as_ref().unwrap().insts.len(), 1);
+        let lib = write("cells.LIB.GZ", "library (l) { cell (INV) { pin (A) { direction : input; } } }\n");
+        assert_eq!(d.load(&lib).unwrap(), "liberty");
+        assert!(d.libs[0].cells.contains_key("INV"));
+        let sp = write("top.spef.gz", "*SPEF \"IEEE 1481-1998\"\n*DESIGN \"top\"\n*T_UNIT 1 NS\n*C_UNIT 1 PF\n*R_UNIT 1 OHM\n*L_UNIT 1 HENRY\n*D_NET a 0.5\n*CONN\n*P a I\n*END\n");
+        assert_eq!(d.load(&sp).unwrap(), "spef");
+        assert_eq!(d.spef.as_ref().unwrap().nets.len(), 1);
+        let sdc = write("top.sdc.gz", "create_clock -name c -period 10 [get_ports a]\n");
+        assert_eq!(d.load(&sdc).unwrap(), "sdc");
+        assert_eq!(d.sdc.as_ref().unwrap().clocks.len(), 1);
+        let err = d.load(&write("x.gds.gz", "")).unwrap_err();
+        assert!(err.to_string().contains("unknown extension '.gds'"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

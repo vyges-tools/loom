@@ -2241,7 +2241,7 @@ pub fn load_flat(path: &str, opts: &FlattenOptions) -> Result<(Netlist, FlattenR
 }
 
 /// [`load`], keeping every module — see [`Design`]. STREAMED: read through a buffer, and
-/// inflated as it is read when it is gzip (with the `gzip` feature), as the reference reads
+/// inflated as it is read when it is gzip (the `gzip` feature, on by default), as the reference reads
 /// through `igzstream`. A byte that is not UTF-8 is read lossily.
 pub fn load_all(path: &str) -> Result<Design, NetlistError> {
     Ok(load_compact(path)?.to_design())
@@ -2286,7 +2286,7 @@ fn gz_stream<R: std::io::BufRead + 'static>(r: R) -> std::io::Result<Box<dyn std
 
 #[cfg(not(feature = "gzip"))]
 fn gz_stream<R: std::io::BufRead + 'static>(_: R) -> std::io::Result<Box<dyn std::io::BufRead>> {
-    Err(std::io::Error::other("gzip-compressed; build vyges-loom with the `gzip` feature to read it"))
+    Err(std::io::Error::other("gzip-compressed; this vyges-loom was built without its default `gzip` feature"))
 }
 
 /// A gzip stream inflated as it is read: every member, concatenated (RFC 1952; `bgzip` and
