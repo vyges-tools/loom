@@ -94,10 +94,15 @@ pub struct Arc {
     /// distinguishable from one that never had any — the first is this reader falling back to
     /// NLDM without saying so, the second is an NLDM library being used as intended.
     pub ccs_declared: bool,
-    // LVF (Liberty Variation Format): per-(slew,load) delay sigma. Empty -> no LVF;
-    // POCV then falls back to the global pocv_sigma fraction.
+    /// The LATE cell-delay sigma (`ocv_sigma_cell_rise` / `_fall`), the same table as
+    /// `lvf_cell[edge].sigma_late`. Kept for readers that predate [`Lvf`]; a timer should take
+    /// the sigma for its analysis from [`Lvf::delay_sigma`]. Empty -> no LVF.
     pub sigma_rise: Table,
     pub sigma_fall: Table,
+    /// LVF for the cell delay, `[rise, fall]`: `ocv_{sigma,std_dev,mean_shift,skewness}_cell_*`.
+    pub lvf_cell: [Lvf; 2],
+    /// LVF for the output transition, `[rise, fall]`: `ocv_*_{rise,fall}_transition`.
+    pub lvf_transition: [Lvf; 2],
     /// While reading: no edge has a table, so the reference builds the arc set with no arc in it —
     /// its role still marks the ports (`makeTimingArcPortMaps`); the reader drops it after that.
     pub(crate) no_edges: bool,
@@ -131,6 +136,60 @@ impl Arc {
     }
 }
 
+/// The Liberty Variation Format tables of ONE delay, transition or constraint edge.
+///
+/// 🔑 **Sigma comes in an early and a late half.** A table group `ocv_sigma_*` may appear
+/// several times, each stating `sigma_type : early | late | early_and_late`. Every group is read
+/// in file order: `early` sets the early table, `late` the late one, and `early_and_late` or no
+/// `sigma_type` sets both, so a later group overrides an earlier one for the halves it names
+/// (the reference's `readEarlyLateTableModels`). A group whose template is unknown reads as an
+/// empty table and still overrides.
+///
+/// The moments (`ocv_std_dev_*`, `ocv_mean_shift_*`, `ocv_skewness_*`) are one table each, the
+/// first group of that name, as the reference's `readLvfModels` takes them.
+///
+/// How the reference uses them, in its `normal` (Gaussian) variation mode:
+/// - a DELAY's standard deviation is `std_dev` when the library gives one, else the sigma of
+///   the analysis — late for a max (setup) path, early for a min (hold) one
+///   (`GateTableModel::gateDelayPocv`); see [`Lvf::delay_sigma`];
+/// - a TRANSITION's sigma is found the same way, but only the reported slew carries it: the next
+///   stage's tables are looked up at the slew's mean;
+/// - `mean_shift` and `skewness` are used only by its skew-normal mode, not by `normal`;
+/// - a CONSTRAINT's tables are looked up under a misspelled group name in the reference
+///   (`ocv_sigma_rise_constraiint`), so a library's correctly named constraint sigma never
+///   reaches its checks. This reader keeps them under the Liberty names.
+#[derive(Debug, Clone, Default)]
+pub struct Lvf {
+    pub sigma_early: Table,
+    pub sigma_late: Table,
+    pub std_dev: Table,
+    pub mean_shift: Table,
+    /// Unitless: not rescaled with time.
+    pub skewness: Table,
+}
+
+impl Lvf {
+    /// No table of any kind.
+    pub fn is_empty(&self) -> bool {
+        [&self.sigma_early, &self.sigma_late, &self.std_dev, &self.mean_shift, &self.skewness]
+            .iter()
+            .all(|t| t.values.is_empty())
+    }
+
+    /// The table a Gaussian timer takes the standard deviation from, for a `late` (max) or
+    /// early (min) analysis: `std_dev` when present, else that analysis's sigma. Empty when
+    /// neither is given.
+    pub fn delay_sigma(&self, late: bool) -> &Table {
+        if !self.std_dev.values.is_empty() {
+            &self.std_dev
+        } else if late {
+            &self.sigma_late
+        } else {
+            &self.sigma_early
+        }
+    }
+}
+
 /// A setup or hold constraint: rise/fall tables indexed by
 /// (index_1 = related/clock transition, index_2 = constrained/data transition).
 /// Evaluated by bilinear interpolation at the operating slews (like delay arcs),
@@ -148,6 +207,9 @@ pub struct Constraint {
     /// The pin the check is made against (`related_pin`), as written: a cell with two clock
     /// pins (a dual-port SRAM) checks each data pin against its own.
     pub related_pin: String,
+    /// LVF for the check, `[rise, fall]`: `ocv_*_{rise,fall}_constraint`. Read and kept; see
+    /// [`Lvf`] for why a timer matching the reference does not apply it.
+    pub lvf: [Lvf; 2],
 }
 
 impl Constraint {
@@ -1161,10 +1223,20 @@ fn parse_arc(timing_body: &str, own: &str, spans: &[GroupSpan], ctx: &Ctx) -> Ar
         } else {
             parse_ccs(timing_body, ctx.ccs_current)
         },
-        sigma_rise: tbl("ocv_sigma_cell_rise"),
-        sigma_fall: tbl("ocv_sigma_cell_fall"),
+        sigma_rise: Table::default(),
+        sigma_fall: Table::default(),
+        lvf_cell: ["rise", "fall"].map(|rf| {
+            let n = |m: &str| format!("ocv_{m}_cell_{rf}");
+            read_lvf(timing_body, spans, ctx, Axes::SlewLoad, &n)
+        }),
+        lvf_transition: ["rise", "fall"].map(|rf| {
+            let n = |m: &str| format!("ocv_{m}_{rf}_transition");
+            read_lvf(timing_body, spans, ctx, Axes::SlewLoad, &n)
+        }),
         no_edges: false,
     };
+    a.sigma_rise = a.lvf_cell[0].sigma_late.clone();
+    a.sigma_fall = a.lvf_cell[1].sigma_late.clone();
     // an edge has an arc only with a table for it — its delay or its transition (`makeTableModels`
     // makes no model otherwise, and no model builds no arc)
     let rise = a.out_edges.drives(true) && !(a.cell_rise.values.is_empty() && a.rise_transition.values.is_empty());
@@ -1231,7 +1303,36 @@ fn parse_constraint(timing_body: &str, spans: &[GroupSpan], ctx: &Ctx, own: &str
         fall: span_table(timing_body, spans, "fall_constraint", ctx, Axes::RelatedConstrained),
         clk_edge: if timing_type.ends_with("_falling") { ClkEdge::Fall } else { ClkEdge::Rise },
         related_pin: simple_attr(own, "related_pin").unwrap_or_default(),
+        lvf: ["rise", "fall"].map(|rf| {
+            let n = |m: &str| format!("ocv_{m}_{rf}_constraint");
+            read_lvf(timing_body, spans, ctx, Axes::RelatedConstrained, &n)
+        }),
     }
+}
+
+/// The LVF tables of one edge, `name(moment)` giving each group's name for the moment
+/// `sigma` / `std_dev` / `mean_shift` / `skewness` — see [`Lvf`] for the early/late rule.
+fn read_lvf(body: &str, spans: &[GroupSpan], ctx: &Ctx, kind: Axes, name: &dyn Fn(&str) -> String) -> Lvf {
+    let mut lvf = Lvf::default();
+    let sigma = name("sigma");
+    for g in spans.iter().filter(|g| g.kw == sigma) {
+        let t = group_table(body, g, ctx, kind);
+        let gbody = &body[g.body.clone()];
+        match simple_attr(gbody, "sigma_type").as_deref().map(str::trim) {
+            None | Some("") | Some("early_and_late") => {
+                lvf.sigma_early = t.clone();
+                lvf.sigma_late = t;
+            }
+            Some("early") => lvf.sigma_early = t,
+            Some("late") => lvf.sigma_late = t,
+            // any other word sets neither half
+            Some(_) => {}
+        }
+    }
+    lvf.std_dev = span_table(body, spans, &name("std_dev"), ctx, kind);
+    lvf.mean_shift = span_table(body, spans, &name("mean_shift"), ctx, kind);
+    lvf.skewness = span_table(body, spans, &name("skewness"), ctx, kind);
+    lvf
 }
 
 fn parse_pin(name: String, body: &str, ctx: &Ctx) -> Pin {
@@ -1422,18 +1523,22 @@ fn span_table(body: &str, spans: &[GroupSpan], kw: &str, ctx: &Ctx, kind: Axes) 
     spans
         .iter()
         .find(|g| g.kw == kw)
-        .map(|g| {
-            // ⛔ a table names its template; one that is not a timing (`lu_table_template`)
-            // template, nor the built-in `scalar`, is dropped as the reference drops it
-            // (`readTableModel`: warning 1253) — and an arc left with no table has no arc
-            let name = g.args.trim().trim_matches('"');
-            match ctx.templates.get(name) {
-                Some(t) => orient(parse_table(&body[g.body.clone()]), Some(t), kind),
-                None if name == "scalar" => orient(parse_table(&body[g.body.clone()]), None, kind),
-                None => Table::default(),
-            }
-        })
+        .map(|g| group_table(body, g, ctx, kind))
         .unwrap_or_default()
+}
+
+/// One table group `g` of `body`, parsed and oriented for `kind`.
+fn group_table(body: &str, g: &GroupSpan, ctx: &Ctx, kind: Axes) -> Table {
+    // ⛔ a table names its template; one that is not a timing (`lu_table_template`)
+    // template, nor the built-in `scalar`, is dropped as the reference drops it
+    // (`readTableModel`: warning 1253) — and an arc left with no table has no arc.
+    // LVF tables are looked up among the same templates (an `ocv_table_template` is not one).
+    let name = g.args.trim().trim_matches('"');
+    match ctx.templates.get(name) {
+        Some(t) => orient(parse_table(&body[g.body.clone()]), Some(t), kind),
+        None if name == "scalar" => orient(parse_table(&body[g.body.clone()]), None, kind),
+        None => Table::default(),
+    }
 }
 
 /// What a table's two axes mean to its consumer — the order [`Table::lookup`] takes them in.
@@ -2620,10 +2725,22 @@ impl Lib {
                 for k in pin.setup.iter_mut().chain(pin.hold.iter_mut()).chain(pin.recovery.iter_mut()).chain(pin.removal.iter_mut()) {
                     table(&mut k.rise, t, t, t);
                     table(&mut k.fall, t, t, t);
+                    for l in &mut k.lvf {
+                        for tb in [&mut l.sigma_early, &mut l.sigma_late, &mut l.std_dev, &mut l.mean_shift] {
+                            table(tb, t, t, t);
+                        }
+                        table(&mut l.skewness, t, t, 1.0);
+                    }
                 }
                 for a in &mut pin.arcs {
                     for tb in [&mut a.cell_rise, &mut a.cell_fall, &mut a.rise_transition, &mut a.fall_transition, &mut a.sigma_rise, &mut a.sigma_fall] {
                         table(tb, t, c, t);
+                    }
+                    for l in a.lvf_cell.iter_mut().chain(a.lvf_transition.iter_mut()) {
+                        for tb in [&mut l.sigma_early, &mut l.sigma_late, &mut l.std_dev, &mut l.mean_shift] {
+                            table(tb, t, c, t);
+                        }
+                        table(&mut l.skewness, t, c, 1.0);
                     }
                     for w in a.ccs.rise.iter_mut().chain(a.ccs.fall.iter_mut()) {
                         w.in_slew *= t;
@@ -4791,5 +4908,96 @@ library (seqgroups) {
         for c in ["DFR", "SDF", "LAT", "BANK", "INV"] {
             assert_eq!(back.cells[c].seq_group, lib.cells[c].seq_group, "{c}");
         }
+    }
+}
+
+/// LVF early/late reading, against a synthetic library whose early group comes first.
+#[cfg(test)]
+mod lvf_tests {
+    use super::*;
+
+    const LVF: &str = include_str!("../tests/fixtures/lvf_early_late.lib");
+
+    /// The table's first value, as stored (a lookup at the corner interpolates and rounds).
+    fn at(t: &Table) -> f64 {
+        t.values[0][0]
+    }
+
+    /// Reference rule (`readEarlyLateTableModels`): every `ocv_sigma_*` group of the arc is read in
+    /// file order; `sigma_type : early` sets the early sigma, `late` the late one, and
+    /// `early_and_late` or no `sigma_type` sets both. Taking only the first group (the early one
+    /// here) would give a setup path the hold path's sigma.
+    #[test]
+    fn early_then_late_sigma_groups_set_each_half() {
+        let lib = Lib::parse(LVF).unwrap();
+        let a = &lib.cells["BUFL"].pins["Z"].arcs[0];
+        assert_eq!(at(&a.lvf_cell[0].sigma_early), 0.001f32 as f64);
+        assert_eq!(at(&a.lvf_cell[0].sigma_late), 0.010f32 as f64);
+        assert_eq!(at(&a.lvf_cell[1].sigma_early), 0.002f32 as f64);
+        assert_eq!(at(&a.lvf_cell[1].sigma_late), 0.020f32 as f64);
+        // the compatibility field is the LATE sigma
+        assert_eq!(at(&a.sigma_rise), 0.010f32 as f64);
+        assert_eq!(at(&a.sigma_fall), 0.020f32 as f64);
+        // transitions: early_and_late, and an unstated sigma_type, set both halves
+        assert_eq!(at(&a.lvf_transition[0].sigma_early), 0.006f32 as f64);
+        assert_eq!(at(&a.lvf_transition[0].sigma_late), 0.006f32 as f64);
+        assert_eq!(at(&a.lvf_transition[1].sigma_early), 0.007f32 as f64);
+        assert_eq!(at(&a.lvf_transition[1].sigma_late), 0.007f32 as f64);
+    }
+
+    /// A later group overrides the halves it names, whatever came before (the reference
+    /// assigns per group, last one wins).
+    #[test]
+    fn a_later_sigma_group_overrides_the_halves_it_names() {
+        let lib = Lib::parse(LVF).unwrap();
+        let a = &lib.cells["DFFL"].pins["Q"].arcs[0];
+        // late then early: each kept
+        assert_eq!(at(&a.lvf_cell[0].sigma_late), 0.030f32 as f64);
+        assert_eq!(at(&a.lvf_cell[0].sigma_early), 0.003f32 as f64);
+        // late then early_and_late: both are the second
+        assert_eq!(at(&a.lvf_cell[1].sigma_late), 0.008f32 as f64);
+        assert_eq!(at(&a.lvf_cell[1].sigma_early), 0.008f32 as f64);
+    }
+
+    /// Reference rule (`GateTableModel::gateDelayPocv`, normal mode): a delay's standard
+    /// deviation is the `std_dev` table when the library gives one, else the analysis's sigma
+    /// (late for max, early for min). The moments are one table each (`readLvfModels`).
+    #[test]
+    fn std_dev_wins_over_sigma_and_the_moments_are_kept() {
+        let lib = Lib::parse(LVF).unwrap();
+        let a = &lib.cells["BUFL"].pins["Z"].arcs[0];
+        assert_eq!(at(a.lvf_cell[0].delay_sigma(true)), 0.010f32 as f64);
+        assert_eq!(at(a.lvf_cell[0].delay_sigma(false)), 0.001f32 as f64);
+        assert_eq!(at(a.lvf_cell[1].delay_sigma(true)), 0.011f32 as f64);
+        assert_eq!(at(a.lvf_cell[1].delay_sigma(false)), 0.011f32 as f64);
+        assert_eq!(at(&a.lvf_cell[1].mean_shift), 0.012f32 as f64);
+        assert_eq!(at(&a.lvf_cell[1].skewness), 0.5);
+        assert!(a.lvf_cell[0].std_dev.values.is_empty());
+        assert!(!a.lvf_cell[0].is_empty() && !a.lvf_transition[1].is_empty());
+    }
+
+    /// Constraint sigma is read under its Liberty name, early and late apart.
+    #[test]
+    fn constraint_sigma_is_read_early_and_late() {
+        let lib = Lib::parse(LVF).unwrap();
+        let k = &lib.cells["DFFL"].pins["D"].setup[0];
+        assert_eq!(at(&k.lvf[0].sigma_early), 0.001f32 as f64);
+        assert_eq!(at(&k.lvf[0].sigma_late), 0.009f32 as f64);
+        assert!(k.lvf[1].is_empty());
+    }
+
+    /// Sigma, std_dev and mean shift are times and rescale with the time unit; skewness is a
+    /// ratio and does not.
+    #[test]
+    fn lvf_rescales_with_time_but_skewness_does_not() {
+        let mut lib = Lib::parse(LVF).unwrap();
+        let mut to = lib.units;
+        to.time_s *= 1e-3; // ns -> ps
+        lib.rescale_to(to);
+        let a = &lib.cells["BUFL"].pins["Z"].arcs[0];
+        let near = |x: f64, y: f64| (x - y).abs() < 1e-6;
+        assert!(near(a.lvf_cell[0].sigma_late.lookup(10.0, 0.001), 0.010f32 as f64 * 1e3));
+        assert!(near(a.lvf_cell[1].mean_shift.lookup(10.0, 0.001), 0.012f32 as f64 * 1e3));
+        assert!(near(a.lvf_cell[1].skewness.lookup(10.0, 0.001), 0.5));
     }
 }

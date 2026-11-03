@@ -1,0 +1,83 @@
+/* Synthetic LVF library for the early/late sigma reading rule. Values are invented and
+   chosen only so that every table is distinguishable from every other. */
+library (lvf_early_late) {
+  delay_model : table_lookup;
+  time_unit : "1ns";
+  capacitive_load_unit (1, pf);
+  input_threshold_pct_rise : 50; input_threshold_pct_fall : 50;
+  output_threshold_pct_rise : 50; output_threshold_pct_fall : 50;
+  slew_lower_threshold_pct_rise : 20; slew_upper_threshold_pct_rise : 80;
+  slew_lower_threshold_pct_fall : 20; slew_upper_threshold_pct_fall : 80;
+  lu_table_template (t2) {
+    variable_1 : input_net_transition;
+    variable_2 : total_output_net_capacitance;
+    index_1 ("0.01, 1.0");
+    index_2 ("0.001, 0.1");
+  }
+  lu_table_template (c2) {
+    variable_1 : related_pin_transition;
+    variable_2 : constrained_pin_transition;
+    index_1 ("0.01, 1.0");
+    index_2 ("0.01, 1.0");
+  }
+  cell (BUFL) {
+    area : 1;
+    pin (A) { direction : input; capacitance : 0.002; }
+    pin (Z) {
+      direction : output;
+      function : "A";
+      timing () {
+        related_pin : "A";
+        timing_sense : positive_unate;
+        cell_rise (t2) { values ("0.10, 0.20", "0.30, 0.40"); }
+        cell_fall (t2) { values ("0.12, 0.22", "0.32, 0.42"); }
+        rise_transition (t2) { values ("0.05, 0.10", "0.15, 0.20"); }
+        fall_transition (t2) { values ("0.05, 0.10", "0.15, 0.20"); }
+        /* early first, then late */
+        ocv_sigma_cell_rise (t2) { sigma_type : "early"; values ("0.001, 0.002", "0.003, 0.004"); }
+        ocv_sigma_cell_rise (t2) { sigma_type : "late"; values ("0.010, 0.020", "0.030, 0.040"); }
+        ocv_sigma_cell_fall (t2) { sigma_type : "early"; values ("0.002, 0.003", "0.004, 0.005"); }
+        ocv_sigma_cell_fall (t2) { sigma_type : "late"; values ("0.020, 0.030", "0.040, 0.050"); }
+        ocv_sigma_rise_transition (t2) { sigma_type : "early_and_late"; values ("0.006, 0.006", "0.006, 0.006"); }
+        ocv_sigma_fall_transition (t2) { values ("0.007, 0.007", "0.007, 0.007"); }
+        ocv_std_dev_cell_fall (t2) { values ("0.011, 0.011", "0.011, 0.011"); }
+        ocv_mean_shift_cell_fall (t2) { values ("0.012, 0.012", "0.012, 0.012"); }
+        ocv_skewness_cell_fall (t2) { values ("0.5, 0.5", "0.5, 0.5"); }
+      }
+    }
+  }
+  cell (DFFL) {
+    area : 2;
+    ff (IQ, IQN) { next_state : "D"; clocked_on : "CK"; }
+    pin (CK) { direction : input; clock : true; capacitance : 0.002; }
+    pin (D) {
+      direction : input;
+      capacitance : 0.002;
+      timing () {
+        related_pin : "CK";
+        timing_type : setup_rising;
+        rise_constraint (c2) { values ("0.05, 0.06", "0.07, 0.08"); }
+        fall_constraint (c2) { values ("0.05, 0.06", "0.07, 0.08"); }
+        ocv_sigma_rise_constraint (c2) { sigma_type : "early"; values ("0.001, 0.001", "0.001, 0.001"); }
+        ocv_sigma_rise_constraint (c2) { sigma_type : "late"; values ("0.009, 0.009", "0.009, 0.009"); }
+      }
+    }
+    pin (Q) {
+      direction : output;
+      function : "IQ";
+      timing () {
+        related_pin : "CK";
+        timing_type : rising_edge;
+        cell_rise (t2) { values ("0.20, 0.30", "0.40, 0.50"); }
+        cell_fall (t2) { values ("0.20, 0.30", "0.40, 0.50"); }
+        rise_transition (t2) { values ("0.05, 0.10", "0.15, 0.20"); }
+        fall_transition (t2) { values ("0.05, 0.10", "0.15, 0.20"); }
+        /* late first, then early, then an early_and_late that overrides both */
+        ocv_sigma_cell_rise (t2) { sigma_type : "late"; values ("0.030, 0.030", "0.030, 0.030"); }
+        ocv_sigma_cell_rise (t2) { sigma_type : "early"; values ("0.003, 0.003", "0.003, 0.003"); }
+        ocv_sigma_cell_fall (t2) { sigma_type : "late"; values ("0.030, 0.030", "0.030, 0.030"); }
+        ocv_sigma_cell_fall (t2) { sigma_type : "early_and_late"; values ("0.008, 0.008", "0.008, 0.008"); }
+      }
+    }
+  }
+}

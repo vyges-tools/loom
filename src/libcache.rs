@@ -15,11 +15,12 @@
 //! in-process cache) mean a changed library is a different entry — never a stale read.
 
 use crate::ccs::{CcsArc, CcsWaveform};
-use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, OutEdges, Pin, PinCaps, RecvCap, Table};
+use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, Lvf, OutEdges, Pin, PinCaps, RecvCap, Table};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLCL"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLCM"; // Vyges Liberty Cache — bump the trailing digit on any format change
+                                 // VLCM: LVF early/late sigma and moments (Arc, Constraint).
                                  // VLCL: Cell gained `ports`.
                                  // VLCJ: Pin gained `clock_tree_paths`, Cell `is_macro`.
                                  // VLCI: Arc keeps its kind (`Arc::feeds` pairs edges by it: latch D->Q).
@@ -181,6 +182,9 @@ fn enc_constraint(w: &mut W, c: &Constraint) {
         ClkEdge::Fall => 1,
     });
     w.s(&c.related_pin);
+    for l in &c.lvf {
+        enc_lvf(w, l);
+    }
 }
 fn dec_constraint(r: &mut R) -> Option<Constraint> {
     Some(Constraint {
@@ -188,6 +192,22 @@ fn dec_constraint(r: &mut R) -> Option<Constraint> {
         fall: dec_table(r)?,
         clk_edge: if r.u8()? == 1 { ClkEdge::Fall } else { ClkEdge::Rise },
         related_pin: r.s()?,
+        lvf: [dec_lvf(r)?, dec_lvf(r)?],
+    })
+}
+
+fn enc_lvf(w: &mut W, l: &Lvf) {
+    for t in [&l.sigma_early, &l.sigma_late, &l.std_dev, &l.mean_shift, &l.skewness] {
+        enc_table(w, t);
+    }
+}
+fn dec_lvf(r: &mut R) -> Option<Lvf> {
+    Some(Lvf {
+        sigma_early: dec_table(r)?,
+        sigma_late: dec_table(r)?,
+        std_dev: dec_table(r)?,
+        mean_shift: dec_table(r)?,
+        skewness: dec_table(r)?,
     })
 }
 
@@ -232,6 +252,9 @@ fn enc_arc(w: &mut W, a: &Arc) {
         OutEdges::Fall => 2,
     });
     w.s(&a.kind);
+    for l in a.lvf_cell.iter().chain(&a.lvf_transition) {
+        enc_lvf(w, l);
+    }
 }
 fn dec_arc(r: &mut R) -> Option<Arc> {
     let mut a = Arc {
@@ -252,6 +275,8 @@ fn dec_arc(r: &mut R) -> Option<Arc> {
         },
         sigma_rise: dec_table(r)?,
         sigma_fall: dec_table(r)?,
+        lvf_cell: Default::default(),
+        lvf_transition: Default::default(),
         no_edges: false,
         // read LAST, as it is written: a struct literal's fields are evaluated in written order
         out_edges: match r.u8()? {
@@ -261,6 +286,8 @@ fn dec_arc(r: &mut R) -> Option<Arc> {
         },
     };
     a.kind = r.s()?;
+    a.lvf_cell = [dec_lvf(r)?, dec_lvf(r)?];
+    a.lvf_transition = [dec_lvf(r)?, dec_lvf(r)?];
     Some(a)
 }
 
@@ -1010,5 +1037,27 @@ library (neg) {
             .sum();
         assert!(total <= cap, "pruned total {total} must be <= cap {cap}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every LVF table survives the cache, early and late apart: a warm-cache run must time a
+    /// setup path with the same late sigma as a cold one.
+    #[test]
+    fn lvf_early_late_tables_survive_the_cache() {
+        let lib = Lib::parse(include_str!("../tests/fixtures/lvf_early_late.lib")).unwrap();
+        let back = decode(&encode(&lib)).expect("decode");
+        let v = |t: &Table| t.values.clone();
+        for (cell, pin) in [("BUFL", "Z"), ("DFFL", "Q")] {
+            let (a, b) = (&lib.cells[cell].pins[pin].arcs[0], &back.cells[cell].pins[pin].arcs[0]);
+            for (x, y) in a.lvf_cell.iter().chain(&a.lvf_transition).zip(b.lvf_cell.iter().chain(&b.lvf_transition)) {
+                assert_eq!(v(&x.sigma_early), v(&y.sigma_early));
+                assert_eq!(v(&x.sigma_late), v(&y.sigma_late));
+                assert_eq!(v(&x.std_dev), v(&y.std_dev));
+                assert_eq!(v(&x.mean_shift), v(&y.mean_shift));
+                assert_eq!(v(&x.skewness), v(&y.skewness));
+            }
+        }
+        let (k, kb) = (&lib.cells["DFFL"].pins["D"].setup[0], &back.cells["DFFL"].pins["D"].setup[0]);
+        assert_eq!(v(&k.lvf[0].sigma_late), v(&kb.lvf[0].sigma_late));
+        assert!(!kb.lvf[0].sigma_late.values.is_empty());
     }
 }
