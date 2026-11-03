@@ -36,6 +36,11 @@ use std::collections::HashMap;
 
 mod kept;
 mod scope;
+mod tcl;
+
+/// A running proc's variables, and its `upvar` links (local name, caller's name) written back
+/// to the caller at its `return`.
+type ProcFrame = (HashMap<String, String>, Vec<(String, String)>);
 mod unset;
 
 pub use kept::{ExceptionCmd, KeptArg, KeptCmd};
@@ -1625,7 +1630,18 @@ fn canonical_queries(line: &str) -> String {
                         .find(|(a, _)| *a == word)
                         .map(|(_, q)| q.to_string())
                         .or_else(|| resolve_command(word).ok());
-                    if let Some(full) = full.filter(|f| KNOWN_QUERIES.contains(&f.as_str())) {
+                    // a signoff timer abbreviates ITS commands too (`get_attr`): a word the
+                    // reference does not know that begins exactly one extension query is that
+                    // query, refused by name below with the read going on
+                    let ext = || {
+                        let m: Vec<&str> = EXTENSION_QUERIES.iter().copied().filter(|q| q.starts_with(word)).collect();
+                        (full.is_none() && m.len() == 1).then(|| m[0])
+                    };
+                    if let Some(q) = ext() {
+                        out.push_str(&line[last..start]);
+                        out.push_str(q);
+                        last = end;
+                    } else if let Some(full) = full.filter(|f| KNOWN_QUERIES.contains(&f.as_str())) {
                         out.push_str(&line[last..start]);
                         out.push_str(&full);
                         last = end;
@@ -2277,17 +2293,25 @@ enum Control {
 /// list this reader cannot evaluate (a design query, a `proc`) REFUSES the whole command — the
 /// branch it would have taken is unknown, and running every branch is how a file's default and
 /// its override both applied, in file order.
-fn control(raw: &str, vars: &HashMap<String, String>) -> Control {
+fn control(raw: &str, vars: &HashMap<String, String>, procs: &HashMap<String, TclProc>) -> Control {
     let head = raw.split_whitespace().next().unwrap_or("");
     match head {
         "if" => {
             let toks = tokenize(raw);
+            // a vendor file's tool-name test reads a signoff timer's name when the flow does not
+            // define it (`tcl::TOOL_NAME_DEFAULT`); `info exists` still sees only what is defined
+            let mut operands = as_operands(vars);
+            operands.entry(tcl::TOOL_NAME_VAR.to_string()).or_insert_with(|| format!("\"{}\"", tcl::TOOL_NAME_DEFAULT));
             let mut k = 1;
             while k + 1 < toks.len() {
-                let Some(counted) = subst_llength(&toks[k], vars) else {
+                // `[dict exists …]`, `[a_proc …]` in the condition, answered first
+                let Ok(valued) = tcl::subst_values(&toks[k], vars, procs, &ReadOpts::default(), 0) else {
                     return Control::Refuse("if".into());
                 };
-                let cond = subst_vars(&subst_info_exists(&counted, vars), &as_operands(vars));
+                let Some(counted) = subst_llength(&valued, vars) else {
+                    return Control::Refuse("if".into());
+                };
+                let cond = subst_vars(&subst_info_exists(&counted, vars), &operands);
                 let mut body = k + 1;
                 if toks.get(body).map(String::as_str) == Some("then") {
                     body += 1;
@@ -2963,7 +2987,7 @@ impl Sdc {
         let mut vars: HashMap<String, String> = opts.defines.iter().cloned().collect();
         let mut procs: HashMap<String, TclProc> = HashMap::new();
         // the variables of each proc call in progress, restored when it returns
-        let mut frames: Vec<(HashMap<String, String>, Vec<String>)> = Vec::new();
+        let mut frames: Vec<ProcFrame> = Vec::new();
         let mut sourced = 0usize;
         let mut loops: Vec<TclLoop> = Vec::new();
         // `current_instance`: the instance pin, cell and net names are read under (`None` the top)
@@ -2976,14 +3000,27 @@ impl Sdc {
         while let Some(raw) = queue.pop_front() {
             // A proc's call ends: its local variables go, the ones it declared `global` stay.
             if raw == PROC_RETURN {
-                if let Some((mut outer, globals)) = frames.pop() {
-                    for g in globals {
-                        match vars.get(&g) {
-                            Some(v) => outer.insert(g, v.clone()),
-                            None => outer.remove(&g),
+                if let Some((mut outer, links)) = frames.pop() {
+                    // `global x` links x to x; `upvar other local` links local to the caller's other
+                    for (local, other) in links {
+                        match vars.get(&local) {
+                            Some(v) => outer.insert(other, v.clone()),
+                            None => outer.remove(&other),
                         };
                     }
                     vars = outer;
+                }
+                continue;
+            }
+            // A sourced file's end: a `return` at its top level stops here (see `Dialect::Return`).
+            if raw == SOURCE_END {
+                continue;
+            }
+            // A signoff timer's take-back of every clock's delay, as the reference's per clock.
+            if let Some(line) = raw.strip_prefix(tcl::EVERY_CLOCK) {
+                let clocks: Vec<String> = sdc.clocks.iter().map(|c| c.name.clone()).collect();
+                for c in tcl::every_clock_lines(line, &clocks).into_iter().rev() {
+                    queue.push_front(c);
                 }
                 continue;
             }
@@ -3007,14 +3044,44 @@ impl Sdc {
                 }
                 continue;
             }
+            // `[dict …]`, `[a_proc …]` and the tool-name query answered in place, outside braces
+            // (`sdc/tcl.rs`); a substitution that cannot be answered refuses its command.
+            let raw = match tcl::subst_values(&raw, &vars, &procs, opts, frames.len()) {
+                Ok(r) => r,
+                Err(why) => {
+                    let cmd = raw.split_whitespace().next().unwrap_or("").to_string();
+                    sdc.rejected.push(format!("{cmd}: {why}; not applied"));
+                    if !BENIGN_FOR_TIMING.contains(&cmd.as_str()) && !matches!(cmd.as_str(), "set" | "puts" | "echo") {
+                        sdc.unevaluated_queries.push(format!("{cmd}: {why}"));
+                    }
+                    continue;
+                }
+            };
             match dialect(&raw, &vars, &mut procs, &mut frames, &mut loops, opts)? {
                 Dialect::Sourced(cmds) => {
                     sourced += 1;
                     if sourced > MAX_SOURCED {
                         return Err(SdcError(format!("more than {MAX_SOURCED} files sourced: a `source` loop")));
                     }
+                    queue.push_front(SOURCE_END.into());
                     for c in cmds.into_iter().rev() {
                         queue.push_front(c);
+                    }
+                    continue;
+                }
+                // Tcl `return`: the rest of the running proc's body is skipped (up to its
+                // PROC_RETURN, which then ends the call), or the rest of the sourced file, or —
+                // at the top of the file read — the rest of the file, as `source` stops there.
+                Dialect::Return => {
+                    while let Some(next) = queue.front() {
+                        if next == PROC_RETURN {
+                            break;
+                        }
+                        let end = next == SOURCE_END;
+                        queue.pop_front();
+                        if end {
+                            break;
+                        }
                     }
                     continue;
                 }
@@ -3034,7 +3101,7 @@ impl Sdc {
                 Dialect::Done => continue,
                 Dialect::None => {}
             }
-            match control(&raw, &vars) {
+            match control(&raw, &vars, &procs) {
                 Control::Run(cmds) => {
                     for c in cmds.into_iter().rev() {
                         queue.push_front(c);
@@ -3754,6 +3821,8 @@ const MAX_LOOP_PASSES: usize = 100_000;
 
 /// The line the reader queues after a proc's body: its call has returned.
 const PROC_RETURN: &str = "\u{1}proc-return";
+/// The line the reader queues after a sourced file's commands: where a `return` in it stops.
+const SOURCE_END: &str = "\u{3}source-end";
 const MAX_PROC_DEPTH: usize = 64;
 const MAX_SOURCED: usize = 256;
 
@@ -3767,6 +3836,8 @@ enum Dialect {
     Refuse(String),
     /// handled; nothing further
     Done,
+    /// Tcl `return`: the running proc's body (or sourced file) ends here
+    Return,
     /// not a dialect command
     None,
 }
@@ -3788,7 +3859,7 @@ fn dialect(
     raw: &str,
     vars: &HashMap<String, String>,
     procs: &mut HashMap<String, TclProc>,
-    frames: &mut Vec<(HashMap<String, String>, Vec<String>)>,
+    frames: &mut Vec<ProcFrame>,
     loops: &mut Vec<TclLoop>,
     opts: &ReadOpts,
 ) -> Result<Dialect, SdcError> {
@@ -3858,6 +3929,10 @@ fn dialect(
                 k += 1;
             }
             let Some(value) = toks.get(k) else { return Ok(Dialect::Refuse("switch: no value; not run".into())) };
+            // the tool-name test of a vendor file, the variable not defined by the flow: read as
+            // a signoff timer's name (`tcl::TOOL_NAME_DEFAULT`; `--define` picks another)
+            let tool = tcl::TOOL_NAME_DEFAULT.to_string();
+            let value = if [format!("${}", tcl::TOOL_NAME_VAR), format!("$::{}", tcl::TOOL_NAME_VAR)].contains(value) { &tool } else { value };
             let pairs: Vec<String> = match &toks[k + 1..] {
                 [one] => tokenize(one),
                 many => many.to_vec(),
@@ -3906,18 +3981,52 @@ fn dialect(
                 _ => Ok(Dialect::Refuse(format!("incr {var}: not an integer; not applied"))),
             }
         }
-        // its body runs once per object of a collection this reader does not enumerate
-        "foreach_in_collection" => Ok(Dialect::Refuse(format!(
-            "foreach_in_collection: `{}` iterates a collection this reader does not enumerate; not applied",
-            raw.split_whitespace().take(3).collect::<Vec<_>>().join(" ")
-        ))),
+        // `foreach_in_collection v C {body}`: a body that only hands `$v` to constraint commands
+        // as an object argument runs ONCE on the whole collection, which applies each command to
+        // each object alike ([`tcl::collection_body_is_setwise`]); a body that names, counts or
+        // tests the object needs the objects one by one, which only the design has: refused.
+        "foreach_in_collection" => {
+            let toks = tokenize(raw);
+            if let [_, var, coll, body] = toks.as_slice() {
+                let lines = logical_lines(body);
+                if tcl::collection_body_is_setwise(var, &lines, procs) {
+                    let mut cmds = vec![format!("set {var} {coll}")];
+                    cmds.extend(lines);
+                    return Ok(Dialect::Run(cmds));
+                }
+            }
+            Ok(Dialect::Refuse(format!(
+                "foreach_in_collection: `{}` uses each object on its own (its name, a test, a derived name), which needs the design's objects one by one; not applied",
+                raw.split_whitespace().take(3).collect::<Vec<_>>().join(" ")
+            )))
+        }
         "global" => {
             // inside a call, these names outlive it; at the top every name is global already
-            if let Some((_, globals)) = frames.last_mut() {
-                globals.extend(tokenize(raw).into_iter().skip(1));
+            if let Some((_, links)) = frames.last_mut() {
+                links.extend(tokenize(raw).into_iter().skip(1).map(|g| {
+                    let g = g.trim_start_matches("::").to_string();
+                    (g.clone(), g)
+                }));
             }
             Ok(Dialect::Done)
         }
+        "return" => Ok(Dialect::Return),
+        // Tcl `upvar ?level? other local …`: `local` is the caller's `other` for the rest of the
+        // call (read now, written back when the call returns). At the top it is the same name.
+        "upvar" => {
+            let links = match tcl::upvar_links(raw) {
+                Ok(l) => l,
+                Err(why) => return Ok(Dialect::Refuse(format!("{why}; not applied"))),
+            };
+            let sets: Vec<String> = links.iter().filter_map(|(local, other)| vars.get(other).map(|v| format!("set {local} {}", brace_word(v)))).collect();
+            if let Some((_, l)) = frames.last_mut() {
+                l.extend(links);
+            }
+            Ok(Dialect::Run(sets))
+        }
+        "dict" => Ok(tcl::dict_statement(raw, vars)),
+        // a signoff timer's `remove_*` / `reset_*`: the reference's `unset_*` / `delete_*` command
+        w if tcl::take_back_alias(w).is_some() => Ok(tcl::rewrite_take_back(raw).map_or(Dialect::None, |l| Dialect::Run(vec![l]))),
         "source" => {
             let line = subst_command_vars(raw, vars);
             let toks = tokenize(&line);
@@ -3957,8 +4066,8 @@ fn dialect(
             let line = subst_exprs(&subst_command_vars(raw, vars), vars);
             let args = tokenize(&line).split_off(1);
             let p = &procs[name];
-            if p.body.iter().any(|c| matches!(c.split_whitespace().next(), Some("return" | "upvar" | "uplevel"))) {
-                return Ok(Dialect::Refuse(format!("{name}: a proc that returns early or reaches its caller's variables; not run")));
+            if p.body.iter().any(|c| c.split_whitespace().next() == Some("uplevel")) {
+                return Ok(Dialect::Refuse(format!("{name}: a proc that runs code in its caller's frame (`uplevel`); not run")));
             }
             let mut sets = Vec::new();
             let mut a = args.iter();
@@ -5576,12 +5685,13 @@ set_load 5 [get_ports $L]
     }
 
     /// What a proc call cannot be read as is refused, and the read goes on; a recursive proc
-    /// stops it rather than looping.
+    /// stops it rather than looping. A proc that only `return`s a value is a command that does
+    /// nothing as a statement (Tcl 8.6 `return`): run, not refused.
     #[test]
     fn a_proc_that_cannot_be_run_is_refused() {
         let s = Sdc::parse("proc f {a} { set_load $a [get_ports x] }\nf\nf 1 2\nproc r {} { return 1 }\nr\nset_load 4 [get_ports y]\n").unwrap();
         assert_eq!(s.env.len(), 1);
-        assert_eq!(s.rejected.len(), 3, "{:?}", s.rejected);
+        assert_eq!(s.rejected.len(), 2, "{:?}", s.rejected);
         assert!(Sdc::parse("proc r {} { r }\nr\n").is_err());
     }
 
@@ -5631,7 +5741,9 @@ set_load 5 [get_ports $L]
         assert_eq!(ports(&s), [v(&["x*", "y"]), v(&["p", "q"]), v(&["r"]), v(&["z"])]);
         assert_eq!(s.unevaluated_queries.len(), 1, "{:?}", s.unevaluated_queries);
         assert!(s.rejected.iter().any(|r| r.starts_with("set_dont_touch")), "{:?}", s.rejected);
-        assert!(s.rejected.iter().any(|r| r.starts_with("foreach_in_collection")), "{:?}", s.rejected);
+        // a body that hands `$p` to a constraint as its object is that constraint on the collection
+        assert!(!s.rejected.iter().any(|r| r.starts_with("foreach_in_collection")), "{:?}", s.rejected);
+        assert_eq!(s.env.len(), 1, "set_load on [all_inputs]: {:?}", s.env);
         // inside braces nothing is a command, so nothing is rewritten
         assert_eq!(dialect_queries("x {[add_to_collection a b]} [add_to_collection -unique a b]"), "x {[add_to_collection a b]} [list a b]");
     }

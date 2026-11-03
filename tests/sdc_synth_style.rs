@@ -1,6 +1,6 @@
 //! A synthesis-flow-style constraint set read whole (field item: commercial-style fixtures):
-//! `source` of a setup script and an I/O file, a `proc` with a default, collection commands,
-//! singular queries, design rules on objects, a clock sense and disabled arcs. Every command is
+//! `source` of a setup script and an I/O file, a `proc` with a default, collection commands (a set-wise
+//! `foreach_in_collection`), singular queries, design rules on objects, a clock sense and disabled arcs. Every command is
 //! either modelled or reported as not applied, and the read reaches the end of the file.
 
 use vyges_loom::sdc::Sdc;
@@ -20,10 +20,12 @@ fn a_synthesis_style_constraint_set_is_read_to_the_end() {
     assert_eq!(s.exceptions.len(), 1);
     // the last line was applied: the read reached the end of the file
     assert!(s.env.iter().any(|e| e.objects == ["dout*"]), "{:?}", s.env);
-    // what was not applied is said: the per-object loop (timing) and the design query (not)
+    // the per-object loop hands `$p` to set_load as its object: set_load on the whole collection
+    assert_eq!(s.env.len(), 2, "{:?}", s.env);
+    // what was not applied is said: the design query (not timing)
     let na = s.not_applied();
     let names: Vec<(&str, bool)> = na.iter().map(|n| (n.command.as_str(), n.affects_timing)).collect();
-    assert!(names.contains(&("foreach_in_collection", true)), "{names:?}");
+    assert!(!names.iter().any(|n| n.0 == "foreach_in_collection"), "{names:?}");
     assert!(names.contains(&("set_dont_touch", false)), "{names:?}");
     assert!(s.unevaluated_queries.is_empty(), "{:?}", s.unevaluated_queries);
 }
