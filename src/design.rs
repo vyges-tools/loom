@@ -14,7 +14,7 @@ use crate::{def, lef, liberty, netlist, sdc, spef, yosys_json};
 /// One recorded load/step — the seed of loom's cross-step state (provenance).
 #[derive(Debug, Clone)]
 pub struct Step {
-    /// `"netlist" | "liberty" | "sdc" | "spef"`.
+    /// `"netlist" | "flatten" | "liberty" | "sdc" | "spef" | "lef" | "def"`.
     pub kind: &'static str,
     pub path: String,
     /// Human-readable one-liner (counts).
@@ -24,7 +24,14 @@ pub struct Step {
 /// The shared in-memory design. Engines read from this rather than re-parsing.
 #[derive(Debug, Default)]
 pub struct Design {
+    /// The netlist's TOP, owned — or, after [`Design::flatten_netlist`], the whole flat design.
+    ///
+    /// ⛔ On a hierarchical netlist the top alone is not the design (see
+    /// [`netlist::Netlist::health`]); [`Design::hierarchy`] has every module.
     pub netlist: Option<netlist::Netlist>,
+    /// EVERY module of the Verilog netlist loaded, in the compact form — or, once flattened, the
+    /// flat design. Never only the top. `None` for a netlist read from Yosys JSON.
+    pub hierarchy: Option<netlist::CompactDesign>,
     /// One entry per `.lib` loaded (corners / multiple libraries).
     pub libs: Vec<liberty::Lib>,
     pub sdc: Option<sdc::Sdc>,
@@ -50,19 +57,52 @@ impl Design {
         Self::default()
     }
 
-    /// Load a structural Verilog netlist (`.v`/`.sv`).
+    /// Load a structural Verilog netlist (`.v`/`.sv`, gzipped or not): every module is kept in
+    /// [`Design::hierarchy`], and the top in [`Design::netlist`]. A hierarchical netlist is
+    /// flattened with [`Design::flatten_netlist`].
     pub fn load_netlist(&mut self, path: &str) -> Result<(), DesignError> {
-        let nl = netlist::load(path).map_err(|e| DesignError(e.to_string()))?;
+        let all = netlist::load_compact(path).map_err(|e| DesignError(e.to_string()))?;
+        let nl = all.top_netlist();
         let summary = format!(
-            "module {} — {} inputs, {} outputs, {} instances",
+            "module {} — {} inputs, {} outputs, {} instances ({} module(s) in the file)",
             nl.module,
             nl.inputs.len(),
             nl.outputs.len(),
-            nl.insts.len()
+            nl.insts.len(),
+            all.modules.len()
         );
         self.steps.push(Step { kind: "netlist", path: path.into(), summary });
         self.netlist = Some(nl);
+        self.hierarchy = Some(all);
         Ok(())
+    }
+
+    /// Flatten the loaded Verilog netlist into ONE module (see
+    /// [`netlist::CompactDesign::flatten`]): [`Design::netlist`] and [`Design::hierarchy`] then
+    /// hold the flat design. `keep` names modules kept as blocks. Cells are checked against the
+    /// Liberty libraries loaded so far; with none loaded, every cell not defined in the netlist
+    /// is reported.
+    pub fn flatten_netlist(&mut self, keep: &[String]) -> Result<netlist::FlattenReport, DesignError> {
+        let Some(all) = self.hierarchy.as_ref() else {
+            return Err(DesignError("flatten: no Verilog netlist loaded".into()));
+        };
+        let library_cells = (!self.libs.is_empty())
+            .then(|| self.libs.iter().flat_map(|l| l.cells.keys().cloned()).collect());
+        let opts = netlist::FlattenOptions { keep: keep.to_vec(), library_cells };
+        let (flat, report) = all.flatten(&opts);
+        let nl = flat.top_netlist();
+        let mut summary = format!(
+            "flattened {} — {} leaf instances from {} module instances",
+            report.top, report.leaves, report.expanded
+        );
+        if let Some(h) = report.health() {
+            summary.push_str(&format!("; {h}"));
+        }
+        let path = self.steps.iter().rev().find(|s| s.kind == "netlist").map(|s| s.path.clone()).unwrap_or_default();
+        self.steps.push(Step { kind: "flatten", path, summary });
+        self.netlist = Some(nl);
+        self.hierarchy = Some(flat);
+        Ok(report)
     }
 
     /// Load a Yosys JSON netlist (`.json`, from `write_json`). Sets the netlist,
@@ -78,6 +118,7 @@ impl Design {
         );
         self.steps.push(Step { kind: "netlist", path: path.into(), summary });
         self.netlist = Some(nl);
+        self.hierarchy = None;
         Ok(())
     }
 
@@ -304,6 +345,35 @@ mod tests {
         assert!(d.summary().contains("empty"));
         assert!(d.to_json().contains("\"netlist\":null"));
         assert!(d.to_json().contains("\"steps\":[]"));
+    }
+
+    /// The design holds every module of a hierarchical netlist, never only the top, and
+    /// `flatten_netlist` replaces both views with the flat design, checking cells against the
+    /// libraries loaded.
+    #[test]
+    fn a_hierarchical_netlist_is_held_whole_and_flattens() {
+        let dir = std::env::temp_dir().join(format!("loom-design-flat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = dir.join("h.v");
+        std::fs::write(
+            &v,
+            "module sub (a, y); input a; output y; INV u (.A(a), .Y(y)); endmodule\n\
+             module top (a, y); input a; output y; wire n; sub s0 (.a(a), .y(n)); sub s1 (.a(n), .y(y)); endmodule\n",
+        )
+        .unwrap();
+        let mut d = Design::new();
+        assert!(d.flatten_netlist(&[]).is_err(), "nothing to flatten yet");
+        d.load(v.to_str().unwrap()).unwrap();
+        assert_eq!(d.netlist.as_ref().unwrap().insts.len(), 2, "the top's own instances");
+        assert_eq!(d.hierarchy.as_ref().unwrap().modules.len(), 2, "and every module");
+        let rep = d.flatten_netlist(&[]).unwrap();
+        assert_eq!(rep.undefined_cells, [("INV".to_string(), 2)], "no library: reported");
+        let nl = d.netlist.as_ref().unwrap();
+        let names: Vec<&str> = nl.insts.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, ["s0/u", "s1/u"]);
+        assert_eq!(d.hierarchy.as_ref().unwrap().modules.len(), 1, "the flat design");
+        assert_eq!(d.steps.last().unwrap().kind, "flatten");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -136,8 +136,20 @@ impl Netlist {
     pub fn health(&self) -> Option<String> {
         let mut notes = Vec::new();
         if self.modules.len() > 1 {
+            // ⛔ The top's own instances are not the design when some of them are modules: the
+            // cells below them are in the hierarchy, and only a flat netlist has them.
+            let defined: std::collections::HashSet<&str> = self.modules.iter().map(String::as_str).collect();
+            let blocks = self.insts.iter().filter(|x| defined.contains(x.cell.as_str())).count();
+            let below = if blocks > 0 {
+                format!(
+                    " — {blocks} of its instances are modules, whose cells are NOT here: flatten it \
+                     (`netlist::load_flat`, `Design::flatten_netlist`) to see the whole design"
+                )
+            } else {
+                String::new()
+            };
             notes.push(format!(
-                "{} modules in the file; `{}` taken as top (the one nothing instantiates)",
+                "{} modules in the file; `{}` taken as top (the one nothing instantiates){below}",
                 self.modules.len(),
                 self.module
             ));
@@ -192,6 +204,9 @@ impl std::fmt::Display for NetlistError {
     }
 }
 impl std::error::Error for NetlistError {}
+
+mod flatten;
+pub use flatten::{FlattenOptions, FlattenReport};
 
 /// A netlist's tokens, read from a STREAM one at a time — the reference's design: its flex
 /// scanner reads through `igzstream` and hands the parser one token at a time, so neither the
@@ -967,7 +982,8 @@ impl CompactDesign {
 ///
 /// ⛔ **`parse` returns only the top**, and on a hierarchical netlist that is not the design:
 /// every non-top module's ports and instances are gone, so nothing below the top can be traced.
-/// A consumer that walks the hierarchy reads this instead.
+/// A consumer that walks the hierarchy reads this instead, and one that wants the cells reads
+/// [`Design::flatten`] (or [`load_flat`]).
 #[derive(Debug, Clone, Default)]
 pub struct Design {
     /// Every module, in DECLARATION order. The file-wide lists (`modules`, `escaped_names`) are
@@ -1004,8 +1020,13 @@ impl Design {
 
 /// The top module only. See [`parse_all`] for a hierarchical netlist.
 pub fn parse(text: &str) -> Result<Netlist, NetlistError> {
-    let mut d = parse_all(text)?;
-    Ok(d.modules.swap_remove(d.top))
+    Ok(parse_compact(text)?.top_netlist())
+}
+
+/// [`parse`] as ONE flat netlist — see [`load_flat`].
+pub fn parse_flat(text: &str, opts: &FlattenOptions) -> Result<(Netlist, FlattenReport), NetlistError> {
+    let (flat, report) = parse_compact(text)?.flatten(opts);
+    Ok((flat.top_netlist(), report))
 }
 
 /// Every module in the file, and which one is the top.
@@ -2202,9 +2223,21 @@ fn assign_pairs(
     (l.len() == r.len()).then(|| l.into_iter().zip(r).collect())
 }
 
+/// The TOP module only.
+///
+/// ⛔ **On a hierarchical netlist this is not the design**: the cells inside the top's module
+/// instances are not in it ([`Netlist::health`] says so). Read [`load_flat`] for one flat
+/// netlist, or [`load_all`] / [`load_compact`] for the hierarchy.
 pub fn load(path: &str) -> Result<Netlist, NetlistError> {
-    let mut d = load_all(path)?;
-    Ok(d.modules.swap_remove(d.top))
+    // only the top is converted to the owned form, not every module
+    Ok(load_compact(path)?.top_netlist())
+}
+
+/// The whole design as ONE flat netlist — every instance of a module the file defines expanded,
+/// names joined with `/` — and what flattening found. See [`CompactDesign::flatten`].
+pub fn load_flat(path: &str, opts: &FlattenOptions) -> Result<(Netlist, FlattenReport), NetlistError> {
+    let (flat, report) = load_compact(path)?.flatten(opts);
+    Ok((flat.top_netlist(), report))
 }
 
 /// [`load`], keeping every module — see [`Design`]. STREAMED: read through a buffer, and
