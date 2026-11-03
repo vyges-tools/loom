@@ -2108,6 +2108,125 @@ fn unresolved_var(raw: &str, vars: &HashMap<String, String>) -> Option<String> {
     None
 }
 
+/// Why the reference's `create_generated_clock` stops before making the clock, checked in its
+/// order (`sdc/Sdc.tcl`, Errors 374–390), as far as the text decides it. ⛔ Read as a clock anyway,
+/// a PLL output declared with no `-source` (an FPGA tool infers it) became a clock of period 0.
+fn generated_clock_fault(val: &dyn Fn(&str) -> Option<String>, has: &dyn Fn(&str) -> bool, no_objects: bool) -> Option<String> {
+    let int_ge1 = |v: &str| v.trim().parse::<i64>().is_ok_and(|n| n >= 1);
+    let (divide, multiply, edges) = (val("-divide_by"), val("-multiply_by"), val("-edges"));
+    let (divide, multiply, edges) = (divide.as_deref(), multiply.as_deref(), edges.as_deref());
+    let combinational = has("-combinational");
+    if no_objects {
+        return Some("Error 374: empty ports/pins/nets argument".into());
+    }
+    if val("-name").is_none() && has("-add") {
+        return Some("Error 375: -add requires -name".into());
+    }
+    if val("-source").is_none() {
+        return Some("Error 377: missing -source argument".into());
+    }
+    if val("-master_clock").is_some_and(|m| m.trim().is_empty() || m.trim() == "{}") {
+        return Some("Error 378: -master_clock argument empty".into());
+    }
+    if val("-master_clock").is_none() && has("-add") {
+        return Some("Error 379: -add requires -master_clock".into());
+    }
+    if divide.is_some() && multiply.is_some() {
+        return Some("Error 380: -multiply_by and -divide_by options are exclusive".into());
+    }
+    if let Some(d) = divide {
+        if !int_ge1(d) {
+            return Some("Error 381: -divide_by is not an integer greater than one".into());
+        }
+        if combinational && d.trim() != "1" {
+            return Some("Error 382: -combinational implies -divide_by 1".into());
+        }
+    } else if let Some(m) = multiply {
+        if !int_ge1(m) {
+            return Some("Error 383: -multiply_by is not an integer greater than one".into());
+        }
+        if let Some(dc) = val("-duty_cycle").as_deref() {
+            if !dc.trim().parse::<f64>().is_ok_and(|v| (0.0..=100.0).contains(&v)) {
+                return Some("Error 384: -duty_cycle is not a float between 0 and 100".into());
+            }
+        }
+    } else if let Some(e) = edges {
+        let words = list_words(e);
+        let es: Vec<&str> = words.split_whitespace().collect();
+        if es.len() != 3 {
+            return Some("Error 385: -edges only supported for three edges".into());
+        }
+        let nums: Vec<Option<i64>> = es.iter().map(|x| x.parse().ok()).collect();
+        if nums.iter().any(Option::is_none) || nums.windows(2).any(|w| w[1] <= w[0]) {
+            return Some("Error 386: edges times are not monotonically increasing".into());
+        }
+        if let Some(s) = val("-edge_shift") {
+            if list_words(&s).split_whitespace().count() != 3 {
+                return Some("Error 387: -edge_shift length does not match -edges length".into());
+            }
+        }
+    } else if !combinational {
+        return Some("Error 388: missing -multiply_by, -divide_by, -combinational or -edges argument".into());
+    }
+    if has("-invert") && divide.is_none() && multiply.is_none() && !combinational {
+        return Some("Error 389: cannot specify -invert without -multiply_by, -divide_by or -combinational".into());
+    }
+    if val("-duty_cycle").is_some() && multiply.is_none() {
+        return Some("Error 390: -duty_cycle requires -multiply_by value".into());
+    }
+    None
+}
+
+/// `[llength X]` in a condition as Tcl answers it, X a query (`[get_ports -quiet io_te]`, written
+/// in place or through a variable `set` to it) or a plain list. A query is counted on the design
+/// in scope (`parse_with`); with no design, or a query the design cannot answer (clocks), `None`
+/// and the `if` refuses. A flow's `if {[llength $te_port] > 0} { set_case_analysis 0 $te_port }`
+/// guard is how a file stays valid on a block without the port.
+fn subst_llength(cond: &str, vars: &HashMap<String, String>) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = cond;
+    while let Some(k) = rest.find("[llength ") {
+        out.push_str(&rest[..k]);
+        let tail = &rest[k + "[llength ".len()..];
+        let mut depth = 0usize;
+        let mut end = None;
+        for (i, c) in tail.char_indices() {
+            match c {
+                '[' => depth += 1,
+                ']' if depth == 0 => {
+                    end = Some(i);
+                    break;
+                }
+                ']' => depth -= 1,
+                _ => {}
+            }
+        }
+        let e = end?;
+        let arg = tail[..e].trim();
+        let val = match arg.strip_prefix('$') {
+            Some(n) => vars.get(n.trim_start_matches("::").trim_start_matches('{').trim_end_matches('}'))?.clone(),
+            // a literal word in braces is its contents, as Tcl hands it to `llength`
+            None => arg.strip_prefix('{').and_then(|a| a.strip_suffix('}')).unwrap_or(arg).to_string(),
+        };
+        let val = val.trim();
+        let n = match val.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+            Some(q) => {
+                let parts = query_words(q);
+                if !parts.first().is_some_and(|c| c.starts_with("get_") && c != "get_clocks") {
+                    return None;
+                }
+                with_design(|d| crate::sdc_query::eval(&parts, d))?.ok()?.len()
+            }
+            None if val.contains('[') || val.contains('$') => return None,
+            None => tokenize(val).len(),
+        };
+        out.push_str(&n.to_string());
+        rest = &tail[e + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
 /// `[info exists NAME]` in a condition as Tcl answers it: 1 when the variable is set (`::env(X)`
 /// from the process environment, as Tcl reads it), else 0. A flow's `if {[info exists
 /// ::env(CLK_PERIOD_PS)]}` override was refused as undecidable, though nothing in it needs a design.
@@ -2165,7 +2284,10 @@ fn control(raw: &str, vars: &HashMap<String, String>) -> Control {
             let toks = tokenize(raw);
             let mut k = 1;
             while k + 1 < toks.len() {
-                let cond = subst_vars(&subst_info_exists(&toks[k], vars), &as_operands(vars));
+                let Some(counted) = subst_llength(&toks[k], vars) else {
+                    return Control::Refuse("if".into());
+                };
+                let cond = subst_vars(&subst_info_exists(&counted, vars), &as_operands(vars));
                 let mut body = k + 1;
                 if toks.get(body).map(String::as_str) == Some("then") {
                     body += 1;
@@ -3138,6 +3260,10 @@ impl Sdc {
                     );
                     let val = |f: &str| with.iter().find(|(k, _)| *k == f).map(|(_, v)| v.as_str());
                     let has = |f: &str| flags.iter().any(|x| x == f);
+                    if let Some(why) = generated_clock_fault(&|f| val(f).map(str::to_string), &has, pos.is_empty()) {
+                        sdc.rejected.push(format!("create_generated_clock: {why}; not applied"));
+                        continue;
+                    }
                     let sources: Vec<String> = pos.iter().flat_map(|o| resolve_objs(o)).collect();
                     let name = val("-name").map(str::to_string).or_else(|| sources.first().cloned()).unwrap_or_default();
                     let src_obj = val("-source").and_then(|o| resolve_objs(o).into_iter().next());
@@ -4408,6 +4534,54 @@ mod bus_match_tests {
         let d = SdcDesign { ports: (0..3).map(|k| (format!("d[{k}]"), "input".into())).chain([("clk".into(), "input".into())]).collect(), ..Default::default() };
         let parts: Vec<String> = ["get_ports", "-filter", "direction==input", "d"].iter().map(|s| s.to_string()).collect();
         assert_eq!(crate::sdc_query::eval(&parts, &d).unwrap(), ["d[0]", "d[1]", "d[2]"]);
+    }
+
+    /// Rule (Tcl `llength` on the collection a `-quiet` query returns, empty when nothing
+    /// matches): a guard `if {[llength $p] > 0}` runs its body only on a design that has the
+    /// object. Without a design the count is unknown and the `if` refuses, as before.
+    #[test]
+    fn llength_of_a_query_is_counted_on_the_design() {
+        let text = "set te [get_ports -quiet io_te]\n\
+                    if {[llength $te] > 0} {\n  set_input_delay 1 -clock c $te\n}\n\
+                    if {[llength [get_ports -quiet nope]] > 0} {\n  set_input_delay 2 -clock c [get_ports nope]\n}\n\
+                    if {[llength {a b c}] == 3} {\n  set_input_delay 3 -clock c [get_ports clk]\n}\n";
+        let with = |ports: &[&str]| {
+            let d = SdcDesign { ports: ports.iter().map(|p| (p.to_string(), "input".into())).collect(), ..Default::default() };
+            Sdc::parse_with(&format!("create_clock -name c -period 1\n{text}"), &d).unwrap()
+        };
+        let s = with(&["io_te", "clk"]);
+        assert_eq!(s.input_delays.len(), 2, "the io_te guard and the plain list ran: {:?}", s.input_delays);
+        assert!(!s.ignored.iter().any(|i| i == "if"), "{:?}", s.ignored);
+        let s = with(&["clk"]);
+        assert_eq!(s.input_delays.len(), 1, "only the plain-list body: {:?}", s.input_delays);
+        let s = Sdc::parse(&format!("create_clock -name c -period 1\n{text}")).unwrap();
+        assert_eq!(s.ignored.iter().filter(|i| *i == "if").count(), 2, "no design: the two query guards refuse");
+    }
+
+    /// Rule (`create_generated_clock` in the reference's `sdc/Sdc.tcl`): it stops with Error 377
+    /// when `-source` is missing, 388 when no -divide_by/-multiply_by/-edges/-combinational, and
+    /// 380 when both -divide_by and -multiply_by — the clock is never made. A PLL output an FPGA
+    /// tool infers (`create_generated_clock -name clk_main [get_pin pll/CLKOUT0]`) was read as a
+    /// clock of period 0.
+    #[test]
+    fn a_generated_clock_the_reference_refuses_is_not_made() {
+        let base = "create_clock -name m -period 10 [get_ports clk]\n";
+        for (line, code) in [
+            ("create_generated_clock -name g [get_pins pll/CLKOUT0]", "Error 377"),
+            ("create_generated_clock -name g -source [get_ports clk] [get_pins d/Q]", "Error 388"),
+            ("create_generated_clock -name g -source [get_ports clk] -divide_by 2 -multiply_by 2 [get_pins d/Q]", "Error 380"),
+            ("create_generated_clock -name g -source [get_ports clk] -divide_by 0 [get_pins d/Q]", "Error 381"),
+            ("create_generated_clock -name g -source [get_ports clk] -edges {1 3} [get_pins d/Q]", "Error 385"),
+            ("create_generated_clock -name g -source [get_ports clk] -divide_by 2 -duty_cycle 50 [get_pins d/Q]", "Error 390"),
+        ] {
+            let s = Sdc::parse(&format!("{base}{line}\n")).unwrap();
+            assert_eq!(s.clocks.len(), 1, "{line}: not made");
+            assert!(s.rejected.iter().any(|r| r.contains(code)), "{line}: {:?}", s.rejected);
+        }
+        let s = Sdc::parse(&format!("{base}create_generated_clock -name g -source [get_ports clk] -divide_by 2 [get_pins d/Q]\n")).unwrap();
+        assert_eq!(s.clocks.len(), 2);
+        assert_eq!(s.clocks[1].period, 20.0);
+        assert!(s.rejected.is_empty(), "{:?}", s.rejected);
     }
 }
 
