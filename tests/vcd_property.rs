@@ -6,8 +6,8 @@
 //! decides how much power a design burns ought to be checked.
 //!
 //! The generator decides every value change itself, so the expected count is arithmetic — the
-//! reference's (`VcdCount::incrCounts`): every change counts one, a half when either side is
-//! `X`/`Z` (a scalar upper-cased first, a bus bit compared raw, so a bus `x` weighs one). It
+//! reference's (`VcdCount::incrCounts`, OpenSTA cdefd85b): values upper-cased, `0 <-> 1` one,
+//! `X <-> Z` none, any other change a half on a scalar and one on a bus bit. It
 //! deliberately produces the cases that cost us four defects: `x`/`z` excursions, `$dumpoff`
 //! windows (an x-flood and its restore are changes like any other), vectors whose leading zeros
 //! are dropped, and one identifier code shared by two names.
@@ -43,14 +43,16 @@ struct Case {
     expect: BTreeMap<String, f64>,
 }
 
-/// The reference's weight of a change (see the module comment).
-fn weight(prev: char, cur: char) -> f64 {
-    if prev == cur {
+/// The reference's weight of a change (see the module comment): `x_value` 0.5 on a scalar
+/// (`varAppendValue`), 1.0 on a bus bit (`varAppendBusValue`).
+fn weight(prev: char, cur: char, x_value: f64) -> f64 {
+    let (prev, cur) = (prev.to_ascii_uppercase(), cur.to_ascii_uppercase());
+    if prev == cur || matches!((prev, cur), ('X', 'Z') | ('Z', 'X')) {
         0.0
-    } else if matches!(prev, 'X' | 'Z') || matches!(cur, 'X' | 'Z') {
-        0.5
-    } else {
+    } else if matches!(prev, '0' | '1') && matches!(cur, '0' | '1') {
         1.0
+    } else {
+        x_value
     }
 }
 
@@ -118,18 +120,18 @@ fn generate(seed: u64) -> Case {
     // A scalar written as `v`: weigh it against what the reader last saw.
     let see_s = |expect: &mut BTreeMap<String, f64>, cur_s: &mut BTreeMap<String, char>, n: &str, v: char| {
         let v = v.to_ascii_uppercase();
-        let w = weight(cur_s[n], v);
+        let w = weight(cur_s[n], v, 0.5);
         *expect.get_mut(&format!("top.{n}")).unwrap() += w;
         if aliased && n == "s0" {
             *expect.get_mut("top.s0_alias").unwrap() += w;
         }
         cur_s.insert(n.to_string(), v);
     };
-    // A vector written as full-width `bits` (a one-character value fills every bit).
+    // A vector as the reader sees it, full width.
     let see_v = |expect: &mut BTreeMap<String, f64>, cur_v: &mut BTreeMap<String, Vec<char>>, n: &str, bits: &[char]| {
         for (i, b) in bits.iter().enumerate() {
             // bit i of a [vw-1:0] vector is named [vw-1-i]
-            *expect.get_mut(&format!("top.{n}[{}]", vw - 1 - i)).unwrap() += weight(cur_v[n][i], *b);
+            *expect.get_mut(&format!("top.{n}[{}]", vw - 1 - i)).unwrap() += weight(cur_v[n][i], *b, 1.0);
         }
         cur_v.insert(n.to_string(), bits.to_vec());
     };
@@ -215,18 +217,14 @@ fn generate(seed: u64) -> Case {
                 }
             }
             // VCD drops leading ZEROS (a leading 0 kept before an x/z, which the standard would
-            // extend). The reference spreads what was WRITTEN: a one-character value fills
-            // every bit — so `b1` on a wide bus reads as all ones — and a longer one pads with 0.
+            // extend). The reference extends a short value on the left with `0`, or with its
+            // leftmost character when that is `x`/`z` (cdefd85b) — so what it reads is exactly
+            // the `bits` written; a single `1` on a wide bus is `0…01`.
             let mut sv: String = bits.iter().collect();
             while sv.len() > 1 && sv.starts_with('0') && matches!(sv.as_bytes()[1], b'0' | b'1') {
                 sv.remove(0);
             }
-            let read: Vec<char> = if sv.len() == 1 {
-                vec![sv.chars().next().unwrap(); vw]
-            } else {
-                std::iter::repeat_n('0', vw - sv.len()).chain(sv.chars()).collect()
-            };
-            see_v(&mut expect, &mut cur_v, n, &read);
+            see_v(&mut expect, &mut cur_v, n, &bits);
             body.push_str(&format!("b{sv} {c}\n"));
         }
     }

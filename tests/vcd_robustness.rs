@@ -38,13 +38,13 @@ fn a_clean_dump_counts_transitions_not_values() {
     assert!((v.sim_time_s - 40e-9).abs() < 1e-18);
 }
 
-/// **A change to or from `x`/`z` weighs a half** (reference `VcdCount::incrCounts`; a scalar
-/// value is upper-cased first). Every change counts, so an excursion through an unknown and
-/// back is one transition, not none.
+/// **On a scalar, a change to or from `x`/`z`/`u` weighs a half, and `x <-> z` none** (reference
+/// `VcdCount::incrCounts` with `x_value` 0.5, OpenSTA cdefd85b; values upper-cased). An
+/// excursion through an unknown and back is one transition, not none.
 #[test]
 fn unknown_values_weigh_a_half() {
     let through = Vcd::parse(&vcd("$var wire 1 ! n $end\n", "#0\n0!\n#10\nx!\n#20\nz!\n#30\n1!\n")).unwrap();
-    assert_eq!(toggles(&through, "n"), 1.5, "0 -> x -> z -> 1: three halves");
+    assert_eq!(toggles(&through, "n"), 1.0, "0 -> x a half, x -> z none, z -> 1 a half");
 
     let back = Vcd::parse(&vcd("$var wire 1 ! n $end\n", "#0\n0!\n#10\nx!\n#20\n0!\n")).unwrap();
     assert_eq!(toggles(&back, "n"), 1.0, "0 -> x -> 0: two halves");
@@ -115,20 +115,22 @@ fn vector_values_are_left_padded_before_comparison() {
     assert_eq!(toggles(&v, "d[1]"), 1.0);
 }
 
-/// A BUS bit is compared RAW (the reference upper-cases scalar values, not bus bits): a bus `x`
-/// is not `X`, so `0 -> x -> 1` on a bus bit is two full changes, and `X` is the half.
-/// A one-character bus value fills every bit — `b1` on a wide bus reads as all ones.
+/// A BUS bit is upper-cased and any change but `0 <-> 1` (and `X <-> Z`, none) weighs ONE, not a
+/// half (`varAppendBusValue` passes `x_value` 1.0, OpenSTA cdefd85b): `0 -> x -> 1 -> X` is
+/// three. A short bus value extends left with `0` unless its leftmost character is `x`/`z` —
+/// `b1` on a wide bus is `0…01`, no longer all ones.
 #[test]
-fn bus_bits_are_weighed_raw_and_a_single_character_fills() {
+fn bus_bits_weigh_one_and_a_short_value_extends_left() {
     let v = Vcd::parse(&vcd(
         "$var wire 2 \" d [1:0] $end\n",
         "#0\nb00 \"\n#10\nbx0 \"\n#20\nb10 \"\n#30\nbX0 \"\n#40\n",
     ))
     .unwrap();
-    assert_eq!(toggles(&v, "d[1]"), 2.5, "0 -> x and x -> 1 one each, 1 -> X a half");
+    assert_eq!(toggles(&v, "d[1]"), 3.0, "0 -> x, x -> 1, 1 -> X: one each");
     assert_eq!(toggles(&v, "d[0]"), 0.0);
     let f = Vcd::parse(&vcd("$var wire 4 \" d [3:0] $end\n", "#0\nb0 \"\n#10\nb1 \"\n#20\n")).unwrap();
-    assert_eq!(toggles(&f, "d[3]"), 1.0, "b1 fills every bit");
+    assert_eq!(toggles(&f, "d[3]"), 0.0, "b1 is 0001: the high bits extend with 0");
+    assert_eq!(toggles(&f, "d[0]"), 1.0);
 }
 
 /// **The windowing invariant.** Activity over the whole dump must equal the activity of its
@@ -259,8 +261,9 @@ fn the_text_and_binary_readers_agree_on_the_same_simulation() {
 /// IEEE 1164 nine-state values, read as the reference reads them, and the same by both readers.
 ///
 /// A scalar: only `0 1 X U Z` are values (upper-cased); `H`, `L`, `W` and `-` are not read at all.
-/// A bus bit: every character is a value, compared raw. A change weighs one, a half when either
-/// side is `X`/`Z`. The counts below are derived by hand from the fixture, not from either reader.
+/// A bus bit: every character is a value, upper-cased; a change weighs one, `X <-> Z` none
+/// (OpenSTA cdefd85b). The counts below are derived by hand from the fixture and the reference's
+/// `incrCounts`, not from either reader.
 #[test]
 fn nine_state_values_are_read_as_the_reference_reads_them() {
     let v = vyges_loom::vcd::Vcd::load(concat!(
@@ -274,10 +277,10 @@ fn nine_state_values_are_read_as_the_reference_reads_them() {
     // U -> H -> L -> W -> H: after the U nothing is a value the reference reads
     assert_eq!(got("top.weak"), 0.0);
     // UUUU -> HLZ0 -> LH1X -> 0011 -> ZZZZ, per bit, MSB first
-    assert_eq!(got("top.bus[3]"), 3.5, "U H L 0 Z");
-    assert_eq!(got("top.bus[2]"), 3.5, "U L H 0 Z");
-    assert_eq!(got("top.bus[1]"), 1.5, "U Z 1 1 Z");
-    assert_eq!(got("top.bus[0]"), 2.5, "U 0 X 1 Z");
+    assert_eq!(got("top.bus[3]"), 4.0, "U H L 0 Z");
+    assert_eq!(got("top.bus[2]"), 4.0, "U L H 0 Z");
+    assert_eq!(got("top.bus[1]"), 3.0, "U Z 1 1 Z");
+    assert_eq!(got("top.bus[0]"), 4.0, "U 0 X 1 Z");
     // a real is one net, not 64: 1.0 -> 2.5 -> 2.5 -> 3.5 -> 3.5
     assert_eq!(got("top.freq"), 2.0);
     assert!(!v.idx.toggles.keys().any(|k| k.starts_with("top.freq[")), "reals are not bit-expanded");

@@ -7,9 +7,10 @@
 //! keyed by their **full hierarchical path** (`$scope`/`$upscope`), and a netlist net
 //! resolves to one by leaf + optional `scope:` — see [`crate::names`]. Depth reserved: FST.
 //!
-//! Counted as the reference counts a dump: every value change weighs one, a half when either
-//! side is `X`/`Z` (see [`change_weight`], [`scalar_value`], [`bus_bits`]), and the whole-dump
-//! rate divides by the span from the dump's start to its last timestamp.
+//! Counted as the reference counts a dump: a `0 <-> 1` change weighs one, any other change (but
+//! `X <-> Z`, which weighs none) a half on a scalar and one on a bus bit (see [`change_weight`],
+//! [`scalar_value`], [`bus_bits`]), and the whole-dump rate divides by the span from the dump's
+//! start to its last timestamp.
 
 use std::collections::HashMap;
 
@@ -49,7 +50,7 @@ pub struct SweepWindow {
     pub to_s: f64,       // window end, clamped to the dump's end
     pub sim_time_s: f64, // measured duration = to_s - from_s, clamped to the dump
     pub events: u64,     // value-change records inside the window (an activity indicator)
-    pub toggles: std::collections::HashMap<String, f64>, // full path -> transitions (X/Z changes weigh a half)
+    pub toggles: std::collections::HashMap<String, f64>, // full path -> transitions, weighed by `change_weight`
 }
 
 /// A **single-pass** sweep: many measurement windows over one parse of one dump.
@@ -111,13 +112,13 @@ impl WindowActivity<'_> {
         }
     }
 
-    /// Transitions / second for a netlist net by the reference's rule — only a dump entry that
-    /// names a port or an instance pin counts ([`crate::names::PinPaths`]).
+    /// Transitions / second for a netlist net by the reference's VCD rule — a dump entry that
+    /// names a port or an instance pin, else one naming the net ([`crate::names::PinPaths::resolve_vcd`]).
     pub fn pin_rate(&self, pins: &crate::names::PinPaths, net: &str) -> f64 {
         if self.win.sim_time_s <= 0.0 {
             return 0.0;
         }
-        match pins.resolve_path(self.decls, net) {
+        match pins.resolve_path_vcd(self.decls, net) {
             Some(p) => self.win.toggles.get(p).copied().unwrap_or(0.0) / self.win.sim_time_s,
             None => 0.0,
         }
@@ -461,10 +462,10 @@ impl Vcd {
         }
     }
 
-    /// Transitions / second for a netlist net by the reference's rule — only a dump entry that
-    /// names a port or an instance pin counts ([`crate::names::PinPaths`]).
+    /// Transitions / second for a netlist net by the reference's VCD rule — a dump entry that
+    /// names a port or an instance pin, else one naming the net ([`crate::names::PinPaths::resolve_vcd`]).
     pub fn pin_rate(&self, pins: &crate::names::PinPaths, net: &str) -> f64 {
-        match pins.resolve(&self.idx, net) {
+        match pins.resolve_vcd(&self.idx, net) {
             Some(n) if self.sim_time_s > 0.0 => n / self.sim_time_s,
             _ => 0.0,
         }
@@ -640,12 +641,10 @@ fn parse_grid(text: &str, grid: Grid) -> Result<VcdSweep, VcdError> {
     // (`$dumpvars` or a change) — the whole-dump rate divides by `last time - start`.
     let mut start_ticks: f64 = 0.0;
     let mut values_started = false;
-    // Whether the reference has entered its value loop (`parseVarValues`). ⛔ **It enters on
-    // `$dumpvars`, or on the first value-change token outside one — and that token is LOST**: the
-    // value loop starts by reading the NEXT token, so the change that triggered it is never
-    // applied. A dump with no `$dumpvars` loses its first change, and that signal's next change
-    // then reads as its initial value rather than a transition. Transcribed as the reference reads.
-    let mut in_value_loop = false;
+    // The reference enters its value loop (`parseVarValues`) on `$dumpvars`, or on the first
+    // value-change token outside one — and, since OpenSTA d3d25c59, APPLIES that token
+    // (`parseVarValues(token)`; before it the loop read the next token and the first change of a
+    // dump with no `$dumpvars` was lost). Either way the dump's start stops moving there.
     let mut active = grid.active(0.0);
     if let Some((_, hi)) = active {
         grow(&mut buckets, hi)?;
@@ -694,7 +693,6 @@ fn parse_grid(text: &str, grid: Grid) -> Result<VcdSweep, VcdError> {
             // The initial values: from here on a timestamp no longer moves the dump's start.
             "$dumpvars" => {
                 values_started = true;
-                in_value_loop = true;
             }
             "$comment" => {
                 for t in toks.by_ref() {
@@ -733,12 +731,10 @@ fn parse_grid(text: &str, grid: Grid) -> Result<VcdSweep, VcdError> {
                     sym2sig.entry(sym).or_default().push(sig);
                 }
             }
-            _ if !in_value_loop && !tok.starts_with('#') && !tok.starts_with('$') => {
-                // The token that starts the reference's value loop — see `in_value_loop`.
-                in_value_loop = true;
-                values_started = true;
-            }
             _ => {
+                if !tok.starts_with('#') && !tok.starts_with('$') {
+                    values_started = true; // a token outside `$dumpvars` opens the value loop
+                }
                 if let Some(rest) = tok.strip_prefix('#') {
                     // PARSED AS A REAL, NOT AN INTEGER. IEEE 1364 says a timestamp is a
                     // whole number of timescale units, but migen writes `#3.2` and viewers
@@ -774,13 +770,13 @@ fn parse_grid(text: &str, grid: Grid) -> Result<VcdSweep, VcdError> {
                             for sig in sym2sig.get(sym).map(Vec::as_slice).unwrap_or(&[]) {
                                 let Sig::Scalar(full) = sig else { continue };
                                 if let Some(p) = last.insert(full.clone(), v) {
-                                    bump(&mut buckets, active, full, change_weight(p, v));
+                                    bump(&mut buckets, active, full, change_weight(p, v, SCALAR_X_WEIGHT));
                                 }
                             }
                         }
                         'b' | 'B' => {
-                            // Vector change: b<value> <sym> — each bit weighed on its own, on
-                            // the RAW character (`bus_bits`, `change_weight`).
+                            // Vector change: b<value> <sym> — each bit weighed on its own, as a
+                            // bus bit (`bus_bits`, `change_weight` with `BUS_X_WEIGHT`).
                             let value = &tok[1..];
                             values_started = true;
                             if let Some(sym) = toks.next() {
@@ -797,12 +793,14 @@ fn parse_grid(text: &str, grid: Grid) -> Result<VcdSweep, VcdError> {
                                     // form so the two spellings agree on one baseline.
                                     let bits = match sig {
                                         Sig::Scalar(full) => {
-                                            // The value's last character is bit 0, raw.
+                                            // The value's last character is bit 0, read
+                                            // as a bus bit: upper-cased, `BUS_X_WEIGHT`.
                                             let Some(v) = value.chars().next_back() else {
                                                 continue;
                                             };
+                                            let v = v.to_ascii_uppercase();
                                             if let Some(p) = last.insert(full.clone(), v) {
-                                                bump(&mut buckets, active, full, change_weight(p, v));
+                                                bump(&mut buckets, active, full, change_weight(p, v, BUS_X_WEIGHT));
                                             }
                                             continue;
                                         }
@@ -827,7 +825,7 @@ fn parse_grid(text: &str, grid: Grid) -> Result<VcdSweep, VcdError> {
                                         if i < prev.len() {
                                             let was = prev[i];
                                             if was != '\0' {
-                                                bump(&mut buckets, active, &bits[i], change_weight(was, c));
+                                                bump(&mut buckets, active, &bits[i], change_weight(was, c, BUS_X_WEIGHT));
                                             }
                                             prev[i] = c;
                                         }
@@ -1031,18 +1029,25 @@ pub(crate) fn scalar_value(c: char) -> Option<char> {
     matches!(c, '0' | '1' | 'X' | 'U' | 'Z').then_some(c)
 }
 
-/// The weight of one value change, as the reference counts it (`VcdCount::incrCounts`): none
-/// for no change, half when either side is `X` or `Z`, otherwise one — so `0 -> x -> 0` is one
-/// transition and an initial `x` settling to `0` is a half. The first value of a signal is never
-/// a change. A SCALAR value is upper-cased before it gets here and a BUS bit is not (the
-/// reference compares the raw character), so a bus bit `x` is not `X` and `x -> 0` weighs one.
-pub(crate) fn change_weight(prev: char, cur: char) -> f64 {
-    if prev == cur {
+/// What a change to or from a non-`0`/`1` value weighs on a SCALAR variable
+/// (`VcdCountReader::varAppendValue` passes `x_value` 0.5).
+pub(crate) const SCALAR_X_WEIGHT: f64 = 0.5;
+/// What it weighs on a BUS bit (`varAppendBusValue` passes 1.0) — a one-bit variable dumped in
+/// vector form (`b0 !`) is read as a bus by the reference, so it weighs this too.
+pub(crate) const BUS_X_WEIGHT: f64 = 1.0;
+
+/// The weight of one value change, as the reference counts it (`VcdCount::incrCounts`, OpenSTA
+/// cdefd85b): both sides upper-cased; none for no change and none for `X <-> Z`; one between
+/// `0` and `1`; otherwise (either side `X`, `Z`, `U`, …) `x_value` — [`SCALAR_X_WEIGHT`] or
+/// [`BUS_X_WEIGHT`]. The first value of a signal is never a change.
+pub(crate) fn change_weight(prev: char, cur: char, x_value: f64) -> f64 {
+    let (prev, cur) = (prev.to_ascii_uppercase(), cur.to_ascii_uppercase());
+    if prev == cur || matches!((prev, cur), ('X', 'Z') | ('Z', 'X')) {
         0.0
-    } else if matches!(prev, 'X' | 'Z') || matches!(cur, 'X' | 'Z') {
-        0.5
-    } else {
+    } else if matches!(prev, '0' | '1') && matches!(cur, '0' | '1') {
         1.0
+    } else {
+        x_value
     }
 }
 
@@ -1059,18 +1064,20 @@ fn parse_range(range: Option<&str>) -> Option<(i64, i64)> {
 }
 
 /// A bus value spread over `width` bits, MSB first, as the reference spreads it
-/// (`varAppendBusValue`): a one-character value fills every bit; a shorter value pads its HIGH
-/// bits with `0` (a leading `x`/`z` is not extended); a longer one keeps its low bits. The
-/// characters are kept raw — see [`change_weight`].
+/// (`varAppendBusValue`, OpenSTA cdefd85b): every character upper-cased; a shorter value is
+/// extended on the left (IEEE 1364 §18.2.1) with its leftmost character when that is `X` or
+/// `Z`, else with `0` — so `b1` on four bits is `0001` and `bx` is `XXXX`; a longer one keeps
+/// its low bits.
 pub(crate) fn bus_bits(value: &str, width: usize) -> Vec<char> {
-    let chars: Vec<char> = value.chars().collect();
-    if chars.len() == 1 {
-        return vec![chars[0]; width];
-    }
+    let chars: Vec<char> = value.chars().map(|c| c.to_ascii_uppercase()).collect();
     if chars.len() >= width {
         return chars[chars.len() - width..].to_vec();
     }
-    let mut out = vec!['0'; width - chars.len()];
+    let extend = match chars.first() {
+        Some(&c @ ('X' | 'Z')) => c,
+        _ => '0',
+    };
+    let mut out = vec![extend; width - chars.len()];
     out.extend(chars);
     out
 }
@@ -1093,23 +1100,51 @@ mod tests {
         assert!(v.toggle_rate("ctrl.state.out[1]") > 0.0);
     }
 
-    /// Reference rule (`VcdParse::read`, `parseVarValues`): outside `$dumpvars`, the first
-    /// value-change token starts the value loop and is itself discarded — the loop begins by
-    /// reading the NEXT token. Witnessed on the reference (`upstream-net-var`): `a` is dumped
-    /// 0,1,0,1,0 at 0/10/20/30/40 ns with no `$dumpvars`, the `0` at 0 ns is never applied, the
-    /// `1` at 10 ns becomes its initial value, and it reads THREE transitions, not four. `y`,
-    /// dumped after it, keeps its initial value and both changes.
+    /// Reference rule (`VcdParse::read` -> `parseVarValues(token)`, OpenSTA d3d25c59): outside
+    /// `$dumpvars`, the first value-change token starts the value loop AND is applied. Witnessed
+    /// on the reference at 4155ac31 (`upstream-net-var`): `a` is dumped 0,1,0,1,0 at
+    /// 0/10/20/30/40 ns with no `$dumpvars` and reads FOUR transitions. (Before d3d25c59 the loop
+    /// began by reading the next token, the `0` at 0 ns was lost and `a` read three.)
     #[test]
-    fn without_dumpvars_the_first_value_change_is_lost() {
+    fn without_dumpvars_the_first_value_change_still_counts() {
         let text = "$timescale 1ns $end\n$scope module tb $end\n$scope module top $end\n\
              $var wire 1 ! a $end\n$var wire 1 # y $end\n$upscope $end\n$upscope $end\n\
              $enddefinitions $end\n#0\n0!\n0#\n#10\n1!\n1#\n#20\n0!\n0#\n#30\n1!\n#40\n0!\n#100\n";
         let v = Vcd::parse(text).unwrap();
-        assert_eq!(v.idx.toggles.get("tb.top.a").copied(), Some(3.0));
+        assert_eq!(v.idx.toggles.get("tb.top.a").copied(), Some(4.0));
         assert_eq!(v.idx.toggles.get("tb.top.y").copied(), Some(2.0));
-        // with `$dumpvars` nothing is lost
+        // the same with `$dumpvars`
         let v = Vcd::parse(&text.replace("#0\n0!", "#0\n$dumpvars\n0!")).unwrap();
         assert_eq!(v.idx.toggles.get("tb.top.a").copied(), Some(4.0));
+    }
+
+    /// Reference rules (`VcdCount::incrCounts`, `varAppendBusValue`, OpenSTA cdefd85b), with the
+    /// reference's own counts at 4155ac31 (`upstream-vcd-rules-4155`, read_vcd debug level 1):
+    /// - values are upper-cased; `X <-> Z` is no change; `0 <-> 1` weighs one;
+    /// - any other change weighs a half on a scalar and ONE on a bus bit;
+    /// - a short bus value extends left with its leftmost character when it is `X`/`Z`, else
+    ///   with `0` (`b1` on four bits is `0001`, not `1111`);
+    /// - a token that ends at EOF (`#100`, no newline) is read (`getToken`, d3d25c59).
+    #[test]
+    fn bus_extension_and_change_weights_are_the_references() {
+        let text = "$timescale 1ns $end\n$scope module tb $end\n$scope module dut $end\n\
+             $var wire 4 ! d [3:0] $end\n$var wire 1 \" e $end\n$upscope $end\n$upscope $end\n\
+             $enddefinitions $end\n#0\nb0 !\n0\"\n#10\nb1 !\n1\"\n#20\nbx !\nx\"\n#30\nbz1 !\nz\"\n\
+             #40\nb10 !\n0\"\n#50\nbX0 !\nu\"\n#60\nb0x0x !\n1\"\n#100";
+        let v = Vcd::parse(text).unwrap();
+        let t = |n: &str| v.idx.toggles.get(n).copied().unwrap_or(0.0);
+        // reference: d[0] 5, d[1] 4, d[2] 3, d[3] 4, e 3.0, over 100 ns
+        assert_eq!([t("tb.dut.d[0]"), t("tb.dut.d[1]"), t("tb.dut.d[2]"), t("tb.dut.d[3]")], [5.0, 4.0, 3.0, 4.0]);
+        assert_eq!(t("tb.dut.e"), 3.0, "e: 1 + 0.5 (1->X) + 0 (X->Z) + 0.5 + 0.5 (0->U) + 0.5 (U->1)");
+        assert!((v.sim_time_s - 100e-9).abs() < 1e-15, "the EOF token #100 is read: {}", v.sim_time_s);
+        assert_eq!(bus_bits("1", 4), ['0', '0', '0', '1']);
+        assert_eq!(bus_bits("x", 3), ['X', 'X', 'X']);
+        assert_eq!(bus_bits("z1", 4), ['Z', 'Z', 'Z', '1']);
+        assert_eq!(bus_bits("10x", 2), ['0', 'X'], "a longer value keeps its low bits");
+        assert_eq!(change_weight('x', 'Z', BUS_X_WEIGHT), 0.0);
+        assert_eq!(change_weight('U', '1', SCALAR_X_WEIGHT), 0.5);
+        assert_eq!(change_weight('x', '0', SCALAR_X_WEIGHT), 0.5);
+        assert_eq!(change_weight('x', '0', BUS_X_WEIGHT), 1.0);
     }
 
     const VCD: &str = r#"

@@ -44,7 +44,7 @@ use std::collections::HashMap;
 /// Shared storage/resolution for both the VCD and SAIF readers.
 #[derive(Clone, Default)]
 pub struct NetIndex {
-    pub toggles: HashMap<String, f64>, // full hierarchical path -> transition count (a VCD X/Z change weighs a half)
+    pub toggles: HashMap<String, f64>, // full hierarchical path -> transition count (weighed by `vcd::change_weight`)
     pub by_leaf: HashMap<String, Vec<String>>, // leaf name -> declared full paths
     pub scope: Option<String>,         // design instance path (job `scope:`)
 }
@@ -149,12 +149,13 @@ impl NetIndex {
 /// The dumped names that may carry a netlist net's activity: the reference's rule for which
 /// dump entries annotate the design.
 ///
-/// 🔑 **The reference annotates PINS, never nets.** Its VCD reader looks each variable up as a pin
-/// (`findPin` on the variable's path below the scope) and its SAIF reader looks each `NET` entry
-/// up as a pin of the enclosing instance. So an entry counts only when it names a **top-level
-/// port** or a **leaf instance's pin** (`inst/pin`, spelled `inst.pin` in a dump path). An entry
-/// naming a bare internal net — `n1` between `u1/X` and `u2/A` — matches no pin and is dropped,
-/// whatever it toggles; so is a power/ground pin. Keyed by net here because the consumers are:
+/// 🔑 **The reference annotates PINS.** Its SAIF reader looks each `NET` entry up as a pin of the
+/// enclosing instance, so a SAIF entry counts only when it names a **top-level port** or a
+/// **leaf instance's pin** (`inst/pin`, spelled `inst.pin` in a dump path); an entry naming a
+/// bare internal net — `n1` between `u1/X` and `u2/A` — is dropped, and so is a power/ground pin
+/// ([`PinPaths::resolve`]). Its VCD reader does the same, and since OpenSTA d3d25c59 a VCD
+/// variable that names a NET also annotates every pin of that net without a variable of its
+/// own (`VcdCountReader::addVarPin`) — [`PinPaths::resolve_vcd`]. Keyed by net here because the consumers are:
 /// a net's rate is the first of its candidates the dump carries — its port, then its instance
 /// pins in netlist order (the reference gives each pin its own entry; every pin of one net
 /// carries one signal, so they agree unless the dump itself disagrees).
@@ -190,6 +191,22 @@ impl PinPaths {
     /// The transition count of `net` in `idx` by this rule.
     pub fn resolve(&self, idx: &NetIndex, net: &str) -> Option<f64> {
         let path = self.resolve_path(idx, net)?;
+        Some(idx.toggles.get(path).copied().unwrap_or(0.0))
+    }
+
+    /// [`PinPaths::resolve_path`] by the VCD reader's rule: a port or pin entry first, else an
+    /// entry naming the net itself — it annotates the net's pins that have no entry of their own
+    /// (OpenSTA d3d25c59, `addVarPin`), and a net with no annotatable pin annotates nothing.
+    pub fn resolve_path_vcd<'a>(&self, idx: &'a NetIndex, net: &str) -> Option<&'a str> {
+        let cands = self.by_net.get(net)?;
+        cands.iter().find_map(|cand| idx.resolve_path(cand)).or_else(|| idx.resolve_path(net))
+    }
+
+    /// The transition count of `net` in `idx` by the VCD reader's rule ([`resolve_path_vcd`]).
+    ///
+    /// [`resolve_path_vcd`]: PinPaths::resolve_path_vcd
+    pub fn resolve_vcd(&self, idx: &NetIndex, net: &str) -> Option<f64> {
+        let path = self.resolve_path_vcd(idx, net)?;
         Some(idx.toggles.get(path).copied().unwrap_or(0.0))
     }
 }
@@ -286,11 +303,13 @@ mod tests {
     const PROBE_V: &str = "module top (a, y);\n input a; output y; wire n1;\n \
         buf1 u1 (.A(a), .X(n1));\n buf1 u2 (.A(n1), .X(y));\nendmodule\n";
 
-    /// Reference rule (VCD reader, `addVarPin`): a variable annotates only through `findPin` on
-    /// its path below the scope — a top-level port or a leaf instance pin. A variable naming the
-    /// internal net `n1` annotates nothing; `a` and `y` annotate their ports.
+    /// Reference rule (VCD reader, `VcdCountReader::addVarPin`, OpenSTA d3d25c59): a variable
+    /// naming the internal NET `n1` annotates the net's pins (u1/X, u2/A — neither has a variable
+    /// of its own); `a` and `y` annotate their ports. Before d3d25c59 only `findPin` was tried
+    /// and `n1` annotated nothing. `a` counts all 4 of its changes: the dump has no `$dumpvars`,
+    /// and since the same commit the first value-change token is applied, not lost.
     #[test]
-    fn a_dump_entry_naming_an_internal_net_annotates_nothing() {
+    fn a_dump_entry_naming_an_internal_net_annotates_its_pins() {
         let nl = crate::netlist::parse(PROBE_V).unwrap();
         let pins = PinPaths::new(&nl, |_, _| false);
         let vcd = crate::vcd::Vcd::parse(
@@ -301,13 +320,14 @@ mod tests {
         )
         .unwrap()
         .with_scope(Some("tb.top".into()));
-        // The reference's own figure: 3 transitions, not the 4 dumped — the dump has no
-        // `$dumpvars`, so `a`'s first change is lost (see the VCD reader's `in_value_loop`).
-        assert!((vcd.pin_rate(&pins, "a") - 3.0e7).abs() < 1.0, "port a: 3 transitions / 100 ns");
+        // The reference's own figures at 4155ac31 (upstream-net-var witness): a 4, n1 2, y 2.
+        assert!((vcd.pin_rate(&pins, "a") - 4.0e7).abs() < 1.0, "port a: 4 transitions / 100 ns");
         assert!((vcd.pin_rate(&pins, "y") - 2.0e7).abs() < 1.0, "port y: 2 toggles / 100 ns");
-        assert_eq!(vcd.pin_rate(&pins, "n1"), 0.0, "n1 is no pin: dropped");
-        // the net-keyed reading the rule replaces gives n1 the dumped rate
-        assert!(vcd.toggle_rate("n1") > 0.0);
+        assert!((vcd.pin_rate(&pins, "n1") - 2.0e7).abs() < 1.0, "the net var reaches n1's pins");
+        // the SAIF rule (pins only) still drops it
+        assert_eq!(pins.resolve(&vcd.idx, "n1"), None, "n1 is no pin");
+        // a net with no annotatable pin annotates nothing, whatever the dump names
+        assert_eq!(pins.resolve_vcd(&vcd.idx, "no_such_net"), None);
     }
 
     /// The other side of the same rule: a variable naming an instance PIN (`u1/X`, dumped as

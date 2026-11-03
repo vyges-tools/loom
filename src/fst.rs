@@ -46,7 +46,7 @@ use std::collections::HashMap;
 
 use crate::lz4;
 use crate::names::NetIndex;
-use crate::vcd::{build_sig, change_weight, join_scope, scalar_value, Sig};
+use crate::vcd::{build_sig, change_weight, join_scope, scalar_value, Sig, BUS_X_WEIGHT, SCALAR_X_WEIGHT};
 
 #[derive(Debug, Clone, Default)]
 pub struct Fst {
@@ -72,10 +72,10 @@ impl Fst {
         }
     }
 
-    /// Transitions / second for a netlist net by the reference's rule — only a dump entry that
-    /// names a port or an instance pin counts ([`crate::names::PinPaths`]).
+    /// Transitions / second for a netlist net by the reference's VCD rule — a dump entry that
+    /// names a port or an instance pin, else one naming the net ([`crate::names::PinPaths::resolve_vcd`]).
     pub fn pin_rate(&self, pins: &crate::names::PinPaths, net: &str) -> f64 {
-        match pins.resolve(&self.idx, net) {
+        match pins.resolve_vcd(&self.idx, net) {
             Some(n) if self.sim_time_s > 0.0 => n / self.sim_time_s,
             _ => 0.0,
         }
@@ -651,7 +651,7 @@ fn decode_chain(
             let Some(val) = scalar_value(val) else { continue }; // not a value the reference reads
             if let Some(was) = prev {
                 if in_window(time_index) && !sets_first(time_index) {
-                    count += change_weight(was, val);
+                    count += change_weight(was, val, SCALAR_X_WEIGHT);
                 }
             }
             prev = Some(val);
@@ -660,7 +660,7 @@ fn decode_chain(
     } else {
         // multi-bit: varint(tdelta<<1 | has_xz) then packed BE bytes (has_xz=0) or ASCII.
         let nbytes = width.div_ceil(8);
-        // Bits are weighed on their RAW characters, as the VCD reader weighs a bus bit.
+        // Bits are weighed as the VCD reader weighs a bus bit (`BUS_X_WEIGHT`).
         let mut prev: Option<Vec<char>> =
             initial.filter(|v| v.len() == width).map(|v| v.iter().map(|&b| b as char).collect());
         let mut counts = vec![0.0f64; width];
@@ -709,7 +709,7 @@ fn decode_chain(
             if let Some(prev) = &prev {
                 if in_window(time_index) && !sets_first(time_index) {
                     for (i, (a, b)) in cur.iter().zip(prev).enumerate() {
-                        counts[i] += change_weight(*b, *a);
+                        counts[i] += change_weight(*b, *a, BUS_X_WEIGHT);
                     }
                 }
             }
@@ -917,7 +917,7 @@ mod tests {
 
     /// A scalar written in nine-state codes, read as the reference reads a scalar: only
     /// `0 1 X U Z` are values, so `H`, `L` and `W` are not read at all, and `U` is a value
-    /// (a change to or from it weighs one).
+    /// (a change to or from it weighs a half, as `X` does — OpenSTA cdefd85b).
     ///
     /// Straight at `decode_chain`, because the conversion path drops these — the codes are
     /// `FST_RCV_*`, `1 | (state << 1) | (tdelta << 4)`, with the state indexing "xzhuwl-?".
@@ -928,9 +928,9 @@ mod tests {
         };
         // u (frame) -> H -> L -> W -> H: nothing after the frame is a value
         assert_eq!(run(&[0x00, 0x15, 0x1b, 0x19, 0x15], b"u"), vec![0.0]);
-        // u (frame) -> 1 -> x -> 0: U->1 weighs one, 1->X and X->0 a half each
+        // u (frame) -> 1 -> x -> 0: U->1, 1->X and X->0 a half each
         // (`1` = 0b10 | td 1 << 2 = 0x06; `x` = 1 | 0<<1 | 1<<4 = 0x11; `0` = 1<<2 = 0x04)
-        assert_eq!(run(&[0x00, 0x06, 0x11, 0x04], b"u"), vec![2.0]);
+        assert_eq!(run(&[0x00, 0x06, 0x11, 0x04], b"u"), vec![1.5]);
     }
 
     /// The same waveform in FST form must produce the same counts as `ninestate.vcd`, whose
@@ -953,12 +953,12 @@ mod tests {
         // SCALAR (GTKWave's own fst2vcd reads the same file back with no changes for it), so the
         // fixture cannot carry them. The vector below does round-trip them, and the scalar path
         // is covered directly by `nine_state_scalar_levels_are_weak_ones_and_zeros`.
-        // Bus bits weighed raw, as the reference weighs them: U H L 0 Z / U L H 1 Z / U Z 1 1 Z /
-        // U 0 X 1 Z — a change weighs one, a half when either side is `X`/`Z`.
-        assert_eq!(got("top.bus[3]"), 3.5);
-        assert_eq!(got("top.bus[2]"), 3.5);
-        assert_eq!(got("top.bus[1]"), 1.5);
-        assert_eq!(got("top.bus[0]"), 2.5);
+        // Bus bits as the reference weighs them: U H L 0 Z / U L H 1 Z / U Z 1 1 Z /
+        // U 0 X 1 Z — every change weighs one on a bus bit, `X <-> Z` none (cdefd85b).
+        assert_eq!(got("top.bus[3]"), 4.0);
+        assert_eq!(got("top.bus[2]"), 4.0);
+        assert_eq!(got("top.bus[1]"), 3.0);
+        assert_eq!(got("top.bus[0]"), 4.0);
         assert_eq!(
             got("top.freq"),
             2.0,
