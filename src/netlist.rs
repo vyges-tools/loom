@@ -1092,8 +1092,139 @@ fn mark_escaped(pool: &mut StrPool, bits: &mut Vec<u64>, tok: &[u8]) {
 /// [`parse_compact`] from a STREAM: neither the file nor an owned copy of any module is held,
 /// only the compact design.
 pub fn parse_compact_reader<R: std::io::BufRead>(r: R) -> Result<CompactDesign, NetlistError> {
+    parse_compact_reader_top(r, None)
+}
+
+/// [`parse_compact`] with the TOP named, as `link_design <top>` names it — see [`pick_top`].
+pub fn parse_compact_top(text: &str, top: &str) -> Result<CompactDesign, NetlistError> {
+    parse_compact_reader_top(text.as_bytes(), Some(top))
+}
+
+/// [`parse_all`] with the TOP named — see [`pick_top`].
+pub fn parse_all_top(text: &str, top: &str) -> Result<Design, NetlistError> {
+    Ok(parse_compact_top(text, top)?.to_design())
+}
+
+/// How much of the file's start is kept for its header comment — see [`header_hint`].
+const HEAD_BYTES: usize = 8 << 10;
+
+/// A stream that keeps a copy of the first [`HEAD_BYTES`] it hands over: the writer's header
+/// comment, which the lexer drops.
+struct Head<R> {
+    r: R,
+    head: Vec<u8>,
+}
+
+impl<R: std::io::BufRead> std::io::Read for Head<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let n = std::io::Read::read(&mut self.r, out)?;
+        let room = HEAD_BYTES.saturating_sub(self.head.len()).min(n);
+        self.head.extend_from_slice(&out[..room]);
+        Ok(n)
+    }
+}
+
+impl<R: std::io::BufRead> std::io::BufRead for Head<R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        self.r.fill_buf()
+    }
+
+    fn consume(&mut self, n: usize) {
+        let room = HEAD_BYTES.saturating_sub(self.head.len()).min(n);
+        if room > 0 {
+            if let Ok(b) = self.r.fill_buf() {
+                let room = room.min(b.len());
+                self.head.extend_from_slice(&b[..room]);
+            }
+        }
+        self.r.consume(n);
+    }
+}
+
+/// The names a writer's header comment gives the design, before the first `module`: a comment
+/// line `Block Name : X`, `Design : X`, `Top module = X` and the like. Only a HINT — see
+/// [`pick_top`].
+fn header_hint(head: &[u8]) -> Vec<String> {
+    const KEYS: [&str; 8] = ["block name", "design name", "top module", "module name", "top", "design", "block", "module"];
+    let text = String::from_utf8_lossy(head);
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.starts_with("module ") || t == "module" {
+            break;
+        }
+        let Some(c) = t.strip_prefix("//").or_else(|| t.strip_prefix("/*")).or_else(|| t.strip_prefix('*')) else {
+            continue;
+        };
+        let c = c.trim_start_matches(['*', '/', ' ', '\t']);
+        let low = c.to_ascii_lowercase();
+        for k in KEYS {
+            let Some(rest) = low.strip_prefix(k) else { continue };
+            let after = rest.trim_start();
+            if let Some(v) = after.strip_prefix(':').or_else(|| after.strip_prefix('=')) {
+                // the value as written (not lowercased): the same offset in `c`
+                let at = c.len() - v.len();
+                if let Some(name) = c[at..].split_whitespace().next() {
+                    let name = name.trim_end_matches([';', ',', '.', '"', '\'']).trim_start_matches(['"', '\'']);
+                    if !name.is_empty() {
+                        out.push(name.to_string());
+                    }
+                }
+            }
+            break;
+        }
+    }
+    out
+}
+
+/// The TOP module: the one named, or else the one no other module instantiates.
+///
+/// 🔑 **Named, it is what the reference's `link_design <top>` links**, and a name the file does
+/// not define is an error, as it is there.
+///
+/// ⛔ **Unnamed, more than one candidate is REFUSED**, with the candidates listed. A netlist
+/// written before mapping carries library modules nothing instantiates (datapath operators and
+/// the like) beside the real top; taking the first such module returned a five-port subtractor as
+/// the design, silently. The one exception is the writer's header comment: when it names exactly
+/// one of the candidates (`// Block Name : chip`), that one is taken — see [`header_hint`].
+///
+/// When every module is instantiated by another (a cycle), the last one is taken, as before.
+fn pick_top(mods: &[CompactModule], pool: &StrPool, top: Option<&str>, head: &[u8]) -> Result<usize, NetlistError> {
+    if let Some(name) = top {
+        // the last definition of a name is the one kept, and the only one left by now
+        return mods.iter().position(|m| pool.get(m.name) == name).ok_or_else(|| {
+            NetlistError(format!("top `{name}` is not a module of the netlist ({} module(s) in it)", mods.len()))
+        });
+    }
+    let instantiated: std::collections::HashSet<Sym> = mods.iter().flat_map(|m| m.insts.iter().map(|x| x.cell)).collect();
+    let roots: Vec<usize> = (0..mods.len()).filter(|&k| !instantiated.contains(&mods[k].name)).collect();
+    match roots[..] {
+        [] => Ok(mods.len() - 1),
+        [k] => Ok(k),
+        _ => {
+            let hints = header_hint(head);
+            let named: Vec<usize> = roots.iter().copied().filter(|&k| hints.iter().any(|h| h == pool.get(mods[k].name))).collect();
+            if let [k] = named[..] {
+                return Ok(k);
+            }
+            let mut names: Vec<&str> = roots.iter().take(20).map(|&k| pool.get(mods[k].name)).collect();
+            let more = roots.len().saturating_sub(20);
+            let tail = if more > 0 { format!(", and {more} more") } else { String::new() };
+            names.sort_unstable();
+            Err(NetlistError(format!(
+                "{} modules are instantiated by no other module, so the top is ambiguous: {}{tail} — \
+                 name the top (`load_all_top`, `load_compact_top`, `Design::netlist_top`)",
+                roots.len(),
+                names.join(", ")
+            )))
+        }
+    }
+}
+
+/// [`parse_compact_reader`] with the top named or not — see [`pick_top`].
+fn parse_compact_reader_top<R: std::io::BufRead>(r: R, top: Option<&str>) -> Result<CompactDesign, NetlistError> {
     let io = |e: std::io::Error| NetlistError(e.to_string());
-    let mut lx = Lexer::new(r);
+    let mut lx = Lexer::new(Head { r, head: Vec::new() });
     let mut pool = StrPool::default();
     let mut escaped = Vec::new();
     // an escaped name that reads as syntax was tagged (see `keep_escape`); untagged at the end
@@ -1190,13 +1321,7 @@ pub fn parse_compact_reader<R: std::io::BufRead>(r: R) -> Result<CompactDesign, 
 
     // TOP is the module no other module instantiates. That is the definition, and it does not
     // depend on declaration order — which is the only thing position could have told us.
-    let instantiated: std::collections::HashSet<Sym> = mods.iter().flat_map(|m| m.insts.iter().map(|x| x.cell)).collect();
-    let top = mods
-        .iter()
-        .position(|m| !instantiated.contains(&m.name))
-        // Every module instantiated by another (mutual recursion, or a single module that
-        // instantiates itself) — fall back to the last, which is the usual emission order.
-        .unwrap_or(mods.len() - 1);
+    let top = pick_top(&mods, &pool, top, &lx.r.head)?;
 
     // ⛔ ONCE, on the top. Both describe the FILE, and a copy on every module is a list of n
     // names times n modules: tens of gigabytes on a netlist of tens of thousands of modules.
@@ -2249,8 +2374,23 @@ pub fn load_all(path: &str) -> Result<Design, NetlistError> {
 
 /// [`load_all`] in the COMPACT form — see [`CompactDesign`]. Streamed, as [`load_all`] is.
 pub fn load_compact(path: &str) -> Result<CompactDesign, NetlistError> {
+    load_compact_opt(path, None)
+}
+
+/// [`load_compact`] with the TOP named, as `link_design <top>` names it — see [`pick_top`].
+pub fn load_compact_top(path: &str, top: &str) -> Result<CompactDesign, NetlistError> {
+    load_compact_opt(path, Some(top))
+}
+
+/// [`load_all`] with the TOP named — see [`pick_top`].
+pub fn load_all_top(path: &str, top: &str) -> Result<Design, NetlistError> {
+    Ok(load_compact_top(path, top)?.to_design())
+}
+
+/// [`load_compact`], the top named or not.
+pub fn load_compact_opt(path: &str, top: Option<&str>) -> Result<CompactDesign, NetlistError> {
     let err = |e: String| NetlistError(format!("{path}: {e}"));
-    parse_compact_reader(open(path).map_err(|e| err(e.to_string()))?).map_err(|e| err(e.0))
+    parse_compact_reader_top(open(path).map_err(|e| err(e.to_string()))?, top).map_err(|e| err(e.0))
 }
 
 /// A netlist file as a buffered byte stream, inflated on the fly when it is gzip.
@@ -2417,6 +2557,43 @@ endmodule
         assert_eq!(d.module_names(), ["leaf", "mid", "chip"]);
         assert_eq!(parse(src).unwrap().modules, ["leaf", "mid", "chip"]);
         assert!(mid.modules.is_empty() && leaf.modules.is_empty());
+    }
+
+    /// Rule: with no top named, MORE THAN ONE module that nothing instantiates is refused, the
+    /// candidates listed — the first was taken, and an orphan library module became the design.
+    /// Named (`link_design <top>`), the named one is the top, and an unknown name is an error.
+    #[test]
+    fn an_ambiguous_top_is_refused_and_a_named_one_is_taken() {
+        let src = "module sub_dp (a, b, y); input a, b; output y; XOR2 x (.A(a), .B(b), .Y(y)); endmodule\n\
+                   module add_dp (a, y); input a; output y; INV i (.A(a), .Y(y)); endmodule\n\
+                   module chip (a, y); input a; output y; add_dp u (.a(a), .y(y)); endmodule\n";
+        let err = parse_compact(src).unwrap_err().0;
+        assert!(err.contains("2 modules are instantiated by no other module"), "{err}");
+        assert!(err.contains("chip, sub_dp"), "{err}");
+        assert!(parse(src).is_err());
+        let d = parse_compact_top(src, "chip").unwrap();
+        assert_eq!(d.str(d.top().name), "chip");
+        assert_eq!(parse_all_top(src, "sub_dp").unwrap().top().module, "sub_dp");
+        let err = parse_compact_top(src, "nosuch").unwrap_err().0;
+        assert!(err.contains("top `nosuch` is not a module"), "{err}");
+    }
+
+    /// Rule: a writer's header comment that names exactly ONE of the candidate tops picks it;
+    /// a name that is not a candidate, or none, leaves the refusal standing.
+    #[test]
+    fn the_header_comment_breaks_a_tie_between_tops() {
+        let body = "module sub_dp (a, y); input a; output y; INV i (.A(a), .Y(y)); endmodule\n\
+                    module chip (a, y); input a; output y; BUF b (.A(a), .X(y)); endmodule\n";
+        let named = format!("/*****\n * Block Name : chip\n * Date : today\n *****/\n{body}");
+        assert_eq!(parse(&named).unwrap().module, "chip");
+        let slashes = format!("// Design: chip;\n{body}");
+        assert_eq!(parse(&slashes).unwrap().module, "chip");
+        let other = format!("// Block Name : nosuch\n{body}");
+        assert!(parse(&other).is_err());
+        // only before the first module: a comment inside one is not the header
+        let late = format!("{body}// Block Name : chip\n");
+        assert!(parse(&late).is_err());
+        assert_eq!(header_hint(b"// Top module = \"chip\"\n// Module: x\nmodule y;"), ["chip", "x"]);
     }
 
     /// Rule (the reference lexer's `^[ \t]*`.*{EOL}`): a line that STARTS, after blanks, with a

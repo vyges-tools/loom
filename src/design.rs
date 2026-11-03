@@ -32,6 +32,9 @@ pub struct Design {
     /// EVERY module of the Verilog netlist loaded, in the compact form — or, once flattened, the
     /// flat design. Never only the top. `None` for a netlist read from Yosys JSON.
     pub hierarchy: Option<netlist::CompactDesign>,
+    /// The top module of the next Verilog netlist loaded, as `link_design <top>` names it. `None`:
+    /// the module nothing instantiates — and a netlist with more than one such is refused.
+    pub netlist_top: Option<String>,
     /// One entry per `.lib` loaded (corners / multiple libraries).
     pub libs: Vec<liberty::Lib>,
     pub sdc: Option<sdc::Sdc>,
@@ -61,7 +64,7 @@ impl Design {
     /// [`Design::hierarchy`], and the top in [`Design::netlist`]. A hierarchical netlist is
     /// flattened with [`Design::flatten_netlist`].
     pub fn load_netlist(&mut self, path: &str) -> Result<(), DesignError> {
-        let all = netlist::load_compact(path).map_err(|e| DesignError(e.to_string()))?;
+        let all = netlist::load_compact_opt(path, self.netlist_top.as_deref()).map_err(|e| DesignError(e.to_string()))?;
         let nl = all.top_netlist();
         let summary = format!(
             "module {} — {} inputs, {} outputs, {} instances ({} module(s) in the file)",
