@@ -387,6 +387,12 @@ pub struct Pin {
 }
 
 impl Pin {
+    /// The pin's `three_state` expression as written — the condition under which the output is
+    /// DISABLED (high impedance); `None` on a pin that is not tri-state.
+    pub fn three_state(&self) -> Option<&str> {
+        self.three_state.as_deref()
+    }
+
     /// True when this output pin drives a **fixed logic level** — a tie cell, declared in
     /// Liberty as `function : "1"` or `function : "0"` with no timing arcs (sky130's
     /// `conb_1` has both, as `HI` and `LO`).
