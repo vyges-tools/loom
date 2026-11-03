@@ -185,6 +185,19 @@ impl Netlist {
                 self.undirected.len()
             ));
         }
+        // a netlist written before technology mapping: its cells are the synthesiser's generic
+        // ones, which no library times
+        let defined: std::collections::HashSet<&str> = self.modules.iter().map(String::as_str).collect();
+        let leaves = self.insts.iter().filter(|x| !defined.contains(x.cell.as_str()));
+        let (generic, total) = leaves.fold((0usize, 0usize), |(g, t), x| (g + usize::from(looks_generic(&x.cell)), t + 1));
+        if generic > 0 {
+            let what = if generic * 2 > total {
+                "— this looks like an UNMAPPED netlist: map it to a library before timing it"
+            } else {
+                "— technology-independent cells no library defines"
+            };
+            notes.push(format!("{generic} of {total} cell instance(s) have generic synthesis cell names {what}"));
+        }
         if self.behavioural > 0 {
             notes.push(format!(
                 "{} behavioural construct(s) ignored — this looks like RTL, not a gate-level \
@@ -194,6 +207,22 @@ impl Netlist {
         }
         (!notes.is_empty()).then(|| notes.join("; "))
     }
+}
+
+/// A cell name of the kind a synthesiser writes BEFORE mapping to a library: a generic,
+/// technology-independent cell or operator. Commercial netlist writers emit them as escaped
+/// names starting with `*` (`\**SEQGEN** `, `\*SELECT_OP_2.1_2.1_1 `), as a `GTECH_` family, or
+/// as `..._OP` operator cells; open synthesis writes its internal cells with a leading `$`.
+///
+/// ⚠️ A heuristic on the NAME only — it says what a cell looks like, not what a library holds;
+/// [`crate::Design::netlist_health`] checks the loaded Liberty too.
+pub fn looks_generic(cell: &str) -> bool {
+    cell.starts_with('*')
+        || cell.starts_with('$')
+        || cell.starts_with("GTECH_")
+        || cell.contains("SEQGEN")
+        || cell.ends_with("_OP")
+        || cell.contains("_OP_")
 }
 
 #[derive(Debug)]
@@ -955,6 +984,66 @@ impl CompactDesign {
     /// Did `s` arrive as an escaped identifier (`\foo[0] `)? See [`Netlist::escaped_names`].
     pub fn is_escaped(&self, s: Sym) -> bool {
         self.escaped.get(s.index() / 64).is_some_and(|w| w >> (s.index() % 64) & 1 == 1)
+    }
+
+    /// Names the bits of each bussed pin of a cell NOT defined in the file by the library's bus
+    /// order, and returns how many pin bits were renamed. `bus(cell, pin)` is the library's
+    /// `(bit_from, bit_to)` for a bus pin, `None` for anything else.
+    ///
+    /// 🔑 Until a library is seen, the reader names a bussed pin's bits as a `downto` bus
+    /// numbered from 0 (`P[k-1-i]` for the i-th connection bit). The reference pairs the i-th
+    /// connection bit with the i-th MEMBER of the library port, from `bit_from` to `bit_to`
+    /// (`makeNamedInstPins`, `memberIterator`), so an `upto` bus (`bit_from : 0; bit_to : 3`), or
+    /// one not ending at 0, takes the reverse or shifted names. Only a pin whose bits are exactly
+    /// `0..k-1` for a bus of `k` bits is renamed; any other shape is left as written.
+    pub fn apply_bus_order<F: Fn(&str, &str) -> Option<(i64, i64)>>(&mut self, bus: F) -> usize {
+        let CompactDesign { pool, modules, by_name, .. } = self;
+        let mut renamed = 0usize;
+        let mut groups: std::collections::HashMap<String, Vec<(bool, usize, i64)>> = std::collections::HashMap::new();
+        for m in modules.iter_mut() {
+            for x in 0..m.insts.len() {
+                let inst = m.insts[x];
+                if by_name.contains_key(&inst.cell) {
+                    continue;
+                }
+                groups.clear();
+                let bit = |s: &str| -> Option<(String, i64)> {
+                    let (base, rest) = s.rsplit_once('[')?;
+                    Some((base.to_string(), rest.strip_suffix(']')?.parse().ok()?))
+                };
+                for k in inst.conns.0 as usize..inst.conns.1 as usize {
+                    if let Some((b, j)) = bit(pool.get(m.conn_table[k].0)) {
+                        groups.entry(b).or_default().push((true, k, j));
+                    }
+                }
+                for k in inst.ties.0 as usize..inst.ties.1 as usize {
+                    if let Some((b, j)) = bit(pool.get(m.tie_table[k].0)) {
+                        groups.entry(b).or_default().push((false, k, j));
+                    }
+                }
+                let cell = pool.get(inst.cell).to_string();
+                for (base, bits) in &groups {
+                    let Some((from, to)) = bus(&cell, base) else { continue };
+                    let k = (to - from).abs() + 1;
+                    let mut js: Vec<i64> = bits.iter().map(|b| b.2).collect();
+                    js.sort_unstable();
+                    if js.len() as i64 != k || !js.iter().enumerate().all(|(i, &j)| i as i64 == j) {
+                        continue;
+                    }
+                    let step = if to >= from { 1 } else { -1 };
+                    for &(conn, at, j) in bits {
+                        let to_j = from + (k - 1 - j) * step;
+                        if to_j == j {
+                            continue;
+                        }
+                        let s = pool.intern(&format!("{base}[{to_j}]"));
+                        if conn { m.conn_table[at].0 = s } else { m.tie_table[at].0 = s }
+                        renamed += 1;
+                    }
+                }
+            }
+        }
+        renamed
     }
 
     /// Every name that arrived as an escaped identifier, in pool order.
@@ -2557,6 +2646,52 @@ endmodule
         assert_eq!(d.module_names(), ["leaf", "mid", "chip"]);
         assert_eq!(parse(src).unwrap().modules, ["leaf", "mid", "chip"]);
         assert!(mid.modules.is_empty() && leaf.modules.is_empty());
+    }
+
+    /// A netlist written before mapping is flagged: its cells carry the generic names a
+    /// synthesiser gives technology-independent cells, and no library times them.
+    #[test]
+    fn an_unmapped_netlist_is_flagged() {
+        let src = "module top (a, b, c, y); input a, b, c; output y; wire n, m;\n\
+                   \\**SEQGEN** r0 (.clear(1'b0), .next_state(a), .clocked_on(b), .Q(n));\n\
+                   \\*SELECT_OP_2.1_2.1_1 s0 (.DATA1(n), .DATA2(c), .CONTROL1(a), .Z(m));\n\
+                   GTECH_AND2 g0 (.A(m), .B(c), .Z(y));\n\
+                   sky130_fd_sc_hd__inv_1 i0 (.A(a), .Y());\nendmodule\n";
+        let nl = parse(src).unwrap();
+        let h = nl.health().expect("must report");
+        assert!(h.contains("3 of 4 cell instance(s) have generic synthesis cell names"), "{h}");
+        assert!(h.contains("UNMAPPED"), "{h}");
+        assert!(looks_generic("$_DFF_P_") && looks_generic("ADD_UNS_OP") && !looks_generic("sky130_fd_sc_hd__dfxtp_1"));
+        let mapped = parse("module top (a, y); input a; output y; INV i (.A(a), .Y(y)); endmodule\n").unwrap();
+        assert!(mapped.health().is_none());
+    }
+
+    /// Rule (the reference's `makeNamedInstPins`, `memberIterator`): the i-th connection bit of
+    /// a library bus pin is the bus's i-th MEMBER, `bit_from` first — so an `upto` bus `[0:3]`
+    /// takes `{a, b, c, d}` as A[0]=a .. A[3]=d, and a `downto` one ending at 1 (`[4:1]`) as
+    /// A[4]=a .. A[1]=d. The reader's library-blind naming (`A[3]`=a .. `A[0]`=d) is renamed.
+    #[test]
+    fn a_library_bus_order_renames_the_pin_bits() {
+        let src = "module top (a, b, c, d); input a, b, c, d;\n\
+                   RAM_UP u (.A({a, b, c, d}), .E({1'b1, a}));\n\
+                   RAM_DN1 v (.A({a, b, c, d}));\n\
+                   RAM_DN0 w (.A({a, b, c, d}));\nendmodule\n";
+        let mut d = parse_compact(src).unwrap();
+        let n = d.apply_bus_order(|cell, pin| match (cell, pin) {
+            ("RAM_UP", "A") => Some((0, 3)),
+            ("RAM_UP", "E") => Some((0, 1)),
+            ("RAM_DN1", "A") => Some((4, 1)),
+            ("RAM_DN0", "A") => Some((3, 0)),
+            _ => None,
+        });
+        let nl = d.top_netlist();
+        let c = |k: usize| nl.insts[k].conns.iter().map(|(p, n)| format!("{p}={n}")).collect::<Vec<_>>();
+        assert_eq!(c(0)[..4], ["A[0]=a", "A[1]=b", "A[2]=c", "A[3]=d"]);
+        assert_eq!(c(0)[4], "E[1]=a");
+        assert_eq!(nl.insts[0].ties, [("E[0]".to_string(), true)], "a tie bit moves with its pin");
+        assert_eq!(c(1), ["A[4]=a", "A[3]=b", "A[2]=c", "A[1]=d"]);
+        assert_eq!(c(2), ["A[3]=a", "A[2]=b", "A[1]=c", "A[0]=d"], "downto from 0: as read");
+        assert_eq!(n, 4 + 2 + 4);
     }
 
     /// Rule: with no top named, MORE THAN ONE module that nothing instantiates is refused, the

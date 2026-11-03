@@ -43,6 +43,9 @@ pub struct Design {
     pub def: Option<def::Def>,
     /// Cross-step state: every load, in order (provenance).
     pub steps: Vec<Step>,
+    /// The loaded Verilog netlist's bussed pins have been named by the Liberty bus order — see
+    /// [`Design::apply_liberty_bus_order`].
+    bus_order_done: bool,
 }
 
 /// Error loading a file into the design (wraps each parser's error).
@@ -64,19 +67,35 @@ impl Design {
     /// [`Design::hierarchy`], and the top in [`Design::netlist`]. A hierarchical netlist is
     /// flattened with [`Design::flatten_netlist`].
     pub fn load_netlist(&mut self, path: &str) -> Result<(), DesignError> {
+        self.read_netlist(path, true)
+    }
+
+    /// [`Design::load_netlist`] keeping ONLY the compact form ([`Design::hierarchy`]), with
+    /// [`Design::netlist`] left `None` — for a chip-scale netlist.
+    ///
+    /// ⚡ Measured on a generated flat netlist of a million two-input cells: the compact form is
+    /// about 100 bytes an instance (its names included), the owned [`netlist::Netlist`] about 500
+    /// more. [`Design::flatten_netlist`] then keeps the flat design compact too.
+    pub fn load_netlist_compact(&mut self, path: &str) -> Result<(), DesignError> {
+        self.read_netlist(path, false)
+    }
+
+    fn read_netlist(&mut self, path: &str, owned: bool) -> Result<(), DesignError> {
         let all = netlist::load_compact_opt(path, self.netlist_top.as_deref()).map_err(|e| DesignError(e.to_string()))?;
-        let nl = all.top_netlist();
+        let t = all.top();
         let summary = format!(
             "module {} — {} inputs, {} outputs, {} instances ({} module(s) in the file)",
-            nl.module,
-            nl.inputs.len(),
-            nl.outputs.len(),
-            nl.insts.len(),
+            all.str(t.name),
+            t.inputs.len(),
+            t.outputs.len(),
+            t.insts.len(),
             all.modules.len()
         );
         self.steps.push(Step { kind: "netlist", path: path.into(), summary });
-        self.netlist = Some(nl);
+        self.netlist = owned.then(|| all.top_netlist());
         self.hierarchy = Some(all);
+        self.bus_order_done = false;
+        self.apply_liberty_bus_order();
         Ok(())
     }
 
@@ -84,7 +103,8 @@ impl Design {
     /// [`netlist::CompactDesign::flatten`]): [`Design::netlist`] and [`Design::hierarchy`] then
     /// hold the flat design. `keep` names modules kept as blocks. Cells are checked against the
     /// Liberty libraries loaded so far; with none loaded, every cell not defined in the netlist
-    /// is reported.
+    /// is reported. The owned [`Design::netlist`] is made only when one was held before (see
+    /// [`Design::load_netlist_compact`]).
     pub fn flatten_netlist(&mut self, keep: &[String]) -> Result<netlist::FlattenReport, DesignError> {
         let Some(all) = self.hierarchy.as_ref() else {
             return Err(DesignError("flatten: no Verilog netlist loaded".into()));
@@ -93,7 +113,7 @@ impl Design {
             .then(|| self.libs.iter().flat_map(|l| l.cells.keys().cloned()).collect());
         let opts = netlist::FlattenOptions { keep: keep.to_vec(), library_cells };
         let (flat, report) = all.flatten(&opts);
-        let nl = flat.top_netlist();
+        let nl = self.netlist.is_some().then(|| flat.top_netlist());
         let mut summary = format!(
             "flattened {} — {} leaf instances from {} module instances",
             report.top, report.leaves, report.expanded
@@ -103,7 +123,7 @@ impl Design {
         }
         let path = self.steps.iter().rev().find(|s| s.kind == "netlist").map(|s| s.path.clone()).unwrap_or_default();
         self.steps.push(Step { kind: "flatten", path, summary });
-        self.netlist = Some(nl);
+        self.netlist = nl;
         self.hierarchy = Some(flat);
         Ok(report)
     }
@@ -135,6 +155,7 @@ impl Design {
         let summary = format!("{} cells", lib.cells.len());
         self.steps.push(Step { kind: "liberty", path: path.into(), summary });
         self.libs.push(lib);
+        self.apply_liberty_bus_order();
         Ok(())
     }
 
@@ -256,6 +277,62 @@ impl Design {
                  .def, each optionally .gz)"
             ))),
         }
+    }
+
+    /// Name the Verilog netlist's bussed cell pins by the Liberty libraries' bus order (see
+    /// [`netlist::CompactDesign::apply_bus_order`]), ONCE: at the first point where both a
+    /// netlist and a library are loaded — called by [`Design::load_netlist`] and
+    /// [`Design::load_liberty`]. Returns the pin bits renamed.
+    ///
+    /// ⚠️ A netlist read from Yosys JSON is not renamed: its bits carry their own names.
+    pub fn apply_liberty_bus_order(&mut self) -> usize {
+        if self.bus_order_done || self.libs.is_empty() {
+            return 0;
+        }
+        let Some(h) = self.hierarchy.as_mut() else { return 0 };
+        let libs = &self.libs;
+        let renamed = h.apply_bus_order(|cell, pin| {
+            let c = libs.iter().find_map(|l| l.cells.get(cell))?;
+            c.ports.iter().find(|p| p.name == pin)?.bus
+        });
+        self.bus_order_done = true;
+        if renamed > 0 {
+            if self.netlist.is_some() {
+                self.netlist = Some(h.top_netlist());
+            }
+            let path = self.steps.iter().rev().find(|s| s.kind == "netlist").map(|s| s.path.clone()).unwrap_or_default();
+            let summary = format!("{renamed} bussed pin bit(s) renamed to the Liberty bus order");
+            self.steps.push(Step { kind: "bus-order", path, summary });
+        }
+        renamed
+    }
+
+    /// One line on anything a consumer should know about the netlist before trusting it, or
+    /// `None`: the netlist's own [`netlist::Netlist::health`], and — with Liberty loaded — how
+    /// many cell instances no library defines.
+    ///
+    /// 🔑 Most cells with no Liberty cell means an UNMAPPED netlist (generic synthesis cells) or
+    /// the wrong library; either way no timing of it means anything.
+    pub fn netlist_health(&self) -> Option<String> {
+        let nl = self.netlist.as_ref()?;
+        let mut notes: Vec<String> = nl.health().into_iter().collect();
+        if !self.libs.is_empty() {
+            let defined: std::collections::HashSet<&str> = nl.modules.iter().map(String::as_str).collect();
+            let leaves = nl.insts.iter().filter(|x| !defined.contains(x.cell.as_str()));
+            let (missing, total) = leaves.fold((0usize, 0usize), |(m, t), x| {
+                let known = self.libs.iter().any(|l| l.cells.contains_key(&x.cell));
+                (m + usize::from(!known), t + 1)
+            });
+            if missing * 2 > total {
+                notes.push(format!(
+                    "{missing} of {total} cell instance(s) have no Liberty cell — an unmapped netlist, or \
+                     the wrong library"
+                ));
+            } else if missing > 0 {
+                notes.push(format!("{missing} of {total} cell instance(s) have no Liberty cell"));
+            }
+        }
+        (!notes.is_empty()).then(|| notes.join("; "))
     }
 
     /// Total cells across all loaded Liberty libraries.
@@ -431,6 +508,13 @@ mod tests {
         assert_eq!(names, ["s0/u", "s1/u"]);
         assert_eq!(d.hierarchy.as_ref().unwrap().modules.len(), 1, "the flat design");
         assert_eq!(d.steps.last().unwrap().kind, "flatten");
+        // compact only: no owned form is made, before or after flattening
+        let mut c = Design::new();
+        c.load_netlist_compact(v.to_str().unwrap()).unwrap();
+        assert!(c.netlist.is_none());
+        let _ = c.flatten_netlist(&[]).unwrap();
+        assert!(c.netlist.is_none());
+        assert_eq!(c.hierarchy.as_ref().unwrap().top().insts.len(), 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -468,6 +552,39 @@ mod tests {
         assert_eq!(d.sdc.as_ref().unwrap().clocks.len(), 1);
         let err = d.load(&write("x.gds.gz", "")).unwrap_err();
         assert!(err.to_string().contains("unknown extension '.gds'"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With Liberty loaded — before or after the netlist — a bussed pin is named by the
+    /// library's bus order once, and the health says how many cells no library defines.
+    #[test]
+    fn liberty_bus_order_and_coverage_apply_in_either_load_order() {
+        let dir = std::env::temp_dir().join(format!("loom-design-bus-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = dir.join("t.v");
+        std::fs::write(&v, "module top (a, b, y); input a, b; output y;\n\
+                            MEM m (.D({a, b}), .Q(y));\n  \\**SEQGEN** r (.next_state(a));\n\
+                            \\*SELECT_OP_2 s (.Z(y));\nendmodule\n").unwrap();
+        let lib = dir.join("m.lib");
+        std::fs::write(&lib, "library (l) {\n type (b2) { base_type : array; data_type : bit; bit_width : 2; \
+                              bit_from : 0; bit_to : 1; }\n cell (MEM) { bus (D) { bus_type : b2; direction : input; }\n \
+                              pin (Q) { direction : output; } } }\n").unwrap();
+        for libs_first in [false, true] {
+            let mut d = Design::new();
+            let (v, lib) = (v.to_str().unwrap(), lib.to_str().unwrap());
+            if libs_first {
+                d.load(lib).unwrap();
+                d.load(v).unwrap();
+            } else {
+                d.load(v).unwrap();
+                d.load(lib).unwrap();
+            }
+            let m = &d.netlist.as_ref().unwrap().insts[0];
+            assert_eq!(m.conns[..2], [("D[0]".to_string(), "a".to_string()), ("D[1]".to_string(), "b".to_string())]);
+            assert_eq!(d.apply_liberty_bus_order(), 0, "once only");
+            let h = d.netlist_health().unwrap();
+            assert!(h.contains("2 of 3 cell instance(s) have no Liberty cell"), "{h}");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
