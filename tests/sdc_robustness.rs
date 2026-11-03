@@ -48,8 +48,8 @@ const HANDLED: &[&str] = &[
     "set_clock_group",
     "set_units",
     "set_unit",
-    // A changed instance scope STOPS the read (names after it would resolve from the top):
-    // modelled as a refusal, so injecting one legitimately changes the result.
+    // A changed instance scope: later pin, cell and net names are read under it (2026-11-03),
+    // so injecting one legitimately changes what they name.
     "current_instance",
     // likewise a separator other than `/`
     "set_hierarchy_separator",

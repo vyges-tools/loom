@@ -34,7 +34,12 @@
 
 use std::collections::HashMap;
 
+mod kept;
+mod scope;
 mod unset;
+
+pub use kept::{ExceptionCmd, KeptArg, KeptCmd};
+pub(crate) use kept::write_kept as kept_line;
 
 /// A timing exception kind (`set_false_path` / `set_multicycle_path`). Defined
 /// here in loom (the data plane) so the SDC model is self-contained; engines
@@ -735,6 +740,12 @@ pub struct Sdc {
     /// [`Sdc::async_groups`] is every command's groups in one list, and cannot say which clocks
     /// one command separated.
     pub clock_groups: Vec<ClockGroups>,
+    /// Every `group_path` and `set_path_margin`, in file order: the reference's other path
+    /// exceptions, which a reset reaches as it reaches a false path (still in [`Sdc::ignored`]).
+    pub other_exceptions: Vec<ExceptionCmd>,
+    /// Every command the reference reads that has no typed model here, kept as written, in file
+    /// order — see [`KeptCmd`] (each still in [`Sdc::ignored`]).
+    pub kept: Vec<KeptCmd>,
     pub ignored: Vec<String>, // commands we recognised but do not model
 }
 
@@ -902,6 +913,20 @@ impl Sdc {
             }
             true
         });
+        // group paths and path margins are exceptions too, by the same rule
+        self.other_exceptions.retain_mut(|p| {
+            for side in ["from", "to"] {
+                let on_side = |k: &str| k.trim_start_matches('-').trim_start_matches("rise_").trim_start_matches("fall_") == side;
+                let names_it = p.args.iter().any(|(k, o)| on_side(k) && o.accessor == "get_clocks" && o.names.iter().any(|n| n == name));
+                if names_it {
+                    p.args.iter_mut().filter(|(k, _)| on_side(k)).for_each(|(_, o)| drop_name(o));
+                    p.args.retain(|(k, o)| !(on_side(k) && o.names.is_empty()));
+                    return p.args.iter().any(|(k, _)| on_side(k));
+                }
+            }
+            true
+        });
+        self.remove_kept_clock(name);
         for g in &mut self.async_groups {
             g.retain(|n| n != name);
         }
@@ -1081,6 +1106,35 @@ pub const MODELLED_BUT_LISTED: &[&str] = &[
     "set_clock_sense",
     "set_disable_clock_gating_check",
     "unset_disable_clock_gating_check",
+    // kept as written (`sdc/kept.rs`)
+    "group_path",
+    "set_path_margin",
+    "set_min_pulse_width",
+    "set_max_time_borrow",
+    "set_clock_gating_check",
+    "set_data_check",
+    "unset_data_check",
+    "set_drive",
+    "set_port_fanout_number",
+    "set_resistance",
+    "set_min_capacitance",
+    "set_fanout_load",
+    "set_max_area",
+    "set_max_dynamic_power",
+    "set_max_leakage_power",
+    "set_operating_conditions",
+    "set_wire_load_mode",
+    "set_wire_load_model",
+    "set_wire_load_selection_group",
+    "set_wire_load_min_block_size",
+    "set_voltage",
+    "set_pvt",
+    "set_ideal_latency",
+    "set_ideal_network",
+    "set_ideal_transition",
+    "create_voltage_area",
+    "set_level_shifter_strategy",
+    "set_level_shifter_threshold",
 ];
 
 /// One kind of command the model does not carry — see [`Sdc::not_applied`].
@@ -2781,6 +2835,8 @@ impl Sdc {
         let mut frames: Vec<(HashMap<String, String>, Vec<String>)> = Vec::new();
         let mut sourced = 0usize;
         let mut loops: Vec<TclLoop> = Vec::new();
+        // `current_instance`: the instance pin, cell and net names are read under (`None` the top)
+        let mut instance_scope: Option<String> = None;
 
         // A QUEUE of commands, not a list: a chosen `if` branch or a `foreach` body is put back at
         // its front, so it runs in place and in order — and its variables are substituted when
@@ -2861,8 +2917,33 @@ impl Sdc {
                 Control::None => {}
             }
             let line = dialect_queries(&canonical_queries(&subst_exprs(&subst_command_vars(&raw, &vars), &vars)));
+            let line = match &instance_scope {
+                None => line,
+                Some(scope) => {
+                    let clocks: Vec<String> = sdc.clocks.iter().map(|c| c.name.clone()).collect();
+                    match scope::scoped_line(&line, scope, &clocks) {
+                        Ok(l) => l,
+                        Err(why) => {
+                            let cmd = tokenize(&line).into_iter().next().unwrap_or_default();
+                            sdc.rejected.push(format!("{cmd}: {why}; not applied"));
+                            if !BENIGN_FOR_TIMING.contains(&cmd.as_str()) {
+                                sdc.unevaluated_queries.push(format!("{cmd}: {why}"));
+                            }
+                            continue;
+                        }
+                    }
+                }
+            };
             let toks = expand_abbreviations(tokenize(&line));
             if toks.is_empty() {
+                continue;
+            }
+            // A clock made INSIDE another command (`set_input_delay -clock [create_clock …] …`):
+            // Tcl runs the substitution first, and the reference's `create_clock` returns nothing,
+            // so the clock is made and the outer command sees an empty word.
+            if let Some((inner, outer)) = nested_clock_definition(&line) {
+                queue.push_front(outer);
+                queue.push_front(inner);
                 continue;
             }
             // A SYNTHESIS-ONLY command the reference does not know (`set_size_only`,
@@ -2937,18 +3018,17 @@ impl Sdc {
                 // `set_clock_group` that means losing an asynchronous-clock declaration, so
                 // paths between clocks that never relate get checked and report false
                 // violations. Found by diffing our command inventory against SDC 2.1.
-                // ⛔ A CHANGED SCOPE STOPS THE READ. Every name after `current_instance u1` is
-                // relative to `u1`, and this reader resolves names from the top: read past, every
-                // later constraint named the wrong objects and a checker tested those. Back to the
-                // top (no argument, or the top itself) changes nothing and is read.
-                "current_instance" | "set_current_instance" => {
-                    if let Some(i) = toks.get(1).filter(|t| !matches!(t.as_str(), "/" | "." | "" | "{}")) {
-                        return Err(SdcError(format!(
-                            "`{} {i}`: names relative to an instance are not supported, and every later name would be read from the top; the file is not read",
-                            toks[0]
-                        )));
-                    }
-                }
+                // A CHANGED SCOPE: every later pin, cell and net name is read under the instance
+                // (see `sdc/scope.rs`). Its argument is an absolute instance path (the reference's
+                // `get_instance_error`); none, or the top, goes back to the top. More than one
+                // instance is the reference's Error 123, and the scope is left as it was.
+                "current_instance" | "set_current_instance" => match toks.get(1).filter(|t| !matches!(t.as_str(), "/" | "." | "" | "{}")) {
+                    None => instance_scope = None,
+                    Some(i) => match resolve_objs(i).as_slice() {
+                        [one] => instance_scope = Some(one.trim_end_matches('/').to_string()),
+                        _ => sdc.rejected.push(format!("{}: instance must be a single instance (Error 123); not applied", toks[0])),
+                    },
+                },
                 "set_hierarchy_separator" => {
                     if let Some(sep) = toks.get(1).filter(|t| t.as_str() != "/") {
                         return Err(SdcError(format!(
@@ -3309,6 +3389,16 @@ impl Sdc {
                     }
                     sdc.ignored.push(toks[0].clone());
                 }
+                // Deprecated spellings the reference runs as `set_disable_clock_gating_check` /
+                // `unset_…` (its Search.tcl, Warnings 528/529): one parameter, the objects.
+                "set_disable_inferred_clock_gating" | "unset_disable_inferred_clock_gating" => {
+                    let cmd = toks[0].replace("_inferred_clock_gating", "_clock_gating_check");
+                    match toks.as_slice() {
+                        [_, o] => sdc.disabled_gating_checks.push(ArcCmd { cmd: cmd.clone(), keys: Vec::new(), flags: Vec::new(), objects: resolve_objs(o), written: Objects::of(o) }),
+                        _ => sdc.rejected.push(format!("{}: {} words where the reference takes one (wrong # args); not applied", toks[0], toks.len() - 1)),
+                    }
+                    sdc.ignored.push(cmd);
+                }
                 "set_driving_cell" => {
                     sdc.driving_cells.push(driving_cell(&toks));
                     sdc.ignored.push("set_driving_cell".to_string());
@@ -3440,6 +3530,20 @@ impl Sdc {
                         flags: written_flags,
                         comment: comment_of(&toks),
                     });
+                }
+                cmd if kept::KEPT_COMMANDS.contains(&cmd) => {
+                    match kept::kept_cmd(&toks) {
+                        Ok(c) => sdc.kept.push(c),
+                        Err(why) => sdc.rejected.push(format!("{cmd}: {why}; not applied")),
+                    }
+                    sdc.ignored.push(cmd.to_string());
+                }
+                cmd if kept::EXCEPTION_COMMANDS.contains(&cmd) => {
+                    match kept::exception_cmd(&toks) {
+                        Ok(x) => sdc.other_exceptions.push(x),
+                        Err(why) => sdc.rejected.push(format!("{cmd}: {why}; not applied")),
+                    }
+                    sdc.ignored.push(cmd.to_string());
                 }
                 cmd if unset::UNSET_COMMANDS.contains(&cmd) => {
                     if let Err(why) = sdc.apply_unset(&toks) {
@@ -3748,8 +3852,55 @@ fn dialect(
     }
 }
 
+/// The first `[create_clock …]` / `[create_generated_clock …]` substituted in `line` (outside
+/// braces, in a command that is not itself one), as `(that command, line with it replaced by
+/// `{}`)` — what the reference's `create_clock` returns (its `make_clock` returns nothing).
+fn nested_clock_definition(line: &str) -> Option<(String, String)> {
+    let b = line.as_bytes();
+    let first = tokenize(line).into_iter().next()?;
+    if first == "create_clock" || first == "create_generated_clock" {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1,
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            b'[' if depth == 0 => {
+                let word_end = line[i + 1..].find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(b.len(), |e| i + 1 + e);
+                if matches!(&line[i + 1..word_end], "create_clock" | "create_generated_clock") {
+                    let mut d = 0usize;
+                    let mut j = i;
+                    while j < b.len() {
+                        match b[j] {
+                            b'\\' => j += 1,
+                            b'[' => d += 1,
+                            b']' => {
+                                d -= 1;
+                                if d == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    let inner = line.get(i + 1..j)?.to_string();
+                    let outer = format!("{}{{}}{}", &line[..i], line.get(j + 1..).unwrap_or(""));
+                    return Some((inner, outer));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// `w` as one Tcl word whose value is `w`: braced unless it is one plain word already.
-fn brace_word(w: &str) -> String {
+pub(crate) fn brace_word(w: &str) -> String {
     if !w.is_empty() && !w.contains(|c: char| c.is_whitespace() || "{}[]$\"\\;".contains(c)) {
         w.to_string()
     } else {
@@ -5136,12 +5287,13 @@ mod scope_and_rule_tests {
         assert_eq!(s.rejected, ["set_max_transition without objects"]);
     }
 
-    /// `current_instance u1` makes every later name relative to `u1`; read past, every later
-    /// constraint named top-level objects instead. It stops the read; back to the top is read.
+    /// `current_instance u1` makes every later name relative to `u1` (see `sdc/scope.rs`); a bare
+    /// name under it needs the design to classify, so its command is refused, not read from the
+    /// top. Back to the top is read.
     #[test]
-    fn a_changed_instance_scope_stops_the_read() {
-        let e = Sdc::parse("current_instance u1\nset_false_path -from a\n").unwrap_err();
-        assert!(e.to_string().contains("current_instance u1"), "{e}");
+    fn a_changed_instance_scope_reads_under_it() {
+        let s = Sdc::parse("current_instance u1\nset_false_path -from a\n").unwrap();
+        assert!(s.exceptions.is_empty() && s.rejected[0].contains("current_instance u1"), "{:?}", s.rejected);
         assert!(Sdc::parse("current_instance\nset_false_path -from a\n").is_ok());
         assert!(Sdc::parse("current_instance /\n").is_ok());
         assert!(Sdc::parse("set_hierarchy_separator .\n").is_err());

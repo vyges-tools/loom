@@ -1017,7 +1017,7 @@ impl Sdc {
     /// (`unset_path_exceptions_cmd`, `Sdc::resetPath`). A from, through or to is required (449),
     /// no other word (448). Each exception the reset matches ([`reset_match`]) keeps what its
     /// expansion keeps ([`residue`]). False paths, multicycles and `set_max_delay` / `set_min_delay` are all
-    /// exceptions here (`group_path` too, which this model does not carry).
+    /// exceptions here, and so are `group_path` and `set_path_margin` ([`super::ExceptionCmd`]).
     fn unset_path_exceptions(&mut self, toks: &[String]) -> Result<(), String> {
         let a = key_args(toks, &[&FROM_KEYS[..], &TO_KEYS[..], &THRU_KEYS[..]].concat(), &["-setup", "-hold", "-rise", "-fall"])?;
         if !a.pos.is_empty() {
@@ -1086,9 +1086,19 @@ impl Sdc {
                 Some(rest) => path_delays.extend(rest.iter().map(|s| PathDelayCmd { objects: shape_args(s), ..p.clone() })),
             }
         }
+        // `group_path` (both checks) and `set_path_margin` (its own) are exceptions to a reset too
+        let mut others = Vec::with_capacity(self.other_exceptions.len());
+        for x in &self.other_exceptions {
+            let min_max = if x.cmd == "group_path" { Both::ALL } else { check_of(&x.flags) };
+            match reset_one(&shape_of(&x.args, &x.flags, min_max))? {
+                None => others.push(x.clone()),
+                Some(rest) => others.extend(rest.iter().map(|s| super::ExceptionCmd { args: shape_args(s), ..x.clone() })),
+            }
+        }
         self.exceptions = exceptions;
         self.exception_objects = exception_objects;
         self.path_delays = path_delays;
+        self.other_exceptions = others;
         Ok(())
     }
 

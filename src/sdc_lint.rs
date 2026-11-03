@@ -1079,12 +1079,12 @@ mod tests {
     /// report has to mean every constraint was looked at.
     #[test]
     fn an_unmodelled_timing_command_is_an_error_not_silence() {
-        let sdc = Sdc::parse(&format!("{CLEAN}set_data_check -from r/CK -to r/D 0.1\n")).unwrap();
+        let sdc = Sdc::parse(&format!("{CLEAN}set_assigned_delay -cell -from u1/A -to u1/Z 0.1\n")).unwrap();
         let r = lint(&nl(), &sdc, &lib());
         let f: Vec<_> = r.findings.iter().filter(|f| f.code == "sdc-not-applied").collect();
         assert_eq!(f.len(), 1, "{:?}", r.findings);
         assert_eq!(f[0].severity, Severity::Error);
-        assert!(f[0].message.contains("set_data_check"), "{}", f[0].message);
+        assert!(f[0].message.contains("set_assigned_delay"), "{}", f[0].message);
     }
 
     /// A query that needs the design and was not evaluated is a rejected command: an error too.
@@ -1100,7 +1100,7 @@ mod tests {
     /// not fail the check.
     #[test]
     fn a_benign_command_is_info_and_does_not_fail() {
-        let sdc = Sdc::parse(&format!("{CLEAN}set_max_area 0\nset_max_area 0\n")).unwrap();
+        let sdc = Sdc::parse(&format!("{CLEAN}set_dont_touch [get_cells u1]\nset_dont_touch [get_cells u2]\n")).unwrap();
         let r = lint(&nl(), &sdc, &lib());
         assert_eq!(r.errors(), 0, "{:?}", r.findings);
         let f: Vec<_> = r.findings.iter().filter(|f| f.code == "sdc-not-applied").collect();
@@ -1121,7 +1121,7 @@ mod tests {
     /// what was not applied.
     #[test]
     fn without_a_design_the_report_says_what_did_not_run() {
-        let sdc = Sdc::parse(&format!("{CLEAN}set_data_check -from r/CK -to r/D 0.1\n")).unwrap();
+        let sdc = Sdc::parse(&format!("{CLEAN}set_assigned_delay -cell -from u1/A -to u1/Z 0.1\n")).unwrap();
         let r = lint_without_design(&sdc);
         assert!(r.findings.iter().any(|f| f.code == "design-checks-not-run" && f.severity == Severity::Info));
         assert_eq!(r.errors(), 1, "{:?}", r.findings);

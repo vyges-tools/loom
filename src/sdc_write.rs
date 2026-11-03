@@ -21,7 +21,7 @@
 //! appears in the file as a `# not written:` comment. A consumer that needs the whole file
 //! refuses on a non-empty list rather than ship constraints with a hole in them.
 
-use crate::sdc::{ExcKind, Objects, Sdc, SdcClock, MODELLED_BUT_LISTED};
+use crate::sdc::{brace_word, ExcKind, Objects, Sdc, SdcClock, MODELLED_BUT_LISTED};
 
 /// What [`Sdc::write`] produced.
 #[derive(Debug, Clone, Default)]
@@ -183,6 +183,7 @@ impl Sdc {
 
         o.section("Design Rules");
         self.write_design_rules(&mut o);
+        self.write_kept(&mut o);
 
         self.write_unwritten(&mut o);
         Written { text: o.text, not_written: o.not_written }
@@ -414,6 +415,27 @@ impl Sdc {
             }
             let flags: String = p.flags.iter().map(|f| format!(" {f}")).collect();
             o.line_or(sides(&p.objects).map(|s| format!("{cmd}{flags}{s} {}{}", num(p.value), comment(&p.comment))), || cmd.to_string());
+        }
+        for x in &self.other_exceptions {
+            let mut head = x.cmd.clone();
+            match (&x.name, x.default) {
+                (Some(n), _) => head += &format!(" -name {}", brace_word(n)),
+                (None, true) => head += " -default",
+                _ => {}
+            }
+            for (k, v) in &x.keys {
+                head += &format!(" {k} {}", brace_word(v));
+            }
+            let flags: String = x.flags.iter().map(|f| format!(" {f}")).collect();
+            let value = x.value.map(|v| format!(" {}", num(v))).unwrap_or_default();
+            o.line_or(sides(&x.args).map(|s| format!("{head}{flags}{s}{value}{}", comment(&x.comment))), || x.cmd.clone());
+        }
+    }
+
+    /// The commands kept as written ([`crate::sdc::KeptCmd`]), in file order.
+    fn write_kept(&self, o: &mut Out) {
+        for c in &self.kept {
+            o.line_or(crate::sdc::kept_line(c, objects), || c.cmd.clone());
         }
     }
 
