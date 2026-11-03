@@ -34,6 +34,8 @@
 
 use std::collections::HashMap;
 
+mod unset;
+
 /// A timing exception kind (`set_false_path` / `set_multicycle_path`). Defined
 /// here in loom (the data plane) so the SDC model is self-contained; engines
 /// consume these as part of the shared design DB.
@@ -789,7 +791,6 @@ const TIMING_AFFECTING: &[&str] = &[
     "set_min_capacitance",
     // ── SDC 2.x ────────────────────────────────────────────────────────────────────────
     "set_disable_clock_gating_check", // removes a check, so its violations vanish
-    "unset_propagated_clock",         // reverts to an ideal network -> latency and skew
     "set_max_trans",                  // Tcl accepts unambiguous abbreviations
 ];
 
@@ -895,6 +896,48 @@ impl Sdc {
             g.retain(|n| n != name);
         }
         self.async_groups.retain(|g| !g.is_empty());
+        // `clockGroupsDeleteClkRefs`: each command's groups lose the clock, an emptied group goes;
+        // the command itself stays
+        for g in &mut self.clock_groups {
+            for grp in &mut g.groups {
+                grp.retain(|n| n != name);
+            }
+            g.groups.retain(|grp| !grp.is_empty());
+        }
+        // `deleteMasterClkRefs`: a generated clock of this master has none
+        for c in &mut self.clocks {
+            if let Some(g) = c.generated.as_mut().filter(|g| g.master_clock.as_deref() == Some(name)) {
+                g.master_clock = None;
+            }
+        }
+        // `deleteInterClockUncertaintiesReferencing`: every pair with the clock on either side
+        // goes; the clock's own uncertainty and slew (`set_clock_transition`) go with the clock
+        let on_clock = |o: &Objects| o.accessor == "get_clocks" || (o.accessor.is_empty() && o.names.iter().any(|n| n == name));
+        self.uncertainties.retain_mut(|u| {
+            if !u.from.is_empty() || !u.to.is_empty() {
+                u.from.retain(|n| n != name);
+                u.to.retain(|n| n != name);
+                for (_, o) in &mut u.written_sides {
+                    o.names.retain(|n| n != name);
+                }
+                return !u.from.is_empty() && !u.to.is_empty();
+            }
+            for w in u.written.iter_mut().filter(|w| on_clock(w)) {
+                w.names.retain(|n| n != name);
+            }
+            u.written.retain(|w| !w.names.is_empty());
+            u.objects = u.written.iter().flat_map(|w| w.names.iter().cloned()).collect();
+            !u.objects.is_empty()
+        });
+        self.refold_uncertainty();
+        self.clock_transitions.retain_mut(|e| {
+            if let Some(w) = e.written.as_mut().filter(|w| on_clock(w)) {
+                w.names.retain(|n| n != name);
+                e.objects = w.names.clone();
+                return !e.objects.is_empty();
+            }
+            true
+        });
         // `deleteExceptionsReferencing`: the `-from` side, if its clocks hold the clock, loses it,
         // else the `-to` side; a side left with no object deletes the exception.
         let mut keep = Vec::with_capacity(self.exceptions.len());
@@ -2689,6 +2732,16 @@ impl Sdc {
         t
     }
 
+    /// An exception command's `-reset_path`: its reset runs first (see [`Sdc::reset_path`]); a
+    /// reset only the design can decide is listed in [`Sdc::rejected`], the exception still made.
+    fn reset_path_first(&mut self, toks: &[String], args: &[(String, Objects)], flags: &[String], both_checks: bool) {
+        if flags.iter().any(|f| f == "-reset_path") {
+            if let Err(why) = self.reset_path(args, flags, both_checks) {
+                self.rejected.push(format!("{} -reset_path: {why}; the reset not applied", toks[0]));
+            }
+        }
+    }
+
     /// A clock command's `[all_clocks]` as the clocks defined so far — what it names when it runs.
     fn clocks_now(&self, mut e: EnvCmd) -> EnvCmd {
         if e.accessor == "all_clocks" {
@@ -3091,19 +3144,7 @@ impl Sdc {
                         continue;
                     }
                     sdc.uncertainties.push(u);
-                    let fold = |hold_side: bool| -> f64 {
-                        let mut last: std::collections::BTreeMap<&str, f64> = Default::default();
-                        for u in &sdc.uncertainties {
-                            if u.from.is_empty() && u.to.is_empty() && (if hold_side { u.hold } else { u.setup }) {
-                                for o in &u.objects {
-                                    last.insert(o.as_str(), u.value);
-                                }
-                            }
-                        }
-                        last.values().fold(0.0f64, |a, b| a.max(*b))
-                    };
-                    sdc.setup_uncertainty = fold(false);
-                    sdc.hold_uncertainty = fold(true);
+                    sdc.refold_uncertainty();
                 }
                 "set_clock_transition" => {
                     sdc.clock_transitions.extend(env_cmd(&toks).map(|e| sdc.clocks_now(e)));
@@ -3195,10 +3236,12 @@ impl Sdc {
                     let valued = ["-from", "-to", "-through", "-rise_from", "-rise_to", "-fall_from", "-fall_to", "-rise_through", "-fall_through", "-comment"];
                     let (with, flags, pos) = split_args(&toks, &valued);
                     let value = pos.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(f64::NAN);
+                    let objects: Vec<(String, Objects)> = with.iter().filter(|(k, _)| *k != "-comment").map(|(k, v)| (k.to_string(), Objects::of(v))).collect();
+                    sdc.reset_path_first(&toks, &objects, &flags, true);
                     sdc.path_delays.push(PathDelayCmd {
                         max: toks[0] == "set_max_delay",
                         value,
-                        objects: with.iter().filter(|(k, _)| *k != "-comment").map(|(k, v)| (k.to_string(), Objects::of(v))).collect(),
+                        objects,
                         flags,
                         comment: comment_of(&toks),
                     });
@@ -3352,6 +3395,7 @@ impl Sdc {
                 "set_false_path" => {
                     let (from, to, refused) = from_to(&toks);
                     let (args, flags) = exception_args(&toks);
+                    sdc.reset_path_first(&toks, &args, &flags, false);
                     sdc.exception_objects.push(exception_sides(&toks));
                     sdc.exceptions.push(Exception { kind: ExcKind::FalsePath, from, to, refused, args, flags, comment: comment_of(&toks), ..Default::default() });
                 }
@@ -3373,6 +3417,7 @@ impl Sdc {
                     let has = |f: &str| flags.iter().any(|x| x == f);
                     let hold = has("-hold");
                     let (args, written_flags) = exception_args(&toks);
+                    sdc.reset_path_first(&toks, &args, &written_flags, false);
                     sdc.exception_objects.push(exception_sides(&toks));
                     sdc.exceptions.push(Exception {
                         kind: ExcKind::Multicycle(n.unwrap_or(1)),
@@ -3385,6 +3430,11 @@ impl Sdc {
                         flags: written_flags,
                         comment: comment_of(&toks),
                     });
+                }
+                cmd if unset::UNSET_COMMANDS.contains(&cmd) => {
+                    if let Err(why) = sdc.apply_unset(&toks) {
+                        sdc.rejected.push(format!("{cmd}: {why}; not applied"));
+                    }
                 }
                 other => sdc.ignored.push(other.to_string()),
             }
