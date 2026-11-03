@@ -137,6 +137,41 @@ fn name_hit(target: &str, held: &str) -> Hit {
     Hit::No
 }
 
+/// A removal's objects, ready to test held names against: exact names by hash, patterns (and
+/// `all_*` collections) by [`name_hit`] — so a removal of N objects from a constraint on M is
+/// N + M, not N × M, unless they are patterns.
+struct Targets<'t> {
+    exact: std::collections::HashSet<(bool, &'t str)>,
+    /// Every target, for a held name that is itself a pattern, and the pattern targets.
+    all: Vec<(bool, &'t str)>,
+    patterns: Vec<(bool, &'t str)>,
+}
+
+impl<'t> Targets<'t> {
+    fn new(it: impl Iterator<Item = (bool, &'t str)>) -> Self {
+        let all: Vec<(bool, &str)> = it.collect();
+        let patterns = all.iter().copied().filter(|(_, t)| wild(t)).collect();
+        Targets { exact: all.iter().copied().collect(), all, patterns }
+    }
+
+    /// Does the removal hit `held` (a clock name when `clock`)?
+    fn hit(&self, clock: bool, held: &str) -> Result<Hit, String> {
+        if self.exact.contains(&(clock, held)) {
+            return Ok(Hit::Yes);
+        }
+        let candidates = if wild(held) { &self.all } else { &self.patterns };
+        let mut hit = Hit::No;
+        for (_, t) in candidates.iter().filter(|(c, _)| *c == clock) {
+            match name_hit(t, held) {
+                Hit::Yes => hit = Hit::Yes,
+                Hit::Unknown => return Err(format!("`{t}` names part of `{held}`, which only the design can split")),
+                Hit::No => {}
+            }
+        }
+        Ok(hit)
+    }
+}
+
 /// What an object names: a clock, or a design object (pin, port, cell, net).
 fn is_clock(accessor: &str, name: &str, clocks: &[SdcClock]) -> bool {
     match accessor {
@@ -186,20 +221,14 @@ fn split_hits(o: &Objects, targets: &[(bool, String)], clocks: &[SdcClock], held
         kept.names = kept.items.iter().flat_map(|i| i.names.iter().cloned()).collect();
         return Ok((kept, taken));
     }
-    let (mut kept, mut taken) = (o.clone(), Vec::new());
-    kept.names.clear();
+    let mut kept = Objects { names: Vec::new(), ..one_object(o, "") };
+    let mut taken = Vec::new();
+    let lookup = Targets::new(targets.iter().map(|(c, t)| (*c, t.as_str())));
     for n in &o.names {
         let clock = held_is_clock.unwrap_or_else(|| is_clock(&o.accessor, n, clocks));
-        let mut hit = Hit::No;
-        for (_, t) in targets.iter().filter(|(tc, _)| *tc == clock) {
-            match name_hit(t, n) {
-                Hit::Yes => hit = Hit::Yes,
-                Hit::Unknown => return Err(format!("`{t}` names part of `{n}`, which only the design can split")),
-                Hit::No => {}
-            }
-        }
+        let hit = lookup.hit(clock, n)?;
         if hit == Hit::Yes {
-            taken.push(Objects { names: vec![n.clone()], items: Vec::new(), ..o.clone() });
+            taken.push(one_object(o, n));
         } else {
             kept.names.push(n.clone());
         }
@@ -460,6 +489,7 @@ impl Sdc {
         let clk_fall = a.has("-clock_fall");
         let rf = Both::of(a.has("-rise"), a.has("-fall"));
         let mm = Both::of(a.has("-max"), a.has("-min"));
+        let lookup = Targets::new(ports.iter().map(|p| (false, p.as_str())));
         let list = if toks[0] == "unset_input_delay" { &self.input_delays } else { &self.output_delays };
         let mut next: Vec<IoDelay> = Vec::with_capacity(list.len());
         for d in list {
@@ -485,15 +515,7 @@ impl Sdc {
             }
             let (mut kept, mut taken) = (Vec::new(), Vec::new());
             for p in &d.ports {
-                let mut hit = Hit::No;
-                for t in &ports {
-                    match name_hit(t, p) {
-                        Hit::Yes => hit = Hit::Yes,
-                        Hit::Unknown => return Err(format!("`{t}` names part of `{p}`, which only the design can split")),
-                        Hit::No => {}
-                    }
-                }
-                if hit == Hit::Yes { taken.push(p.clone()) } else { kept.push(p.clone()) }
+                if lookup.hit(false, p)? == Hit::Yes { taken.push(p.clone()) } else { kept.push(p.clone()) }
             }
             if taken.is_empty() {
                 next.push(d.clone());
@@ -765,7 +787,13 @@ fn points(o: &Objects) -> Vec<Point> {
     if !o.items.is_empty() {
         return o.items.iter().flat_map(points).collect();
     }
-    o.names.iter().map(|n| Objects { names: vec![n.clone()], items: Vec::new(), ..o.clone() }).collect()
+    o.names.iter().map(|n| one_object(o, n)).collect()
+}
+
+/// `o`'s accessor and options over ONE of its names — without copying its whole name list per
+/// name, which on a 10 000-object list is 10^8 string copies.
+fn one_object(o: &Objects, name: &str) -> Objects {
+    Objects { accessor: o.accessor.clone(), names: vec![name.to_string()], flags: o.flags.clone(), keys: o.keys.clone(), items: Vec::new() }
 }
 
 /// The kind of object a point is: `c` clock, `p` pin or port, `i` instance, `n` net, `?` a bare
@@ -848,84 +876,76 @@ fn reset_match(reset: &ExcShape, held: &ExcShape, clocks: &[SdcClock]) -> Hit {
     hit
 }
 
-/// The exception, one point per side (`ExpandedExceptionVisitor`): every from point × every
-/// point of each thru × every to point. A side with no points (a to that is only `-rise`) yields
-/// none — the exception then expands to nothing.
-fn expand(e: &ExcShape) -> Vec<ExcShape> {
-    let single = |s: &Side, p: &Point| Side { key: s.key.clone(), points: vec![p.clone()] };
-    let mut out = vec![ExcShape { from: None, thrus: Vec::new(), to: None, ..e.clone() }];
-    if let Some(f) = &e.from {
-        out = out.into_iter().flat_map(|x| f.points.iter().map(move |p| ExcShape { from: Some(single(f, p)), ..x.clone() })).collect();
+/// What survives a reset of `held`, as `Sdc::resetPath` leaves it — WITHOUT enumerating its
+/// expansion.
+///
+/// The reference expands a matched exception to one point per side (`ExpandedExceptionVisitor`:
+/// every from point × every point of each thru × every to point; a side with no points, a to that
+/// is only `-rise`, yields none) and keeps the expansions the reset does not match. An expansion
+/// is matched exactly when, in EVERY dimension the reset names, its point intersects the reset's
+/// (the edge and check tests are the same for all of them). So the matched expansions are the
+/// product of the matching points `M_d` of those dimensions, and what survives is the full
+/// product minus that box — written as one exception per named dimension `d_i`, last first: `M`
+/// on the named dimensions after it, the points NOT matched on `d_i`, and all points elsewhere. That is
+/// linear in the points; enumerating the product is not (10 000 from points × 10 000 to points is
+/// 10^8 expansions, on a large design routine).
+fn residue(reset: &ExcShape, held: &ExcShape, clocks: &[SdcClock]) -> Result<Vec<ExcShape>, String> {
+    // (reset side, held side) per named dimension, by position: 0 from, 1.. thrus, last to
+    let mut named: Vec<(usize, &Side, &Side)> = Vec::new();
+    if let (Some(r), Some(h)) = (&reset.from, &held.from) {
+        named.push((0, r, h));
     }
-    for t in &e.thrus {
-        out = out
-            .into_iter()
-            .flat_map(|x| {
-                t.points.iter().map(move |p| {
-                    let mut y = x.clone();
-                    y.thrus.push(single(t, p));
-                    y
-                })
-            })
-            .collect();
+    for (i, (r, h)) in reset.thrus.iter().zip(&held.thrus).enumerate() {
+        named.push((i + 1, r, h));
     }
-    if let Some(to) = &e.to {
-        out = out.into_iter().flat_map(|x| to.points.iter().map(move |p| ExcShape { to: Some(single(to, p)), ..x.clone() })).collect();
+    let to_at = held.thrus.len() + 1;
+    if let (Some(r), Some(h)) = (&reset.to, &held.to) {
+        named.push((to_at, r, h));
     }
-    out
-}
-
-/// Expansions that differ in the points of ONE side, merged back into one exception over the
-/// union of them, until none merges (`Sdc::addException` merges the same way), in order.
-fn merge(mut list: Vec<ExcShape>) -> Vec<ExcShape> {
-    loop {
-        let mut merged = false;
-        'outer: for i in 0..list.len() {
-            for j in i + 1..list.len() {
-                if let Some(m) = merge_two(&list[i], &list[j]) {
-                    list[i] = m;
-                    list.remove(j);
-                    merged = true;
-                    break 'outer;
-                }
+    // per named dimension, its points split into those the reset matches and the rest
+    let mut split: Vec<(usize, Side, Side)> = Vec::new();
+    for (at, r, h) in named {
+        let (mut hit, mut rest) = (Vec::new(), Vec::new());
+        for p in &h.points {
+            match sides_intersect(r, &Side { key: h.key.clone(), points: vec![p.clone()] }, clocks) {
+                Hit::Yes => hit.push(p.clone()),
+                Hit::No => rest.push(p.clone()),
+                Hit::Unknown => return Err("an exception it matches has objects only the design can split".into()),
             }
         }
-        if !merged {
-            return list;
+        split.push((at, Side { key: h.key.clone(), points: hit }, Side { key: h.key.clone(), points: rest }));
+    }
+    let set = |e: &mut ExcShape, at: usize, side: Side| {
+        if at == 0 {
+            e.from = Some(side);
+        } else if at == to_at {
+            e.to = Some(side);
+        } else {
+            e.thrus[at - 1] = side;
+        }
+    };
+    // LAST named dimension first, as the reference's merge of the kept expansions leaves them
+    // (measured 2026-11-03: from `{req_val reset}` × to `{resp_val req_rdy}` reset at req_val to
+    // resp_val keeps `{req_val reset}` to req_rdy, then reset to resp_val)
+    let mut out = Vec::new();
+    for (i, (at, _, rest)) in split.iter().enumerate().rev() {
+        if rest.points.is_empty() {
+            continue;
+        }
+        let mut e = held.clone();
+        for (at_j, hit_j, _) in &split[i + 1..] {
+            set(&mut e, *at_j, hit_j.clone());
+        }
+        set(&mut e, *at, rest.clone());
+        // a side with no points makes an empty product: nothing of it survives
+        let empty = e.from.as_ref().is_some_and(|f| f.points.is_empty())
+            || e.thrus.iter().any(|t| t.points.is_empty())
+            || e.to.as_ref().is_some_and(|t| t.points.is_empty());
+        if !empty {
+            out.push(e);
         }
     }
-}
-
-fn merge_two(a: &ExcShape, b: &ExcShape) -> Option<ExcShape> {
-    if a.end != b.end || a.min_max != b.min_max || a.thrus.len() != b.thrus.len() {
-        return None;
-    }
-    let sides = |e: &ExcShape| -> Vec<Option<Side>> {
-        let mut v = vec![e.from.clone()];
-        v.extend(e.thrus.iter().cloned().map(Some));
-        v.push(e.to.clone());
-        v
-    };
-    let (sa, sb) = (sides(a), sides(b));
-    let differ: Vec<usize> = (0..sa.len()).filter(|&i| sa[i] != sb[i]).collect();
-    let [i] = differ.as_slice() else { return None };
-    let (Some(x), Some(y)) = (&sa[*i], &sb[*i]) else { return None };
-    if x.key != y.key {
-        return None;
-    }
-    let mut points = x.points.clone();
-    points.extend(y.points.iter().filter(|p| !x.points.contains(p)).cloned());
-    let mut m = a.clone();
-    let side = Side { key: x.key.clone(), points };
-    let last = sa.len() - 1;
-    if *i == 0 {
-        m.from = Some(side);
-    } else if *i == last {
-        m.to = Some(side);
-    } else {
-        m.thrus[*i - 1] = side;
-    }
-    Some(m)
+    Ok(out)
 }
 
 /// Points back to one object list: one accessor when they share it, else a `[list …]`.
@@ -995,9 +1015,8 @@ fn exception_over(e: &Exception, args: Vec<(String, Objects)>) -> (Exception, [V
 impl Sdc {
     /// `unset_path_exceptions [-setup|-hold] [-from …] [-through …]… [-to …] [-rise|-fall]`
     /// (`unset_path_exceptions_cmd`, `Sdc::resetPath`). A from, through or to is required (449),
-    /// no other word (448). Each exception the reset matches ([`reset_match`]) is expanded to one
-    /// point per side; the expansions the reset also matches are dropped, the rest are kept,
-    /// merged back. False paths, multicycles and `set_max_delay` / `set_min_delay` are all
+    /// no other word (448). Each exception the reset matches ([`reset_match`]) keeps what its
+    /// expansion keeps ([`residue`]). False paths, multicycles and `set_max_delay` / `set_min_delay` are all
     /// exceptions here (`group_path` too, which this model does not carry).
     fn unset_path_exceptions(&mut self, toks: &[String]) -> Result<(), String> {
         let a = key_args(toks, &[&FROM_KEYS[..], &TO_KEYS[..], &THRU_KEYS[..]].concat(), &["-setup", "-hold", "-rise", "-fall"])?;
@@ -1039,17 +1058,7 @@ impl Sdc {
             match reset_match(reset, held, &clocks) {
                 Hit::No => Ok(None),
                 Hit::Unknown => Err("whether it matches an exception depends on objects only the design can resolve".into()),
-                Hit::Yes => {
-                    let mut kept = Vec::new();
-                    for x in expand(held) {
-                        match reset_match(reset, &x, &clocks) {
-                            Hit::Yes => {}
-                            Hit::No => kept.push(x),
-                            Hit::Unknown => return Err("an exception it matches has objects only the design can split".into()),
-                        }
-                    }
-                    Ok(Some(merge(kept)))
-                }
+                Hit::Yes => residue(reset, held, &clocks).map(Some),
             }
         };
         let mut exceptions = Vec::with_capacity(self.exceptions.len());
@@ -1265,6 +1274,31 @@ mod tests {
         assert_eq!(s.exceptions.len(), 1, "a -from reset needs a from");
         let s = read("unset_path_exceptions -setup\n");
         assert!(s.rejected[0].contains("449"), "{:?}", s.rejected);
+    }
+
+    /// Rule (resetPath expansion): a reset naming two dimensions takes only their product — from
+    /// `{a b}` × to `{y z}` reset `-from a -to y` keeps `{a b}` to z, then b to y (the
+    /// reference's form).
+    #[test]
+    fn unset_path_exceptions_two_dimensions() {
+        let s = read("set_false_path -from [get_ports {a b}] -to [get_ports {y z}]\nunset_path_exceptions -from [get_ports a] -to [get_ports y]\n");
+        let kept: Vec<(Vec<String>, Vec<String>)> = s.exceptions.iter().map(|e| (e.args[0].1.names.clone(), e.args[1].1.names.clone())).collect();
+        assert_eq!(kept, [(vec!["a".to_string(), "b".to_string()], vec!["z".to_string()]), (vec!["b".to_string()], vec!["y".to_string()])]);
+    }
+
+    /// A reset of a huge exception is linear in its points: 10 000 × 10 000 would be 10^8
+    /// expansions if enumerated.
+    #[test]
+    fn unset_path_exceptions_scales() {
+        let from: Vec<String> = (0..10_000).map(|i| format!("f{i}")).collect();
+        let to: Vec<String> = (0..10_000).map(|i| format!("t{i}")).collect();
+        let text = format!("set_false_path -from [get_pins {{{}}}] -to [get_pins {{{}}}]\nunset_path_exceptions -from [get_pins f17]\n", from.join(" "), to.join(" "));
+        let t0 = std::time::Instant::now();
+        let s = read(&text);
+        assert_eq!(s.exceptions.len(), 1);
+        assert_eq!(s.exceptions[0].args[0].1.names.len(), 9_999);
+        assert_eq!(s.exceptions[0].args[1].1.names.len(), 10_000);
+        assert!(t0.elapsed().as_secs() < 5, "took {:?}", t0.elapsed());
     }
 
     /// Rule (`-reset_path`): `set_max_delay` / `set_min_delay` reset over their own points for
