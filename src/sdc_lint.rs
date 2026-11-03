@@ -771,6 +771,9 @@ struct Graph {
     inst_index: BTreeMap<String, usize>,
     conns: Vec<Vec<(String, String)>>,
     out_pins: Vec<Vec<String>>,
+    /// Per instance, the pins it has: the ones it connects and, for a library cell, every pin
+    /// the cell defines (an unconnected `QN` is still a pin).
+    pins: Vec<BTreeSet<String>>,
 }
 
 impl Graph {
@@ -785,6 +788,7 @@ impl Graph {
             inst_index: BTreeMap::new(),
             conns: Vec::new(),
             out_pins: Vec::new(),
+            pins: Vec::new(),
         };
         for p in nl.inputs.iter().chain(nl.outputs.iter()) {
             g.driver.entry(p.clone()).or_insert(None);
@@ -796,6 +800,11 @@ impl Graph {
             g.inst_index.insert(inst.name.clone(), i);
             g.known.insert(inst.name.clone());
             g.conns.push(inst.conns.clone());
+            let mut pins: BTreeSet<String> = inst.conns.iter().map(|(p, _)| p.clone()).collect();
+            if let Some(c) = cell {
+                pins.extend(c.pins.keys().cloned());
+            }
+            g.pins.push(pins);
             let mut outs = Vec::new();
             for (pin, net) in &inst.conns {
                 g.known.insert(net.clone());
@@ -812,8 +821,29 @@ impl Graph {
     }
 
     /// `inst/pin` paths resolve on the instance half.
+    ///
+    /// ⛔ The pin half must be a pin of that instance. Accepted on the instance alone, a pin inside
+    /// a block kept whole (`u_b/r/D`, read at instance level as `u_b/r`) passed on `u_b` — an
+    /// exception naming nothing, reported as fine.
     fn knows(&self, obj: &str) -> bool {
-        self.known.contains(obj) || self.known.contains(instance_of(obj))
+        if self.known.contains(obj) {
+            return true;
+        }
+        let inst = instance_of(obj);
+        let Some(&i) = self.inst_index.get(inst).filter(|_| inst != obj) else { return false };
+        obj.get(inst.len() + 1..).is_some_and(|pin| self.pins[i].contains(pin))
+    }
+
+    /// The instance an SDC object names: the object ITSELF when it is an instance (an exception
+    /// side is kept at instance level, `u_b/r`), else the instance part of a pin (`u_b/r/D`).
+    /// ⛔ Stripped unconditionally, a hierarchical instance `u_b/r` became `u_b`, which is no
+    /// instance, and every exception on a flattened block's register read as dead.
+    fn base_of<'o>(&self, obj: &'o str) -> &'o str {
+        if self.inst_index.contains_key(obj) {
+            obj
+        } else {
+            instance_of(obj)
+        }
     }
 
     fn net_at(&self, inst: usize, pin: &str) -> Option<&str> {
@@ -851,7 +881,7 @@ impl Graph {
 
     /// The nets an SDC object launches from: a port is itself, an instance is its outputs.
     fn start_nets(&self, obj: &str) -> Vec<String> {
-        let base = instance_of(obj);
+        let base = self.base_of(obj);
         if let Some(&i) = self.inst_index.get(base) {
             return self.out_pins[i]
                 .iter()
@@ -894,7 +924,7 @@ impl Graph {
 
     /// Is `to` reached by any timing path — walking back to a register or a primary input?
     fn captures_anything(&self, to: &str) -> bool {
-        let base = instance_of(to);
+        let base = self.base_of(to);
         // Start from the object's input nets (an instance) or the net itself (a port).
         let mut stack: Vec<String> = match self.inst_index.get(base) {
             Some(&i) => self.conns[i]
@@ -937,7 +967,7 @@ impl Graph {
     /// Is there a structural path from `from` to `to`? Forward through combinational logic,
     /// stopping at sequential cells — which is what a timing path is.
     fn reaches(&self, from: &str, to: &str) -> bool {
-        let target_base = instance_of(to);
+        let target_base = self.base_of(to);
         let target_inst = self.inst_index.get(target_base).copied();
         let mut seen: BTreeSet<String> = BTreeSet::new();
         let mut stack = self.start_nets(from);
@@ -1613,6 +1643,34 @@ mod declared_domain_tests {
             .findings
             .iter()
             .any(|f| f.code == "domain-not-constrained"));
+    }
+}
+
+#[cfg(test)]
+mod hierarchical_name_tests {
+    use super::*;
+
+    /// A flattened block's register is an instance whose own name has a `/` (`u_b/r`): an
+    /// exception to it is live, as it is for the same register in a flat netlist.
+    #[test]
+    fn an_exception_on_a_flattened_register_is_not_dead() {
+        let lib = Lib::load("tests/data/sdc_lint/seq.lib").expect("seq.lib");
+        let nl = crate::netlist::parse(
+            "module t(clk,din,dout);\ninput clk,din; output dout;\nwire mid;\n\
+             DFF u_a/r(.CK(clk),.D(din),.Q(mid));\nDFF u_b/r(.CK(clk),.D(mid),.Q(dout));\nendmodule\n"
+                .replace("u_a/r", "\\u_a/r ")
+                .replace("u_b/r", "\\u_b/r ")
+                .as_str(),
+        )
+        .expect("netlist");
+        let sdc = Sdc::parse(
+            "create_clock -name clk -period 10 [get_ports clk]\nset_input_delay 1 -clock clk [all_inputs]\n\
+             set_output_delay 1 -clock clk [all_outputs]\nset_false_path -to [get_pins u_b/r/D]\n\
+             set_false_path -from [get_pins u_a/r/CK] -to [get_pins u_b/r/D]\n",
+        )
+        .expect("sdc");
+        let r = lint(&nl, &sdc, &lib);
+        assert!(r.findings.iter().all(|f| !f.code.starts_with("exception-")), "{:?}", r.findings);
     }
 }
 
