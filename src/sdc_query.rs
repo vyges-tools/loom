@@ -15,9 +15,14 @@
 //!     `ref_name` `cell` `is_hierarchical`; a pin's `name` `lib_pin_name` `full_name` `direction`
 //!     `is_port` `is_hierarchical`; a net's `name` `full_name`.
 //!
-//! What this cannot answer it says so ([`Err`]) and the command is not applied: `-regexp`, a
-//! property the reference has but this view does not carry (timing, Liberty attributes), and a
-//! property the reference does not know (an error there too).
+//!   * `-regexp`: each pattern is a regular expression ANCHORED as the reference anchors it, `^`
+//!     + pattern + `$` with no group (so `a|b` is "starts with a, or ends with b"), `-nocase`
+//!     making it case-blind; a bus port or a pin is matched the way a glob is (see [`tcl_regex`]).
+//!
+//! What this cannot answer it says so ([`Err`]) and the command is not applied: a `-regexp`
+//! pattern the reference's dialect reads differently ([`tcl_regex`]), a property the reference
+//! has but this view does not carry (timing, Liberty attributes), and a property the reference
+//! does not know (an error there too).
 
 use crate::liberty::{Dir, Lib};
 use crate::netlist::Netlist;
@@ -137,7 +142,7 @@ fn names(o: &Objs, d: &SdcDesign) -> Vec<String> {
 fn objects(parts: &[String], d: &SdcDesign) -> Result<Objs, String> {
     let cmd = parts.first().map(String::as_str).unwrap_or("");
     let keys = crate::sdc_flags::FLAGS.iter().find(|(n, _, _)| *n == cmd).map_or(&[][..], |(_, k, _)| *k);
-    let (mut filter, mut of, mut regexp, mut hier) = (None, None, false, false);
+    let (mut filter, mut of, mut regexp, mut hier, mut nocase) = (None, None, false, false, false);
     let mut patterns: Vec<String> = Vec::new();
     let mut k = 1;
     while k < parts.len() {
@@ -154,14 +159,15 @@ fn objects(parts: &[String], d: &SdcDesign) -> Result<Objs, String> {
         }
         match w {
             "-regexp" => regexp = true,
+            "-nocase" => nocase = true,
             "-hierarchical" => hier = true,
             w if w.starts_with('-') => {}
             w => patterns.extend(w.split_whitespace().map(String::from)),
         }
         k += 1;
     }
-    if regexp {
-        return Err("-regexp is not evaluated".into());
+    if regexp && cmd == "get_clocks" {
+        return Err("get_clocks -regexp is not evaluated".into());
     }
     if cmd == "get_clocks" {
         return if filter.is_some() || of.is_some() { Err("get_clocks with -filter / -of_objects is not evaluated".into()) } else { Ok(Objs::Clocks) };
@@ -171,6 +177,7 @@ fn objects(parts: &[String], d: &SdcDesign) -> Result<Objs, String> {
     }
     let base = match of {
         Some(of) => of_objects(cmd, &of, d)?,
+        None if regexp => by_regexp(cmd, &patterns, nocase, d)?,
         None => by_pattern(cmd, &patterns, hier, d)?,
     };
     match filter {
@@ -205,6 +212,98 @@ fn by_pattern(cmd: &str, patterns: &[String], _hier: bool, d: &SdcDesign) -> Res
             Objs::Nets(out)
         }
         c => return Err(format!("{c} is not evaluated")),
+    })
+}
+
+/// A Tcl regular expression (Advanced RE, as the reference compiles one) as a Rust [`Regex`],
+/// `anchored` as `PatternMatch::compileRegexp` anchors it: `^` + pattern + `$`, NOT grouped.
+///
+/// The two dialects agree on what object patterns use (classes, `\d` `\w` `\s`, `.`, `*` `+` `?`,
+/// bounds, alternation, groups). Where they differ, Rust either fails to compile (back-references,
+/// lookahead, `\m` `\M` `\y` `\Y` `\e`, `[[:<:]]`) — refused — or reads it differently: `\b` is
+/// a backspace and `\B` a backslash in Tcl, word boundaries in Rust, so those are refused too.
+///
+/// [`Regex`]: regex::Regex
+pub(crate) fn tcl_regex(pat: &str, anchored: bool, nocase: bool) -> Result<regex::Regex, String> {
+    let mut chars = pat.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' && matches!(chars.next(), Some('b' | 'B')) {
+            return Err(format!("-regexp `{pat}`: `\\b` / `\\B` mean a backspace / backslash to the reference, a word boundary here; not evaluated"));
+        }
+    }
+    let full = if anchored { format!("^{pat}$") } else { pat.to_string() };
+    regex::RegexBuilder::new(&full)
+        .case_insensitive(nocase)
+        .build()
+        .map_err(|e| format!("-regexp `{pat}`: not a pattern evaluated here as the reference evaluates it ({})", e.to_string().lines().last().unwrap_or("")))
+}
+
+/// `-regexp` patterns over names, as the reference's finders apply them: a port pattern through
+/// the bus rule ([`crate::sdc::object_matches_by`]), a pin pattern split at its LAST `/` into an
+/// instance pattern and a pin pattern (`pathNameLast`), each matched whole; cells and nets whole.
+fn by_regexp(cmd: &str, patterns: &[String], nocase: bool, d: &SdcDesign) -> Result<Objs, String> {
+    let mut compiled: std::collections::HashMap<String, regex::Regex> = std::collections::HashMap::new();
+    let mut need = |p: &str| -> Result<(), String> {
+        if !compiled.contains_key(p) {
+            compiled.insert(p.to_string(), tcl_regex(p, true, nocase)?);
+        }
+        Ok(())
+    };
+    let mut split_pins = Vec::new();
+    for p in patterns {
+        match cmd {
+            "get_ports" => {
+                need(p)?;
+                if let Some((base, _)) = crate::sdc::bus_form(p) {
+                    need(base)?;
+                }
+            }
+            "get_pins" => {
+                let Some((inst, pin)) = p.rsplit_once('/') else {
+                    return Err(format!("get_pins -regexp `{p}`: a pattern with no instance part is not evaluated"));
+                };
+                need(inst)?;
+                need(pin)?;
+                split_pins.push((inst.to_string(), pin.to_string()));
+            }
+            "get_cells" | "get_nets" => need(p)?,
+            c => return Err(format!("{c} -regexp is not evaluated")),
+        }
+    }
+    let is = |p: &str, n: &str| compiled.get(p).is_some_and(|r| r.is_match(n));
+    let pick = |n: usize, name: &dyn Fn(usize) -> String, hit: &dyn Fn(&str, &str) -> bool| -> Vec<usize> {
+        let mut out = Vec::new();
+        for p in patterns {
+            for k in 0..n {
+                if hit(p, &name(k)) && !out.contains(&k) {
+                    out.push(k);
+                }
+            }
+        }
+        out
+    };
+    Ok(match cmd {
+        "get_ports" => Objs::Ports(pick(d.ports.len(), &|k| d.ports[k].0.clone(), &|p, n| crate::sdc::object_matches_by(p, n, &is))),
+        "get_cells" => Objs::Cells(pick(d.insts.len(), &|k| d.insts[k].0.clone(), &is)),
+        "get_pins" => {
+            let mut out = Vec::new();
+            for (ip, pp) in &split_pins {
+                for k in 0..d.pins.len() {
+                    if is(ip, &d.insts[d.pins[k].0].0) && is(pp, &d.pins[k].1) && !out.contains(&k) {
+                        out.push(k);
+                    }
+                }
+            }
+            Objs::Pins(out)
+        }
+        _ => {
+            let all = d.nets();
+            let mut out: Vec<String> = Vec::new();
+            for p in patterns {
+                out.extend(all.iter().filter(|n| is(p, n) && !out.contains(n)).cloned().collect::<Vec<_>>());
+            }
+            Objs::Nets(out)
+        }
     })
 }
 
@@ -605,13 +704,48 @@ endmodule
         assert_eq!(p.join(" "), "u1/A u2/A u3/A u4/A u5/A");
     }
 
+    /// Rule (`-regexp`, `PatternMatch::compileRegexp` + the finders): `^` + pattern + `$` unGROUPED
+    /// (`a|y1` is "starts with a or ends with y1"); a PORT pattern ending `[digits…]` is first read
+    /// as a bus subscript, so on scalar ports `y[0-9]` finds nothing, `-nocase` included; cells and
+    /// nets are not bus-read; a pin pattern is instance and pin. Every answer is the reference's
+    /// (OpenSTA on this design and library, 2026-11-03, sorted).
+    #[test]
+    fn regexp_queries_match_the_reference() {
+        let sorted = |s: &str| {
+            let mut v = q(s).unwrap();
+            v.sort();
+            v.join(" ")
+        };
+        for (query, want) in [
+            ("get_ports -regexp {y[1-3]}", ""),
+            ("get_ports -regexp {y[0-9]}", ""),
+            ("get_ports -regexp {a|y1}", "a y1"),
+            ("get_ports -regexp {y.}", "y1 y2 y3 y4 y5 y6"),
+            ("get_ports -regexp -nocase {Y[25]}", ""),
+            ("get_ports -regexp {e.*}", "en"),
+            ("get_cells -regexp {u[1-3]}", "u1 u2 u3"),
+            ("get_cells -regexp {u.}", "u1 u2 u3 u4 u5"),
+            ("get_pins -regexp {u[12]/[AB]}", "u1/A u1/B u2/A u2/B"),
+            ("get_pins -regexp {u.*/Y}", "u1/Y u2/Y u3/Y u4/Y u5/Y"),
+            ("get_nets -regexp {y[456]}", "y4 y5 y6"),
+            ("get_ports -regexp {y\\d}", "y1 y2 y3 y4 y5 y6"),
+            ("get_ports -regexp {(a|b)}", "a b"),
+            ("get_pins -regexp {u1/.}", "u1/A u1/B u1/Y"),
+            ("get_ports -regexp {y1|b}", "b y1"),
+        ] {
+            assert_eq!(sorted(query), want, "{query}");
+        }
+        // a case-blind regexp that is not bus-read does fold case
+        assert_eq!(sorted("get_cells -regexp -nocase {U[12]}"), "u1 u2");
+    }
+
     /// What this cannot answer it says so: an unknown property (an error in the reference too),
-    /// one the view does not carry, and -regexp.
+    /// one the view does not carry, and a -regexp pattern Rust would read differently.
     #[test]
     fn what_cannot_be_evaluated_says_why() {
         assert!(q("get_ports -filter is_clock *").unwrap_err().contains("do not have a is_clock"));
         assert!(q("get_cells -filter is_buffer *").unwrap_err().contains("not evaluated"));
-        assert!(q("get_ports -regexp {y[1-3]}").is_err());
+        assert!(q("get_ports -regexp {y\\b}").is_err());
     }
 
     /// The command is applied once a design is in scope, and still refused without one.

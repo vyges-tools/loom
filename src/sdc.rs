@@ -104,12 +104,22 @@ fn endpoint_matches(set: &[String], name: &str) -> bool {
 /// then is it matched as a bus, and NEVER as a whole-name glob: `req_msg[1?]` is bit 1 (the
 /// subscript is read as an integer, its leading digits), not bits 10 to 19.
 pub fn object_matches(pattern: &str, name: &str) -> bool {
-    let named = |p: &str, n: &str| p == n || (p.contains(['*', '?']) && glob(p, n));
-    let bus_form = pattern
+    object_matches_by(pattern, name, &|p: &str, n: &str| p == n || (p.contains(['*', '?']) && glob(p, n)))
+}
+
+/// A pattern's bus form, `(bus, subscript)`, when its last `[…]` starts with a digit or `*`
+/// (`parseBusName`) — for a glob and a `-regexp` pattern alike.
+pub(crate) fn bus_form(pattern: &str) -> Option<(&str, &str)> {
+    pattern
         .strip_suffix(']')
         .and_then(|p| p.rsplit_once('['))
-        .filter(|(b, sub)| !b.is_empty() && !b.ends_with('\\') && sub.starts_with(|c: char| c.is_ascii_digit() || c == '*'));
-    let Some((pbase, sub)) = bus_form else {
+        .filter(|(b, sub)| !b.is_empty() && !b.ends_with('\\') && sub.starts_with(|c: char| c.is_ascii_digit() || c == '*'))
+}
+
+/// [`object_matches`] with the name matcher given: the reference's port finder applies the same
+/// bus rule whether the pattern is a glob or (`-regexp`) a regular expression.
+pub(crate) fn object_matches_by(pattern: &str, name: &str, named: &dyn Fn(&str, &str) -> bool) -> bool {
+    let Some((pbase, sub)) = bus_form(pattern) else {
         // a plain pattern is matched against PORT names: a scalar's, or a bit's bus (every bit of
         // a bus it names) — never a bit's own name, so `req_msg[?]` names nothing
         return match bus_bit(name) {
@@ -3583,16 +3593,23 @@ fn dialect(
         }
         // Tcl `switch ?-exact|-glob? ?--? value {pattern body …}` (or the pairs inline): the first
         // matching pattern's body runs, `default` matching anything; a body `-` falls through to
-        // the next one. `-regexp` is not evaluated, so the switch is refused.
+        // the next one. `-regexp` matches as Tcl's `regexp` does; `-nocase` folds case.
         "switch" => {
             let line = subst_command_vars(raw, vars);
             let toks = tokenize(&line);
             let mut k = 1;
-            let mut glob_mode = false;
+            // ONE mode option: a second is Tcl's error (`bad option "-regexp": -glob option
+            // already found`, Tcl 8.6.14)
+            let (mut mode, mut nocase) = (None, false);
             while let Some(t) = toks.get(k).filter(|t| t.starts_with('-')) {
                 match t.as_str() {
-                    "-exact" => {}
-                    "-glob" => glob_mode = true,
+                    m @ ("-exact" | "-glob" | "-regexp") => {
+                        if let Some(first) = mode {
+                            return Ok(Dialect::Refuse(format!("switch: bad option \"{m}\": {first} option already found (Tcl's error); not run")));
+                        }
+                        mode = Some(m);
+                    }
+                    "-nocase" => nocase = true,
                     "--" => {
                         k += 1;
                         break;
@@ -3609,10 +3626,21 @@ fn dialect(
             if !pairs.len().is_multiple_of(2) {
                 return Ok(Dialect::Refuse("switch: patterns and bodies do not pair; not run".into()));
             }
+            let fold = |s: &str| if nocase { s.to_lowercase() } else { s.to_string() };
             let mut hit = false;
             for pb in pairs.chunks(2) {
                 let (pat, body) = (&pb[0], &pb[1]);
-                hit = hit || pat == "default" || if glob_mode { glob(pat, value) } else { pat == value };
+                // `-regexp` is Tcl's `regexp`: unanchored, the first pattern found anywhere in it
+                let matched = match mode.unwrap_or("-exact") {
+                    _ if pat == "default" => true,
+                    "-regexp" => match crate::sdc_query::tcl_regex(pat, false, nocase) {
+                        Ok(r) => r.is_match(value),
+                        Err(why) => return Ok(Dialect::Refuse(format!("switch: {why}; not run"))),
+                    },
+                    "-glob" => glob(&fold(pat), &fold(value)),
+                    _ => fold(pat) == fold(value),
+                };
+                hit = hit || matched;
                 if hit && body != "-" {
                     return Ok(Dialect::Run(logical_lines(body)));
                 }
@@ -5195,6 +5223,21 @@ set_load 5 [get_ports $L]
 ").is_err());
         assert!(Sdc::parse("for {set i 0} {$i < 3} {incr i} { if {$i} { break } }
 ").unwrap().rejected.iter().any(|r| r.starts_with("for")));
+    }
+
+    /// Rule (Tcl 8.6 `switch`, measured on the reference's interpreter 2026-11-03): `-regexp` is
+    /// `regexp`, UNANCHORED (`slow` hits `^s`, `x9` hits `[0-9]`, `fast` falls to `default`);
+    /// `-nocase` folds case for `-glob` too; a second mode option is an error, nothing runs.
+    #[test]
+    fn switch_regexp_and_nocase_as_tcl() {
+        let loads = |text: &str| -> Vec<Vec<String>> { Sdc::parse(text).unwrap().env.iter().map(|e| e.objects.clone()).collect() };
+        for (v, port) in [("slow", "s"), ("fast", "dflt"), ("x9", "digit")] {
+            let t = format!("set v {v}\nswitch -regexp $v {{ {{^s}} {{ set_load 1 [get_ports s] }} {{[0-9]}} {{ set_load 1 [get_ports digit] }} default {{ set_load 1 [get_ports dflt] }} }}\n");
+            assert_eq!(loads(&t), [vec![port.to_string()]], "{v}");
+        }
+        assert_eq!(loads("switch -nocase -glob ABC { a* { set_load 1 [get_ports hit] } default { set_load 1 [get_ports miss] } }\n"), [vec!["hit".to_string()]]);
+        let s = Sdc::parse("switch -glob -regexp abc { b { set_load 1 [get_ports r] } default { set_load 1 [get_ports g] } }\n").unwrap();
+        assert!(s.env.is_empty() && s.rejected.iter().any(|r| r.contains("already found")), "{:?}", s.rejected);
     }
 
     /// What a proc call cannot be read as is refused, and the read goes on; a recursive proc

@@ -26,6 +26,8 @@ gzip = ["dep:miniz_oxide"]
 
 [dependencies]
 miniz_oxide = { version = "0.8", optional = true }
+# `-regexp` object queries and `switch -regexp` (MIT / Apache-2.0)
+regex = "1"
 
 [lib]
 name = "vyges_loom"
