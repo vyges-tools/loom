@@ -56,6 +56,20 @@ const HANDLED: &[&str] = &[
     // A LOOM EXTENSION (synthesis-tool dialect, 2026-11-02): grows a collection variable, read
     // where the reference stops; it sets a variable, so it records nothing as dropped.
     "append_to_collection",
+    // Take-back commands, applied to the model as the reference applies them (2026-11-03):
+    // nothing of them is left to record as dropped.
+    "delete_clock",
+    "delete_generated_clock",
+    "unset_case_analysis",
+    "unset_clock_groups",
+    "unset_clock_latency",
+    "unset_clock_transition",
+    "unset_clock_uncertainty",
+    "unset_input_delay",
+    "unset_output_delay",
+    "unset_path_exceptions",
+    "unset_propagated_clock",
+    "unset_timing_derate",
 ];
 
 /// The mined commands the reference does NOT know (`invalid command name`; measured on the pinned

@@ -704,19 +704,17 @@ impl Sdc {
                         }
                         continue;
                     }
-                    for i in 0..2 {
-                        if left[i][0] == left[i][1] {
-                            if left[i][0].any() {
+                    for (i, row) in left.iter().enumerate() {
+                        if row[0] == row[1] {
+                            if row[0].any() {
                                 let (fk, tk) = keys(i, 0, false, true);
-                                next.push(one_pair(fk, tk, left[i][0].0, left[i][0].1));
+                                next.push(one_pair(fk, tk, row[0].0, row[0].1));
                             }
                             continue;
                         }
-                        for j in 0..2 {
-                            if left[i][j].any() {
-                                let (fk, tk) = keys(i, j, false, false);
-                                next.push(one_pair(fk, tk, left[i][j].0, left[i][j].1));
-                            }
+                        for (j, cell) in row.iter().enumerate().filter(|(_, c)| c.any()) {
+                            let (fk, tk) = keys(i, j, false, false);
+                            next.push(one_pair(fk, tk, cell.0, cell.1));
                         }
                     }
                 }
@@ -918,14 +916,14 @@ fn merge_two(a: &ExcShape, b: &ExcShape) -> Option<ExcShape> {
     let mut points = x.points.clone();
     points.extend(y.points.iter().filter(|p| !x.points.contains(p)).cloned());
     let mut m = a.clone();
-    let side = Some(Side { key: x.key.clone(), points });
+    let side = Side { key: x.key.clone(), points };
     let last = sa.len() - 1;
     if *i == 0 {
-        m.from = side;
+        m.from = Some(side);
     } else if *i == last {
-        m.to = side;
+        m.to = Some(side);
     } else {
-        m.thrus[*i - 1] = side.expect("built as Some above");
+        m.thrus[*i - 1] = side;
     }
     Some(m)
 }

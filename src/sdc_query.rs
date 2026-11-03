@@ -15,9 +15,10 @@
 //!     `ref_name` `cell` `is_hierarchical`; a pin's `name` `lib_pin_name` `full_name` `direction`
 //!     `is_port` `is_hierarchical`; a net's `name` `full_name`.
 //!
-//!   * `-regexp`: each pattern is a regular expression ANCHORED as the reference anchors it, `^`
-//!     + pattern + `$` with no group (so `a|b` is "starts with a, or ends with b"), `-nocase`
-//!     making it case-blind; a bus port or a pin is matched the way a glob is (see [`tcl_regex`]).
+//!   * `-regexp`: each pattern is a regular expression ANCHORED as the reference anchors it, a
+//!     `^` before and a `$` after with no group (so `a|b` is "starts with a, or ends with b"),
+//!     `-nocase` making it case-blind; a bus port or a pin is matched the way a glob is (see
+//!     [`tcl_regex`]).
 //!
 //! What this cannot answer it says so ([`Err`]) and the command is not applied: a `-regexp`
 //! pattern the reference's dialect reads differently ([`tcl_regex`]), a property the reference
