@@ -580,6 +580,11 @@ pub struct Sdc {
     pub max_fanout: Option<f64>,
     /// A `set_max_fanout` on anything but the design.
     pub max_fanout_on_objects: bool,
+    /// Every `set_max_transition` on anything but the design alone (ports, clocks with
+    /// `-clock_path` / `-data_path`, `-rise` / `-fall`), in file order.
+    pub max_transition_objects: Vec<DesignRuleCmd>,
+    /// Every `set_max_fanout` on anything but the design alone, in file order.
+    pub max_fanout_objects: Vec<DesignRuleCmd>,
     /// `set_max_capacitance V [current_design]`: the design-wide capacitance limit AS WRITTEN —
     /// not scaled by `set_units`, which in the reference only checks the unit; the value is in the
     /// library's capacitance unit. Recorded in [`Sdc::ignored`] as well, like `set_max_transition`.
@@ -950,6 +955,22 @@ pub struct NotApplied {
     pub affects_timing: bool,
 }
 
+/// A design-rule limit on objects (`set_max_transition -clock_path 0.2 [get_clocks c]`): the
+/// value AS WRITTEN (NaN when it is not a number), the flags that take no value, and the objects.
+#[derive(Debug, Clone)]
+pub struct DesignRuleCmd {
+    pub value: f64,
+    pub flags: Vec<String>,
+    pub objects: Objects,
+}
+
+/// `<cmd> [flags] value objects`, or `None` when there is no object word.
+fn design_rule_cmd(toks: &[String]) -> Option<DesignRuleCmd> {
+    let (_, flags, pos) = split_args(toks, &[]);
+    let value = pos.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(f64::NAN);
+    Some(DesignRuleCmd { value, flags, objects: Objects::of(pos.get(1)?) })
+}
+
 #[derive(Debug)]
 pub struct SdcError(pub String);
 impl std::fmt::Display for SdcError {
@@ -1190,7 +1211,7 @@ fn resolve_objs(tok: &str) -> Vec<String> {
                 }
                 return names;
             }
-            "get_ports" | "get_pins" | "get_clocks" | "get_nets" | "get_cells" => {
+            "get_ports" | "get_pins" | "get_clocks" | "get_nets" | "get_cells" | "get_lib_cells" | "get_lib_pins" | "get_libs" => {
                 // The patterns are the POSITIONAL arguments: a key (`-filter`, `-of_objects`,
                 // `-hsc`, abbreviated or not) takes the next word as its value, a flag
                 // (`-hierarchical`, `-quiet`) none. ⛔ Skipping only the `-` words read a filter
@@ -1359,6 +1380,58 @@ fn resolve_command(word: &str) -> Result<String, String> {
 /// subscript (`[0]`, `[7:0]`, `[*]`) is the reference's literal, not a command.
 fn unknown_command(line: &str) -> Option<String> {
     unknown_substituted_command(line).or_else(|| resolve_command(&tokenize(line.trim()).into_iter().next()?).err())
+}
+
+/// The reference's query aliases (`define_cmd_alias` in its SDC Tcl): each singular spelling is
+/// the plural query, nothing else.
+const QUERY_ALIASES: [(&str, &str); 8] = [
+    ("get_cell", "get_cells"),
+    ("get_clock", "get_clocks"),
+    ("get_lib_cell", "get_lib_cells"),
+    ("get_lib_pin", "get_lib_pins"),
+    ("get_lib", "get_libs"),
+    ("get_net", "get_nets"),
+    ("get_pin", "get_pins"),
+    ("get_port", "get_ports"),
+];
+
+/// `line` with each substituted query word (`[get_cell …]`) spelled as the query it names
+/// (`[get_cells …]`): a singular spelling — legal SDC since 1.5 — is an alias of the plural query
+/// in the reference ([`QUERY_ALIASES`]), and an abbreviation resolves to the ONE global command it
+/// begins (`sta_unknown`); matched by exact name here, both were refused. Inside braces nothing is substituted, so nothing
+/// is rewritten; a word that names no query, or more than one, is left for the read checks.
+fn canonical_queries(line: &str) -> String {
+    let b = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let (mut depth, mut i, mut last) = (0usize, 0usize, 0usize);
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1,
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            b'[' if depth == 0 => {
+                let start = i + 1;
+                let end = line[start..].find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(b.len(), |e| start + e);
+                let word = &line[start..end];
+                if !word.is_empty() && !KNOWN_QUERIES.contains(&word) && word.starts_with("get_") {
+                    let full = QUERY_ALIASES
+                        .iter()
+                        .find(|(a, _)| *a == word)
+                        .map(|(_, q)| q.to_string())
+                        .or_else(|| resolve_command(word).ok());
+                    if let Some(full) = full.filter(|f| KNOWN_QUERIES.contains(&f.as_str())) {
+                        out.push_str(&line[last..start]);
+                        out.push_str(&full);
+                        last = end;
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push_str(&line[last..]);
+    out
 }
 
 /// Queries a synthesis tool has and the reference does not, known here so that a constraint using
@@ -2505,7 +2578,7 @@ impl Sdc {
                 }
                 Control::None => {}
             }
-            let line = subst_exprs(&subst_command_vars(&raw, &vars), &vars);
+            let line = canonical_queries(&subst_exprs(&subst_command_vars(&raw, &vars), &vars));
             let toks = expand_abbreviations(tokenize(&line));
             if toks.is_empty() {
                 continue;
@@ -2576,6 +2649,25 @@ impl Sdc {
                 // `set_clock_group` that means losing an asynchronous-clock declaration, so
                 // paths between clocks that never relate get checked and report false
                 // violations. Found by diffing our command inventory against SDC 2.1.
+                // ⛔ A CHANGED SCOPE STOPS THE READ. Every name after `current_instance u1` is
+                // relative to `u1`, and this reader resolves names from the top: read past, every
+                // later constraint named the wrong objects and a checker tested those. Back to the
+                // top (no argument, or the top itself) changes nothing and is read.
+                "current_instance" | "set_current_instance" => {
+                    if let Some(i) = toks.get(1).filter(|t| !matches!(t.as_str(), "/" | "." | "" | "{}")) {
+                        return Err(SdcError(format!(
+                            "`{} {i}`: names relative to an instance are not supported, and every later name would be read from the top; the file is not read",
+                            toks[0]
+                        )));
+                    }
+                }
+                "set_hierarchy_separator" => {
+                    if let Some(sep) = toks.get(1).filter(|t| t.as_str() != "/") {
+                        return Err(SdcError(format!(
+                            "`set_hierarchy_separator {sep}`: only `/` is supported, and names using another separator would not resolve; the file is not read"
+                        )));
+                    }
+                }
                 "current_design" => {
                     if let Some(n) = toks.get(1) {
                         sdc.current_design = resolve_objs(n).into_iter().next();
@@ -2831,7 +2923,13 @@ impl Sdc {
                 "set_max_fanout" => {
                     match (toks.len() == 3 && toks[2] == "[current_design]", toks.get(1).and_then(|v| v.parse::<f64>().ok())) {
                         (true, Some(v)) => sdc.max_fanout = Some(v),
-                        _ => sdc.max_fanout_on_objects = true,
+                        _ => {
+                            sdc.max_fanout_on_objects = true;
+                            match design_rule_cmd(&toks) {
+                                Some(d) => sdc.max_fanout_objects.push(d),
+                                None => sdc.rejected.push(format!("{} without objects", toks[0])),
+                            }
+                        }
                     }
                     sdc.ignored.push("set_max_fanout".to_string());
                 }
@@ -2884,7 +2982,13 @@ impl Sdc {
                 "set_max_transition" => {
                     match (toks.len() == 3 && toks[2] == "[current_design]", toks.get(1).and_then(|v| v.parse::<f64>().ok())) {
                         (true, Some(v)) => sdc.max_transition = Some(v),
-                        _ => sdc.max_transition_on_objects = true,
+                        _ => {
+                            sdc.max_transition_on_objects = true;
+                            match design_rule_cmd(&toks) {
+                                Some(d) => sdc.max_transition_objects.push(d),
+                                None => sdc.rejected.push(format!("{} without objects", toks[0])),
+                            }
+                        }
                     }
                     sdc.ignored.push("set_max_transition".to_string());
                 }
@@ -4365,5 +4469,91 @@ mod tcl_values {
         let s = Sdc::parse("set p 5\nif {[info exists ::env(VYGES_SDC_TEST_UNSET_VAR)]} {\n  set p 7\n}\nif {[info exists p]} {\n  create_clock -name c -period $p [get_ports clk]\n}\n").unwrap();
         assert!(s.ignored.is_empty(), "{:?}", s.ignored);
         assert_eq!(s.clocks[0].period, 5.0);
+    }
+}
+
+#[cfg(test)]
+mod query_spelling_tests {
+    use super::*;
+
+    /// Rule (reference `define_cmd_alias`): `get_port` IS `get_ports`, `get_cell` IS `get_cells`,
+    /// and so on for every singular query. Read by exact name, they were refused.
+    #[test]
+    fn singular_queries_are_their_plurals() {
+        let s = Sdc::parse(
+            "create_clock -name c -period 10 [get_port clk]\n\
+             set_input_delay 1 -clock [get_clock c] [get_port {a b}]\n\
+             set_false_path -from [get_cell r1] -to [get_pin r2/D]\n",
+        )
+        .unwrap();
+        assert!(s.rejected.is_empty(), "{:?}", s.rejected);
+        assert_eq!(s.clocks[0].source, "clk");
+        assert_eq!(s.input_delays.len(), 1);
+        assert_eq!(s.input_delays[0].ports, ["a", "b"]);
+        assert_eq!(s.exception_objects[0][0][0].accessor, "get_cells");
+        assert_eq!(s.exception_objects[0][1][0].accessor, "get_pins");
+    }
+
+    /// Inside braces nothing is substituted, so nothing is rewritten.
+    #[test]
+    fn a_braced_query_word_is_not_rewritten() {
+        assert_eq!(canonical_queries("set x {[get_port a]}"), "set x {[get_port a]}");
+        assert_eq!(canonical_queries("set_load 1 [get_port a]"), "set_load 1 [get_ports a]");
+        assert_eq!(canonical_queries("set_load 1 a[0]"), "set_load 1 a[0]");
+    }
+
+    /// `get_lib_cells` / `get_lib_pins` / `get_libs` name their patterns; the command word itself
+    /// was taken as the object name.
+    #[test]
+    fn library_queries_name_their_patterns() {
+        assert_eq!(resolve_objs("[get_lib_cells {lib/BUF_X1}]"), ["lib/BUF_X1"]);
+        assert_eq!(resolve_objs("[get_lib_pins lib/BUF_X1/A]"), ["lib/BUF_X1/A"]);
+        assert_eq!(resolve_objs("[get_libs mylib]"), ["mylib"]);
+        assert_eq!(resolve_objs("[get_lib_cell lib/INV]"), ["get_lib_cell"], "resolve_objs sees canonical words only");
+    }
+}
+
+#[cfg(test)]
+mod scope_and_rule_tests {
+    use super::*;
+    use crate::sdc_write::WriteOpts;
+
+    /// A design-rule limit on objects is kept and written back, not only flagged.
+    #[test]
+    fn design_rules_on_objects_are_kept_and_written() {
+        let s = Sdc::parse(
+            "create_clock -name c -period 10 [get_ports clk]\n\
+             set_max_transition -clock_path 0.2 [get_clocks c]\n\
+             set_max_transition 0.3 [get_ports {a b}]\n\
+             set_max_fanout 8 [get_ports a]\n",
+        )
+        .unwrap();
+        assert_eq!(s.max_transition_objects.len(), 2);
+        assert_eq!(s.max_transition_objects[0].flags, ["-clock_path"]);
+        assert_eq!(s.max_transition_objects[0].value, 0.2);
+        assert_eq!(s.max_fanout_objects[0].objects.names, ["a"]);
+        let w = s.write(&WriteOpts::default());
+        assert!(w.not_written.is_empty(), "{:?}", w.not_written);
+        assert!(w.text.contains("set_max_transition -clock_path 0.2 [get_clocks {c}]"), "{}", w.text);
+        assert!(w.text.contains("set_max_fanout 8 [get_ports {a}]"), "{}", w.text);
+        assert!(s.not_applied().is_empty(), "{:?}", s.not_applied());
+    }
+
+    #[test]
+    fn a_design_rule_without_objects_is_rejected() {
+        let s = Sdc::parse("set_max_transition 0.3\n").unwrap();
+        assert_eq!(s.rejected, ["set_max_transition without objects"]);
+    }
+
+    /// `current_instance u1` makes every later name relative to `u1`; read past, every later
+    /// constraint named top-level objects instead. It stops the read; back to the top is read.
+    #[test]
+    fn a_changed_instance_scope_stops_the_read() {
+        let e = Sdc::parse("current_instance u1\nset_false_path -from a\n").unwrap_err();
+        assert!(e.to_string().contains("current_instance u1"), "{e}");
+        assert!(Sdc::parse("current_instance\nset_false_path -from a\n").is_ok());
+        assert!(Sdc::parse("current_instance /\n").is_ok());
+        assert!(Sdc::parse("set_hierarchy_separator .\n").is_err());
+        assert!(Sdc::parse("set_hierarchy_separator /\n").is_ok());
     }
 }

@@ -434,14 +434,19 @@ impl Sdc {
     /// The design's and the objects' transition, fanout and capacitance limits.
     fn write_design_rules(&self, o: &mut Out) {
         for (cmd, v, on_objects) in [
-            ("set_max_transition", self.max_transition, self.max_transition_on_objects),
-            ("set_max_fanout", self.max_fanout, self.max_fanout_on_objects),
+            ("set_max_transition", self.max_transition, &self.max_transition_objects),
+            ("set_max_fanout", self.max_fanout, &self.max_fanout_objects),
         ] {
             if let Some(v) = v {
                 o.line(format!("{cmd} {} [current_design]", num(v)));
             }
-            if on_objects {
-                o.skip(format!("{cmd} on objects other than the design (kept as a flag only)"));
+            for d in on_objects {
+                if d.value.is_nan() {
+                    o.skip(format!("{cmd}: a value that is not a number"));
+                    continue;
+                }
+                let flags: String = d.flags.iter().map(|f| format!(" {f}")).collect();
+                o.line_or(objects(&d.objects).map(|x| format!("{cmd}{flags} {} {x}", num(d.value))), || cmd.into());
             }
         }
         if let Some(v) = self.max_capacitance {
