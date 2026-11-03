@@ -627,7 +627,7 @@ fn env_cmd(toks: &[String]) -> Option<EnvCmd> {
     Some(EnvCmd { cmd: toks[0].clone(), value, flags, clock, accessor, accessor_flags, objects: resolve_objs(obj), written: Some(Objects::of(obj)) })
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Sdc {
     /// `current_design <name>`: the design the constraints were written for (the last one named).
     pub current_design: Option<String>,

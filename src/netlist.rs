@@ -821,6 +821,9 @@ pub struct CompactModule {
     pub undirected: Vec<Sym>,
     /// the module's ports as a PARENT sees them, in header order — see [`CellPort`]
     cell_ports: Vec<CellPort>,
+    /// every port bit as a TOP has it, in header order, whatever its direction — see
+    /// [`CompactModule::port_bits`]
+    port_bits: Vec<Sym>,
 }
 
 /// One port of a module as the reference's `makeCellPorts` makes it from the header: a name, a
@@ -918,6 +921,21 @@ impl CompactModule {
     /// `inst`'s constant ties — see [`Inst::ties`].
     pub fn ties(&self, inst: &CompactInst) -> &[(Sym, bool)] {
         &self.tie_table[inst.ties.0 as usize..inst.ties.1 as usize]
+    }
+
+    /// Every port bit of the module as a TOP, in HEADER order and across directions — the order
+    /// `inputs`, `outputs`, `inouts` and `undirected` each keep but, split by direction, cannot
+    /// give back. The reference (`linkNetwork`) makes the top instance's pins in this order: a
+    /// header entry's bits, a bus's left index first, each bit once. A timer that numbers its port
+    /// vertices as the reference does reads this.
+    pub fn port_bits(&self) -> &[Sym] {
+        &self.port_bits
+    }
+
+    /// Whether the header has a `.X(expr)` entry — a port BUNDLE over the expression's bits, which
+    /// a parent connects as one port and a top has as its member bits.
+    pub fn has_bundle_ports(&self) -> bool {
+        self.cell_ports.iter().any(|p| p.bundle)
     }
 
     /// The owned form. `modules` / `escaped_names` are the DESIGN's, and are left empty here.
@@ -2182,6 +2200,7 @@ impl ModuleReader {
                     continue;
                 }
                 let s = pool.intern(&b);
+                nl.port_bits.push(s);
                 match d {
                     Some(PortDir::Input) => nl.inputs.push(s),
                     Some(PortDir::Output) => nl.outputs.push(s),
@@ -2722,6 +2741,21 @@ endmodule
         assert_eq!(c(1), ["A[4]=a", "A[3]=b", "A[2]=c", "A[1]=d"]);
         assert_eq!(c(2), ["A[3]=a", "A[2]=b", "A[1]=c", "A[0]=d"], "downto from 0: as read");
         assert_eq!(n, 4 + 2 + 4);
+    }
+
+    /// Rule (`VerilogReader::linkNetwork`, witnessed by the reference's graph build: its port
+    /// vertices are `clk a[1] a[0] b y z[1] z[0] c`): the top's pins are made in HEADER order
+    /// across directions, a bus's left index first. Split by direction the order is lost;
+    /// `port_bits` keeps it.
+    #[test]
+    fn port_bits_keep_the_header_order_across_directions() {
+        let src = "module ord (clk, a, b, y, z, c);\n input clk; input [1:0] a; input b; output y; output [1:0] z; input c;\nendmodule\n";
+        let d = parse_compact(src).unwrap();
+        let bits: Vec<&str> = d.top().port_bits().iter().map(|s| d.str(*s)).collect();
+        assert_eq!(bits, ["clk", "a[1]", "a[0]", "b", "y", "z[1]", "z[0]", "c"]);
+        assert!(!d.top().has_bundle_ports());
+        let b = parse_compact("module t (.x({p, q}), r); input p, q, r; endmodule\n").unwrap();
+        assert!(b.top().has_bundle_ports());
     }
 
     /// Rule: with no top named, MORE THAN ONE module that nothing instantiates is refused, the
