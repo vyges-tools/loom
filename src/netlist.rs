@@ -136,8 +136,20 @@ impl Netlist {
     pub fn health(&self) -> Option<String> {
         let mut notes = Vec::new();
         if self.modules.len() > 1 {
+            // ⛔ The top's own instances are not the design when some of them are modules: the
+            // cells below them are in the hierarchy, and only a flat netlist has them.
+            let defined: std::collections::HashSet<&str> = self.modules.iter().map(String::as_str).collect();
+            let blocks = self.insts.iter().filter(|x| defined.contains(x.cell.as_str())).count();
+            let below = if blocks > 0 {
+                format!(
+                    " — {blocks} of its instances are modules, whose cells are NOT here: flatten it \
+                     (`netlist::load_flat`, `Design::flatten_netlist`) to see the whole design"
+                )
+            } else {
+                String::new()
+            };
             notes.push(format!(
-                "{} modules in the file; `{}` taken as top (the one nothing instantiates)",
+                "{} modules in the file; `{}` taken as top (the one nothing instantiates){below}",
                 self.modules.len(),
                 self.module
             ));
@@ -173,6 +185,19 @@ impl Netlist {
                 self.undirected.len()
             ));
         }
+        // a netlist written before technology mapping: its cells are the synthesiser's generic
+        // ones, which no library times
+        let defined: std::collections::HashSet<&str> = self.modules.iter().map(String::as_str).collect();
+        let leaves = self.insts.iter().filter(|x| !defined.contains(x.cell.as_str()));
+        let (generic, total) = leaves.fold((0usize, 0usize), |(g, t), x| (g + usize::from(looks_generic(&x.cell)), t + 1));
+        if generic > 0 {
+            let what = if generic * 2 > total {
+                "— this looks like an UNMAPPED netlist: map it to a library before timing it"
+            } else {
+                "— technology-independent cells no library defines"
+            };
+            notes.push(format!("{generic} of {total} cell instance(s) have generic synthesis cell names {what}"));
+        }
         if self.behavioural > 0 {
             notes.push(format!(
                 "{} behavioural construct(s) ignored — this looks like RTL, not a gate-level \
@@ -184,6 +209,22 @@ impl Netlist {
     }
 }
 
+/// A cell name of the kind a synthesiser writes BEFORE mapping to a library: a generic,
+/// technology-independent cell or operator. Commercial netlist writers emit them as escaped
+/// names starting with `*` (`\**SEQGEN** `, `\*SELECT_OP_2.1_2.1_1 `), as a `GTECH_` family, or
+/// as `..._OP` operator cells; open synthesis writes its internal cells with a leading `$`.
+///
+/// ⚠️ A heuristic on the NAME only — it says what a cell looks like, not what a library holds;
+/// [`crate::Design::netlist_health`] checks the loaded Liberty too.
+pub fn looks_generic(cell: &str) -> bool {
+    cell.starts_with('*')
+        || cell.starts_with('$')
+        || cell.starts_with("GTECH_")
+        || cell.contains("SEQGEN")
+        || cell.ends_with("_OP")
+        || cell.contains("_OP_")
+}
+
 #[derive(Debug)]
 pub struct NetlistError(pub String);
 impl std::fmt::Display for NetlistError {
@@ -192,6 +233,9 @@ impl std::fmt::Display for NetlistError {
     }
 }
 impl std::error::Error for NetlistError {}
+
+mod flatten;
+pub use flatten::{FlattenOptions, FlattenReport};
 
 /// A netlist's tokens, read from a STREAM one at a time — the reference's design: its flex
 /// scanner reads through `igzstream` and hands the parser one token at a time, so neither the
@@ -942,6 +986,66 @@ impl CompactDesign {
         self.escaped.get(s.index() / 64).is_some_and(|w| w >> (s.index() % 64) & 1 == 1)
     }
 
+    /// Names the bits of each bussed pin of a cell NOT defined in the file by the library's bus
+    /// order, and returns how many pin bits were renamed. `bus(cell, pin)` is the library's
+    /// `(bit_from, bit_to)` for a bus pin, `None` for anything else.
+    ///
+    /// 🔑 Until a library is seen, the reader names a bussed pin's bits as a `downto` bus
+    /// numbered from 0 (`P[k-1-i]` for the i-th connection bit). The reference pairs the i-th
+    /// connection bit with the i-th MEMBER of the library port, from `bit_from` to `bit_to`
+    /// (`makeNamedInstPins`, `memberIterator`), so an `upto` bus (`bit_from : 0; bit_to : 3`), or
+    /// one not ending at 0, takes the reverse or shifted names. Only a pin whose bits are exactly
+    /// `0..k-1` for a bus of `k` bits is renamed; any other shape is left as written.
+    pub fn apply_bus_order<F: Fn(&str, &str) -> Option<(i64, i64)>>(&mut self, bus: F) -> usize {
+        let CompactDesign { pool, modules, by_name, .. } = self;
+        let mut renamed = 0usize;
+        let mut groups: std::collections::HashMap<String, Vec<(bool, usize, i64)>> = std::collections::HashMap::new();
+        for m in modules.iter_mut() {
+            for x in 0..m.insts.len() {
+                let inst = m.insts[x];
+                if by_name.contains_key(&inst.cell) {
+                    continue;
+                }
+                groups.clear();
+                let bit = |s: &str| -> Option<(String, i64)> {
+                    let (base, rest) = s.rsplit_once('[')?;
+                    Some((base.to_string(), rest.strip_suffix(']')?.parse().ok()?))
+                };
+                for k in inst.conns.0 as usize..inst.conns.1 as usize {
+                    if let Some((b, j)) = bit(pool.get(m.conn_table[k].0)) {
+                        groups.entry(b).or_default().push((true, k, j));
+                    }
+                }
+                for k in inst.ties.0 as usize..inst.ties.1 as usize {
+                    if let Some((b, j)) = bit(pool.get(m.tie_table[k].0)) {
+                        groups.entry(b).or_default().push((false, k, j));
+                    }
+                }
+                let cell = pool.get(inst.cell).to_string();
+                for (base, bits) in &groups {
+                    let Some((from, to)) = bus(&cell, base) else { continue };
+                    let k = (to - from).abs() + 1;
+                    let mut js: Vec<i64> = bits.iter().map(|b| b.2).collect();
+                    js.sort_unstable();
+                    if js.len() as i64 != k || !js.iter().enumerate().all(|(i, &j)| i as i64 == j) {
+                        continue;
+                    }
+                    let step = if to >= from { 1 } else { -1 };
+                    for &(conn, at, j) in bits {
+                        let to_j = from + (k - 1 - j) * step;
+                        if to_j == j {
+                            continue;
+                        }
+                        let s = pool.intern(&format!("{base}[{to_j}]"));
+                        if conn { m.conn_table[at].0 = s } else { m.tie_table[at].0 = s }
+                        renamed += 1;
+                    }
+                }
+            }
+        }
+        renamed
+    }
+
     /// Every name that arrived as an escaped identifier, in pool order.
     pub fn escaped_names(&self) -> impl Iterator<Item = Sym> + '_ {
         (0..self.pool.len() as u32).map(Sym).filter(|s| self.is_escaped(*s))
@@ -967,7 +1071,8 @@ impl CompactDesign {
 ///
 /// ⛔ **`parse` returns only the top**, and on a hierarchical netlist that is not the design:
 /// every non-top module's ports and instances are gone, so nothing below the top can be traced.
-/// A consumer that walks the hierarchy reads this instead.
+/// A consumer that walks the hierarchy reads this instead, and one that wants the cells reads
+/// [`Design::flatten`] (or [`load_flat`]).
 #[derive(Debug, Clone, Default)]
 pub struct Design {
     /// Every module, in DECLARATION order. The file-wide lists (`modules`, `escaped_names`) are
@@ -1004,8 +1109,13 @@ impl Design {
 
 /// The top module only. See [`parse_all`] for a hierarchical netlist.
 pub fn parse(text: &str) -> Result<Netlist, NetlistError> {
-    let mut d = parse_all(text)?;
-    Ok(d.modules.swap_remove(d.top))
+    Ok(parse_compact(text)?.top_netlist())
+}
+
+/// [`parse`] as ONE flat netlist — see [`load_flat`].
+pub fn parse_flat(text: &str, opts: &FlattenOptions) -> Result<(Netlist, FlattenReport), NetlistError> {
+    let (flat, report) = parse_compact(text)?.flatten(opts);
+    Ok((flat.top_netlist(), report))
 }
 
 /// Every module in the file, and which one is the top.
@@ -1071,8 +1181,139 @@ fn mark_escaped(pool: &mut StrPool, bits: &mut Vec<u64>, tok: &[u8]) {
 /// [`parse_compact`] from a STREAM: neither the file nor an owned copy of any module is held,
 /// only the compact design.
 pub fn parse_compact_reader<R: std::io::BufRead>(r: R) -> Result<CompactDesign, NetlistError> {
+    parse_compact_reader_top(r, None)
+}
+
+/// [`parse_compact`] with the TOP named, as `link_design <top>` names it — see [`pick_top`].
+pub fn parse_compact_top(text: &str, top: &str) -> Result<CompactDesign, NetlistError> {
+    parse_compact_reader_top(text.as_bytes(), Some(top))
+}
+
+/// [`parse_all`] with the TOP named — see [`pick_top`].
+pub fn parse_all_top(text: &str, top: &str) -> Result<Design, NetlistError> {
+    Ok(parse_compact_top(text, top)?.to_design())
+}
+
+/// How much of the file's start is kept for its header comment — see [`header_hint`].
+const HEAD_BYTES: usize = 8 << 10;
+
+/// A stream that keeps a copy of the first [`HEAD_BYTES`] it hands over: the writer's header
+/// comment, which the lexer drops.
+struct Head<R> {
+    r: R,
+    head: Vec<u8>,
+}
+
+impl<R: std::io::BufRead> std::io::Read for Head<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let n = std::io::Read::read(&mut self.r, out)?;
+        let room = HEAD_BYTES.saturating_sub(self.head.len()).min(n);
+        self.head.extend_from_slice(&out[..room]);
+        Ok(n)
+    }
+}
+
+impl<R: std::io::BufRead> std::io::BufRead for Head<R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        self.r.fill_buf()
+    }
+
+    fn consume(&mut self, n: usize) {
+        let room = HEAD_BYTES.saturating_sub(self.head.len()).min(n);
+        if room > 0 {
+            if let Ok(b) = self.r.fill_buf() {
+                let room = room.min(b.len());
+                self.head.extend_from_slice(&b[..room]);
+            }
+        }
+        self.r.consume(n);
+    }
+}
+
+/// The names a writer's header comment gives the design, before the first `module`: a comment
+/// line `Block Name : X`, `Design : X`, `Top module = X` and the like. Only a HINT — see
+/// [`pick_top`].
+fn header_hint(head: &[u8]) -> Vec<String> {
+    const KEYS: [&str; 8] = ["block name", "design name", "top module", "module name", "top", "design", "block", "module"];
+    let text = String::from_utf8_lossy(head);
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.starts_with("module ") || t == "module" {
+            break;
+        }
+        let Some(c) = t.strip_prefix("//").or_else(|| t.strip_prefix("/*")).or_else(|| t.strip_prefix('*')) else {
+            continue;
+        };
+        let c = c.trim_start_matches(['*', '/', ' ', '\t']);
+        let low = c.to_ascii_lowercase();
+        for k in KEYS {
+            let Some(rest) = low.strip_prefix(k) else { continue };
+            let after = rest.trim_start();
+            if let Some(v) = after.strip_prefix(':').or_else(|| after.strip_prefix('=')) {
+                // the value as written (not lowercased): the same offset in `c`
+                let at = c.len() - v.len();
+                if let Some(name) = c[at..].split_whitespace().next() {
+                    let name = name.trim_end_matches([';', ',', '.', '"', '\'']).trim_start_matches(['"', '\'']);
+                    if !name.is_empty() {
+                        out.push(name.to_string());
+                    }
+                }
+            }
+            break;
+        }
+    }
+    out
+}
+
+/// The TOP module: the one named, or else the one no other module instantiates.
+///
+/// 🔑 **Named, it is what the reference's `link_design <top>` links**, and a name the file does
+/// not define is an error, as it is there.
+///
+/// ⛔ **Unnamed, more than one candidate is REFUSED**, with the candidates listed. A netlist
+/// written before mapping carries library modules nothing instantiates (datapath operators and
+/// the like) beside the real top; taking the first such module returned a five-port subtractor as
+/// the design, silently. The one exception is the writer's header comment: when it names exactly
+/// one of the candidates (`// Block Name : chip`), that one is taken — see [`header_hint`].
+///
+/// When every module is instantiated by another (a cycle), the last one is taken, as before.
+fn pick_top(mods: &[CompactModule], pool: &StrPool, top: Option<&str>, head: &[u8]) -> Result<usize, NetlistError> {
+    if let Some(name) = top {
+        // the last definition of a name is the one kept, and the only one left by now
+        return mods.iter().position(|m| pool.get(m.name) == name).ok_or_else(|| {
+            NetlistError(format!("top `{name}` is not a module of the netlist ({} module(s) in it)", mods.len()))
+        });
+    }
+    let instantiated: std::collections::HashSet<Sym> = mods.iter().flat_map(|m| m.insts.iter().map(|x| x.cell)).collect();
+    let roots: Vec<usize> = (0..mods.len()).filter(|&k| !instantiated.contains(&mods[k].name)).collect();
+    match roots[..] {
+        [] => Ok(mods.len() - 1),
+        [k] => Ok(k),
+        _ => {
+            let hints = header_hint(head);
+            let named: Vec<usize> = roots.iter().copied().filter(|&k| hints.iter().any(|h| h == pool.get(mods[k].name))).collect();
+            if let [k] = named[..] {
+                return Ok(k);
+            }
+            let mut names: Vec<&str> = roots.iter().take(20).map(|&k| pool.get(mods[k].name)).collect();
+            let more = roots.len().saturating_sub(20);
+            let tail = if more > 0 { format!(", and {more} more") } else { String::new() };
+            names.sort_unstable();
+            Err(NetlistError(format!(
+                "{} modules are instantiated by no other module, so the top is ambiguous: {}{tail} — \
+                 name the top (`load_all_top`, `load_compact_top`, `Design::netlist_top`)",
+                roots.len(),
+                names.join(", ")
+            )))
+        }
+    }
+}
+
+/// [`parse_compact_reader`] with the top named or not — see [`pick_top`].
+fn parse_compact_reader_top<R: std::io::BufRead>(r: R, top: Option<&str>) -> Result<CompactDesign, NetlistError> {
     let io = |e: std::io::Error| NetlistError(e.to_string());
-    let mut lx = Lexer::new(r);
+    let mut lx = Lexer::new(Head { r, head: Vec::new() });
     let mut pool = StrPool::default();
     let mut escaped = Vec::new();
     // an escaped name that reads as syntax was tagged (see `keep_escape`); untagged at the end
@@ -1169,13 +1410,7 @@ pub fn parse_compact_reader<R: std::io::BufRead>(r: R) -> Result<CompactDesign, 
 
     // TOP is the module no other module instantiates. That is the definition, and it does not
     // depend on declaration order — which is the only thing position could have told us.
-    let instantiated: std::collections::HashSet<Sym> = mods.iter().flat_map(|m| m.insts.iter().map(|x| x.cell)).collect();
-    let top = mods
-        .iter()
-        .position(|m| !instantiated.contains(&m.name))
-        // Every module instantiated by another (mutual recursion, or a single module that
-        // instantiates itself) — fall back to the last, which is the usual emission order.
-        .unwrap_or(mods.len() - 1);
+    let top = pick_top(&mods, &pool, top, &lx.r.head)?;
 
     // ⛔ ONCE, on the top. Both describe the FILE, and a copy on every module is a list of n
     // names times n modules: tens of gigabytes on a netlist of tens of thousands of modules.
@@ -1962,10 +2197,17 @@ impl ModuleReader {
             for x in nl.insts.iter_mut() {
                 let (cs, ts) = (&old_c[x.conns.0 as usize..x.conns.1 as usize], &old_t[x.ties.0 as usize..x.ties.1 as usize]);
                 // a held named pin, whole: its items in order — a name, or a constant bit
+                // ⚡ found by name through an index: a linear search per bit was quadratic in the
+                // instance's pin count — a 50,000-pin macro connected to undeclared nets (writers
+                // declare no scalar wires) took 11 s to read, now a fraction of a second
                 let mut held: Vec<(String, Vec<HeldItem>)> = Vec::new();
-                let mut item = |pin: &str, order: u32, v: Result<String, bool>| match held.iter_mut().find(|h| h.0 == pin) {
-                    Some(h) => h.1.push((order, v)),
-                    None => held.push((pin.to_string(), vec![(order, v)])),
+                let mut held_at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                let mut item = |pin: &str, order: u32, v: Result<String, bool>| match held_at.get(pin) {
+                    Some(&h) => held[h].1.push((order, v)),
+                    None => {
+                        held_at.insert(pin.to_string(), held.len());
+                        held.push((pin.to_string(), vec![(order, v)]));
+                    }
                 };
                 for &(p, net) in cs {
                     if let Some((order, pin)) = read_named_tag(pool.get(p)) {
@@ -1987,7 +2229,7 @@ impl ModuleReader {
                 for &(p, net) in cs {
                     if let Some((_, pin)) = read_named_tag(pool.get(p)) {
                         // the whole pin, where its first bit was
-                        let h = held.iter().position(|h| h.0 == pin).unwrap_or(0);
+                        let h = held_at.get(pin).copied().unwrap_or(0);
                         if std::mem::replace(&mut emitted[h], true) {
                             continue;
                         }
@@ -2202,13 +2444,25 @@ fn assign_pairs(
     (l.len() == r.len()).then(|| l.into_iter().zip(r).collect())
 }
 
+/// The TOP module only.
+///
+/// ⛔ **On a hierarchical netlist this is not the design**: the cells inside the top's module
+/// instances are not in it ([`Netlist::health`] says so). Read [`load_flat`] for one flat
+/// netlist, or [`load_all`] / [`load_compact`] for the hierarchy.
 pub fn load(path: &str) -> Result<Netlist, NetlistError> {
-    let mut d = load_all(path)?;
-    Ok(d.modules.swap_remove(d.top))
+    // only the top is converted to the owned form, not every module
+    Ok(load_compact(path)?.top_netlist())
+}
+
+/// The whole design as ONE flat netlist — every instance of a module the file defines expanded,
+/// names joined with `/` — and what flattening found. See [`CompactDesign::flatten`].
+pub fn load_flat(path: &str, opts: &FlattenOptions) -> Result<(Netlist, FlattenReport), NetlistError> {
+    let (flat, report) = load_compact(path)?.flatten(opts);
+    Ok((flat.top_netlist(), report))
 }
 
 /// [`load`], keeping every module — see [`Design`]. STREAMED: read through a buffer, and
-/// inflated as it is read when it is gzip (with the `gzip` feature), as the reference reads
+/// inflated as it is read when it is gzip (the `gzip` feature, on by default), as the reference reads
 /// through `igzstream`. A byte that is not UTF-8 is read lossily.
 pub fn load_all(path: &str) -> Result<Design, NetlistError> {
     Ok(load_compact(path)?.to_design())
@@ -2216,8 +2470,23 @@ pub fn load_all(path: &str) -> Result<Design, NetlistError> {
 
 /// [`load_all`] in the COMPACT form — see [`CompactDesign`]. Streamed, as [`load_all`] is.
 pub fn load_compact(path: &str) -> Result<CompactDesign, NetlistError> {
+    load_compact_opt(path, None)
+}
+
+/// [`load_compact`] with the TOP named, as `link_design <top>` names it — see [`pick_top`].
+pub fn load_compact_top(path: &str, top: &str) -> Result<CompactDesign, NetlistError> {
+    load_compact_opt(path, Some(top))
+}
+
+/// [`load_all`] with the TOP named — see [`pick_top`].
+pub fn load_all_top(path: &str, top: &str) -> Result<Design, NetlistError> {
+    Ok(load_compact_top(path, top)?.to_design())
+}
+
+/// [`load_compact`], the top named or not.
+pub fn load_compact_opt(path: &str, top: Option<&str>) -> Result<CompactDesign, NetlistError> {
     let err = |e: String| NetlistError(format!("{path}: {e}"));
-    parse_compact_reader(open(path).map_err(|e| err(e.to_string()))?).map_err(|e| err(e.0))
+    parse_compact_reader_top(open(path).map_err(|e| err(e.to_string()))?, top).map_err(|e| err(e.0))
 }
 
 /// A netlist file as a buffered byte stream, inflated on the fly when it is gzip.
@@ -2253,7 +2522,7 @@ fn gz_stream<R: std::io::BufRead + 'static>(r: R) -> std::io::Result<Box<dyn std
 
 #[cfg(not(feature = "gzip"))]
 fn gz_stream<R: std::io::BufRead + 'static>(_: R) -> std::io::Result<Box<dyn std::io::BufRead>> {
-    Err(std::io::Error::other("gzip-compressed; build vyges-loom with the `gzip` feature to read it"))
+    Err(std::io::Error::other("gzip-compressed; this vyges-loom was built without its default `gzip` feature"))
 }
 
 /// A gzip stream inflated as it is read: every member, concatenated (RFC 1952; `bgzip` and
@@ -2384,6 +2653,112 @@ endmodule
         assert_eq!(d.module_names(), ["leaf", "mid", "chip"]);
         assert_eq!(parse(src).unwrap().modules, ["leaf", "mid", "chip"]);
         assert!(mid.modules.is_empty() && leaf.modules.is_empty());
+    }
+
+    /// A wide instance on UNDECLARED nets (writers declare no scalar wires, so every named
+    /// connection waits for `finish`) reads in time linear in its pins, and bit for bit as
+    /// written — including a pin whose net is declared as a bus only AFTER the instance.
+    /// (Each held pin was found by a linear search: 50,000 pins took 11 s.)
+    #[test]
+    fn a_wide_instance_on_undeclared_nets_reads_in_linear_time() {
+        for n in [5_000usize, 20_000] {
+            let pins: Vec<String> = (0..n).map(|k| format!(".P{k}(n{k})")).collect();
+            let src = format!("module top (a, b); input a;\n  MACRO u0 ({}, .BUS(b));\n  input [1:0] b;\nendmodule\n", pins.join(", "));
+            let t = std::time::Instant::now();
+            let nl = parse(&src).unwrap();
+            let took = t.elapsed();
+            println!("{n} pins: {took:?}");
+            let c = &nl.insts[0].conns;
+            assert_eq!(c.len(), n + 2);
+            assert_eq!((c[0].0.as_str(), c[0].1.as_str()), ("P0", "n0"));
+            assert_eq!((c[n - 1].0.as_str(), c[n - 1].1.as_str()), (format!("P{}", n - 1).as_str(), format!("n{}", n - 1).as_str()));
+            assert_eq!(c[n..], [("BUS[1]".to_string(), "b[1]".to_string()), ("BUS[0]".to_string(), "b[0]".to_string())]);
+            // quadratic, 20,000 pins took 1.7 s in an optimised build (and 35 ms linear)
+            assert!(n < 20_000 || took < std::time::Duration::from_secs(1), "{n} pins took {took:?}");
+        }
+    }
+
+    /// A netlist written before mapping is flagged: its cells carry the generic names a
+    /// synthesiser gives technology-independent cells, and no library times them.
+    #[test]
+    fn an_unmapped_netlist_is_flagged() {
+        let src = "module top (a, b, c, y); input a, b, c; output y; wire n, m;\n\
+                   \\**SEQGEN** r0 (.clear(1'b0), .next_state(a), .clocked_on(b), .Q(n));\n\
+                   \\*SELECT_OP_2.1_2.1_1 s0 (.DATA1(n), .DATA2(c), .CONTROL1(a), .Z(m));\n\
+                   GTECH_AND2 g0 (.A(m), .B(c), .Z(y));\n\
+                   sky130_fd_sc_hd__inv_1 i0 (.A(a), .Y());\nendmodule\n";
+        let nl = parse(src).unwrap();
+        let h = nl.health().expect("must report");
+        assert!(h.contains("3 of 4 cell instance(s) have generic synthesis cell names"), "{h}");
+        assert!(h.contains("UNMAPPED"), "{h}");
+        assert!(looks_generic("$_DFF_P_") && looks_generic("ADD_UNS_OP") && !looks_generic("sky130_fd_sc_hd__dfxtp_1"));
+        let mapped = parse("module top (a, y); input a; output y; INV i (.A(a), .Y(y)); endmodule\n").unwrap();
+        assert!(mapped.health().is_none());
+    }
+
+    /// Rule (the reference's `makeNamedInstPins`, `memberIterator`): the i-th connection bit of
+    /// a library bus pin is the bus's i-th MEMBER, `bit_from` first — so an `upto` bus `[0:3]`
+    /// takes `{a, b, c, d}` as A[0]=a .. A[3]=d, and a `downto` one ending at 1 (`[4:1]`) as
+    /// A[4]=a .. A[1]=d. The reader's library-blind naming (`A[3]`=a .. `A[0]`=d) is renamed.
+    #[test]
+    fn a_library_bus_order_renames_the_pin_bits() {
+        let src = "module top (a, b, c, d); input a, b, c, d;\n\
+                   RAM_UP u (.A({a, b, c, d}), .E({1'b1, a}));\n\
+                   RAM_DN1 v (.A({a, b, c, d}));\n\
+                   RAM_DN0 w (.A({a, b, c, d}));\nendmodule\n";
+        let mut d = parse_compact(src).unwrap();
+        let n = d.apply_bus_order(|cell, pin| match (cell, pin) {
+            ("RAM_UP", "A") => Some((0, 3)),
+            ("RAM_UP", "E") => Some((0, 1)),
+            ("RAM_DN1", "A") => Some((4, 1)),
+            ("RAM_DN0", "A") => Some((3, 0)),
+            _ => None,
+        });
+        let nl = d.top_netlist();
+        let c = |k: usize| nl.insts[k].conns.iter().map(|(p, n)| format!("{p}={n}")).collect::<Vec<_>>();
+        assert_eq!(c(0)[..4], ["A[0]=a", "A[1]=b", "A[2]=c", "A[3]=d"]);
+        assert_eq!(c(0)[4], "E[1]=a");
+        assert_eq!(nl.insts[0].ties, [("E[0]".to_string(), true)], "a tie bit moves with its pin");
+        assert_eq!(c(1), ["A[4]=a", "A[3]=b", "A[2]=c", "A[1]=d"]);
+        assert_eq!(c(2), ["A[3]=a", "A[2]=b", "A[1]=c", "A[0]=d"], "downto from 0: as read");
+        assert_eq!(n, 4 + 2 + 4);
+    }
+
+    /// Rule: with no top named, MORE THAN ONE module that nothing instantiates is refused, the
+    /// candidates listed — the first was taken, and an orphan library module became the design.
+    /// Named (`link_design <top>`), the named one is the top, and an unknown name is an error.
+    #[test]
+    fn an_ambiguous_top_is_refused_and_a_named_one_is_taken() {
+        let src = "module sub_dp (a, b, y); input a, b; output y; XOR2 x (.A(a), .B(b), .Y(y)); endmodule\n\
+                   module add_dp (a, y); input a; output y; INV i (.A(a), .Y(y)); endmodule\n\
+                   module chip (a, y); input a; output y; add_dp u (.a(a), .y(y)); endmodule\n";
+        let err = parse_compact(src).unwrap_err().0;
+        assert!(err.contains("2 modules are instantiated by no other module"), "{err}");
+        assert!(err.contains("chip, sub_dp"), "{err}");
+        assert!(parse(src).is_err());
+        let d = parse_compact_top(src, "chip").unwrap();
+        assert_eq!(d.str(d.top().name), "chip");
+        assert_eq!(parse_all_top(src, "sub_dp").unwrap().top().module, "sub_dp");
+        let err = parse_compact_top(src, "nosuch").unwrap_err().0;
+        assert!(err.contains("top `nosuch` is not a module"), "{err}");
+    }
+
+    /// Rule: a writer's header comment that names exactly ONE of the candidate tops picks it;
+    /// a name that is not a candidate, or none, leaves the refusal standing.
+    #[test]
+    fn the_header_comment_breaks_a_tie_between_tops() {
+        let body = "module sub_dp (a, y); input a; output y; INV i (.A(a), .Y(y)); endmodule\n\
+                    module chip (a, y); input a; output y; BUF b (.A(a), .X(y)); endmodule\n";
+        let named = format!("/*****\n * Block Name : chip\n * Date : today\n *****/\n{body}");
+        assert_eq!(parse(&named).unwrap().module, "chip");
+        let slashes = format!("// Design: chip;\n{body}");
+        assert_eq!(parse(&slashes).unwrap().module, "chip");
+        let other = format!("// Block Name : nosuch\n{body}");
+        assert!(parse(&other).is_err());
+        // only before the first module: a comment inside one is not the header
+        let late = format!("{body}// Block Name : chip\n");
+        assert!(parse(&late).is_err());
+        assert_eq!(header_hint(b"// Top module = \"chip\"\n// Module: x\nmodule y;"), ["chip", "x"]);
     }
 
     /// Rule (the reference lexer's `^[ \t]*`.*{EOL}`): a line that STARTS, after blanks, with a
