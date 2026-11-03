@@ -2197,10 +2197,17 @@ impl ModuleReader {
             for x in nl.insts.iter_mut() {
                 let (cs, ts) = (&old_c[x.conns.0 as usize..x.conns.1 as usize], &old_t[x.ties.0 as usize..x.ties.1 as usize]);
                 // a held named pin, whole: its items in order — a name, or a constant bit
+                // ⚡ found by name through an index: a linear search per bit was quadratic in the
+                // instance's pin count — a 50,000-pin macro connected to undeclared nets (writers
+                // declare no scalar wires) took 11 s to read, now a fraction of a second
                 let mut held: Vec<(String, Vec<HeldItem>)> = Vec::new();
-                let mut item = |pin: &str, order: u32, v: Result<String, bool>| match held.iter_mut().find(|h| h.0 == pin) {
-                    Some(h) => h.1.push((order, v)),
-                    None => held.push((pin.to_string(), vec![(order, v)])),
+                let mut held_at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                let mut item = |pin: &str, order: u32, v: Result<String, bool>| match held_at.get(pin) {
+                    Some(&h) => held[h].1.push((order, v)),
+                    None => {
+                        held_at.insert(pin.to_string(), held.len());
+                        held.push((pin.to_string(), vec![(order, v)]));
+                    }
                 };
                 for &(p, net) in cs {
                     if let Some((order, pin)) = read_named_tag(pool.get(p)) {
@@ -2222,7 +2229,7 @@ impl ModuleReader {
                 for &(p, net) in cs {
                     if let Some((_, pin)) = read_named_tag(pool.get(p)) {
                         // the whole pin, where its first bit was
-                        let h = held.iter().position(|h| h.0 == pin).unwrap_or(0);
+                        let h = held_at.get(pin).copied().unwrap_or(0);
                         if std::mem::replace(&mut emitted[h], true) {
                             continue;
                         }
@@ -2646,6 +2653,29 @@ endmodule
         assert_eq!(d.module_names(), ["leaf", "mid", "chip"]);
         assert_eq!(parse(src).unwrap().modules, ["leaf", "mid", "chip"]);
         assert!(mid.modules.is_empty() && leaf.modules.is_empty());
+    }
+
+    /// A wide instance on UNDECLARED nets (writers declare no scalar wires, so every named
+    /// connection waits for `finish`) reads in time linear in its pins, and bit for bit as
+    /// written — including a pin whose net is declared as a bus only AFTER the instance.
+    /// (Each held pin was found by a linear search: 50,000 pins took 11 s.)
+    #[test]
+    fn a_wide_instance_on_undeclared_nets_reads_in_linear_time() {
+        for n in [5_000usize, 20_000] {
+            let pins: Vec<String> = (0..n).map(|k| format!(".P{k}(n{k})")).collect();
+            let src = format!("module top (a, b); input a;\n  MACRO u0 ({}, .BUS(b));\n  input [1:0] b;\nendmodule\n", pins.join(", "));
+            let t = std::time::Instant::now();
+            let nl = parse(&src).unwrap();
+            let took = t.elapsed();
+            println!("{n} pins: {took:?}");
+            let c = &nl.insts[0].conns;
+            assert_eq!(c.len(), n + 2);
+            assert_eq!((c[0].0.as_str(), c[0].1.as_str()), ("P0", "n0"));
+            assert_eq!((c[n - 1].0.as_str(), c[n - 1].1.as_str()), (format!("P{}", n - 1).as_str(), format!("n{}", n - 1).as_str()));
+            assert_eq!(c[n..], [("BUS[1]".to_string(), "b[1]".to_string()), ("BUS[0]".to_string(), "b[0]".to_string())]);
+            // quadratic, 20,000 pins took 1.7 s in an optimised build (and 35 ms linear)
+            assert!(n < 20_000 || took < std::time::Duration::from_secs(1), "{n} pins took {took:?}");
+        }
     }
 
     /// A netlist written before mapping is flagged: its cells carry the generic names a
