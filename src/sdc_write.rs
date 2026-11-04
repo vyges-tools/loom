@@ -364,10 +364,9 @@ impl Sdc {
     fn write_arcs(&self, o: &mut Out) {
         for c in self.disabled_timing.iter().chain(&self.senses).chain(&self.disabled_gating_checks) {
             let mut head = c.cmd.clone();
-            // set_sense: SDC 2.1, no public definition to verify against; restore when a real file needs it.
-            // if c.cmd == "set_sense" {
-            //     head += " -type clock";
-            // }
+            if c.cmd == "set_sense" {
+                head += " -type clock";
+            }
             let mut ok = true;
             for (k, v) in &c.keys {
                 let w = if k.starts_with("-clock") {

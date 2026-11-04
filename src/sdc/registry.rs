@@ -51,14 +51,15 @@ impl Status {
 
 /// The SDC version a command first appears in. The authority is the reference SDC parser that
 /// Synopsys published with the standard (one declaration file per version, 1.1 to 2.0): a command
-/// is dated by the first file that declares it.
+/// is dated by the first file that declares it. No public source declares SDC 2.1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Since {
     /// First declared by the reference parser's file for this version.
     Sdc(&'static str),
-    // Sdc21 — SDC 2.1, which no public source declares; its one command (set_sense) is commented
-    // out until a real file needs it, and the variant with it.
-    // Sdc21,
+    /// SDC 2.1, per the reference timer's own documentation (its SDC Tcl: `set_clock_sense` is
+    /// deprecated as of SDC 2.1, use `set_sense -type clock`). No public SDC 2.1 document exists,
+    /// so this is the one version not taken from the public parser.
+    Sdc21,
     /// A Tcl command SDC files use; Tcl provides it, so the parser declares nothing.
     Tcl,
     /// Not declared by any SDC version the parser covers.
@@ -70,7 +71,7 @@ impl Since {
     pub fn label(self) -> &'static str {
         match self {
             Since::Sdc(v) => v,
-            // Since::Sdc21 => "2.1 ‡",
+            Since::Sdc21 => "2.1 ‡",
             Since::Tcl => "Tcl",
             Since::Outside => "—",
         }
@@ -204,8 +205,8 @@ pub const SDC_COMMANDS: &[Command] = &[
     v("1.1", kept("set_port_fanout_number", "set_port_fanout_number 2 [get_ports y]")),
     v("1.1", cmd("set_propagated_clock", Applied, STA, "set_propagated_clock [get_clocks c]")),
     v("1.1", kept("set_resistance", "set_resistance 1 [get_nets n1]")),
-    // set_sense: SDC 2.1, no public definition to verify against; restore when a real file needs it:
-    // since(Since::Sdc21, kept("set_sense", "set_sense -type clock -positive [get_pins u1/Z]")),
+    // 2.1 per the reference timer's documentation, not the public parser (see `Since::Sdc21`)
+    since(Since::Sdc21, kept("set_sense", "set_sense -type clock -positive [get_pins u1/Z]")),
     v("1.5", cmd("set_timing_derate", Applied, STA, "set_timing_derate -late 1.05")),
     v("1.7", Command { name: "set_unit", spelling_of: Some("set_units"), status: Applied, applied_by: R, since: Since::Outside, probe: "set_unit -time ns", note: "" }),
     v("1.7", cmd("set_units", Applied, R, "set_units -time ns")),
@@ -312,7 +313,7 @@ fn row(c: &Command, with_version: bool) -> String {
 pub fn coverage_markdown() -> String {
     let count = |st: Status| SDC_COMMANDS.iter().filter(|c| c.status == st).count();
     let mut t = format!(
-        "SDC 1.1 to 2.0: {} applied, {} kept, {} Tcl, {} read past, {} unhandled, of {} commands.\n\n",
+        "SDC 1.1 to 2.1: {} applied, {} kept, {} Tcl, {} read past, {} unhandled, of {} commands.\n\n",
         count(Status::Applied),
         count(Status::Kept),
         count(Status::Tcl),
