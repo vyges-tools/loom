@@ -91,7 +91,8 @@ pub struct Command {
     pub since: Since,
     /// One line that uses it, read after [`PROBE_SETUP`] by the registry's test.
     pub probe: &'static str,
-    /// What the reader does not do with it, when that is part of its status (empty otherwise).
+    /// A qualification of its status: what the reader does not do with it, or the one mode in
+    /// which a consumer applies it (empty otherwise).
     pub note: &'static str,
 }
 
@@ -99,6 +100,7 @@ const R: &[&str] = &["reader"];
 const CHECK_STA: &[&str] = &["check", "sta", "sta-si"];
 const STA: &[&str] = &["sta", "sta-si"];
 const STA_SI: &[&str] = &["sta-si"];
+const STA_ONLY: &[&str] = &["sta"];
 const RSZ: &[&str] = &["rsz"];
 const NONE: &[&str] = &[];
 
@@ -158,11 +160,11 @@ pub const SDC_COMMANDS: &[Command] = &[
     v("1.7", kept("group_path", "group_path -name g -to [get_ports y]")),
     since(Since::Tcl, cmd("list", Tcl, NONE, "set_false_path -to [list [get_ports y]]")),
     since(Since::Tcl, cmd("set", Tcl, NONE, "set p 10")),
-    v("1.1", cmd("set_case_analysis", Applied, STA, "set_case_analysis 0 [get_ports a]")),
+    v("1.1", note("`sta`: through its logic simulation, with the design", cmd("set_case_analysis", Applied, STA, "set_case_analysis 0 [get_ports a]"))),
     v("1.2", kept("set_clock_gating_check", "set_clock_gating_check -setup 0.1 [get_clocks c]")),
     v("1.7", Command { name: "set_clock_group", spelling_of: Some("set_clock_groups"), status: Applied, applied_by: STA, since: Since::Outside, probe: "set_clock_group -asynchronous -group c", note: "" }),
     v("1.7", cmd("set_clock_groups", Applied, STA, "set_clock_groups -asynchronous -group c")),
-    v("1.1", cmd("set_clock_latency", Applied, STA, "set_clock_latency 0.5 [get_clocks c]")),
+    v("1.1", note("`sta-si`: only as included in an I/O delay (`-source_latency_included`, `-network_latency_included`)", cmd("set_clock_latency", Applied, STA, "set_clock_latency 0.5 [get_clocks c]"))),
     v("1.7", kept("set_clock_sense", "set_clock_sense -positive [get_pins u1/Z]")),
     v("1.1", cmd("set_clock_transition", Applied, STA, "set_clock_transition 0.1 [get_clocks c]")),
     v("1.1", cmd("set_clock_uncertainty", Applied, STA, "set_clock_uncertainty 0.2 [get_clocks c]")),
@@ -181,9 +183,9 @@ pub const SDC_COMMANDS: &[Command] = &[
     v("1.6", kept("set_level_shifter_strategy", "set_level_shifter_strategy -rule all")),
     v("1.6", kept("set_level_shifter_threshold", "set_level_shifter_threshold -voltage 0.1")),
     v("1.1", cmd("set_load", Applied, STA, "set_load 0.1 [get_ports y]")),
-    v("1.1", cmd("set_logic_dc", Applied, STA, "set_logic_dc [get_ports a]")),
-    v("1.1", cmd("set_logic_one", Applied, STA, "set_logic_one [get_ports a]")),
-    v("1.1", cmd("set_logic_zero", Applied, STA, "set_logic_zero [get_ports a]")),
+    v("1.1", note("through its logic simulation, with the design", cmd("set_logic_dc", Applied, STA_ONLY, "set_logic_dc [get_ports a]"))),
+    v("1.1", note("`sta`: through its logic simulation, with the design", cmd("set_logic_one", Applied, STA, "set_logic_one [get_ports a]"))),
+    v("1.1", note("`sta`: through its logic simulation, with the design", cmd("set_logic_zero", Applied, STA, "set_logic_zero [get_ports a]"))),
     v("1.1", kept("set_max_area", "set_max_area 0")),
     v("1.1", cmd("set_max_capacitance", Applied, RSZ, "set_max_capacitance 0.2 [current_design]")),
     v("1.1", cmd("set_max_delay", Applied, &["check", "sta"], "set_max_delay 5 -to [get_ports y]")),
