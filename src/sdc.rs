@@ -3388,7 +3388,7 @@ impl Sdc {
             if !options.is_empty() {
                 sdc.ignored.extend(options.iter().cloned());
                 sdc.kept_options.extend(options.iter().cloned());
-                let typed = matches!(toks[0].as_str(), "set_input_delay" | "set_output_delay" | "set_timing_derate")
+                let typed = (matches!(toks[0].as_str(), "set_input_delay" | "set_output_delay" | "set_timing_derate") || kept::KEPT_COMMANDS.contains(&toks[0].as_str()))
                     && options.iter().all(|o| o.split(' ').next() == Some(toks[0].as_str()));
                 if !typed {
                     sdc.kept.push(kept::verbatim(&toks));

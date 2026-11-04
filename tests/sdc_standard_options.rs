@@ -137,3 +137,27 @@ fn check_reports_a_kept_option() {
     assert!(f[0].message.contains("`set_driving_cell -clock`"), "{}", f[0].message);
     assert_eq!(r.errors(), 0, "{:?}", r.findings);
 }
+
+/// The kept commands' SDC options: SDC 1.4+ `set_max_dynamic_power` / `set_max_leakage_power`
+/// declare `-unit` (the reference takes the unit as a second positional); SDC 1.1+
+/// `set_operating_conditions` declares `-object_list`; SDC 1.1 to 1.9
+/// `set_wire_load_selection_group` name the group with `-group_name` (2.0 makes it the
+/// positional). Each is kept with its option, written back, and reported.
+#[test]
+fn the_kept_commands_read_their_sdc_options() {
+    for (line, opt) in [
+        ("set_max_dynamic_power 1 -unit mW", "set_max_dynamic_power -unit"),
+        ("set_max_leakage_power 1 -unit uW", "set_max_leakage_power -unit"),
+        ("set_operating_conditions -object_list [get_cells u1] typ", "set_operating_conditions -object_list"),
+        ("set_wire_load_selection_group -group_name sel", "set_wire_load_selection_group -group_name"),
+    ] {
+        let s = read(line);
+        assert!(s.rejected.is_empty(), "{line}: {:?}", s.rejected);
+        let got: Vec<String> = kept(&s).into_iter().map(|(c, _)| c).collect();
+        assert!(got.contains(&opt.to_string()), "{line}: {got:?}");
+        let o = opt.split(' ').nth(1).unwrap();
+        let text = written(&s);
+        assert!(text.lines().any(|l| l.starts_with(line.split(' ').next().unwrap()) && l.contains(o)), "{line}:\n{text}");
+    }
+    assert!(!read("set_wire_load_selection_group").rejected.is_empty(), "no group at all is still refused");
+}

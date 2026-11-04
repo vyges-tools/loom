@@ -57,19 +57,22 @@ const SPECS: &[Spec] = &[
     Spec { cmd: "set_min_capacitance", keys: &[], object_keys: &[], flags: &[], argc: (2, 2), object_args: &[1] },
     Spec { cmd: "set_fanout_load", keys: &[], object_keys: &[], flags: &[], argc: (2, 2), object_args: &[1] },
     Spec { cmd: "set_max_area", keys: &[], object_keys: &[], flags: &[], argc: (1, 1), object_args: &[] },
-    Spec { cmd: "set_max_dynamic_power", keys: &[], object_keys: &[], flags: &[], argc: (1, 2), object_args: &[] },
-    Spec { cmd: "set_max_leakage_power", keys: &[], object_keys: &[], flags: &[], argc: (1, 2), object_args: &[] },
+    // SDC's `-unit`; the reference's unit is the second positional
+    Spec { cmd: "set_max_dynamic_power", keys: &["-unit"], object_keys: &[], flags: &[], argc: (1, 2), object_args: &[] },
+    Spec { cmd: "set_max_leakage_power", keys: &["-unit"], object_keys: &[], flags: &[], argc: (1, 2), object_args: &[] },
     Spec {
         cmd: "set_operating_conditions",
-        keys: &["-analysis_type", "-library", "-min", "-max", "-min_library", "-max_library"],
-        object_keys: &[],
+        // `-object_list` is SDC's, not the reference's
+        keys: &["-analysis_type", "-library", "-min", "-max", "-min_library", "-max_library", "-object_list"],
+        object_keys: &["-object_list"],
         flags: &[],
         argc: (0, 1),
         object_args: &[],
     },
     Spec { cmd: "set_wire_load_mode", keys: &[], object_keys: &[], flags: &[], argc: (1, 1), object_args: &[] },
     Spec { cmd: "set_wire_load_model", keys: &["-name", "-library"], object_keys: &[], flags: &["-min", "-max"], argc: (0, 1), object_args: &[0] },
-    Spec { cmd: "set_wire_load_selection_group", keys: &["-library"], object_keys: &[], flags: &["-min", "-max"], argc: (1, 2), object_args: &[1] },
+    // SDC 1.1 to 1.9's `-group_name` names the group the positional names in 2.0 and the reference
+    Spec { cmd: "set_wire_load_selection_group", keys: &["-library", "-group_name"], object_keys: &[], flags: &["-min", "-max"], argc: (0, 2), object_args: &[1] },
     Spec { cmd: "set_wire_load_min_block_size", keys: &[], object_keys: &[], flags: &[], argc: (1, 1), object_args: &[] },
     Spec { cmd: "set_voltage", keys: &["-min", "-object_list"], object_keys: &["-object_list"], flags: &[], argc: (1, 1), object_args: &[] },
     Spec { cmd: "set_pvt", keys: &["-process", "-voltage", "-temperature"], object_keys: &[], flags: &["-min", "-max"], argc: (1, 1), object_args: &[0] },
@@ -312,9 +315,9 @@ fn check(c: &KeptCmd) -> Result<(), String> {
             None => Err("no wire load model specified (Error 479)".into()),
             Some(m) => lib_lookup(c, "-library", m, |g| &g.wire_loads, 480, 480, "wire load model"),
         },
-        "set_wire_load_selection_group" => match arg(0) {
+        "set_wire_load_selection_group" => match key("-group_name").or(arg(0)) {
             Some(g) => lib_lookup(c, "-library", g, |l| &l.wire_load_selections, 481, 481, "wire load selection group"),
-            None => Ok(()),
+            None => Err("requires one or two positional arguments (Error 568), given 0".into()),
         },
         "set_operating_conditions" => {
             match key("-analysis_type") {

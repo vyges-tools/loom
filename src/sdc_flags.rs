@@ -95,8 +95,13 @@ pub(crate) const STANDARD_ONLY: &[(&str, &[&str], &[&str])] = &[
     ("set_input_delay", &[], &["-level_sensitive"]),
     // the parser's own spelling of `-subtract_pin_load`, read as it
     ("set_load", &[], &["-substract_pin_load"]),
+    ("set_max_dynamic_power", &["-unit"], &[]),
+    ("set_max_leakage_power", &["-unit"], &[]),
+    ("set_operating_conditions", &["-object_list"], &[]),
     ("set_output_delay", &[], &["-level_sensitive"]),
     ("set_timing_derate", &[], &["-min", "-max"]),
+    // SDC 1.1 to 1.9 name the group with `-group_name`; 2.0 makes it the positional
+    ("set_wire_load_selection_group", &["-group_name"], &[]),
 ];
 
 /// The [`STANDARD_ONLY`] options no consumer here applies: a command using one is kept and
@@ -119,6 +124,10 @@ pub(crate) const KEPT_OPTIONS: &[(&str, &str)] = &[
     ("set_output_delay", "-level_sensitive"),
     ("set_timing_derate", "-min"),
     ("set_timing_derate", "-max"),
+    ("set_max_dynamic_power", "-unit"),
+    ("set_max_leakage_power", "-unit"),
+    ("set_operating_conditions", "-object_list"),
+    ("set_wire_load_selection_group", "-group_name"),
 ];
 
 /// A command's keys and flags: the reference timer's ([`FLAGS`]) then the standard's
