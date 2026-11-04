@@ -4774,6 +4774,10 @@ mod exception_check_tests {
             "set_timing_derate -increment 1.05",
             "set_load -internal 1 [get_ports dout]",
             "set_input_delay 1 -clock clk [all_inputs -bogus]",
+            // a synthesis tool's query options that no SDC version declares (the public parser's
+            // sdc1.1 … sdc2.0) and the reference does not read (its Error 562): refused, both
+            "set_false_path -to [get_pins -leaf u1/A]",
+            "set_false_path -to [get_nets -segments n1]",
         ];
         for line in bad {
             let s = Sdc::parse(line).unwrap();
