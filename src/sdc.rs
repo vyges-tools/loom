@@ -816,7 +816,7 @@ const TIMING_AFFECTING: &[&str] = &[
     "set_max_fanout",
     "set_max_capacitance",
     "set_min_capacitance",
-    // ── SDC 2.x ────────────────────────────────────────────────────────────────────────
+    // ── outside the SDC versions the reference parser declares (to 2.0) ─────────────────
     "set_disable_clock_gating_check", // removes a check, so its violations vanish
     "set_max_trans",                  // Tcl accepts unambiguous abbreviations
 ];
