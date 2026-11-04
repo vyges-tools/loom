@@ -206,7 +206,7 @@ pub const SDC_COMMANDS: &[Command] = &[
     v("1.1", cmd("set_propagated_clock", Applied, STA, "set_propagated_clock [get_clocks c]")),
     v("1.1", kept("set_resistance", "set_resistance 1 [get_nets n1]")),
     // 2.1 per the reference timer's documentation, not the public parser (see `Since::Sdc21`)
-    since(Since::Sdc21, kept("set_sense", "set_sense -type clock -positive [get_pins u1/Z]")),
+    since(Since::Sdc21, note("without `-type`: read as `-type clock`, the SDC 2.1 default; `-type data` is not modelled", kept("set_sense", "set_sense -type clock -positive [get_pins u1/Z]"))),
     v("1.5", cmd("set_timing_derate", Applied, STA, "set_timing_derate -late 1.05")),
     v("1.7", Command { name: "set_unit", spelling_of: Some("set_units"), status: Applied, applied_by: R, since: Since::Outside, probe: "set_unit -time ns", note: "" }),
     v("1.7", cmd("set_units", Applied, R, "set_units -time ns")),

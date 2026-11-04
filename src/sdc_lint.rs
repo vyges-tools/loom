@@ -535,6 +535,7 @@ pub fn lint_with_meta(
 
     not_applied_findings(sdc, &mut f);
     kept_not_applied_findings(sdc, &mut f);
+    sense_type_default_findings(sdc, &mut f);
     extension_findings(sdc, &mut f);
     braced_variable_findings(sdc, &mut f);
     f.sort_by(|a, b| (a.severity as u8, a.code).cmp(&(b.severity as u8, b.code)));
@@ -714,6 +715,22 @@ fn extension_findings(sdc: &Sdc, f: &mut Vec<Finding>) {
     }
 }
 
+/// The `set_sense` commands written without `-type` ([`Sdc::senses_type_defaulted`]), with their
+/// count: read as clock, the SDC 2.1 default, where the reference timer applies none of them.
+/// Info only — the file is SDC as written; the note is that the two readings differ.
+fn sense_type_default_findings(sdc: &Sdc, f: &mut Vec<Finding>) {
+    let n = sdc.senses_type_defaulted.len();
+    if n == 0 {
+        return;
+    }
+    let times = if n == 1 { String::new() } else { format!(" ({n} commands)") };
+    f.push(Finding {
+        severity: Severity::Info,
+        code: "sdc-sense-type-default",
+        message: format!("`set_sense`{times} no -type: applied as clock (SDC 2.1 default); the reference timer ignores it without -type"),
+    });
+}
+
 fn kept_not_applied_findings(sdc: &Sdc, f: &mut Vec<Finding>) {
     for k in sdc.kept_not_applied() {
         let times = if k.count == 1 { String::new() } else { format!(" ({} commands)", k.count) };
@@ -779,6 +796,7 @@ pub fn lint_without_design(sdc: &Sdc) -> LintReport {
     }
     not_applied_findings(sdc, &mut f);
     kept_not_applied_findings(sdc, &mut f);
+    sense_type_default_findings(sdc, &mut f);
     extension_findings(sdc, &mut f);
     braced_variable_findings(sdc, &mut f);
     f.push(Finding {
@@ -1121,6 +1139,28 @@ mod tests {
         assert_eq!(f.len(), 1, "{:?}", r.findings);
         assert_eq!(f[0].severity, Severity::Error);
         assert!(f[0].message.contains("set_assigned_delay"), "{}", f[0].message);
+    }
+
+    /// A `set_sense` without `-type` is read as clock, the SDC 2.1 default, and check says so at
+    /// info level with its count — the reference timer applies nothing for it. One with
+    /// `-type clock`, and `set_clock_sense`, are not counted.
+    #[test]
+    fn a_sense_without_a_type_is_reported_as_read_as_clock() {
+        let text = "set_sense -stop_propagation [get_pins u1/Y]\nset_sense -positive -clocks [get_clocks c] [get_pins u2/Y]\n\
+                    set_sense -type clock -negative [get_pins u3/Y]\nset_clock_sense -positive [get_pins u4/Y]\n";
+        let r = lint_without_design(&Sdc::parse(text).unwrap());
+        let f: Vec<_> = r.findings.iter().filter(|f| f.code == "sdc-sense-type-default").collect();
+        assert_eq!(f.len(), 1, "{:?}", r.findings);
+        assert_eq!(f[0].severity, Severity::Info);
+        assert_eq!(
+            f[0].message,
+            "`set_sense` (2 commands) no -type: applied as clock (SDC 2.1 default); the reference timer ignores it without -type"
+        );
+        let one = lint_without_design(&Sdc::parse("set_sense -stop_propagation [get_pins u1/Y]\n").unwrap());
+        let f: Vec<_> = one.findings.iter().filter(|f| f.code == "sdc-sense-type-default").map(|f| f.message.as_str()).collect();
+        assert_eq!(f, ["`set_sense` no -type: applied as clock (SDC 2.1 default); the reference timer ignores it without -type"]);
+        let typed = lint_without_design(&Sdc::parse("set_sense -type clock -negative [get_pins u3/Y]\n").unwrap());
+        assert!(!typed.findings.iter().any(|f| f.code == "sdc-sense-type-default"), "{:?}", typed.findings);
     }
 
     /// A command kept and written back that no checker or timer here applies is REPORTED, with its

@@ -419,16 +419,25 @@ fn arc_cmd(toks: &[String], keys: &[&str], flags: &[&str]) -> Result<ArcCmd, Str
 /// reference applies nothing, and `-type data` it does not support (Warning 413). `-clocks`
 /// replaces `-clock` when both are given; `-pulse` is read and not supported (Warning 416), and
 /// the three senses together only warn (417): each is kept as written for a consumer to refuse.
-fn sense_cmd(toks: &[String]) -> Result<ArcCmd, String> {
+/// One clock sense, and whether it is a `set_sense` written without `-type` (`true`): SDC 2.1
+/// makes `-type clock` the default, so it is read as `-type clock` and written back with it.
+///
+/// ⚠️ The reference differs here: its `set_sense` proc defaults the type to clock, but calls its
+/// sense command only inside the branch for an explicit `-type`, so without `-type` it applies
+/// nothing (though its own help says the type defaults to clock). Lint reports each such command.
+fn sense_cmd(toks: &[String]) -> Result<(ArcCmd, bool), String> {
     const KEYS: [&str; 3] = ["-clock", "-clocks", "-pulse"];
     const FLAGS: [&str; 3] = ["-positive", "-negative", "-stop_propagation"];
+    let defaulted = toks[0] == "set_sense" && !toks.iter().any(|t| t == "-type");
     let rest: Vec<String> = if toks[0] == "set_sense" {
         let ty = toks.iter().position(|t| t == "-type").and_then(|i| toks.get(i + 1).map(|v| (i, v.as_str())));
         match ty {
             Some((i, "clock")) => toks.iter().enumerate().filter(|(j, _)| *j != i && *j != i + 1).map(|(_, t)| t.clone()).collect(),
             Some((_, "data")) => return Err("set_sense: -type data is not supported by the reference (Warning 413); not applied".into()),
             Some((_, other)) => return Err(format!("set_sense: -type {other} is not clock or data (the reference's Error 414); not applied")),
-            None => return Err("set_sense: without -type the reference applies no sense (it applies one only with -type clock); not applied".into()),
+            // `-type` as the last word: the value is missing
+            None if !defaulted => return Err("set_sense: -type needs a value (clock or data); not applied".into()),
+            None => toks.to_vec(),
         }
     } else {
         toks.to_vec()
@@ -442,7 +451,7 @@ fn sense_cmd(toks: &[String]) -> Result<ArcCmd, String> {
     if c.keys.iter().any(|(k, _)| k == "-clocks") {
         c.keys.retain(|(k, _)| k != "-clock");
     }
-    Ok(c)
+    Ok((c, defaulted))
 }
 
 /// One `set_load` / `set_input_transition` as written: its value in the SDC's user unit (NOT
@@ -717,6 +726,9 @@ pub struct Sdc {
     /// Every clock sense the reference applies — `set_sense -type clock`, `set_clock_sense` — in
     /// file order (still in [`Sdc::ignored`]).
     pub senses: Vec<ArcCmd>,
+    /// The indices in [`Sdc::senses`] of each `set_sense` written without `-type`: read as
+    /// `-type clock`, the SDC 2.1 default (the reference applies none of them — see `sense_cmd`).
+    pub senses_type_defaulted: Vec<usize>,
     /// Every `set_disable_clock_gating_check` and `unset_…`, in file order (still in
     /// [`Sdc::ignored`]).
     pub disabled_gating_checks: Vec<ArcCmd>,
@@ -3842,7 +3854,12 @@ impl Sdc {
                 }
                 "set_sense" | "set_clock_sense" => {
                     match sense_cmd(&toks) {
-                        Ok(c) => sdc.senses.push(c),
+                        Ok((c, defaulted)) => {
+                            if defaulted {
+                                sdc.senses_type_defaulted.push(sdc.senses.len());
+                            }
+                            sdc.senses.push(c)
+                        }
                         Err(why) => sdc.rejected.push(why),
                     }
                     sdc.ignored.push(toks[0].clone());
@@ -6072,9 +6089,15 @@ mod arc_tests {
         assert!(w.contains("unset_disable_timing [get_pins {u2/A}]"), "{w}");
     }
 
-    /// Rule (`set_sense`): a sense only with `-type clock`; without `-type` the reference applies
-    /// nothing, `-type data` is not supported (413). `set_clock_sense` always applies;
-    /// `-clocks` wins over `-clock`; a word it does not know fails it (wrong # args).
+    /// Rule (`set_sense`): `-type clock` is a clock sense, and so is a `set_sense` without `-type`
+    /// (SDC 2.1 makes clock the default); `-type data` is not supported (the reference's Warning
+    /// 413); `-type` with no value is refused. `set_clock_sense` always applies; `-clocks` wins
+    /// over `-clock`; a word it does not know fails it (wrong # args).
+    ///
+    /// ⚠️ Reference quirk, pinned and NOT followed: the reference's `set_sense` proc sets the type
+    /// to clock by default, but calls its sense command only inside `if` `-type` was given, so a
+    /// `set_sense` without `-type` applies nothing there, though its help says clock is the
+    /// default. Here it is read as clock and listed in `senses_type_defaulted` for lint to report.
     #[test]
     fn a_sense_is_applied_as_the_reference_applies_it() {
         let s = Sdc::parse(
@@ -6091,12 +6114,27 @@ mod arc_tests {
             got,
             [
                 ("set_sense", vec![("-clocks".into(), "c".into())], vec!["-stop_propagation".to_string()], vec!["u1/Y".to_string()]),
+                ("set_sense", vec![], vec!["-stop_propagation".to_string()], vec!["u2/Y".to_string()]),
                 ("set_clock_sense", vec![("-clocks".into(), "c".into())], vec!["-negative".to_string()], vec!["u4/Y".to_string()]),
             ]
         );
-        assert_eq!(s.rejected.len(), 3, "{:?}", s.rejected);
+        assert_eq!(s.senses_type_defaulted, [1]);
+        assert_eq!(s.rejected.len(), 2, "{:?}", s.rejected);
+        assert!(s.rejected[0].contains("-type data"), "{:?}", s.rejected);
         let w = s.write(&crate::sdc_write::WriteOpts::default()).text;
         assert!(w.contains("set_sense -type clock -clocks [get_clocks {c}] -stop_propagation [get_pins {u1/Y}]"), "{w}");
+        // the defaulted one is written back with the type it was read as
+        assert!(w.contains("set_sense -type clock -stop_propagation [get_pins {u2/Y}]"), "{w}");
+    }
+
+    /// Rule: `-type` is a valued option; written with no value it names no type, and is refused
+    /// rather than read as the default.
+    #[test]
+    fn a_sense_type_with_no_value_is_refused() {
+        let s = Sdc::parse("set_sense -stop_propagation [get_pins u2/Y] -type\n").unwrap();
+        assert!(s.senses.is_empty(), "{:?}", s.senses);
+        assert!(s.senses_type_defaulted.is_empty());
+        assert_eq!(s.rejected, ["set_sense: -type needs a value (clock or data); not applied"]);
     }
 
     /// Rule (`set_disable_clock_gating_check { objects }`): one object list, Tcl's own arity.
