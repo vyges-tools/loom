@@ -674,10 +674,15 @@ fn path_point_findings(sdc: &Sdc, g: &Graph, f: &mut Vec<Finding>) {
 /// Without these, every check above runs on what was read and says nothing about what was not, so
 /// a file whose `set_disable_timing` or design-dependent queries were all skipped could come back
 /// clean. A clean report must mean the whole file was looked at.
+const SENSE_DATA_TAIL: &str = "not modelled, not applied; the reference timer does not apply it either";
+
 fn not_applied_findings(sdc: &Sdc, f: &mut Vec<Finding>) {
     for n in sdc.not_applied() {
         let times = if n.count == 1 { String::new() } else { format!(" ({} commands)", n.count) };
-        if n.affects_timing {
+        if n.command == "set_sense" && n.why.ends_with(crate::sdc::SENSE_TYPE_DATA) {
+            // not applied here or by the reference: the two agree, so a warning
+            f.push(Finding::warn("sdc-not-applied", format!("`set_sense -type data`{times}: {SENSE_DATA_TAIL}")));
+        } else if n.affects_timing {
             f.push(Finding::err(
                 "sdc-not-applied",
                 format!(
@@ -1161,6 +1166,21 @@ mod tests {
         assert_eq!(f, ["`set_sense` no -type: applied as clock (SDC 2.1 default); the reference timer ignores it without -type"]);
         let typed = lint_without_design(&Sdc::parse("set_sense -type clock -negative [get_pins u3/Y]\n").unwrap());
         assert!(!typed.findings.iter().any(|f| f.code == "sdc-sense-type-default"), "{:?}", typed.findings);
+    }
+
+    /// `set_sense -type data` is not modelled: a WARNING, not an error, since the reference timer
+    /// does not apply it either (its Warning 413). The command is not written back.
+    #[test]
+    fn a_data_sense_is_a_warning() {
+        let s = Sdc::parse("set_sense -type data -positive [get_pins u3/Y]\nset_sense -type data -negative [get_pins u4/Y]\n").unwrap();
+        let r = lint_without_design(&s);
+        let f: Vec<(Severity, &str)> = r.findings.iter().filter(|f| f.code == "sdc-not-applied").map(|f| (f.severity, f.message.as_str())).collect();
+        assert_eq!(
+            f,
+            [(Severity::Warning, "`set_sense -type data` (2 commands): not modelled, not applied; the reference timer does not apply it either")]
+        );
+        assert_eq!(r.errors(), 0, "{:?}", r.findings);
+        assert!(s.senses.is_empty());
     }
 
     /// A command kept and written back that no checker or timer here applies is REPORTED, with its

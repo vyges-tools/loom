@@ -415,16 +415,22 @@ fn arc_cmd(toks: &[String], keys: &[&str], flags: &[&str]) -> Result<ArcCmd, Str
 }
 
 /// A clock sense, as the reference applies one (`set_sense`, `set_clock_sense_cmd1` in its SDC
-/// Tcl): `set_clock_sense …` always; `set_sense` ONLY with `-type clock` — without `-type` the
-/// reference applies nothing, and `-type data` it does not support (Warning 413). `-clocks`
-/// replaces `-clock` when both are given; `-pulse` is read and not supported (Warning 416), and
-/// the three senses together only warn (417): each is kept as written for a consumer to refuse.
-/// One clock sense, and whether it is a `set_sense` written without `-type` (`true`): SDC 2.1
+/// Tcl): `set_clock_sense …` always; `set_sense` with `-type clock`, and without `-type` (below);
+/// `-type data` the reference does not support (Warning 413), and neither does this reader
+/// ([`SENSE_TYPE_DATA`]). `-clocks` replaces `-clock` when both are given; `-pulse` is read and
+/// not supported (Warning 416), and the three senses together only warn (417): each is kept as
+/// written for a consumer to refuse.
+///
+/// Returns the sense, and whether it is a `set_sense` written without `-type` (`true`): SDC 2.1
 /// makes `-type clock` the default, so it is read as `-type clock` and written back with it.
 ///
 /// ⚠️ The reference differs here: its `set_sense` proc defaults the type to clock, but calls its
 /// sense command only inside the branch for an explicit `-type`, so without `-type` it applies
 /// nothing (though its own help says the type defaults to clock). Lint reports each such command.
+/// Why a `set_sense -type data` is refused. Lint reports it as a warning, not an error: the
+/// reference timer does not apply it either (its Warning 413), so a run here and a run there agree.
+pub const SENSE_TYPE_DATA: &str = "-type data is not modelled (the reference timer does not apply it either, its Warning 413); not applied";
+
 fn sense_cmd(toks: &[String]) -> Result<(ArcCmd, bool), String> {
     const KEYS: [&str; 3] = ["-clock", "-clocks", "-pulse"];
     const FLAGS: [&str; 3] = ["-positive", "-negative", "-stop_propagation"];
@@ -433,7 +439,7 @@ fn sense_cmd(toks: &[String]) -> Result<(ArcCmd, bool), String> {
         let ty = toks.iter().position(|t| t == "-type").and_then(|i| toks.get(i + 1).map(|v| (i, v.as_str())));
         match ty {
             Some((i, "clock")) => toks.iter().enumerate().filter(|(j, _)| *j != i && *j != i + 1).map(|(_, t)| t.clone()).collect(),
-            Some((_, "data")) => return Err("set_sense: -type data is not supported by the reference (Warning 413); not applied".into()),
+            Some((_, "data")) => return Err(format!("set_sense: {SENSE_TYPE_DATA}")),
             Some((_, other)) => return Err(format!("set_sense: -type {other} is not clock or data (the reference's Error 414); not applied")),
             // `-type` as the last word: the value is missing
             None if !defaulted => return Err("set_sense: -type needs a value (clock or data); not applied".into()),
