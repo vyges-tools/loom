@@ -324,7 +324,7 @@ impl Objects {
             "list" | "concat" => items = parts.iter().skip(1).map(|p| Objects::of(p)).collect(),
             _ if parts.iter().any(|p| p == "-filter" || p == "-of_objects") => {}
             _ => {
-                let keys = crate::sdc_flags::FLAGS.iter().find(|(n, _, _)| *n == accessor).map_or(&[][..], |(_, k, _)| *k);
+                let keys = crate::sdc_flags::keys(&accessor);
                 let mut k = 1;
                 while k < parts.len() {
                     let p = &parts[k];
@@ -752,6 +752,12 @@ pub struct Sdc {
     /// Every command the reference reads that has no typed model here, kept as written, in file
     /// order — see [`KeptCmd`] (each still in [`Sdc::ignored`]).
     pub kept: Vec<KeptCmd>,
+    /// Each use of an SDC option no consumer here applies (`set_input_delay -level_sensitive`,
+    /// `all_inputs -clock`: [`crate::sdc_flags::KEPT_OPTIONS`]), as `command -option`, in file
+    /// order. Its command is kept and written back — in its typed record when the record carries
+    /// the option, else as written in [`Sdc::kept`] — and `check` reports it as kept-not-applied.
+    /// Each is also in [`Sdc::ignored`], for a consumer that reads only that.
+    pub kept_options: Vec<String>,
     pub ignored: Vec<String>, // commands we recognised but do not model
 }
 
@@ -1082,7 +1088,7 @@ impl Sdc {
             let why = r[cut..].trim_start_matches(':').trim().to_string();
             add(r[..cut].to_string(), if why.is_empty() { "rejected".into() } else { format!("rejected: {why}") });
         }
-        for c in self.ignored.iter().filter(|c| !MODELLED_BUT_LISTED.contains(&c.as_str())) {
+        for c in self.ignored.iter().filter(|c| !MODELLED_BUT_LISTED.contains(&c.as_str()) && !self.kept_options.contains(c)) {
             add(c.clone(), "not modelled; read past".into());
         }
         out
@@ -1095,7 +1101,8 @@ impl Sdc {
     /// reports each, so a file is not called clean while one of these goes unapplied.
     pub fn kept_not_applied(&self) -> Vec<KeptNotApplied> {
         let mut out: Vec<KeptNotApplied> = Vec::new();
-        for c in self.ignored.iter().filter(|c| registry::kept_not_applied(c)) {
+        let options = self.kept_options.iter();
+        for c in self.ignored.iter().filter(|c| registry::kept_not_applied(c)).chain(options) {
             match out.iter_mut().find(|k| &k.command == c) {
                 Some(k) => k.count += 1,
                 None => out.push(KeptNotApplied { command: c.clone(), count: 1, affects_timing: !BENIGN_FOR_TIMING.contains(&c.as_str()) }),
@@ -1499,7 +1506,7 @@ fn resolve_objs(tok: &str) -> Vec<String> {
                         return names;
                     }
                 }
-                let keys = crate::sdc_flags::FLAGS.iter().find(|(n, _, _)| *n == parts[0]).map_or(&[][..], |(_, k, _)| *k);
+                let keys = crate::sdc_flags::keys(&parts[0]);
                 let mut names = Vec::new();
                 let mut k = 1;
                 while k < parts.len() {
@@ -1850,13 +1857,12 @@ fn unknown_substituted_command(line: &str) -> Option<String> {
 /// ⛔ Unexpanded, `create_clock -per 10` failed the whole file, and `set_max_trans 0.5` was an
 /// unknown command whose limit was lost.
 fn expand_abbreviations(mut toks: Vec<String>) -> Vec<String> {
-    use crate::sdc_flags::FLAGS;
     const OWN: [&str; 4] = ["-through", "-rise_through", "-fall_through", "-group"];
     let Some(c) = toks.first() else { return toks };
     if let Ok(full) = resolve_command(c) {
         toks[0] = full;
     }
-    let Some((_, keys, flags)) = FLAGS.iter().find(|(n, _, _)| *n == toks[0]) else { return toks };
+    let Some((keys, flags)) = crate::sdc_flags::options(&toks[0]) else { return toks };
     let mut k = 1;
     while k < toks.len() {
         let t = toks[k].as_str();
@@ -1877,6 +1883,18 @@ fn expand_abbreviations(mut toks: Vec<String>) -> Vec<String> {
             }
         }
         k += 1;
+    }
+    // SDC spellings the model reads as another: the parser's `-substract_pin_load` is
+    // `-subtract_pin_load`; `get_ports -hierarchical` is `get_ports` (a port is at the top level,
+    // with no hierarchy below it to search), so the flag selects nothing more and is not kept
+    match toks[0].as_str() {
+        "set_load" => {
+            for t in toks.iter_mut().filter(|t| *t == "-substract_pin_load") {
+                *t = "-subtract_pin_load".into();
+            }
+        }
+        "get_ports" => toks.retain(|t| t != "-hierarchical"),
+        _ => {}
     }
     toks
 }
@@ -1945,15 +1963,16 @@ fn misplaced_except(toks: &[String]) -> Option<String> {
 /// as the reference's argument parser decides it: a word is an option when it is `-` and a letter
 /// (`-0.5` is a value); it is one of the command's keys (which takes the next word as its value)
 /// or flags exactly, or else the beginning of one. Anything else fails the command in the
-/// reference (Error 562, "not a known keyword or flag": `all_inputs -edge_triggered`,
-/// `set_driving_cell -clock`, `get_ports -hierarchical`, SDC options it does not implement), so
-/// it builds no constraint; read as a constraint here it ignored the option. A command whose parse
+/// reference (Error 562, "not a known keyword or flag"), so it builds no constraint; read as a
+/// constraint here it ignored the option. The options SDC declares and the reference timer lacks
+/// (`all_inputs -edge_triggered`, `set_driving_cell -clock`, `get_ports -hierarchical`:
+/// [`crate::sdc_flags::STANDARD_ONLY`]) are valid SDC and are accepted. A command whose parse
 /// passes unknown options on ([`PASSES_UNKNOWN`]), or that this table does not list, is not judged.
 fn unknown_option(toks: &[String]) -> Option<String> {
-    use crate::sdc_flags::{FLAGS, PASSES_UNKNOWN};
+    use crate::sdc_flags::PASSES_UNKNOWN;
     let is_option = |t: &str| t.len() >= 2 && t.starts_with('-') && t[1..].starts_with(|c: char| c.is_ascii_alphabetic());
     let cmd = toks.first()?.as_str();
-    if let Some((_, keys, flags)) = FLAGS.iter().find(|(n, _, _)| *n == cmd).filter(|_| !PASSES_UNKNOWN.contains(&cmd)) {
+    if let Some((keys, flags)) = crate::sdc_flags::options(cmd).filter(|_| !PASSES_UNKNOWN.contains(&cmd)) {
         let mut k = 1;
         while k < toks.len() {
             let t = toks[k].as_str();
@@ -1975,19 +1994,35 @@ fn unknown_option(toks: &[String]) -> Option<String> {
     })
 }
 
-/// The first query in `toks` (at any depth of `[...]`) given positional arguments its reference
-/// definition refuses: `all_outputs` takes no argument at all, not even an option (Error 564,
-/// "positional arguments not supported"), `all_clocks` none either (Tcl: wrong # args), and
-/// `all_registers` options only (Error 564). `all_inputs` ignores a stray word, as the reference
-/// does. Read as the query, `[all_outputs -clock clk]` constrained every output; the reference
-/// fails the command.
+/// Each SDC option in `toks` (at any depth of `[...]`) that no consumer here applies
+/// ([`crate::sdc_flags::KEPT_OPTIONS`]), as `command -option`, in the order written.
+fn kept_options_in(toks: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(cmd) = toks.first() else { return out };
+    for t in &toks[1..] {
+        if crate::sdc_flags::KEPT_OPTIONS.iter().any(|(c, o)| c == cmd && o == t) {
+            out.push(format!("{cmd} {t}"));
+        }
+        if let Some(inner) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            out.extend(kept_options_in(&expand_abbreviations(tokenize(inner.trim()))));
+        }
+    }
+    out
+}
+
+/// The first query in `toks` (at any depth of `[...]`) given positional arguments its definition
+/// refuses: `all_clocks` takes none and no option (Tcl: wrong # args), `all_outputs` and
+/// `all_registers` options only (Error 564, "positional arguments not supported"; SDC gives
+/// `all_outputs` the options `-clock`, `-level_sensitive` and `-edge_triggered`, which the
+/// reference timer's lacks). `all_inputs` ignores a stray word, as the reference does.
 fn argument_fault(toks: &[String]) -> Option<String> {
-    use crate::sdc_flags::FLAGS;
     let cmd = toks.first()?.as_str();
     let fault = match cmd {
-        "all_outputs" | "all_clocks" => toks.len() > 1,
-        "all_registers" => {
-            let keys = FLAGS.iter().find(|(n, _, _)| *n == cmd).map_or(&[][..], |(_, k, _)| *k);
+        "all_clocks" => toks.len() > 1,
+        // SDC's `all_outputs` takes its options (`-clock`, `-level_sensitive`, `-edge_triggered`)
+        // and no positional; the reference timer's takes nothing
+        "all_outputs" | "all_registers" => {
+            let keys = crate::sdc_flags::keys(cmd);
             let mut k = 1;
             let mut positional = false;
             while k < toks.len() {
@@ -2003,7 +2038,7 @@ fn argument_fault(toks: &[String]) -> Option<String> {
         _ => false,
     };
     if fault {
-        return Some(format!("`{}`: {cmd} takes no positional argument{}", toks.join(" "), if cmd == "all_registers" { "" } else { " or option" }));
+        return Some(format!("`{}`: {cmd} takes no positional argument{}", toks.join(" "), if cmd == "all_clocks" { " or option" } else { "" }));
     }
     toks[1..].iter().find_map(|t| {
         let inner = t.strip_prefix('[').and_then(|s| s.strip_suffix(']'))?;
@@ -3317,6 +3352,22 @@ impl Sdc {
                     continue;
                 }
             }
+            // ⛔ An SDC option no consumer here applies (`set_driving_cell -clock`, `[all_inputs
+            // -clock c]`: `sdc_flags::KEPT_OPTIONS`) is valid SDC: neither refused nor dropped. Its
+            // command is kept and written back — in its typed record where that carries the
+            // option (an I/O delay's flags; a derate's flags, which then sets no design-wide
+            // derate), else as written — and reported as kept-not-applied.
+            let options = kept_options_in(&toks);
+            if !options.is_empty() {
+                sdc.ignored.extend(options.iter().cloned());
+                sdc.kept_options.extend(options.iter().cloned());
+                let typed = matches!(toks[0].as_str(), "set_input_delay" | "set_output_delay" | "set_timing_derate")
+                    && options.iter().all(|o| o.split(' ').next() == Some(toks[0].as_str()));
+                if !typed {
+                    sdc.kept.push(kept::verbatim(&toks));
+                    continue;
+                }
+            }
             match toks[0].as_str() {
                 "set" => {
                     if toks.len() >= 3 {
@@ -3773,8 +3824,9 @@ impl Sdc {
                     };
                     let objects: Vec<String> = pos.iter().skip(1).flat_map(|o| resolve_objs(o)).collect();
                     let written = pos.get(1).map(|o| Objects::of(o));
+                    // SDC's `-min` / `-max` (a min or max operating condition) scope it too
                     let scoped = !objects.is_empty()
-                        || ["-cell_delay", "-net_delay", "-cell_check", "-data", "-clock", "-rise", "-fall"].iter().any(|f| has(f));
+                        || ["-cell_delay", "-net_delay", "-cell_check", "-data", "-clock", "-rise", "-fall", "-min", "-max"].iter().any(|f| has(f));
                     if scoped {
                         sdc.ignored.push("set_timing_derate".into());
                     } else {
@@ -4538,17 +4590,17 @@ mod exception_check_tests {
     /// one of the command's keys or flags exactly, or the beginning of one (first key, then first
     /// flag), or the command fails (Error 562, measured 2026-10-31 on the spec-matrix probes and on
     /// the parser itself). An SDC option it does not implement is such an option. A command whose
-    /// parse passes unknown options on (the exception commands) is not judged here.
+    /// parse passes unknown options on (the exception commands) is not judged here. An option
+    /// the SDC standard declares and the reference lacks (`all_inputs -edge_triggered`,
+    /// `set_driving_cell -clock`, `get_ports -hierarchical`) is valid SDC and is read: see
+    /// `tests/sdc_standard_options.rs`.
     #[test]
     fn an_option_the_command_does_not_have_is_refused() {
         let bad = [
-            "set_input_delay 1 -clock clk [all_inputs -edge_triggered]",
-            "set_input_delay 1 -clock clk [all_inputs -clock clk]",
-            "set_load 1 [get_ports -hierarchical dout]",
-            "set_driving_cell -lib_cell BUF -clock clk [get_ports din]",
             "set_clock_latency -dynamic 1 [get_clocks clk]",
             "set_timing_derate -increment 1.05",
-            "set_input_delay -level_sensitive 1 -clock clk [get_ports din]",
+            "set_load -internal 1 [get_ports dout]",
+            "set_input_delay 1 -clock clk [all_inputs -bogus]",
         ];
         for line in bad {
             let s = Sdc::parse(line).unwrap();
@@ -4622,14 +4674,16 @@ mod exception_check_tests {
         assert!(Sdc::parse("set_size_o [get_cells u0]").is_err());
     }
 
-    /// Rule (`all_outputs`, `all_clocks`, `all_registers`, Sdc.tcl, observed 2026-10-31): the
-    /// first two take no argument, the third options only; `all_inputs` ignores a stray word.
+    /// Rule (`all_outputs`, `all_clocks`, `all_registers`, Sdc.tcl, observed 2026-10-31):
+    /// `all_clocks` takes no argument, `all_registers` options only; `all_inputs` ignores a stray
+    /// word. SDC gives `all_outputs` options (`-clock`, `-level_sensitive`, `-edge_triggered`) and
+    /// no positional, so an option is read (and kept: nothing here evaluates it) and a positional
+    /// still fails the command.
     #[test]
     fn a_query_given_arguments_it_does_not_take_fails_its_command() {
         let clk = "create_clock -name clk -period 10 [get_ports clk]\n";
         for cmd in [
             "set_output_delay 1 -clock clk [all_outputs dout]",
-            "set_output_delay 1 -clock clk [all_outputs -clock clk]",
             "set_load 1 [all_outputs {}]",
             "set_clock_latency 1 [all_clocks x]",
             "set_false_path -to [all_registers foo]",
@@ -4639,6 +4693,7 @@ mod exception_check_tests {
         }
         for cmd in [
             "set_output_delay 1 -clock clk [all_outputs]",
+            "set_output_delay 1 -clock clk [all_outputs -clock clk]",
             "set_input_delay 1 -clock clk [all_inputs din]",
             "set_false_path -to [all_registers -clock clk -edge_triggered]",
         ] {

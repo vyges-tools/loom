@@ -526,7 +526,7 @@ impl Sdc {
             head(o);
             o.skip(format!("rejected: {r}"));
         }
-        for r in self.ignored.iter().filter(|r| !MODELLED_BUT_LISTED.contains(&r.as_str())) {
+        for r in self.ignored.iter().filter(|r| !MODELLED_BUT_LISTED.contains(&r.as_str()) && !self.kept_options.contains(r)) {
             head(o);
             o.skip(format!("not modelled: {r}"));
         }

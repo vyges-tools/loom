@@ -385,6 +385,30 @@ pub(super) fn kept_cmd(toks: &[String]) -> Result<KeptCmd, String> {
     Ok(c)
 }
 
+/// Any command kept as written because it uses an SDC option no consumer here applies (see
+/// `Sdc::kept_options`): its keys ([`crate::sdc_flags::options`]) with their values, its flags,
+/// and its positionals, a `[...]` word as the objects it names. The writer writes it back whole.
+pub(super) fn verbatim(toks: &[String]) -> KeptCmd {
+    let (keys, _) = crate::sdc_flags::options(&toks[0]).unwrap_or_default();
+    let mut c = KeptCmd { cmd: toks[0].clone(), keys: Vec::new(), flags: Vec::new(), args: Vec::new() };
+    let arg = |w: &String| if w.starts_with('[') { KeptArg::Objects(Objects::of(w)) } else { KeptArg::Word(w.clone()) };
+    let mut k = 1;
+    while k < toks.len() {
+        let t = &toks[k];
+        match toks.get(k + 1) {
+            Some(v) if keys.contains(&t.as_str()) => {
+                c.keys.push((t.clone(), arg(v)));
+                k += 2;
+                continue;
+            }
+            _ if t.starts_with('-') && t.parse::<f64>().is_err() => c.flags.push(t.clone()),
+            _ => c.args.push(arg(t)),
+        }
+        k += 1;
+    }
+    c
+}
+
 /// `group_path` / `set_path_margin` read as the reference reads them (`group_path`,
 /// `set_path_margin` in its SDC Tcl), or why it refuses the command.
 pub(super) fn exception_cmd(toks: &[String]) -> Result<ExceptionCmd, String> {

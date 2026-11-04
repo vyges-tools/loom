@@ -79,3 +79,65 @@ pub(crate) const FLAGS: &[(&str, &[&str], &[&str])] = &[
     ("unset_path_exceptions", &["-from", "-rise_from", "-fall_from", "-to", "-rise_to", "-fall_to"], &["-setup", "-hold", "-rise", "-fall"]),
     ("write_sdc", &["-mode", "-digits"], &["-map_hpins", "-compatible", "-gzip", "-no_timestamp"]),
 ];
+
+/// `(command, keys, flags)` the SDC standard declares that the reference timer's parse does not
+/// have: the reference SDC parser's declarations (SDC 1.1 to 2.0) less [`FLAGS`]. They are valid
+/// SDC, so they are read, not refused (the reference timer refuses them, Error 562; the difference
+/// is recorded in the internal spec matrix). Each is applied where the model can apply it and is
+/// otherwise kept, written back, and reported as kept-not-applied — see [`KEPT_OPTIONS`].
+/// Matched after [`FLAGS`], so an abbreviation the reference resolves still resolves as it does.
+pub(crate) const STANDARD_ONLY: &[(&str, &[&str], &[&str])] = &[
+    ("all_inputs", &["-clock"], &["-level_sensitive", "-edge_triggered"]),
+    ("all_outputs", &["-clock"], &["-level_sensitive", "-edge_triggered"]),
+    ("all_registers", &[], &["-no_hierarchy", "-slave_clock_pins", "-master_slave"]),
+    ("get_ports", &[], &["-hierarchical"]),
+    ("set_driving_cell", &["-clock"], &["-clock_fall"]),
+    ("set_input_delay", &[], &["-level_sensitive"]),
+    // the parser's own spelling of `-subtract_pin_load`, read as it
+    ("set_load", &[], &["-substract_pin_load"]),
+    ("set_output_delay", &[], &["-level_sensitive"]),
+    ("set_timing_derate", &[], &["-min", "-max"]),
+];
+
+/// The [`STANDARD_ONLY`] options no consumer here applies: a command using one is kept and
+/// written back with it, and `check` reports it as kept-not-applied. The others are applied:
+/// `get_ports -hierarchical` is `get_ports` (a port is at the top level, with no hierarchy to
+/// descend), and `set_load -substract_pin_load` is `-subtract_pin_load`.
+pub(crate) const KEPT_OPTIONS: &[(&str, &str)] = &[
+    ("all_inputs", "-clock"),
+    ("all_inputs", "-level_sensitive"),
+    ("all_inputs", "-edge_triggered"),
+    ("all_outputs", "-clock"),
+    ("all_outputs", "-level_sensitive"),
+    ("all_outputs", "-edge_triggered"),
+    ("all_registers", "-no_hierarchy"),
+    ("all_registers", "-slave_clock_pins"),
+    ("all_registers", "-master_slave"),
+    ("set_driving_cell", "-clock"),
+    ("set_driving_cell", "-clock_fall"),
+    ("set_input_delay", "-level_sensitive"),
+    ("set_output_delay", "-level_sensitive"),
+    ("set_timing_derate", "-min"),
+    ("set_timing_derate", "-max"),
+];
+
+/// A command's keys and flags: the reference timer's ([`FLAGS`]) then the standard's
+/// ([`STANDARD_ONLY`]); `None` for a command neither lists.
+pub(crate) fn options(cmd: &str) -> Option<(Vec<&'static str>, Vec<&'static str>)> {
+    let reference = FLAGS.iter().find(|(n, _, _)| *n == cmd);
+    let standard = STANDARD_ONLY.iter().find(|(n, _, _)| *n == cmd);
+    if reference.is_none() && standard.is_none() {
+        return None;
+    }
+    let (mut keys, mut flags) = (Vec::new(), Vec::new());
+    for (_, k, f) in reference.into_iter().chain(standard) {
+        keys.extend_from_slice(k);
+        flags.extend_from_slice(f);
+    }
+    Some((keys, flags))
+}
+
+/// [`options`]' keys alone (none for a command neither table lists).
+pub(crate) fn keys(cmd: &str) -> Vec<&'static str> {
+    options(cmd).map(|(k, _)| k).unwrap_or_default()
+}

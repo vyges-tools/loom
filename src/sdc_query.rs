@@ -150,7 +150,7 @@ fn names(o: &Objs, d: &SdcDesign) -> Vec<String> {
 
 fn objects(parts: &[String], d: &SdcDesign) -> Result<Objs, String> {
     let cmd = parts.first().map(String::as_str).unwrap_or("");
-    let keys = crate::sdc_flags::FLAGS.iter().find(|(n, _, _)| *n == cmd).map_or(&[][..], |(_, k, _)| *k);
+    let keys = crate::sdc_flags::keys(cmd);
     let (mut filter, mut of, mut regexp, mut hier, mut nocase) = (None, None, false, false, false);
     let mut patterns: Vec<String> = Vec::new();
     let mut k = 1;

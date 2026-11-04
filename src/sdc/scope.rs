@@ -56,7 +56,7 @@ pub(super) fn scoped_line(line: &str, scope: &str, clocks: &[String]) -> Result<
         return Ok(line.to_string());
     }
     let mut out = vec![cmd.clone()];
-    let keys: &[&str] = crate::sdc_flags::FLAGS.iter().find(|(n, _, _)| *n == cmd).map_or(&[][..], |(_, k, _)| *k);
+    let keys = crate::sdc_flags::keys(&cmd);
     let mut positional = 0usize;
     let mut k = 1;
     while k < toks.len() {
@@ -119,7 +119,7 @@ fn query(w: &str, scope: &str, clocks: &[String]) -> Result<String, String> {
     if scoped && toks.iter().any(|t| t == "-hierarchical" || t == "-hier") {
         return Err(format!("`{q} -hierarchical` under current_instance {scope}: a match from every level below it is not modelled"));
     }
-    let keys: &[&str] = crate::sdc_flags::FLAGS.iter().find(|(n, _, _)| *n == q).map_or(&[][..], |(_, k, _)| *k);
+    let keys = crate::sdc_flags::keys(&q);
     let mut out = vec![q.clone()];
     let mut k = 1;
     while k < toks.len() {
