@@ -53,7 +53,10 @@ pub(crate) const FLAGS: &[(&str, &[&str], &[&str])] = &[
     ("set_input_delay", &["-clock", "-reference_pin"], &["-rise", "-fall", "-max", "-min", "-clock_fall", "-add_delay", "-source_latency_included", "-network_latency_included"]),
     ("set_input_transition", &["-clock"], &["-rise", "-fall", "-max", "-min", "-clock_fall"]),
     ("set_load", &[], &["-rise", "-fall", "-min", "-max", "-subtract_pin_load", "-pin_load", "-wire_load"]),
+    // SDC and the reference: `value object_list`, no option
+    ("set_max_capacitance", &[], &[]),
     ("set_max_delay", &["-from", "-rise_from", "-fall_from", "-to", "-rise_to", "-fall_to", "-comment"], &["-rise", "-fall", "-ignore_clock_latency", "-reset_path", "-probe"]),
+    ("set_max_fanout", &[], &[]),
     ("set_max_transition", &[], &["-clock_path", "-data_path", "-rise", "-fall"]),
     ("set_min_delay", &["-from", "-rise_from", "-fall_from", "-to", "-rise_to", "-fall_to", "-comment"], &["-rise", "-fall", "-ignore_clock_latency", "-reset_path", "-probe"]),
     ("set_min_pulse_width", &[], &["-low", "-high"]),
@@ -90,7 +93,9 @@ pub(crate) const STANDARD_ONLY: &[(&str, &[&str], &[&str])] = &[
     ("all_inputs", &["-clock"], &["-level_sensitive", "-edge_triggered"]),
     ("all_outputs", &["-clock"], &["-level_sensitive", "-edge_triggered"]),
     ("all_registers", &[], &["-no_hierarchy", "-slave_clock_pins", "-master_slave"]),
+    ("current_instance", &["-instance"], &[]),
     ("get_ports", &[], &["-hierarchical"]),
+    ("set_data_check", &[], &["-rise", "-fall"]),
     ("set_driving_cell", &["-clock"], &["-clock_fall"]),
     ("set_input_delay", &[], &["-level_sensitive"]),
     // the parser's own spelling of `-subtract_pin_load`, read as it
@@ -107,7 +112,8 @@ pub(crate) const STANDARD_ONLY: &[(&str, &[&str], &[&str])] = &[
 /// The [`STANDARD_ONLY`] options no consumer here applies: a command using one is kept and
 /// written back with it, and `check` reports it as kept-not-applied. The others are applied:
 /// `get_ports -hierarchical` is `get_ports` (a port is at the top level, with no hierarchy to
-/// descend), and `set_load -substract_pin_load` is `-subtract_pin_load`.
+/// descend), `set_load -substract_pin_load` is `-subtract_pin_load`, and `current_instance
+/// -instance i` is `current_instance i`.
 pub(crate) const KEPT_OPTIONS: &[(&str, &str)] = &[
     ("all_inputs", "-clock"),
     ("all_inputs", "-level_sensitive"),
@@ -118,6 +124,8 @@ pub(crate) const KEPT_OPTIONS: &[(&str, &str)] = &[
     ("all_registers", "-no_hierarchy"),
     ("all_registers", "-slave_clock_pins"),
     ("all_registers", "-master_slave"),
+    ("set_data_check", "-rise"),
+    ("set_data_check", "-fall"),
     ("set_driving_cell", "-clock"),
     ("set_driving_cell", "-clock_fall"),
     ("set_input_delay", "-level_sensitive"),

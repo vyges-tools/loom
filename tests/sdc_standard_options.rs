@@ -161,3 +161,76 @@ fn the_kept_commands_read_their_sdc_options() {
     }
     assert!(!read("set_wire_load_selection_group").rejected.is_empty(), "no group at all is still refused");
 }
+
+/// SDC 1.4+ `set_data_check` declares `-rise` / `-fall` (a check on that edge of the data). Read
+/// as SDC's flags — the reference timer takes `-rise` as an abbreviation of `-rise_from` — kept
+/// with them, written back, and reported: no consumer here times a one-edge data check.
+#[test]
+fn a_one_edge_data_check_is_kept_with_its_edge() {
+    for edge in ["-rise", "-fall"] {
+        let line = format!("set_data_check {edge} -from [get_pins r/D] -to [get_pins s/D] 0.1");
+        let s = accepted(&line, &[&format!("set_data_check {edge}")]);
+        let text = written(&s);
+        let w = text.lines().find(|l| l.starts_with("set_data_check")).unwrap_or_else(|| panic!("{text}"));
+        assert!(w.split(' ').any(|t| t == edge) && w.contains("-from") && w.contains("0.1"), "{w}");
+    }
+}
+
+/// SDC 1.7+ `set_ideal_network` spells the option `-no_propagate`; the reference timer
+/// `-no_propagation`. Both are read as the option — not as the command's object, which stays the
+/// port — and written back as written.
+#[test]
+fn ideal_network_reads_both_spellings() {
+    for opt in ["-no_propagate", "-no_propagation"] {
+        let s = read(&format!("set_ideal_network {opt} [get_ports clk]"));
+        assert!(s.rejected.is_empty(), "{opt}: {:?}", s.rejected);
+        let k = s.kept.iter().find(|k| k.cmd == "set_ideal_network").unwrap_or_else(|| panic!("{opt}: not kept"));
+        assert!(k.has(opt), "{opt}: not read as the option: {k:?}");
+        assert!(matches!(k.args.as_slice(), [vyges_loom::sdc::KeptArg::Objects(_)]), "{opt}: {:?}", k.args);
+        assert!(written(&s).lines().any(|l| l.starts_with("set_ideal_network") && l.contains(opt)), "{opt}: {}", written(&s));
+    }
+}
+
+/// SDC 1.1+ `current_instance` names the instance with `-instance`; the reference timer takes it
+/// as the positional. Both set the same scope.
+#[test]
+fn current_instance_takes_the_instance_option() {
+    let scoped = |cmd: &str| {
+        let s = read(&format!("{cmd}\nset_false_path -to [get_pins r1/D]"));
+        assert!(s.rejected.is_empty(), "{cmd}: {:?}", s.rejected);
+        s.exceptions[0].args[0].1.names.clone()
+    };
+    assert_eq!(scoped("current_instance -instance u1"), ["u1/r1/D"]);
+    assert_eq!(scoped("current_instance -instance u1"), scoped("current_instance u1"));
+}
+
+/// The exceptions and `set_clock_groups` take their lists (`-through`, `-rise_through`,
+/// `-fall_through`; `-group`) after the options; SDC declares nothing else on them, so an option
+/// that is neither is refused, not passed through unread.
+#[test]
+fn exception_and_clock_group_options_are_checked() {
+    let s = read("set_false_path -from [get_ports a] -through [get_pins u/A] -fall_through [get_pins u/B] -rise_through [get_pins u/C] -to [get_ports y]");
+    assert!(s.rejected.is_empty(), "{:?}", s.rejected);
+    assert_eq!(s.exceptions.len(), 1);
+    let s = read("set_clock_groups -asynchronous -group c -group [get_clocks c]");
+    assert!(s.rejected.is_empty(), "{:?}", s.rejected);
+    for line in [
+        "set_false_path -bogus x -to [get_ports y]",
+        "set_multicycle_path 2 -setup -thru_all [get_pins u/A]",
+        "group_path -name g -bogus -to [get_ports y]",
+        "set_clock_groups -asynchronous -group c -bogus c",
+    ] {
+        assert!(!read(line).rejected.is_empty(), "{line}");
+    }
+}
+
+/// Options no SDC version declares, and the reference timer lacks too: refused, as before.
+/// (`set_load` declares `-min -max -substract_pin_load -pin_load -wire_load`; `set_max_transition`
+/// `-clock_path -rise -fall`.)
+#[test]
+fn options_neither_declares_are_refused() {
+    for line in ["set_load -allow_negative_cap 0.1 [get_ports y]", "set_max_transition -force 0.5 [current_design]"] {
+        assert!(!read(line).rejected.is_empty(), "{line}");
+    }
+}
+

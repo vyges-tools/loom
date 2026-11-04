@@ -49,7 +49,9 @@ const SPECS: &[Spec] = &[
     Spec { cmd: "set_min_pulse_width", keys: &[], object_keys: &[], flags: &["-low", "-high"], argc: (1, 2), object_args: &[1] },
     Spec { cmd: "set_max_time_borrow", keys: &[], object_keys: &[], flags: &[], argc: (2, 2), object_args: &[1] },
     Spec { cmd: "set_clock_gating_check", keys: &["-setup", "-hold"], object_keys: &[], flags: &["-rise", "-fall", "-high", "-low"], argc: (0, 1), object_args: &[0] },
-    Spec { cmd: "set_data_check", keys: &DATA_CHECK_KEYS, object_keys: &DATA_CHECK_KEYS, flags: &["-setup", "-hold"], argc: (1, 1), object_args: &[] },
+    // `-rise` / `-fall` are SDC's (1.4+); the reference reads them as abbreviations of `-rise_from`
+    // / `-fall_from`
+    Spec { cmd: "set_data_check", keys: &DATA_CHECK_KEYS, object_keys: &DATA_CHECK_KEYS, flags: &["-setup", "-hold", "-rise", "-fall"], argc: (1, 1), object_args: &[] },
     Spec { cmd: "unset_data_check", keys: &DATA_CHECK_KEYS, object_keys: &DATA_CHECK_KEYS, flags: &["-setup", "-hold"], argc: (0, 0), object_args: &[] },
     Spec { cmd: "set_drive", keys: &[], object_keys: &[], flags: &["-rise", "-fall", "-min", "-max"], argc: (2, 2), object_args: &[1] },
     Spec { cmd: "set_port_fanout_number", keys: &[], object_keys: &[], flags: &["-max", "-min"], argc: (2, 2), object_args: &[1] },
@@ -78,7 +80,7 @@ const SPECS: &[Spec] = &[
     Spec { cmd: "set_pvt", keys: &["-process", "-voltage", "-temperature"], object_keys: &[], flags: &["-min", "-max"], argc: (1, 1), object_args: &[0] },
     // parsed and ignored by the reference: any arguments
     Spec { cmd: "set_ideal_latency", keys: &[], object_keys: &[], flags: &["-rise", "-fall", "-min", "-max"], argc: (0, ANY), object_args: &[1] },
-    Spec { cmd: "set_ideal_network", keys: &[], object_keys: &[], flags: &["-no_propagation"], argc: (0, ANY), object_args: &[0] },
+    Spec { cmd: "set_ideal_network", keys: &[], object_keys: &[], flags: &["-no_propagation", "-no_propagate"], argc: (0, ANY), object_args: &[0] },
     Spec { cmd: "set_ideal_transition", keys: &[], object_keys: &[], flags: &["-rise", "-fall", "-min", "-max"], argc: (0, ANY), object_args: &[1] },
     Spec {
         cmd: "create_voltage_area",

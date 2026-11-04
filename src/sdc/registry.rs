@@ -138,7 +138,7 @@ pub const SDC_COMMANDS: &[Command] = &[
     v("1.3", cmd("create_generated_clock", Applied, CHECK_STA, "create_generated_clock -name g -source [get_ports clk] -divide_by 2 [get_pins r/Q]")),
     v("1.6", kept("create_voltage_area", "create_voltage_area -name va -coordinate {0 0 10 10} [get_cells u1]")),
     v("1.1", cmd("current_design", Applied, R, "current_design top")),
-    v("1.1", note("an unqualified name under it, and `-hierarchical` under it, are refused", cmd("current_instance", Applied, R, "current_instance"))),
+    v("1.1", note("`-instance` or the positional; an unqualified name under it, and `-hierarchical` under it, are refused", cmd("current_instance", Applied, R, "current_instance"))),
     since(Since::Tcl, cmd("expr", Tcl, NONE, "set x [expr 2 * 3]")),
     v("1.5", spelling("get_cell", "get_cells", "set_false_path -through [get_cell u1]")),
     v("1.1", cmd("get_cells", Applied, R, "set_false_path -through [get_cells u1]")),
@@ -166,7 +166,7 @@ pub const SDC_COMMANDS: &[Command] = &[
     v("1.7", kept("set_clock_sense", "set_clock_sense -positive [get_pins u1/Z]")),
     v("1.1", cmd("set_clock_transition", Applied, STA, "set_clock_transition 0.1 [get_clocks c]")),
     v("1.1", cmd("set_clock_uncertainty", Applied, STA, "set_clock_uncertainty 0.2 [get_clocks c]")),
-    v("1.4", cmd("set_data_check", Applied, STA_SI, "set_data_check -from [get_pins r/D] -to [get_pins s/D] 0.1")),
+    v("1.4", note("`-rise` / `-fall`: kept, not applied", cmd("set_data_check", Applied, STA_SI, "set_data_check -from [get_pins r/D] -to [get_pins s/D] 0.1"))),
     v("1.1", cmd("set_disable_timing", Applied, STA_SI, "set_disable_timing [get_cells u1]")),
     v("1.1", kept("set_drive", "set_drive 1 [get_ports a]")),
     v("1.1", cmd("set_driving_cell", Applied, STA, "set_driving_cell -lib_cell BUF [get_ports a]")),
@@ -174,7 +174,7 @@ pub const SDC_COMMANDS: &[Command] = &[
     v("1.1", kept("set_fanout_load", "set_fanout_load 2 [get_ports y]")),
     v("1.2", note("`/` only: another stops the read", cmd("set_hierarchy_separator", Applied, R, "set_hierarchy_separator /"))),
     v("1.7", kept("set_ideal_latency", "set_ideal_latency 0.1 [get_pins r/CK]")),
-    v("1.7", kept("set_ideal_network", "set_ideal_network [get_ports clk]")),
+    v("1.7", note("SDC's `-no_propagate` and the reference's `-no_propagation` both read", kept("set_ideal_network", "set_ideal_network [get_ports clk]"))),
     v("1.7", kept("set_ideal_transition", "set_ideal_transition 0.1 [get_ports clk]")),
     v("1.1", cmd("set_input_delay", Applied, CHECK_STA, "set_input_delay 1 -clock c [get_ports a]")),
     v("1.1", cmd("set_input_transition", Applied, STA, "set_input_transition 0.1 [get_ports a]")),
@@ -221,6 +221,8 @@ pub const OTHER_COMMANDS: &[Command] = &[
     cmd("all_fanin", Status::NotApplied, NONE, "set_false_path -to [all_fanin -to [get_ports y]]"),
     cmd("all_fanout", Status::NotApplied, NONE, "set_false_path -from [all_fanout -from [get_ports a]]"),
     cmd("append_to_collection", Applied, R, "append_to_collection v [get_ports y]"),
+    cmd("delete_clock", Applied, R, "delete_clock [get_clocks c]"),
+    cmd("delete_generated_clock", Applied, R, "create_generated_clock -name g -source [get_ports clk] -divide_by 2 [get_pins r/Q]\ndelete_generated_clock [get_clocks g]"),
     note("known, not run: it stops the read", cmd("derive_clock_uncertainty", Unhandled, NONE, "derive_clock_uncertainty")),
     note("known, not run: it stops the read", cmd("derive_pll_clocks", Unhandled, NONE, "derive_pll_clocks")),
     cmd("filter_collection", Status::NotApplied, NONE, "set_false_path -to [filter_collection [get_ports y] direction==out]"),
@@ -240,10 +242,20 @@ pub const OTHER_COMMANDS: &[Command] = &[
     kept("set_pvt", "set_pvt -voltage 1.0 [get_cells u1]"),
     cmd("sizeof_collection", Status::NotApplied, NONE, "set_load [sizeof_collection [get_ports y]] [get_ports y]"),
     cmd("sort_collection", Status::NotApplied, NONE, "set_false_path -to [sort_collection [get_ports y] name]"),
+    cmd("unset_case_analysis", Applied, R, "set_case_analysis 0 [get_ports a]\nunset_case_analysis [get_ports a]"),
+    cmd("unset_clock_groups", Applied, R, "set_clock_groups -name g -asynchronous -group c\nunset_clock_groups -asynchronous -name g"),
+    cmd("unset_clock_latency", Applied, R, "set_clock_latency 0.1 [get_clocks c]\nunset_clock_latency [get_clocks c]"),
+    cmd("unset_clock_transition", Applied, R, "set_clock_transition 0.1 [get_clocks c]\nunset_clock_transition [get_clocks c]"),
+    cmd("unset_clock_uncertainty", Applied, R, "set_clock_uncertainty 0.1 [get_clocks c]\nunset_clock_uncertainty [get_clocks c]"),
     cmd("unset_data_check", Applied, STA_SI, "unset_data_check -from [get_pins r/D] -to [get_pins s/D]"),
     kept("unset_disable_clock_gating_check", "unset_disable_clock_gating_check [get_cells u1]"),
     cmd("unset_disable_timing", Applied, STA_SI, "unset_disable_timing [get_cells u1]"),
+    cmd("unset_input_delay", Applied, R, "set_input_delay 1 -clock c [get_ports a]\nunset_input_delay -clock c [get_ports a]"),
+    cmd("unset_output_delay", Applied, R, "set_output_delay 1 -clock c [get_ports y]\nunset_output_delay -clock c [get_ports y]"),
+    cmd("unset_path_exceptions", Applied, R, "set_false_path -to [get_ports y]\nunset_path_exceptions -to [get_ports y]"),
     cmd("unset_propagated_clock", Applied, R, "unset_propagated_clock [get_clocks c]"),
+    cmd("unset_timing_derate", Applied, R, "set_timing_derate -late 1.05\nunset_timing_derate"),
+    note("an output command, not a constraint: listed as not applied", cmd("write_sdc", Status::NotApplied, NONE, "write_sdc out.sdc")),
 ];
 
 /// The registry's entry for `name`, if it has one.
@@ -412,17 +424,16 @@ mod tests {
         assert_eq!(command("get_cells").map(|c| c.since), Some(Since::Sdc("1.1")));
     }
 
-    /// The generated table has one row per command and per standard option, and its count line
-    /// adds up to the command set.
+    /// The generated table has one row per command and per standard option, and its count line adds up to the command set.
     #[test]
     fn the_coverage_table_has_a_row_for_everything() {
         let t = coverage_markdown();
-        let (commands, _) = t.split_once("Options SDC declares").expect("the options table follows the commands");
+        let (commands, rest) = t.split_once("Options SDC declares").expect("the options table follows the commands");
         for c in SDC_COMMANDS.iter().chain(OTHER_COMMANDS) {
             assert_eq!(commands.lines().filter(|l| l.starts_with(&format!("| `{}` |", c.name))).count(), 1, "{}", c.name);
         }
-        let options = t.lines().filter(|l| l.split(" | ").nth(1).is_some_and(|o| o.starts_with("`-"))).count();
-        assert_eq!(options, standard_options().len());
+        let options = |s: &str| s.lines().filter(|l| l.split(" | ").nth(1).is_some_and(|o| o.starts_with("`-"))).count();
+        assert_eq!(options(rest), standard_options().len());
         assert!(t.contains(&format!("of {} commands", SDC_COMMANDS.len())), "{t}");
     }
 

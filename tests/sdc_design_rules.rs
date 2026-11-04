@@ -45,6 +45,9 @@ fn an_option_the_limit_does_not_have_is_refused() {
     refused("set_max_capacitance -min 0.2 [get_ports a]", "-min is not an option of set_max_capacitance");
     refused("set_max_fanout -max 8 [current_design]", "-max is not an option of set_max_fanout");
     refused("set_max_transition -min 0.2 [current_design]", "-min is not an option of set_max_transition");
+    // `-clock_path` is `set_max_transition`'s alone
+    refused("set_max_capacitance -clock_path 0.1 [get_clocks c]", "-clock_path is not an option of set_max_capacitance");
+    refused("set_max_fanout -clock_path 8 [get_clocks c]", "-clock_path is not an option of set_max_fanout");
 }
 
 #[test]

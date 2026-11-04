@@ -1999,7 +1999,19 @@ fn unknown_option(toks: &[String]) -> Option<String> {
     use crate::sdc_flags::PASSES_UNKNOWN;
     let is_option = |t: &str| t.len() >= 2 && t.starts_with('-') && t[1..].starts_with(|c: char| c.is_ascii_alphabetic());
     let cmd = toks.first()?.as_str();
-    if let Some((keys, flags)) = crate::sdc_flags::options(cmd).filter(|_| !PASSES_UNKNOWN.contains(&cmd)) {
+    // The commands whose reference parse passes unknown options on parse their own lists after
+    // it: those lists are their options too (SDC declares `-through` and its edge forms on the
+    // exceptions, `-group` on `set_clock_groups`), and anything else is not one. The senses keep
+    // the reference's rule: SDC declares neither.
+    let own: &[&str] = match cmd {
+        "set_clock_groups" => &["-group"],
+        "set_sense" | "set_clock_sense" => &[],
+        c if PASSES_UNKNOWN.contains(&c) => &["-through", "-rise_through", "-fall_through"],
+        _ => &[],
+    };
+    let judged = !PASSES_UNKNOWN.contains(&cmd) || !own.is_empty();
+    if let Some((mut keys, flags)) = crate::sdc_flags::options(cmd).filter(|_| judged) {
+        keys.extend_from_slice(own);
         let mut k = 1;
         while k < toks.len() {
             let t = toks[k].as_str();
@@ -3410,7 +3422,8 @@ impl Sdc {
                 // (see `sdc/scope.rs`). Its argument is an absolute instance path (the reference's
                 // `get_instance_error`); none, or the top, goes back to the top. More than one
                 // instance is the reference's Error 123, and the scope is left as it was.
-                "current_instance" | "set_current_instance" => match toks.get(1).filter(|t| !matches!(t.as_str(), "/" | "." | "" | "{}")) {
+                // SDC declares the instance as `-instance`; the reference as the positional
+                "current_instance" | "set_current_instance" => match toks.iter().skip(1).find(|t| *t != "-instance").filter(|t| !matches!(t.as_str(), "/" | "." | "" | "{}")) {
                     None => instance_scope = None,
                     Some(i) => match resolve_objs(i).as_slice() {
                         [one] => instance_scope = Some(one.trim_end_matches('/').to_string()),
