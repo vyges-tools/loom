@@ -80,9 +80,20 @@ pub mod saif;
 pub mod vcd;
 /// FST (GTKWave binary waveform) activity reader — same `NetIndex` output as [`vcd`].
 /// Behind the `fst` feature because it needs a zlib decoder (`miniz_oxide`); LZ4 is
-/// clean-roomed in-tree. Off by default so loom's core stays std-only.
+/// clean-roomed in-tree. On by default (the same inflater `gzip` already pulls in);
+/// `default-features = false` keeps loom's core std-only.
 #[cfg(feature = "fst")]
 pub mod fst;
+/// The whole-file FST reader: hierarchy, every value change, reals and strings, streamed a
+/// block at a time. ⛔ Query an FST in place; never convert it to VCD to inspect it.
+#[cfg(feature = "fst")]
+pub mod fst_wave;
+/// The FST writer, and VCD → FST / FST-subset / bounded FST → VCD conversions.
+#[cfg(feature = "fst")]
+pub mod fst_writer;
+/// `vyges loom fst`: header, hierarchy, transition and sample queries on an FST.
+#[cfg(feature = "fst")]
+pub mod fst_query;
 #[cfg(feature = "fst")]
 mod lz4;
 /// Unified tech-LEF reader (per-layer width/thickness/resistance/EM limits) —

@@ -39,6 +39,12 @@ USAGE:
 COMMANDS:
   inspect <files...>   parse files into the design DB and summarize
   check   <files...>   parse-validate files; non-zero exit on any parse error
+  fst <file.fst> ...   query an FST waveform: --info, --list, transitions, --sample_at
+  fst-write <in> -o <out.fst>   VCD -> FST, or a window/signal subset of an FST
+  fst-to-vcd <in.fst> -o <out.vcd> --start T --end T <signals...>   bounded export
+
+  ⛔ Never convert an FST to VCD to inspect it: the VCD can fill the disk and an agent's
+     context. Query the FST in place (vyges loom fst <file> --help).
   version              print version
   help                 print this help
 
@@ -94,9 +100,9 @@ pub fn main() -> ExitCode {
   "schema": "vyges-tool-descriptor/1.1",
   "kind": "multi-command",
   "name": "loom",
-  "summary": "shared design-data foundation — parse netlist / Liberty / SDC / SPEF / LEF / DEF into the design DB",
+  "summary": "shared design-data foundation — parse netlist / Liberty / SDC / SPEF / LEF / DEF into the design DB; query FST waveforms in place (fst: --info, --list, a --start/--end window, --limit, --sample_at). Never convert an FST to VCD to inspect it: the VCD can exhaust the disk and an agent's context; fst-to-vcd is bounded to a window and a signal list.",
   "maturity": "structured",
-  "commands": ["inspect", "check"],
+  "commands": ["inspect", "check", "fst", "fst-write", "fst-to-vcd"],
   "assertion": { "not_applicable": true },
   "provenance_limitations": [
       "Reports what the named files contain; it does not verify that they describe the same design, nor that they are the files a flow actually consumed."
@@ -104,6 +110,22 @@ pub fn main() -> ExitCode {
 }"#;
         println!("{DESCRIBE}");
         return ExitCode::SUCCESS;
+    }
+
+    // The FST commands take their own flags (the fst_query contract), so they dispatch before
+    // the generic option parser rejects them.
+    #[cfg(feature = "fst")]
+    if let Some(first) = args.first() {
+        let rest = &args[1..];
+        let rc = match first.as_str() {
+            "fst" => Some(vyges_loom::fst_query::fst_main(rest)),
+            "fst-write" => Some(vyges_loom::fst_query::fst_write_main(rest)),
+            "fst-to-vcd" => Some(vyges_loom::fst_query::fst_to_vcd_main(rest)),
+            _ => None,
+        };
+        if let Some(rc) = rc {
+            return ExitCode::from(rc.clamp(0, 255) as u8);
+        }
     }
 
     // -V/--version short-circuits anywhere.

@@ -64,6 +64,39 @@ Common commands live here; **tool-specific verbs (timing, power, extraction, …
 belong to the engines**, which build on the `vyges_loom` library and — in the
 two-utility packaging — attach as `vyges-loom <engine>` subcommands.
 
+## FST waveforms — query in place
+
+> ⛔ **Never convert an FST file to VCD to look at it.** A simulation's VCD is many times the
+> size of its FST: it can fill the disk, and read into an AI agent's context it exhausts that
+> too. Query the FST instead — `--info` reads only the header, `--list` only the hierarchy, and a
+> time-window query only the blocks that window touches.
+
+```sh
+vyges-loom fst run.fst --info                          # writer, timescale, time range, counts
+vyges-loom fst run.fst --list --scope top.core --depth 1
+vyges-loom fst run.fst --start 1000 --end 2000 top.core.pc   # transitions in a window
+vyges-loom fst run.fst --sample_at 1500,1800 --exact top.core.pc top.core.valid
+vyges-loom fst run.fst --count top.core.pc --json
+vyges-loom fst run.fst --batch queries.txt             # one query per line, one file open
+vyges-loom fst-write run.vcd -o run.fst                # VCD -> FST (streamed)
+vyges-loom fst-write run.fst -o win.fst --start 1000 --end 2000 top.core   # window + subset
+```
+
+- **Reader** (`fst_wave`): every block type — header, value-change blocks (all three position
+  table forms; zlib, LZ4 and FastLZ chains), geometry, blackout, hierarchy (gzip, LZ4, LZ4-duo)
+  and gzip-wrapped files — streamed one block at a time. Reals and strings are decoded too.
+- **Query** (`fst`): the flag set and output of CoralNPU's `fst_query`, line for line: default
+  `--limit 1000` with a notice on stderr when it stops, `--tail`, `--count`, `--sample_at`,
+  `--regex`/`--exact`, `--batch` with a `--- [query end] ---` marker; `--json` on every query.
+  Where that tool misreads a file (1-bit `x`/`z`, FastLZ chains, some zlib-compressed sections,
+  gzip-wrapped files) this one follows the format, as `fst2vcd` does; it also prints reals and
+  strings, which that tool skips.
+- **Writer** (`fst_writer`): files read back identically by `fst2vcd`, `fst_query` and this
+  reader. `fst-to-vcd` exists only for a tool that cannot read FST: it requires a time window
+  **and** a signal list and stops at 256 MiB.
+- The `fst` feature is on by default; `default-features = false` leaves it out. Value-change
+  blocks of the two older types (1 and 5) are decoded but no corpus file exercises them yet.
+
 ## Use from Python
 
 The same parse-once / query-many database is available to Python (notebooks,
@@ -96,6 +129,8 @@ built `abi3-py39`) is a thin, additive layer over it — see [`python/README.md`
 | `spef` | parasitic RC |
 | `design` | the in-memory `Design` DB + cross-step state |
 | `verbosity` | shared `-q`/`-v` / `VYGES_LOG` plumbing engines reuse |
+| `vcd`, `saif`, `fst` | switching activity per net, for power |
+| `fst_wave`, `fst_writer`, `fst_query` | FST waveforms: full reader, writer, the `fst` query command |
 
 Seeded from `vyges-sta-si`'s in-tree parsers (the most complete in the stack); the
 SDC reader was decoupled from sta-si's job model into a standalone `Sdc`.
