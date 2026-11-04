@@ -18,7 +18,7 @@ pub(crate) const PASSES_UNKNOWN: &[&str] = &[
     "set_min_delay",
     "set_multicycle_path",
     "set_path_margin",
-    "set_sense",
+    // "set_sense", — set_sense: SDC 2.1, no public definition to verify against; restore when a real file needs it
     "unset_path_exceptions",
 ];
 
@@ -67,7 +67,7 @@ pub(crate) const FLAGS: &[(&str, &[&str], &[&str])] = &[
     ("set_port_fanout_number", &[], &["-max", "-min"]),
     ("set_pvt", &["-process", "-voltage", "-temperature"], &["-min", "-max"]),
     ("set_resistance", &[], &["-max", "-min"]),
-    ("set_sense", &["-type"], &[]),
+    // ("set_sense", &["-type"], &[]), — set_sense: SDC 2.1, no public definition to verify against; restore when a real file needs it
     ("set_timing_derate", &[], &["-rise", "-fall", "-early", "-late", "-clock", "-data", "-net_delay", "-cell_delay", "-cell_check"]),
     ("set_units", &["-capacitance", "-resistance", "-time", "-voltage", "-current", "-power", "-distance"], &[]),
     ("set_voltage", &["-min", "-object_list"], &[]),

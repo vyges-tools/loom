@@ -90,6 +90,8 @@ const UNKNOWN_TO_REFERENCE: &[&str] = &[
     "set_min_porosity",
     "set_optimize_design",
     "set_scan_configuration",
+    // known to the reference, but commented out of this reader (SDC 2.1, no public definition)
+    "set_sense",
     "set_size_only",
     "set_timing_enable_verification",
 ];

@@ -489,7 +489,8 @@ set_routing_watermark
 set_routing_watermark_strength
 set_scene
 set_scene_analysis_corner
-set_sense
+# set_sense: SDC 2.1, no public definition to verify against; restore when a real file needs it
+# set_sense
 set_simulated_annealing
 set_thread_count
 set_timing_derate
