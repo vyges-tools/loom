@@ -1130,6 +1130,23 @@ mod tests {
         assert_eq!(r.findings.iter().filter(|f| f.code == "sdc-kept-not-applied").count(), 2, "{:?}", r.findings);
     }
 
+    /// The kept timing commands outside the synthesis directives are each a WARNING: a latch's
+    /// borrow limit (`set_max_time_borrow`), a path margin (`set_path_margin`), a PVT
+    /// (`set_pvt`). A file whose only extra constraints are these is not reported clean.
+    #[test]
+    fn kept_latch_margin_and_pvt_commands_are_warnings() {
+        let text = format!(
+            "{CLEAN}set_max_time_borrow 0.5 [get_clocks clk]\nset_path_margin 0.1 -to [get_ports dout]\nset_pvt -voltage 1.0 [get_cells r]\n"
+        );
+        let sdc = Sdc::parse(&text).unwrap();
+        let r = lint(&nl(), &sdc, &lib());
+        assert_eq!(r.errors(), 0, "{:?}", r.findings);
+        for c in ["set_max_time_borrow", "set_path_margin", "set_pvt"] {
+            let found = r.findings.iter().any(|f| f.code == "sdc-kept-not-applied" && f.severity == Severity::Warning && f.message.contains(&format!("`{c}`")));
+            assert!(found, "{c}: {:?}", r.findings);
+        }
+    }
+
     /// A query that needs the design and was not evaluated is a rejected command: an error too.
     #[test]
     fn an_unevaluated_query_is_an_error() {
