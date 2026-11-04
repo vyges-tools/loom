@@ -2323,6 +2323,54 @@ fn unresolved_var(raw: &str, vars: &HashMap<String, String>) -> Option<String> {
     None
 }
 
+/// Tcl's error for reading `var` (as [`unresolved_var`] names it: `$X`, `$::env(X)`), word for
+/// word as tclsh 8.6 gives it: `can't read "X": no such variable`; for the environment array, whose
+/// read trace raises the error, `no such variable` and the trace line.
+pub(super) const NO_SUCH_VARIABLE: &str = "no such variable";
+
+pub(super) fn no_such_variable(var: &str) -> String {
+    let name = var.trim_start_matches('$');
+    if name.starts_with("::env(") || name.starts_with("env(") {
+        format!("no such variable (read trace on \"{name}\")")
+    } else {
+        format!("can't read \"{name}\": no such variable")
+    }
+}
+
+/// The first variable an executed line reads that is not defined: outside braces (Tcl substitutes
+/// nothing inside them), and inside the braced expression of an `[expr {…}]`, which `expr`
+/// substitutes itself.
+pub(super) fn undefined_read(raw: &str, vars: &HashMap<String, String>) -> Option<String> {
+    // the tool-name variable: read as the signoff timer's name when undefined (`tcl::TOOL_NAME_DEFAULT`)
+    let mut known = vars.clone();
+    known.entry(tcl::TOOL_NAME_VAR.to_string()).or_default();
+    if let Some(v) = unresolved_var(raw, &known) {
+        return Some(v);
+    }
+    // `[expr {…}]` outside braces: the braced expression is substituted by `expr` itself
+    let cs: Vec<char> = raw.chars().collect();
+    let (mut depth, mut i) = (0usize, 0usize);
+    while i < cs.len() {
+        match cs[i] {
+            '\\' => i += 1,
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            '[' if depth == 0 => {
+                let rest: String = cs[i + 1..].iter().collect();
+                if let Some(e) = rest.strip_prefix("expr ").map(str::trim_start).filter(|e| e.starts_with('{')) {
+                    let toks = tokenize(e.split(']').next().unwrap_or(""));
+                    if let Some(v) = toks.first().and_then(|t| unresolved_var(t, &known)) {
+                        return Some(v);
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Why the reference's `create_generated_clock` stops before making the clock, checked in its
 /// order (`sdc/Sdc.tcl`, Errors 374–390), as far as the text decides it. ⛔ Read as a clock anyway,
 /// a PLL output declared with no `-source` (an FPGA tool infers it) became a clock of period 0.
@@ -2482,7 +2530,18 @@ fn list_words(v: &str) -> String {
 enum Control {
     Run(Vec<String>),
     Refuse(String),
+    /// Tcl's error, which stops the read (a condition reading an undefined variable).
+    Error(String),
     None,
+}
+
+/// The first variable a braced `expr` condition reads that is not defined (`expr` substitutes it
+/// itself). The tool-name variable is the exception this reader makes on purpose: undefined, a
+/// condition reads it as the signoff timer's name (`tcl::TOOL_NAME_DEFAULT`).
+fn undefined_in_condition(cond: &str, vars: &HashMap<String, String>) -> Option<String> {
+    let mut known = vars.clone();
+    known.entry(tcl::TOOL_NAME_VAR.to_string()).or_default();
+    unresolved_var(cond, &known)
 }
 
 /// `if` and `foreach`, evaluated as the reference's Tcl would — where they can be.
@@ -2503,6 +2562,9 @@ fn control(raw: &str, vars: &HashMap<String, String>, procs: &HashMap<String, Tc
             operands.entry(tcl::TOOL_NAME_VAR.to_string()).or_insert_with(|| format!("\"{}\"", tcl::TOOL_NAME_DEFAULT));
             let mut k = 1;
             while k + 1 < toks.len() {
+                if let Some(v) = undefined_in_condition(&toks[k], vars) {
+                    return Control::Error(format!("{} in the condition `{}`", no_such_variable(&v), toks[k]));
+                }
                 // `[dict exists …]`, `[a_proc …]` in the condition, answered first
                 let Ok(valued) = tcl::subst_values(&toks[k], vars, procs, &ReadOpts::default(), 0) else {
                     return Control::Refuse("if".into());
@@ -3251,6 +3313,14 @@ impl Sdc {
             // A loop's test, queued after each pass of its body: run the body again while it holds.
             if let Some(id) = raw.strip_prefix(LOOP_TEST) {
                 let Some(l) = id.parse::<usize>().ok().and_then(|i| loops.get_mut(i)) else { continue };
+                if let Some(v) = undefined_in_condition(&l.cond, &vars) {
+                    return Err(SdcError(format!(
+                        "{} in the condition `{}` of `{}`: Tcl stops at a variable that is not defined, as the reference does, so this file is not read",
+                        no_such_variable(&v),
+                        l.cond,
+                        l.cmd
+                    )));
+                }
                 let cond = subst_vars(&subst_info_exists(&l.cond, &vars), &as_operands(&vars));
                 match eval_expr(&cond, &vars).and_then(|v| v.truthy()) {
                     Some(true) => {
@@ -3272,10 +3342,25 @@ impl Sdc {
                 }
                 continue;
             }
+            // ⛔ AN UNDEFINED VARIABLE STOPS THE READ, as Tcl stops `source` there and so the
+            // reference's `read_sdc` (user 2026-11-04): nothing after it is applied. Read on, `set
+            // MAIN_CLK_PIN $MAIN_CLK_PIN` stored the text `$MAIN_CLK_PIN`, and a clock was made on
+            // a pin of that name.
+            if let Some(v) = undefined_read(&raw, &vars) {
+                return Err(SdcError(format!(
+                    "{} in `{}`: Tcl stops at a variable that is not defined, as the reference does, so this file is not read",
+                    no_such_variable(&v),
+                    raw.trim()
+                )));
+            }
             // `[dict …]`, `[a_proc …]` and the tool-name query answered in place, outside braces
             // (`sdc/tcl.rs`); a substitution that cannot be answered refuses its command.
             let raw = match tcl::subst_values(&raw, &vars, &procs, opts, frames.len()) {
                 Ok(r) => r,
+                // a proc called for its value read an undefined variable: Tcl's error, so the stop
+                Err(why) if why.contains(NO_SUCH_VARIABLE) => {
+                    return Err(SdcError(format!("{why}: Tcl stops at a variable that is not defined, as the reference does, so this file is not read")));
+                }
                 Err(why) => {
                     let cmd = raw.split_whitespace().next().unwrap_or("").to_string();
                     sdc.rejected.push(format!("{cmd}: {why}; not applied"));
@@ -3340,6 +3425,9 @@ impl Sdc {
                     sdc.ignored.push(kw);
                     continue;
                 }
+                Control::Error(why) => {
+                    return Err(SdcError(format!("{why}: Tcl stops at a variable that is not defined, as the reference does, so this file is not read")));
+                }
                 Control::None => {}
             }
             let line = dialect_queries(&canonical_queries(&subst_exprs(&subst_command_vars(&raw, &vars), &vars)));
@@ -3392,20 +3480,6 @@ impl Sdc {
                     "{why} in `{}`: the reference stops reading the file at a command it does not know, so this file is not read",
                     line.trim()
                 )));
-            }
-            // ⛔ An UNDEFINED VARIABLE is an error to Tcl, so to the reference; not applied here
-            // either, and listed with the queries not evaluated — the list every consumer refuses
-            // on. Kept as text, `-lib_cell ${DRIVING_CELL}` split into a lib cell `$` and a stray
-            // word, and an unread delay was applied as 0 by a consumer that did not check
-            // `value_read`. `create_clock` reports its own, naming the variable; `set` stores text.
-            if !matches!(toks[0].as_str(), "set" | "create_clock") {
-                if let Some(v) = unresolved_var(&raw, &vars) {
-                    sdc.rejected.push(format!("{}: the variable {v} is not defined; not applied", toks[0]));
-                    if !BENIGN_FOR_TIMING.contains(&toks[0].as_str()) {
-                        sdc.unevaluated_queries.push(format!("{}: {v} (not defined)", toks[0]));
-                    }
-                    continue;
-                }
             }
             // A word that cannot name what it appears to (`[get_ports a]0`, `{[get_ports a]}`): the
             // reference builds no constraint from it, so neither does this reader — said, not
@@ -5164,11 +5238,10 @@ mod lossless_tests {
         let d = &s.output_delays[0];
         assert_eq!((d.reference_pin.as_deref(), d.ports.clone(), d.accessor.as_str()), (Some("r1/CK"), vec!["out".to_string()], "get_ports"));
         // no port list is rejected (the reference's STA-0567), not read as every input
-        // and an undefined variable is an error (Tcl's), not a value of 0: rejected, and listed
-        // with the queries not evaluated, which every consumer refuses on
-        let d = Sdc::parse("set_input_delay 1 -clock clk\nset_input_delay $undefined -clock clk [get_ports a]\n").unwrap();
-        assert_eq!(d.rejected.len(), 2);
-        assert!(d.input_delays.is_empty() && d.unevaluated_queries == ["set_input_delay: $undefined (not defined)"]);
+        // and an undefined variable is Tcl's error, not a value of 0: the read stops there
+        let d = Sdc::parse("set_input_delay 1 -clock clk\n").unwrap();
+        assert_eq!(d.rejected.len(), 1);
+        assert!(Sdc::parse("set_input_delay $undefined -clock clk [get_ports a]\n").is_err());
         // a value that is not a number is still kept as unread
         let d = Sdc::parse("set_input_delay abc -clock clk [get_ports a]\n").unwrap();
         assert!(!d.input_delays[0].value_read && d.input_delays[0].value == 0.0);
@@ -5194,15 +5267,13 @@ mod lossless_tests {
         let s = Sdc::parse("set_propagated_clock [get_clocks {clk}]\nset_clock_latency -source 0.2 [get_clocks {clk}]\nset_max_delay\\
     -ignore_clock_latency\\
     -from [get_pins {r1/CK}]\\
-    -to [get_clocks {clk}] 0.5000\nset_min_delay -from [get_pins {a/Z}] $undefined\n").unwrap();
+    -to [get_clocks {clk}] 0.5000\n").unwrap();
         assert_eq!(s.propagated, vec![Objects { accessor: "get_clocks".into(), names: vec!["clk".into()], ..Default::default() }]);
         assert_eq!((s.clock_latencies.len(), s.clock_latencies[0].flags.clone(), s.clock_latency), (1, vec!["-source".to_string()], 0.2));
         let p = &s.path_delays[0];
         assert_eq!((p.max, p.value, p.flags.clone()), (true, 0.5, vec!["-ignore_clock_latency".to_string()]));
         assert_eq!(p.objects, vec![("-from".to_string(), Objects { accessor: "get_pins".into(), names: vec!["r1/CK".into()], ..Default::default() }), ("-to".to_string(), Objects { accessor: "get_clocks".into(), names: vec!["clk".into()], ..Default::default() })]);
-        // `$undefined` is not a value: the command is not kept (see `unresolved_var`)
         assert_eq!(s.path_delays.len(), 1);
-        assert_eq!(s.unevaluated_queries, ["set_min_delay: $undefined (not defined)"]);
         assert!(s.ignored.iter().any(|c| c == "set_propagated_clock") && s.ignored.iter().filter(|c| c.ends_with("_delay")).count() == 1);
     }
 }
@@ -5771,23 +5842,38 @@ mod clock_state_rules {
 mod unevaluable_is_refused {
     use super::*;
 
-    /// Rule (Tcl, so the reference): an undefined variable is an error. It is not a value: the
-    /// command is not applied and is listed with the queries not evaluated. Found reading
-    /// OpenTitan's constraint files, written for a synthesis tool: `${DRIVING_CELL}` (set by the
-    /// flow) became a lib cell `$`. (Its `remove_from_collection`, a command the reference does not
-    /// have, is read as a loom extension: `remove_from_collection_is_every_port_but`.)
+    /// Rule (Tcl, so the reference): reading an undefined variable is an error, and an error in a
+    /// sourced file stops `source` there — the reference's `read_sdc` reads nothing after it (the
+    /// pinned OpenSTA on `set X $X` then a `create_clock`: `can't read "X": no such variable`, and
+    /// the clock after it is not made). The messages are tclsh 8.6's, word for word. Read on, `set
+    /// MAIN_CLK_PIN $MAIN_CLK_PIN` stored the text, and a clock was made on a pin named
+    /// `$MAIN_CLK_PIN`; before that, `${DRIVING_CELL}` became a lib cell `$`.
     #[test]
-    fn an_undefined_variable_refuses_its_command() {
-        let s = Sdc::parse(
-            "create_clock -name c -period 8 [get_ports clk_i]\n\
-             set_driving_cell -lib_cell ${DRIVING_CELL} [all_inputs]\n\
-             set_output_delay 1 [all_outputs] -clock c\n",
+    fn an_undefined_variable_stops_the_read() {
+        let stop = |text: &str| Sdc::parse(&format!("create_clock -name c -period 8 [get_ports clk_i]\n{text}\ncreate_clock -name d -period 4 [get_ports d]\n")).unwrap_err().0;
+        for (text, msg) in [
+            ("set MAIN_CLK_PIN $MAIN_CLK_PIN", "can't read \"MAIN_CLK_PIN\": no such variable"),
+            ("set_driving_cell -lib_cell ${DRIVING_CELL} [all_inputs]", "can't read \"DRIVING_CELL\": no such variable"),
+            ("set_load 1 [get_ports $port]", "can't read \"port\": no such variable"),
+            ("puts \"x$T\"", "can't read \"T\": no such variable"),
+            ("set_load [expr {$R * 2}] [get_ports x]", "can't read \"R\": no such variable"),
+            ("set ::V $::V", "can't read \"::V\": no such variable"),
+            ("set_load $::env(VYGES_NO_SUCH_VAR_ZZ) [get_ports x]", "no such variable (read trace on \"::env(VYGES_NO_SUCH_VAR_ZZ)\")"),
+            ("if {$Q} { set_load 1 [get_ports x] }", "can't read \"Q\": no such variable"),
+            ("while {$n < 3} { incr n }", "can't read \"n\": no such variable"),
+            ("proc f {} { return $nope }\nset_load [f] [get_ports x]", "no such variable"),
+        ] {
+            let e = stop(text);
+            assert!(e.contains(msg), "{text}: {e}");
+            assert!(e.contains("so this file is not read"), "{text}: {e}");
+        }
+        // defined, or inside braces, or an `info exists` test: no error
+        let s = Sdc::parse_opts(
+            "set_load $L [get_ports x]\nset_false_path -to [get_pins {a$_DFF_P_/D}]\nif {[info exists W]} { set_load $W [get_ports y] }\n",
+            &ReadOpts { defines: vec![("L".into(), "1".into())], base_dir: None },
         )
         .unwrap();
-        assert!(s.driving_cells.is_empty(), "{s:?}");
-        assert_eq!(s.output_delays.len(), 1, "the rest of the file still applies");
-        assert_eq!(s.unevaluated_queries.len(), 1, "{:?}", s.unevaluated_queries);
-        assert!(s.unevaluated_queries[0].contains("$DRIVING_CELL"), "{:?}", s.unevaluated_queries);
+        assert_eq!((s.env.len(), s.exceptions.len()), (1, 1));
     }
 
     /// Inside braces Tcl substitutes nothing: an escaped name's `$` is text, not a variable.
@@ -5930,9 +6016,9 @@ mod dialect_tests {
         let got: Vec<(f64, Vec<String>)> = s.input_delays.iter().map(|d| (d.value, d.ports.clone())).collect();
         assert_eq!(got, [(2.0, vec!["a".to_string()]), (3.0, vec!["b".into()]), (7.0, vec!["e".into()])]);
         assert!(s.ignored.iter().all(|i| i != "proc"), "{:?}", s.ignored);
-        // a call's local is gone after it returns: Tcl's error, so not applied here
-        let s = Sdc::parse("proc f {} { set local 1 }\nf\nset_load $local [get_ports x]\n").unwrap();
-        assert!(s.env.is_empty() && s.rejected.iter().any(|r| r.contains("$local")), "{:?}", s.rejected);
+        // a call's local is gone after it returns: reading it is Tcl's error, which stops the read
+        let e = Sdc::parse("proc f {} { set local 1 }\nf\nset_load $local [get_ports x]\n").unwrap_err();
+        assert!(e.0.starts_with("can't read \"local\": no such variable"), "{}", e.0);
     }
 
     /// Tcl: a variable in a braced `if` condition is one operand, so a string value compares as

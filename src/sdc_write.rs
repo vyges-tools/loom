@@ -625,11 +625,11 @@ set_max_delay 3 -from [get_ports a] -comment {budget}
         }
     }
 
-    /// A value that is not a number is not written, and is said not to be: writing `0` for an
-    /// unresolved `$var` would ship a constraint the file never stated.
+    /// A value that is not a number is not written, and is said not to be: writing `0` for it
+    /// would ship a constraint the file never stated.
     #[test]
     fn an_unread_value_is_reported_not_written_as_zero() {
-        let w = Sdc::parse("create_clock -name clk -period 10 [get_ports clk]\nset_input_delay $undefined -clock clk [get_ports a]\n")
+        let w = Sdc::parse("create_clock -name clk -period 10 [get_ports clk]\nset_input_delay abc -clock clk [get_ports a]\n")
             .unwrap()
             .write(&WriteOpts::default());
         assert!(!w.text.lines().any(|l| l.starts_with("set_input_delay")), "{}", w.text);

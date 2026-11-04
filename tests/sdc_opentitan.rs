@@ -70,6 +70,15 @@ fn as_published() {
     assert!(e.0.starts_with("invalid command name \"gpo\" in `set_disable_clock_gating_check"), "{}", e.0);
 }
 
+/// Rule (Tcl, so the reference): reading an undefined variable stops the read. Without the
+/// flow's variables the file stops at its first use of one, `set CLK_PERIOD_FACTOR
+/// $CLK_PERIOD_FACTOR`, and no clock is made on a pin named after the variable.
+#[test]
+fn without_the_flows_variables_it_stops_at_the_first() {
+    let e = Sdc::parse(&format!("{GPO}{}", text())).expect_err("CLK_PERIOD_FACTOR is the flow's");
+    assert!(e.0.starts_with("can't read \"CLK_PERIOD_FACTOR\": no such variable in `set CLK_PERIOD_FACTOR $CLK_PERIOD_FACTOR"), "{}", e.0);
+}
+
 #[test]
 fn reads_to_the_end_with_its_clocks() {
     let s = read();

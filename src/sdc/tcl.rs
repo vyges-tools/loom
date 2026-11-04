@@ -419,6 +419,9 @@ pub(super) fn proc_value(name: &str, args: &[String], caller: &HashMap<String, S
         if steps > super::MAX_LOOP_PASSES {
             return Err(format!("{name}: more than {} steps", super::MAX_LOOP_PASSES));
         }
+        if let Some(v) = super::undefined_read(&raw, &vars) {
+            return Err(format!("{name}: {} in `{}`", super::no_such_variable(&v), raw.trim()));
+        }
         let raw = subst_values(&raw, &vars, &procs_local, opts, depth)?;
         let head = raw.split_whitespace().next().unwrap_or("").to_string();
         match head.as_str() {
@@ -496,6 +499,7 @@ pub(super) fn proc_value(name: &str, args: &[String], caller: &HashMap<String, S
                 continue;
             }
             Control::Refuse(kw) => return Err(format!("{name}: its `{kw}` is not evaluated")),
+            Control::Error(why) => return Err(format!("{name}: {why}")),
             Control::None => {}
         }
         if matches!(head.as_str(), "puts" | "echo" | "expr") {
