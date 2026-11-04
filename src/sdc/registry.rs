@@ -100,7 +100,6 @@ const R: &[&str] = &["reader"];
 const CHECK_STA: &[&str] = &["check", "sta", "sta-si"];
 const STA: &[&str] = &["sta", "sta-si"];
 const STA_SI: &[&str] = &["sta-si"];
-const STA_ONLY: &[&str] = &["sta"];
 const RSZ: &[&str] = &["rsz"];
 const NONE: &[&str] = &[];
 
@@ -183,7 +182,7 @@ pub const SDC_COMMANDS: &[Command] = &[
     v("1.6", kept("set_level_shifter_strategy", "set_level_shifter_strategy -rule all")),
     v("1.6", kept("set_level_shifter_threshold", "set_level_shifter_threshold -voltage 0.1")),
     v("1.1", cmd("set_load", Applied, STA, "set_load 0.1 [get_ports y]")),
-    v("1.1", note("through its logic simulation, with the design", cmd("set_logic_dc", Applied, STA_ONLY, "set_logic_dc [get_ports a]"))),
+    v("1.1", note("`sta`: through its logic simulation, with the design", cmd("set_logic_dc", Applied, STA, "set_logic_dc [get_ports a]"))),
     v("1.1", note("`sta`: through its logic simulation, with the design", cmd("set_logic_one", Applied, STA, "set_logic_one [get_ports a]"))),
     v("1.1", note("`sta`: through its logic simulation, with the design", cmd("set_logic_zero", Applied, STA, "set_logic_zero [get_ports a]"))),
     v("1.1", kept("set_max_area", "set_max_area 0")),
