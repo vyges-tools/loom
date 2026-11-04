@@ -25,9 +25,12 @@ pub enum Status {
     Kept,
     /// Tcl, run as Tcl runs it.
     Tcl,
-    /// Recognised and skipped: it steers synthesis or power, not timing. `write` lists it as not
-    /// written.
+    /// Recognised and skipped: a synthesis-only command the reference timer does not run. `write`
+    /// lists it as not written.
     ReadPast,
+    /// Recognised, but not evaluated: the command that uses it is reported as not applied (an
+    /// error in `check` when it can move a slack), and the read goes on.
+    NotApplied,
     /// Not read: the file stops there, as it stops the reference timer's read.
     Unhandled,
 }
@@ -40,6 +43,7 @@ impl Status {
             Status::Kept => "Kept",
             Status::Tcl => "Tcl",
             Status::ReadPast => "Read past",
+            Status::NotApplied => "Not applied",
             Status::Unhandled => "Unhandled",
         }
     }
@@ -87,6 +91,8 @@ pub struct Command {
     pub since: Since,
     /// One line that uses it, read after [`PROBE_SETUP`] by the registry's test.
     pub probe: &'static str,
+    /// What the reader does not do with it, when that is part of its status (empty otherwise).
+    pub note: &'static str,
 }
 
 const R: &[&str] = &["reader"];
@@ -97,13 +103,13 @@ const RSZ: &[&str] = &["rsz"];
 const NONE: &[&str] = &[];
 
 const fn cmd(name: &'static str, status: Status, applied_by: &'static [&'static str], probe: &'static str) -> Command {
-    Command { name, spelling_of: None, status, applied_by, since: Since::Outside, probe }
+    Command { name, spelling_of: None, status, applied_by, since: Since::Outside, probe, note: "" }
 }
 const fn spelling(name: &'static str, of: &'static str, probe: &'static str) -> Command {
-    Command { name, spelling_of: Some(of), status: Status::Applied, applied_by: R, since: Since::Outside, probe }
+    Command { name, spelling_of: Some(of), status: Status::Applied, applied_by: R, since: Since::Outside, probe, note: "" }
 }
 const fn kept(name: &'static str, probe: &'static str) -> Command {
-    Command { name, spelling_of: None, status: Status::Kept, applied_by: NONE, since: Since::Outside, probe }
+    Command { name, spelling_of: None, status: Status::Kept, applied_by: NONE, since: Since::Outside, probe, note: "" }
 }
 /// `c`, dated: first declared in SDC `v`.
 const fn v(v: &'static str, c: Command) -> Command {
@@ -111,6 +117,10 @@ const fn v(v: &'static str, c: Command) -> Command {
 }
 const fn since(since: Since, c: Command) -> Command {
     Command { since, ..c }
+}
+/// `c`, with what the reader does not do with it.
+const fn note(note: &'static str, c: Command) -> Command {
+    Command { note, ..c }
 }
 
 /// What every probe is read after: a clock, so a probe can name one.
@@ -128,7 +138,7 @@ pub const SDC_COMMANDS: &[Command] = &[
     v("1.3", cmd("create_generated_clock", Applied, CHECK_STA, "create_generated_clock -name g -source [get_ports clk] -divide_by 2 [get_pins r/Q]")),
     v("1.6", kept("create_voltage_area", "create_voltage_area -name va -coordinate {0 0 10 10} [get_cells u1]")),
     v("1.1", cmd("current_design", Applied, R, "current_design top")),
-    v("1.1", cmd("current_instance", Applied, R, "current_instance")),
+    v("1.1", note("an unqualified name under it, and `-hierarchical` under it, are refused", cmd("current_instance", Applied, R, "current_instance"))),
     since(Since::Tcl, cmd("expr", Tcl, NONE, "set x [expr 2 * 3]")),
     v("1.5", spelling("get_cell", "get_cells", "set_false_path -through [get_cell u1]")),
     v("1.1", cmd("get_cells", Applied, R, "set_false_path -through [get_cells u1]")),
@@ -150,7 +160,7 @@ pub const SDC_COMMANDS: &[Command] = &[
     since(Since::Tcl, cmd("set", Tcl, NONE, "set p 10")),
     v("1.1", cmd("set_case_analysis", Applied, STA, "set_case_analysis 0 [get_ports a]")),
     v("1.2", kept("set_clock_gating_check", "set_clock_gating_check -setup 0.1 [get_clocks c]")),
-    v("1.7", Command { name: "set_clock_group", spelling_of: Some("set_clock_groups"), status: Applied, applied_by: STA, since: Since::Outside, probe: "set_clock_group -asynchronous -group c" }),
+    v("1.7", Command { name: "set_clock_group", spelling_of: Some("set_clock_groups"), status: Applied, applied_by: STA, since: Since::Outside, probe: "set_clock_group -asynchronous -group c", note: "" }),
     v("1.7", cmd("set_clock_groups", Applied, STA, "set_clock_groups -asynchronous -group c")),
     v("1.1", cmd("set_clock_latency", Applied, STA, "set_clock_latency 0.5 [get_clocks c]")),
     v("1.7", kept("set_clock_sense", "set_clock_sense -positive [get_pins u1/Z]")),
@@ -162,7 +172,7 @@ pub const SDC_COMMANDS: &[Command] = &[
     v("1.1", cmd("set_driving_cell", Applied, STA, "set_driving_cell -lib_cell BUF [get_ports a]")),
     v("1.1", cmd("set_false_path", Applied, CHECK_STA, "set_false_path -from [get_ports a]")),
     v("1.1", kept("set_fanout_load", "set_fanout_load 2 [get_ports y]")),
-    v("1.2", cmd("set_hierarchy_separator", Applied, R, "set_hierarchy_separator /")),
+    v("1.2", note("`/` only: another stops the read", cmd("set_hierarchy_separator", Applied, R, "set_hierarchy_separator /"))),
     v("1.7", kept("set_ideal_latency", "set_ideal_latency 0.1 [get_pins r/CK]")),
     v("1.7", kept("set_ideal_network", "set_ideal_network [get_ports clk]")),
     v("1.7", kept("set_ideal_transition", "set_ideal_transition 0.1 [get_ports clk]")),
@@ -194,7 +204,7 @@ pub const SDC_COMMANDS: &[Command] = &[
     v("1.1", kept("set_resistance", "set_resistance 1 [get_nets n1]")),
     since(Since::Sdc21, kept("set_sense", "set_sense -type clock -positive [get_pins u1/Z]")),
     v("1.5", cmd("set_timing_derate", Applied, STA, "set_timing_derate -late 1.05")),
-    v("1.7", Command { name: "set_unit", spelling_of: Some("set_units"), status: Applied, applied_by: R, since: Since::Outside, probe: "set_unit -time ns" }),
+    v("1.7", Command { name: "set_unit", spelling_of: Some("set_units"), status: Applied, applied_by: R, since: Since::Outside, probe: "set_unit -time ns", note: "" }),
     v("1.7", cmd("set_units", Applied, R, "set_units -time ns")),
     v("1.8", kept("set_voltage", "set_voltage 1.0")),
     v("1.1", kept("set_wire_load_min_block_size", "set_wire_load_min_block_size 10")),
@@ -203,9 +213,24 @@ pub const SDC_COMMANDS: &[Command] = &[
     v("1.1", kept("set_wire_load_selection_group", "set_wire_load_selection_group sel")),
 ];
 
-/// Commands found in constraint files written for other tools, outside the SDC command set, and
-/// the reader's undo commands for SDC ones.
+/// Commands found in constraint files written for other tools, outside the SDC command set: the
+/// reader's undo commands for SDC ones, and a synthesis tool's collection commands (SDC declares
+/// none of them).
 pub const OTHER_COMMANDS: &[Command] = &[
+    cmd("add_to_collection", Applied, R, "set_false_path -to [add_to_collection [get_ports y] [get_ports a]]"),
+    cmd("all_fanin", Status::NotApplied, NONE, "set_false_path -to [all_fanin -to [get_ports y]]"),
+    cmd("all_fanout", Status::NotApplied, NONE, "set_false_path -from [all_fanout -from [get_ports a]]"),
+    cmd("append_to_collection", Applied, R, "append_to_collection v [get_ports y]"),
+    note("known, not run: it stops the read", cmd("derive_clock_uncertainty", Unhandled, NONE, "derive_clock_uncertainty")),
+    note("known, not run: it stops the read", cmd("derive_pll_clocks", Unhandled, NONE, "derive_pll_clocks")),
+    cmd("filter_collection", Status::NotApplied, NONE, "set_false_path -to [filter_collection [get_ports y] direction==out]"),
+    cmd("foreach_in_collection", Applied, R, "foreach_in_collection p [get_ports y] { set_load 0.1 $p }"),
+    cmd("get_attribute", Status::NotApplied, NONE, "set_load [get_attribute [get_ports y] capacitance] [get_ports y]"),
+    cmd("get_designs", Status::NotApplied, NONE, "set_false_path -through [get_designs top]"),
+    cmd("get_object_name", Applied, R, "set_false_path -to [get_object_name [get_ports y]]"),
+    cmd("index_collection", Status::NotApplied, NONE, "set_false_path -to [index_collection [get_ports y] 0]"),
+    cmd("load_of", Status::NotApplied, NONE, "set_load [load_of lib/BUF/A] [get_ports y]"),
+    note("only as every input or output but some, the objects of an I/O delay", cmd("remove_from_collection", Applied, R, "set_input_delay 1 -clock c [remove_from_collection [all_inputs] [get_ports clk]]")),
     cmd("remove_propagated_clock", Applied, R, "remove_propagated_clock [get_clocks c]"),
     cmd("set_clock_jitter", Unhandled, NONE, "set_clock_jitter -cycle 0.1 [get_clocks c]"),
     cmd("set_current_design", Unhandled, NONE, "set_current_design top"),
@@ -213,6 +238,8 @@ pub const OTHER_COMMANDS: &[Command] = &[
     cmd("set_dont_touch", ReadPast, NONE, "set_dont_touch [get_cells u1]"),
     kept("set_path_margin", "set_path_margin 0.1 -to [get_ports y]"),
     kept("set_pvt", "set_pvt -voltage 1.0 [get_cells u1]"),
+    cmd("sizeof_collection", Status::NotApplied, NONE, "set_load [sizeof_collection [get_ports y]] [get_ports y]"),
+    cmd("sort_collection", Status::NotApplied, NONE, "set_false_path -to [sort_collection [get_ports y] name]"),
     cmd("unset_data_check", Applied, STA_SI, "unset_data_check -from [get_pins r/D] -to [get_pins s/D]"),
     kept("unset_disable_clock_gating_check", "unset_disable_clock_gating_check [get_cells u1]"),
     cmd("unset_disable_timing", Applied, STA_SI, "unset_disable_timing [get_cells u1]"),
@@ -244,10 +271,17 @@ pub fn standard_options() -> Vec<(&'static str, &'static str, Status)> {
 }
 
 fn row(c: &Command, with_version: bool) -> String {
-    let status = match c.spelling_of {
-        Some(of) => format!("{} (spelling of `{of}`)", c.status.label()),
-        None => c.status.label().to_string(),
-    };
+    let mut status = c.status.label().to_string();
+    let mut notes: Vec<String> = Vec::new();
+    if let Some(of) = c.spelling_of {
+        notes.push(format!("spelling of `{of}`"));
+    }
+    if !c.note.is_empty() {
+        notes.push(c.note.to_string());
+    }
+    if !notes.is_empty() {
+        status += &format!(" ({})", notes.join("; "));
+    }
     let by: Vec<String> = c.applied_by.iter().map(|b| format!("`{b}`")).collect();
     let by = if by.is_empty() { "—".to_string() } else { by.join(", ") };
     match with_version {
@@ -275,7 +309,7 @@ pub fn coverage_markdown() -> String {
     for c in SDC_COMMANDS {
         t += &row(c, true);
     }
-    t += "\nCommands outside the SDC versions the reference parser declares, found in constraint files written for other tools:\n\n";
+    t += "\nCommands outside the SDC versions the reference parser declares, found in constraint files written for other tools (a synthesis tool's collection commands among them):\n\n";
     t += "| Command | Status | Applied by |\n| --- | --- | --- |\n";
     for c in OTHER_COMMANDS {
         t += &row(c, false);
@@ -319,6 +353,10 @@ mod tests {
                 return;
             }
             let s = read.unwrap_or_else(|e| panic!("{}: {e:?}", c.name));
+            if c.status == Status::NotApplied {
+                assert!(!s.not_applied().is_empty(), "{}: Not applied, yet nothing was reported", c.name);
+                return;
+            }
             assert!(s.rejected.is_empty(), "{}: probe refused: {:?}", c.name, s.rejected);
             let not_applied: Vec<_> = s.not_applied().into_iter().map(|n| n.command).collect();
             let kept: Vec<_> = s.kept_not_applied().into_iter().map(|k| k.command).collect();
@@ -342,7 +380,7 @@ mod tests {
                     assert!(not_applied.is_empty(), "{}: {not_applied:?}", c.name);
                     assert!(kept.is_empty(), "{}: applied, yet reported kept-not-applied: {kept:?}", c.name);
                 }
-                Status::Unhandled => unreachable!(),
+                Status::Unhandled | Status::NotApplied => unreachable!(),
             }
             assert_eq!(c.applied_by.is_empty(), c.status != Status::Applied, "{}: applied_by is for Applied only", c.name);
         }
