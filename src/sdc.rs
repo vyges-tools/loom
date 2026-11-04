@@ -2394,11 +2394,14 @@ fn control(raw: &str, vars: &HashMap<String, String>, procs: &HashMap<String, Tc
                 return Control::Refuse("foreach".into());
             }
             let body = logical_lines(&toks[3]);
+            let tag = format!("f{}", FOREACH_TAGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
             let mut out = Vec::new();
             for e in list.split_whitespace() {
                 out.push(format!("set {} {{{e}}}", toks[1]));
                 out.extend(body.iter().cloned());
+                out.push(format!("{LOOP_CONT}{tag}"));
             }
+            out.push(format!("{LOOP_END}{tag}"));
             Control::Run(out)
         }
         _ => Control::None,
@@ -3079,6 +3082,28 @@ impl Sdc {
                 }
                 continue;
             }
+            if raw.starts_with(LOOP_CONT) || raw.starts_with(LOOP_END) {
+                continue;
+            }
+            // Tcl `break` / `continue`: the rest of the innermost running loop's pass is dropped,
+            // through its continue marker; `break` drops on through the loop's stop line. One
+            // with no loop running in its proc or file is Tcl's error, which stops the read.
+            if matches!(raw.trim(), "break" | "continue") {
+                let word = raw.trim().to_string();
+                let marker = queue.iter().position(|q| q.starts_with(LOOP_CONT) || q == PROC_RETURN || q == SOURCE_END);
+                let Some(at) = marker.filter(|&k| queue[k].starts_with(LOOP_CONT)) else {
+                    return Err(SdcError(format!("invoked \"{word}\" outside of a loop (Tcl's error; the read stops)")));
+                };
+                let tag = queue[at][LOOP_CONT.len()..].to_string();
+                queue.drain(..=at);
+                if word == "break" {
+                    let stop = loop_stop(&tag);
+                    if let Some(k) = queue.iter().position(|q| *q == stop) {
+                        queue.drain(..=k);
+                    }
+                }
+                continue;
+            }
             // A loop's test, queued after each pass of its body: run the body again while it holds.
             if let Some(id) = raw.strip_prefix(LOOP_TEST) {
                 let Some(l) = id.parse::<usize>().ok().and_then(|i| loops.get_mut(i)) else { continue };
@@ -3090,7 +3115,11 @@ impl Sdc {
                             return Err(SdcError(format!("`{} {}`: more than {MAX_LOOP_PASSES} passes; not read as a loop that ends", l.cmd, l.cond)));
                         }
                         queue.push_front(raw.clone());
-                        for c in l.next.iter().rev().chain(l.body.iter().rev()) {
+                        for c in l.next.iter().rev() {
+                            queue.push_front(c.clone());
+                        }
+                        queue.push_front(format!("{LOOP_CONT}t{id}"));
+                        for c in l.body.iter().rev() {
                             queue.push_front(c.clone());
                         }
                     }
@@ -3900,6 +3929,24 @@ struct TclLoop {
 
 /// The line the reader queues before each pass of a loop: `LOOP_TEST` and the loop's index.
 const LOOP_TEST: &str = "\u{2}loop-test ";
+/// The line queued at the end of each pass of a loop's body, with the loop's tag: `continue` drops
+/// the queue through the first one ahead (the innermost running loop's), `break` on to its stop
+/// line ([`loop_stop`]).
+const LOOP_CONT: &str = "\u{2}loop-cont ";
+/// The line queued after a `foreach`'s last pass, with its tag: where its `break` stops.
+const LOOP_END: &str = "\u{2}loop-end ";
+
+/// The line a `break` in the loop tagged `tag` drops the queue through: a `for`/`while` (`t<id>`)
+/// its test, a `foreach` (`f<n>`) its end.
+fn loop_stop(tag: &str) -> String {
+    match tag.strip_prefix('t') {
+        Some(id) => format!("{LOOP_TEST}{id}"),
+        None => format!("{LOOP_END}{tag}"),
+    }
+}
+
+/// Tags for `foreach` loops, unique within the process.
+static FOREACH_TAGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const MAX_LOOP_PASSES: usize = 100_000;
 
 /// The line the reader queues after a proc's body: its call has returned.
@@ -3968,7 +4015,7 @@ fn dialect(
         "puts" | "echo" => Ok(Dialect::Done),
         // Tcl `for {init} {test} {next} {body}` and `while {test} {body}`: the test is evaluated
         // before each pass, with the variables as they are then (a queued test line, see the
-        // read loop). A body that would `break` or `continue` is refused, unrun.
+        // read loop). `continue` ends the pass (the `next` and the test still run), `break` the loop.
         "for" | "while" => {
             let toks = tokenize(raw);
             let (init, cond, next, body) = match (head, toks.as_slice()) {
@@ -3976,9 +4023,6 @@ fn dialect(
                 ("while", [_, c, b]) => (Vec::new(), c.clone(), Vec::new(), b),
                 _ => return Ok(Dialect::Refuse(format!("{head}: `{}` is not the {head} form; not run", raw.trim()))),
             };
-            if tokenize(body).iter().chain(&next).any(|w| w.split_whitespace().any(|x| x == "break" || x == "continue")) {
-                return Ok(Dialect::Refuse(format!("{head}: a body that breaks or continues; not run")));
-            }
             loops.push(TclLoop { cmd: head.to_string(), cond, next, body: logical_lines(body), passes: 0 });
             let mut cmds = init;
             cmds.push(format!("{LOOP_TEST}{}", loops.len() - 1));
@@ -5749,7 +5793,7 @@ set_load 5 [get_ports $L]
         assert!(Sdc::parse("while {1} { set x 1 }
 ").is_err());
         assert!(Sdc::parse("for {set i 0} {$i < 3} {incr i} { if {$i} { break } }
-").unwrap().rejected.iter().any(|r| r.starts_with("for")));
+").unwrap().rejected.is_empty());
     }
 
     /// Rule (Tcl 8.6 `switch`, measured on the reference's interpreter 2026-11-03): `-regexp` is
@@ -6024,5 +6068,53 @@ mod reference_error_tests {
         one(&s.rejected, "Error 431");
         let s = Sdc::parse(&format!("{CLK}set_disable_timing -from D -to Q [get_cells r]\n")).unwrap();
         assert_eq!(s.disabled_timing.len(), 1, "{:?}", s.rejected);
+    }
+}
+
+/// Tcl `break` and `continue` (Tcl 8.6, the reference's interpreter; each expected list below was
+/// run in `tclsh` with `set_input_delay` as a proc that records its value): `continue` ends the
+/// pass, the `for` step and test still run; `break` ends the innermost running loop; either one
+/// with no loop running is Tcl's error ("invoked break outside of a loop").
+#[cfg(test)]
+mod break_continue_tests {
+    use super::*;
+
+    fn delays(body: &str) -> (Vec<f64>, Vec<String>) {
+        let s = Sdc::parse(&format!("create_clock -name c -period 10 [get_ports clk]\n{body}\n")).unwrap();
+        (s.input_delays.iter().map(|d| d.value).collect(), s.rejected)
+    }
+
+    #[test]
+    fn for_continue_skips_the_rest_of_the_pass() {
+        let (v, r) = delays("for {set i 0} {$i < 4} {incr i} { if {$i == 1} { continue }\n set_input_delay $i -clock c [get_ports a] }");
+        assert_eq!((v, r), (vec![0.0, 2.0, 3.0], vec![]));
+    }
+
+    #[test]
+    fn while_break_ends_the_loop() {
+        let (v, r) = delays("set i 0\nwhile {1} { if {$i == 2} { break }\n set_input_delay $i -clock c [get_ports a]\n incr i }\nset_input_delay 9 -clock c [get_ports a]");
+        assert_eq!((v, r), (vec![0.0, 1.0, 9.0], vec![]));
+    }
+
+    #[test]
+    fn foreach_break_and_continue() {
+        let (v, _) = delays("foreach x {1 2 3 4} { if {$x == 2} { continue }\n if {$x == 4} { break }\n set_input_delay $x -clock c [get_ports a] }");
+        assert_eq!(v, vec![1.0, 3.0]);
+    }
+
+    #[test]
+    fn break_ends_only_the_inner_loop() {
+        let (v, _) = delays("foreach x {1 2} { foreach y {10 20 30} { if {$y == 20} { break }\n set_input_delay [expr {$x + $y}] -clock c [get_ports a] }\n set_input_delay $x -clock c [get_ports a] }");
+        assert_eq!(v, vec![11.0, 1.0, 12.0, 2.0]);
+    }
+
+    #[test]
+    fn break_outside_a_loop_is_an_error() {
+        for w in ["break", "continue"] {
+            let e = Sdc::parse(&format!("{w}\nset_input_delay 1 -clock c [get_ports a]\n")).unwrap_err();
+            assert!(e.0.contains("outside of a loop"), "{e}");
+        }
+        // in a proc called from a loop body, the proc's frame ends the search: still an error
+        assert!(Sdc::parse("proc p {} { break }\nforeach x {1 2} { p }\n").is_err());
     }
 }

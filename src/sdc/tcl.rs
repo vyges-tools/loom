@@ -534,7 +534,7 @@ pub(super) fn collection_body_is_setwise(var: &str, body: &[String], procs: &Has
     const NOT_SETWISE: &[&str] = &[
         "set", "if", "foreach", "for", "while", "switch", "proc", "return", "upvar", "global", "dict",
         "lappend", "incr", "foreach_in_collection", "append_to_collection", "create_clock",
-        "create_generated_clock",
+        "create_generated_clock", "break", "continue",
     ];
     let whole = [format!("${var}"), format!("${{{var}}}")];
     !body.is_empty()
