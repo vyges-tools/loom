@@ -229,6 +229,65 @@ pub fn kept_not_applied(name: &str) -> bool {
     command(name).is_some_and(|c| c.status == Status::Kept)
 }
 
+/// One option the SDC standard declares that the reference timer lacks: whether a consumer here
+/// applies it ([`Status::Applied`], by the reader) or it is kept with its command
+/// ([`Status::Kept`]).
+pub fn standard_options() -> Vec<(&'static str, &'static str, Status)> {
+    let mut out = Vec::new();
+    for (cmd, keys, flags) in crate::sdc_flags::STANDARD_ONLY {
+        for o in keys.iter().chain(flags.iter()) {
+            let kept = crate::sdc_flags::KEPT_OPTIONS.iter().any(|(c, k)| c == cmd && k == o);
+            out.push((*cmd, *o, if kept { Status::Kept } else { Status::Applied }));
+        }
+    }
+    out
+}
+
+fn row(c: &Command, with_version: bool) -> String {
+    let status = match c.spelling_of {
+        Some(of) => format!("{} (spelling of `{of}`)", c.status.label()),
+        None => c.status.label().to_string(),
+    };
+    let by: Vec<String> = c.applied_by.iter().map(|b| format!("`{b}`")).collect();
+    let by = if by.is_empty() { "—".to_string() } else { by.join(", ") };
+    match with_version {
+        true => format!("| `{}` | {} | {status} | {by} |\n", c.name, c.since.label()),
+        false => format!("| `{}` | {status} | {by} |\n", c.name),
+    }
+}
+
+/// The command coverage tables, as the `vyges-sdc` README carries them between its
+/// `sdc-coverage` markers: a count line, the SDC command set, the commands outside it, and the
+/// standard options the reference timer lacks. Generated from this registry, so the README can
+/// say no more than the reader does.
+pub fn coverage_markdown() -> String {
+    let count = |st: Status| SDC_COMMANDS.iter().filter(|c| c.status == st).count();
+    let mut t = format!(
+        "SDC 1.1 to 2.1: {} applied, {} kept, {} Tcl, {} read past, {} unhandled, of {} commands.\n\n",
+        count(Status::Applied),
+        count(Status::Kept),
+        count(Status::Tcl),
+        count(Status::ReadPast),
+        count(Status::Unhandled),
+        SDC_COMMANDS.len()
+    );
+    t += "| Command | SDC | Status | Applied by |\n| --- | --- | --- | --- |\n";
+    for c in SDC_COMMANDS {
+        t += &row(c, true);
+    }
+    t += "\nCommands outside the SDC versions the reference parser declares, found in constraint files written for other tools:\n\n";
+    t += "| Command | Status | Applied by |\n| --- | --- | --- |\n";
+    for c in OTHER_COMMANDS {
+        t += &row(c, false);
+    }
+    t += "\nOptions SDC declares that the reference timer does not have. They are read, never refused:\n\n";
+    t += "| Command | Option | Status |\n| --- | --- | --- |\n";
+    for (cmd, o, st) in standard_options() {
+        t += &format!("| `{cmd}` | `{o}` | {} |\n", st.label());
+    }
+    t
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +372,20 @@ mod tests {
             assert_eq!(command(q).map(|c| c.since), Some(Since::Sdc("1.5")), "{q}");
         }
         assert_eq!(command("get_cells").map(|c| c.since), Some(Since::Sdc("1.1")));
+    }
+
+    /// The generated table has one row per command and per standard option, and its count line
+    /// adds up to the command set.
+    #[test]
+    fn the_coverage_table_has_a_row_for_everything() {
+        let t = coverage_markdown();
+        let (commands, _) = t.split_once("Options SDC declares").expect("the options table follows the commands");
+        for c in SDC_COMMANDS.iter().chain(OTHER_COMMANDS) {
+            assert_eq!(commands.lines().filter(|l| l.starts_with(&format!("| `{}` |", c.name))).count(), 1, "{}", c.name);
+        }
+        let options = t.lines().filter(|l| l.split(" | ").nth(1).is_some_and(|o| o.starts_with("`-"))).count();
+        assert_eq!(options, standard_options().len());
+        assert!(t.contains(&format!("of {} commands", SDC_COMMANDS.len())), "{t}");
     }
 
     #[test]
