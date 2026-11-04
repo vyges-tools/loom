@@ -1199,6 +1199,33 @@ pub struct DesignRuleCmd {
     pub objects: Objects,
 }
 
+/// Why a design-rule limit's arguments are refused, by its definition: SDC declares
+/// `set_max_capacitance` and `set_max_fanout` as `value object_list` and nothing else, and
+/// `set_max_transition` as `[-clock_path] [-rise] [-fall] value object_list` (the reference
+/// adds `-data_path`; an option neither has is refused before here, Error 562). Each requires
+/// both, and a value that is a positive float (`$par>=0`; the reference's Error 572). The two
+/// fixed ones are Tcl procs of two parameters, so any other word count is `wrong # args`.
+/// ⛔ Unchecked, `set_max_capacitance -min 0.2 [get_ports a]` read `0.2` as the objects of a limit
+/// with no value, and `set_max_capacitance 0.2` was dropped without a word.
+fn design_rule_fault(toks: &[String]) -> Option<String> {
+    let fixed = matches!(toks[0].as_str(), "set_max_capacitance" | "set_max_fanout");
+    let (_, flags, pos) = split_args(toks, &[]);
+    if fixed && !flags.is_empty() {
+        return Some(format!("{} is not an option of {} (it takes a value and objects only)", flags[0], toks[0]));
+    }
+    let Some(value) = pos.first() else { return Some("missing value".into()) };
+    if pos.len() < 2 {
+        return Some("missing objects (the value applies to an object list, `[current_design]` for the design)".into());
+    }
+    if pos.len() > 2 {
+        return Some(format!("{} positional arguments where it takes a value and objects (wrong # args)", pos.len()));
+    }
+    if value.trim_matches(|c| c == '{' || c == '}').trim().parse::<f64>().map_or(true, |v| v < 0.0) {
+        return Some(format!("value '{value}' is not a positive float (Error 572)"));
+    }
+    None
+}
+
 /// `<cmd> [flags] value objects`, or `None` when there is no object word.
 fn design_rule_cmd(toks: &[String]) -> Option<DesignRuleCmd> {
     let (_, flags, pos) = split_args(toks, &[]);
@@ -3659,6 +3686,10 @@ impl Sdc {
                     }
                 }
                 "set_max_fanout" => {
+                    if let Some(why) = design_rule_fault(&toks) {
+                        sdc.rejected.push(format!("{}: {why}; not applied", toks[0]));
+                        continue;
+                    }
                     match (toks.len() == 3 && toks[2] == "[current_design]", toks.get(1).and_then(|v| v.parse::<f64>().ok())) {
                         (true, Some(v)) => sdc.max_fanout = Some(v),
                         _ => {
@@ -3672,6 +3703,10 @@ impl Sdc {
                     sdc.ignored.push("set_max_fanout".to_string());
                 }
                 "set_max_capacitance" => {
+                    if let Some(why) = design_rule_fault(&toks) {
+                        sdc.rejected.push(format!("{}: {why}; not applied", toks[0]));
+                        continue;
+                    }
                     match (toks.len() == 3 && toks[2] == "[current_design]", toks.get(1).and_then(|v| v.parse::<f64>().ok())) {
                         (true, Some(v)) => sdc.max_capacitance = Some(v),
                         (_, v) => {
@@ -3720,6 +3755,10 @@ impl Sdc {
                     sdc.ignored.push(toks[0].clone());
                 }
                 "set_max_transition" => {
+                    if let Some(why) = design_rule_fault(&toks) {
+                        sdc.rejected.push(format!("{}: {why}; not applied", toks[0]));
+                        continue;
+                    }
                     match (toks.len() == 3 && toks[2] == "[current_design]", toks.get(1).and_then(|v| v.parse::<f64>().ok())) {
                         (true, Some(v)) => sdc.max_transition = Some(v),
                         _ => {
@@ -5786,7 +5825,8 @@ mod scope_and_rule_tests {
     #[test]
     fn a_design_rule_without_objects_is_rejected() {
         let s = Sdc::parse("set_max_transition 0.3\n").unwrap();
-        assert_eq!(s.rejected, ["set_max_transition without objects"]);
+        assert_eq!(s.rejected.len(), 1, "{:?}", s.rejected);
+        assert!(s.rejected[0].starts_with("set_max_transition: missing objects"), "{:?}", s.rejected);
     }
 
     /// `current_instance u1` makes every later name relative to `u1` (see `sdc/scope.rs`); a bare
