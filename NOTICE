@@ -9,3 +9,12 @@ License in the accompanying LICENSE file or at:
 
 vyges-loom is the shared design-data foundation for the Vyges EDA toolchain:
 parse-once / query-many readers for the formats the engines consume.
+
+Third-party test data
+---------------------
+
+tests/data/sdc/coralnpu/rvv_core_mini-asap7.sdc is an unmodified copy of
+synthesis/rvv_core_mini/asap7/constraint.sdc from CoralNPU
+(https://github.com/google-coral/coralnpu, commit
+aa4239301fa7dea060028c3f426fe27742332686). Copyright 2026 Google LLC.
+Licensed under the Apache License, Version 2.0.

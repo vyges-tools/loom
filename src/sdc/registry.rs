@@ -157,6 +157,7 @@ pub const SDC_COMMANDS: &[Command] = &[
     v("1.5", spelling("get_port", "get_ports", "set_input_delay 1 -clock c [get_port a]")),
     v("1.1", cmd("get_ports", Applied, R, "set_input_delay 1 -clock c [get_ports a]")),
     v("1.7", kept("group_path", "group_path -name g -to [get_ports y]")),
+    since(Since::Tcl, note("a condition the file alone decides (`info exists`, a variable); one on a query's result needs the design and is listed as not applied", cmd("if", Tcl, NONE, "if {1} { set_load 0.1 [get_ports y] }"))),
     since(Since::Tcl, cmd("list", Tcl, NONE, "set_false_path -to [list [get_ports y]]")),
     since(Since::Tcl, cmd("set", Tcl, NONE, "set p 10")),
     v("1.1", note("`sta`: through its logic simulation, with the design", cmd("set_case_analysis", Applied, STA, "set_case_analysis 0 [get_ports a]"))),
