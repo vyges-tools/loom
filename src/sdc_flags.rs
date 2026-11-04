@@ -158,3 +158,73 @@ pub(crate) fn options(cmd: &str) -> Option<(Vec<&'static str>, Vec<&'static str>
 pub(crate) fn keys(cmd: &str) -> Vec<&'static str> {
     options(cmd).map(|(k, _)| k).unwrap_or_default()
 }
+
+/// The reference timer's options that no SDC version declares (1.1 to 2.0 in the reference SDC
+/// parser), `(command, option)`. Read, as the reference reads them; `check` names each one a file
+/// uses, at info level, so a file that leans on them is known not to be portable SDC.
+pub(crate) const EXTENSION_OPTIONS: &[(&str, &str)] = &[
+    ("all_inputs", "-no_clocks"),
+    ("get_cells", "-filter"),
+    ("get_cells", "-quiet"),
+    ("get_clocks", "-filter"),
+    ("get_clocks", "-quiet"),
+    ("get_lib_cells", "-filter"),
+    ("get_lib_cells", "-of_objects"),
+    ("get_lib_cells", "-quiet"),
+    ("get_lib_pins", "-filter"),
+    ("get_lib_pins", "-of_objects"),
+    ("get_lib_pins", "-quiet"),
+    ("get_libs", "-filter"),
+    ("get_libs", "-quiet"),
+    ("get_nets", "-filter"),
+    ("get_nets", "-quiet"),
+    ("get_pins", "-filter"),
+    ("get_pins", "-of_objects"),
+    ("get_pins", "-quiet"),
+    ("get_ports", "-filter"),
+    ("get_ports", "-nocase"),
+    ("get_ports", "-of_objects"),
+    ("get_ports", "-quiet"),
+    ("group_path", "-critical_range"),
+    ("set_clock_sense", "-clock"),
+    ("set_driving_cell", "-cell"),
+    ("set_false_path", "-reset_path"),
+    ("set_load", "-fall"),
+    ("set_load", "-rise"),
+    ("set_max_delay", "-ignore_clock_latency"),
+    ("set_max_delay", "-probe"),
+    ("set_max_delay", "-reset_path"),
+    ("set_max_transition", "-data_path"),
+    ("set_min_delay", "-ignore_clock_latency"),
+    ("set_min_delay", "-probe"),
+    ("set_min_delay", "-reset_path"),
+    ("set_multicycle_path", "-reset_path"),
+    ("set_port_fanout_number", "-max"),
+    ("set_port_fanout_number", "-min"),
+    ("set_units", "-distance"),
+];
+
+/// The reference timer's commands that no SDC version declares and that a constraint file may
+/// use: its undo commands (`unset_*`, `delete_*`; a signoff timer's `remove_*` / `reset_*` are
+/// read as these), its own constraints, and `write_sdc`.
+pub(crate) const EXTENSION_COMMANDS: &[&str] = &[
+    "delete_clock",
+    "delete_generated_clock",
+    "set_disable_clock_gating_check",
+    "set_path_margin",
+    "set_pvt",
+    "unset_case_analysis",
+    "unset_clock_groups",
+    "unset_clock_latency",
+    "unset_clock_transition",
+    "unset_clock_uncertainty",
+    "unset_data_check",
+    "unset_disable_clock_gating_check",
+    "unset_disable_timing",
+    "unset_input_delay",
+    "unset_output_delay",
+    "unset_path_exceptions",
+    "unset_propagated_clock",
+    "unset_timing_derate",
+    "write_sdc",
+];

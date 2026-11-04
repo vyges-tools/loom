@@ -234,3 +234,18 @@ fn options_neither_declares_are_refused() {
     }
 }
 
+/// The reference timer's options and commands that no SDC version declares are read as it reads
+/// them, and `check` names each one used, with its count, at info level only. An option SDC does
+/// declare (`-comment`) is not named.
+#[test]
+fn reference_extensions_are_named_at_info_level() {
+    let s = read("set_input_delay 1 -clock c [get_ports -filter {direction==in} *]\nset_output_delay 1 -clock c [get_ports -quiet y]\n\
+                  set_output_delay 1 -clock c [get_ports -quiet z]\nset_false_path -to [get_ports y] -comment x\nset_pvt [get_cells u1] -voltage 1.0");
+    assert_eq!(s.extensions, ["get_ports -filter", "get_ports -quiet", "get_ports -quiet", "set_pvt"]);
+    let r = vyges_loom::sdc_lint::lint_without_design(&s);
+    let f: Vec<_> = r.findings.iter().filter(|f| f.code == "sdc-extension").collect();
+    assert_eq!(f.len(), 3, "{:?}", r.findings);
+    assert!(f.iter().all(|f| f.severity == vyges_loom::sdc_lint::Severity::Info), "{f:?}");
+    assert!(f[1].message.contains("`get_ports -quiet` (2 uses)"), "{}", f[1].message);
+    assert!(read("create_clock -name d -period 5 -comment x [get_ports d]").extensions.is_empty());
+}

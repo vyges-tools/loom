@@ -535,6 +535,7 @@ pub fn lint_with_meta(
 
     not_applied_findings(sdc, &mut f);
     kept_not_applied_findings(sdc, &mut f);
+    extension_findings(sdc, &mut f);
     braced_variable_findings(sdc, &mut f);
     f.sort_by(|a, b| (a.severity as u8, a.code).cmp(&(b.severity as u8, b.code)));
     LintReport { findings: f }
@@ -697,6 +698,22 @@ fn not_applied_findings(sdc: &Sdc, f: &mut Vec<Finding>) {
 /// ([`Sdc::kept_not_applied`]): a WARNING when applying it could move a slack, so the report is not
 /// called clean while it goes unapplied, and INFO when it could not (a power or area directive).
 /// Never an error: the command was read as the reference reads it, and `write` writes it back.
+/// Each reference-timer extension the file uses ([`Sdc::extensions`]), with its count: read and
+/// applied like the rest, but not SDC, so another SDC reader may refuse the file. Info only.
+fn extension_findings(sdc: &Sdc, f: &mut Vec<Finding>) {
+    let mut seen: Vec<(&str, usize)> = Vec::new();
+    for e in &sdc.extensions {
+        match seen.iter_mut().find(|(n, _)| n == e) {
+            Some((_, c)) => *c += 1,
+            None => seen.push((e, 1)),
+        }
+    }
+    for (e, n) in seen {
+        let times = if n == 1 { String::new() } else { format!(" ({n} uses)") };
+        f.push(Finding { severity: Severity::Info, code: "sdc-extension", message: format!("`{e}`{times}: a reference-timer extension no SDC version declares") });
+    }
+}
+
 fn kept_not_applied_findings(sdc: &Sdc, f: &mut Vec<Finding>) {
     for k in sdc.kept_not_applied() {
         let times = if k.count == 1 { String::new() } else { format!(" ({} commands)", k.count) };
@@ -762,6 +779,7 @@ pub fn lint_without_design(sdc: &Sdc) -> LintReport {
     }
     not_applied_findings(sdc, &mut f);
     kept_not_applied_findings(sdc, &mut f);
+    extension_findings(sdc, &mut f);
     braced_variable_findings(sdc, &mut f);
     f.push(Finding {
         severity: Severity::Info,

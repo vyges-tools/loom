@@ -758,6 +758,11 @@ pub struct Sdc {
     /// the option, else as written in [`Sdc::kept`] — and `check` reports it as kept-not-applied.
     /// Each is also in [`Sdc::ignored`], for a consumer that reads only that.
     pub kept_options: Vec<String>,
+    /// Each use of a reference-timer command or option that no SDC version declares
+    /// (`get_ports -filter`, `set_pvt`: [`crate::sdc_flags::EXTENSION_OPTIONS`] /
+    /// [`crate::sdc_flags::EXTENSION_COMMANDS`]), as `command` or `command -option`, in file
+    /// order. Read as the reference reads it; `check` names each at info level (portability only).
+    pub extensions: Vec<String>,
     pub ignored: Vec<String>, // commands we recognised but do not model
 }
 
@@ -2031,6 +2036,25 @@ fn unknown_option(toks: &[String]) -> Option<String> {
         let inner = t.strip_prefix('[').and_then(|s| s.strip_suffix(']'))?;
         unknown_option(&expand_abbreviations(tokenize(inner.trim())))
     })
+}
+
+/// The reference-timer extensions `toks` uses, at any depth of `[...]`: the command itself when no
+/// SDC version declares it, and each option of it no SDC version declares.
+fn extensions_in(toks: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(cmd) = toks.first() else { return out };
+    if crate::sdc_flags::EXTENSION_COMMANDS.contains(&cmd.as_str()) {
+        out.push(cmd.clone());
+    }
+    for t in &toks[1..] {
+        if crate::sdc_flags::EXTENSION_OPTIONS.iter().any(|(c, o)| c == cmd && o == t) {
+            out.push(format!("{cmd} {t}"));
+        }
+        if let Some(inner) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            out.extend(extensions_in(&expand_abbreviations(tokenize(inner.trim()))));
+        }
+    }
+    out
 }
 
 /// Each SDC option in `toks` (at any depth of `[...]`) that no consumer here applies
@@ -3322,6 +3346,7 @@ impl Sdc {
             if toks.is_empty() {
                 continue;
             }
+            sdc.extensions.extend(extensions_in(&toks));
             // A clock made INSIDE another command (`set_input_delay -clock [create_clock …] …`):
             // Tcl runs the substitution first, and the reference's `create_clock` returns nothing,
             // so the clock is made and the outer command sees an empty word.

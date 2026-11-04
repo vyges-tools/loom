@@ -331,6 +331,11 @@ pub fn coverage_markdown() -> String {
     for (cmd, o, st) in standard_options() {
         t += &format!("| `{cmd}` | `{o}` | {} |\n", st.label());
     }
+    t += "\nReference-timer options no SDC version declares. They are read as the reference reads them, and `check` names each one a file uses, at info level (the file is not portable SDC):\n\n";
+    t += "| Command | Option |\n| --- | --- |\n";
+    for (cmd, o) in crate::sdc_flags::EXTENSION_OPTIONS {
+        t += &format!("| `{cmd}` | `{o}` |\n");
+    }
     t
 }
 
@@ -424,17 +429,37 @@ mod tests {
         assert_eq!(command("get_cells").map(|c| c.since), Some(Since::Sdc("1.1")));
     }
 
-    /// The generated table has one row per command and per standard option, and its count line adds up to the command set.
+    /// The generated table has one row per command, per standard option and per reference
+    /// extension, and its count line adds up to the command set.
     #[test]
     fn the_coverage_table_has_a_row_for_everything() {
         let t = coverage_markdown();
         let (commands, rest) = t.split_once("Options SDC declares").expect("the options table follows the commands");
+        let (standard, extensions) = rest.split_once("Reference-timer options").expect("the extensions table follows");
         for c in SDC_COMMANDS.iter().chain(OTHER_COMMANDS) {
             assert_eq!(commands.lines().filter(|l| l.starts_with(&format!("| `{}` |", c.name))).count(), 1, "{}", c.name);
         }
         let options = |s: &str| s.lines().filter(|l| l.split(" | ").nth(1).is_some_and(|o| o.starts_with("`-"))).count();
-        assert_eq!(options(rest), standard_options().len());
+        assert_eq!(options(standard), standard_options().len());
+        assert_eq!(options(extensions), crate::sdc_flags::EXTENSION_OPTIONS.len());
         assert!(t.contains(&format!("of {} commands", SDC_COMMANDS.len())), "{t}");
+    }
+
+    /// An extension is the reference timer's and no SDC version's: never a standard option, every
+    /// extension option one the reference timer has, and every extension command outside the SDC
+    /// set, with a row of its own.
+    #[test]
+    fn extensions_are_outside_the_standard() {
+        let standard = standard_options();
+        for (c, o) in crate::sdc_flags::EXTENSION_OPTIONS {
+            assert!(!standard.iter().any(|(sc, so, _)| sc == c && so == o), "{c} {o} is standard");
+            let (keys, flags) = crate::sdc_flags::options(c).unwrap_or_else(|| panic!("{c}: no options"));
+            assert!(keys.contains(o) || flags.contains(o), "{c} {o}: not the reference timer's");
+        }
+        for c in crate::sdc_flags::EXTENSION_COMMANDS {
+            assert!(OTHER_COMMANDS.iter().any(|x| x.name == *c), "{c}: no row outside SDC");
+            assert!(command(c).is_some_and(|x| !matches!(x.since, Since::Sdc(_))), "{c}: dated as SDC");
+        }
     }
 
     #[test]
