@@ -1791,9 +1791,9 @@ fn canonical_queries(line: &str) -> String {
 /// Queries a synthesis tool has and the reference does not, known here so that a constraint using
 /// one is refused by name and the read goes on (user 2026-10-31), not stopped as at an unknown
 /// command. `remove_from_collection` is read in one form ([`all_ports_except`]). `load_of
-/// <lib>/<cell>/<pin>` (a library pin's capacitance) is never evaluated: OpenTitan's
-/// `set_load [load_of ${LOAD_CELL_LIB}/…]` names cells its flow sets in a setup script outside
-/// the constraint file, so its command is refused (listed with the queries not evaluated).
+/// <lib>/<cell>/<pin>` (a library pin's capacitance) is evaluated when the libraries are given
+/// ([`subst_load_of`], user 2026-11-04); without them its command is refused (listed with the
+/// queries not evaluated).
 ///
 /// The rest are a synthesis tool's collection commands, known so that a
 /// constraint using one is refused by name, with the read going on: `get_designs` (a design, not
@@ -1804,6 +1804,42 @@ const EXTENSION_QUERIES: [&str; 10] = [
     "remove_from_collection", "load_of", "get_designs", "filter_collection", "get_attribute",
     "sizeof_collection", "index_collection", "sort_collection", "all_fanin", "all_fanout",
 ];
+
+/// `line` with each `[load_of lib/cell/pin]` outside braces replaced by the library pin's
+/// capacitance (in the library's unit, as `set_load` reads its value), when the design in scope
+/// has the libraries. One it cannot answer is left as written, and its command is refused with
+/// the reason ([`unevaluated_query`]).
+fn subst_load_of(line: &str) -> String {
+    if !line.contains("[load_of ") {
+        return line.to_string();
+    }
+    let cs: Vec<char> = line.chars().collect();
+    let (mut out, mut depth, mut i) = (String::new(), 0usize, 0usize);
+    while i < cs.len() {
+        let c = cs[i];
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            '[' if depth == 0 => {
+                let rest: String = cs[i..].iter().collect();
+                if let Some(inner) = rest.strip_prefix("[load_of ").and_then(|r| r.split_once(']')).map(|(a, _)| a.to_string()) {
+                    let arg = inner.trim().trim_matches(|c| c == '{' || c == '}').to_string();
+                    if !arg.contains(['[', ' ']) {
+                        if let Some(Ok(cap)) = with_design(|d| d.load_of(&arg)) {
+                            out.push_str(&cap.to_string());
+                            i += "[load_of ".len() + inner.len() + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
 
 /// `line` with a synthesis tool's collection spellings written as the Tcl lists they are, outside
 /// braces: `[add_to_collection ?-unique? A B]` is `[list A B]` (`-unique` only drops a repeat,
@@ -1964,6 +2000,11 @@ fn unevaluated_query(toks: &[String]) -> Option<String> {
         // a port called `remove_from_collection`: the delay went nowhere, and nothing said so.
         // `expr` is evaluated where it can be, and a value it leaves is reported where it is read.
         let known = KNOWN_QUERIES.contains(&cmd.as_str()) || cmd == "expr" || (matches!(cmd.as_str(), "lsearch" | "remove_from_collection") && all_ports_except(t).is_some());
+        if cmd == "load_of" {
+            let arg = parts.get(1).cloned().unwrap_or_default();
+            let why = with_design(|d| d.load_of(&arg).err()).flatten().unwrap_or_else(|| "no library was given".into());
+            return Some(format!("[{}] (a library pin's capacitance, not evaluated: {why})", inner.trim()));
+        }
         if !known {
             return Some(format!("[{}] (a command this reader does not evaluate)", inner.trim()));
         }
@@ -3431,6 +3472,7 @@ impl Sdc {
                 Control::None => {}
             }
             let line = dialect_queries(&canonical_queries(&subst_exprs(&subst_command_vars(&raw, &vars), &vars)));
+            let line = subst_load_of(&line);
             let line = match &instance_scope {
                 None => line,
                 Some(scope) => {
@@ -4934,8 +4976,9 @@ mod exception_check_tests {
         assert!(w.text.contains("[lsearch -inline -all -not -exact [all_inputs] [get_ports {clk_i}]]"), "{}", w.text);
     }
 
-    /// A LOOM EXTENSION (user 2026-10-31): `[load_of <lib>/<cell>/<pin>]` is known, never
-    /// evaluated — its command is refused by name and what follows is read; a bare `load_of`
+    /// A LOOM EXTENSION (user 2026-10-31): `[load_of <lib>/<cell>/<pin>]` is known; with no
+    /// library it is not evaluated — its command is refused by name and what follows is read (with
+    /// the libraries: `load_of_is_the_library_pins_capacitance`); a bare `load_of`
     /// still stops the read, as any command the reference does not know.
     #[test]
     fn load_of_is_refused_with_its_command_and_the_read_goes_on() {
@@ -6273,7 +6316,36 @@ mod reference_error_tests {
                 wire_loads: vec!["small".into()],
                 wire_load_selections: vec!["sel".into()],
             }],
+            lib_pins: vec![("DFF".into(), "D".into(), 0.0021)],
         }
+    }
+
+    /// `load_of lib/cell/pin` (a synthesis tool's query; neither SDC nor the reference declares
+    /// it) is the library pin's capacitance, in the library's unit as `set_load` takes it, when
+    /// the libraries are given; a library, cell or pin they do not have, or no library, refuses
+    /// the command with the reason. Variables in its argument are substituted first.
+    #[test]
+    fn load_of_is_the_library_pins_capacitance() {
+        let d = design();
+        let s = Sdc::parse_with_opts(
+            "set_load [load_of seq_demo/DFF/D] [get_ports din]\nset_load [load_of ${L}/DFF/D] [get_ports clk]\n",
+            &d,
+            &ReadOpts { defines: vec![("L".into(), "seq_demo".into())], base_dir: None },
+        )
+        .unwrap();
+        let got: Vec<(f64, Vec<String>)> = s.env.iter().map(|e| (e.value, e.objects.clone())).collect();
+        assert_eq!(got, [(0.0021, vec!["din".to_string()]), (0.0021, vec!["clk".to_string()])]);
+        for (line, why) in [
+            ("set_load [load_of other/DFF/D] [get_ports din]", "no library `other` was read"),
+            ("set_load [load_of seq_demo/DFF/Q] [get_ports din]", "library `seq_demo` has no pin DFF/Q"),
+            ("set_load [load_of DFF/D] [get_ports din]", "`DFF/D` is not lib/cell/pin"),
+        ] {
+            let s = Sdc::parse_with(line, &d).unwrap();
+            assert!(s.env.is_empty(), "{line}");
+            assert!(s.unevaluated_queries.iter().any(|q| q.contains(why)), "{line}: {:?}", s.unevaluated_queries);
+        }
+        let s = Sdc::parse_with("set_load [load_of seq_demo/DFF/D] [get_ports din]", &SdcDesign::default()).unwrap();
+        assert!(s.unevaluated_queries.iter().any(|q| q.contains("not evaluated: no library was given")), "{:?}", s.unevaluated_queries);
     }
 
     fn one(r: &[String], needle: &str) {

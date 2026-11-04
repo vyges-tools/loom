@@ -40,6 +40,10 @@ pub struct SdcDesign {
     /// The libraries read, in read order, with the group names SDC looks up. Empty when no
     /// library was given: a lookup is then not checked.
     pub libs: Vec<crate::liberty::LibGroups>,
+    /// Each library cell pin's capacitance, in the library's unit: `(cell, pin, capacitance)`,
+    /// the libraries merged ([`crate::liberty::Pin::capacitance`]). Empty with no library. What
+    /// `[load_of lib/cell/pin]` reads.
+    pub lib_pins: Vec<(String, String, f64)>,
 }
 
 fn dir_name(d: Dir, tristate: bool) -> &'static str {
@@ -74,7 +78,31 @@ impl SdcDesign {
                 pins.push((k, p.clone(), dir(p), None));
             }
         }
-        SdcDesign { ports, insts, pins, libs: lib.map(|l| l.libraries.clone()).unwrap_or_default() }
+        let mut lib_pins = Vec::new();
+        for (cell, c) in lib.map(|l| &l.cells).into_iter().flatten() {
+            lib_pins.extend(c.pins.iter().map(|(p, q)| (cell.clone(), p.clone(), q.capacitance)));
+        }
+        SdcDesign { ports, insts, pins, libs: lib.map(|l| l.libraries.clone()).unwrap_or_default(), lib_pins }
+    }
+
+    /// `load_of lib/cell/pin`: the library pin's capacitance, in the library's unit. `Err` says
+    /// why it has none: no library given, a library, cell or pin the libraries do not have.
+    pub(crate) fn load_of(&self, arg: &str) -> Result<f64, String> {
+        if self.libs.is_empty() {
+            return Err("no library was given".into());
+        }
+        let parts: Vec<&str> = arg.rsplitn(3, '/').collect();
+        let [pin, cell, lib] = parts.as_slice() else {
+            return Err(format!("`{arg}` is not lib/cell/pin"));
+        };
+        if !self.libs.iter().any(|l| l.name == *lib) {
+            return Err(format!("no library `{lib}` was read"));
+        }
+        self.lib_pins
+            .iter()
+            .find(|(c, p, _)| c == cell && p == pin)
+            .map(|(_, _, cap)| *cap)
+            .ok_or_else(|| format!("library `{lib}` has no pin {cell}/{pin}"))
     }
 
     /// `name` is one of the design's ports or instance pins.
