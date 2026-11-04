@@ -1,4 +1,4 @@
-//! A synthesis-flow-style constraint set read whole (field item: commercial-style fixtures):
+//! A synthesis-flow-style constraint set read whole (a commercial-style fixture):
 //! `source` of a setup script and an I/O file, a `proc` with a default, collection commands (a set-wise
 //! `foreach_in_collection`), singular queries, design rules on objects, a clock sense and disabled arcs. Every command is
 //! either modelled or reported as not applied, and the read reaches the end of the file.

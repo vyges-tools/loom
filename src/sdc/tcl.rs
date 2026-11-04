@@ -2,8 +2,7 @@
 //! called for their value, `foreach_in_collection`, the tool-name test, and a signoff timer's
 //! `remove_*` / `reset_*` spellings of the reference's `unset_*` / `delete_*` commands.
 //!
-//! Field item (second review, 2026-11): constraint files a DFT insertion tool generates were the
-//! largest group the reader stopped on. They define their helpers as procs that `return` a value
+//! Constraint files a DFT insertion tool generates are a common kind the reader used to stop on. They define their helpers as procs that `return` a value
 //! or reach their caller's variables with `upvar`, keep their tables in `dict`s, walk collections
 //! with `foreach_in_collection`, and branch on which tool is reading them. The reference reads SDC
 //! in a full Tcl interpreter, where every one of these works; here each is read as Tcl runs it,

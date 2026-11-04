@@ -1772,7 +1772,7 @@ fn canonical_queries(line: &str) -> String {
 /// `set_load [load_of ${LOAD_CELL_LIB}/…]` names cells its flow sets in a setup script outside
 /// the constraint file, so its command is refused (listed with the queries not evaluated).
 ///
-/// The rest are a synthesis tool's collection commands (Tier-2 field item), known so that a
+/// The rest are a synthesis tool's collection commands, known so that a
 /// constraint using one is refused by name, with the read going on: `get_designs` (a design, not
 /// a timing object), and the ones that select by attribute, count, index or the design's
 /// connectivity, which this reader does not evaluate. `add_to_collection` and `get_object_name`
@@ -4091,9 +4091,8 @@ enum Dialect {
     None,
 }
 
-/// The commands a synthesis tool's Tcl adds to SDC, read as that Tcl would run them (Tier-2
-/// field item: constraint files written for a synthesis tool use them and otherwise stopped the
-/// read at the first one). Each is a LOOM EXTENSION where the reference does not have it; the
+/// The commands a synthesis tool's Tcl adds to SDC, read as that Tcl would run them (constraint
+/// files written for a synthesis tool use them, and otherwise stopped the read at the first one). Each is a LOOM EXTENSION where the reference does not have it; the
 /// reference's own Tcl commands (`proc`, `source`, `puts`, `global`) follow Tcl.
 ///
 /// - `proc name {params} {body}` is remembered; a call runs its body with the parameters set
@@ -5843,7 +5842,7 @@ mod scope_and_rule_tests {
     }
 }
 
-/// The synthesis-tool dialect (Tier-2 field item): what each command is read as. Tcl's own rules
+/// The synthesis-tool dialect: what each command is read as. Tcl's own rules
 /// where the reference has the command (`proc`, `source`, `puts`, `global`); LOOM EXTENSIONS for
 /// the collection commands it does not have.
 #[cfg(test)]
@@ -5999,7 +5998,7 @@ set_load 5 [get_ports $L]
     }
 }
 
-/// Tier-3 field item: arcs and senses the reference models, read as its SDC / search Tcl reads
+/// Arcs and senses the reference models, read as its SDC / search Tcl reads
 /// them (`set_disable_timing`, `set_sense` / `set_clock_sense_cmd1`, `set_disable_clock_gating_check`).
 #[cfg(test)]
 mod arc_tests {
