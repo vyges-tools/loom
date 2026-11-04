@@ -1171,6 +1171,53 @@ fn design_rule_cmd(toks: &[String]) -> Option<DesignRuleCmd> {
     Some(DesignRuleCmd { value, flags, objects: Objects::of(pos.get(1)?) })
 }
 
+/// `set_units` / `check_unit` (OpenSTA `sdc/Sdc.tcl`): each unit's value is `[scale][prefix]suffix`,
+/// the suffix matched without case (`s`, `f`, `ohm`, `v`, `A`, `W`, `m`), the scale `1`, `10`, `100`,
+/// ... (a `.` and trailing zeros allowed) and the prefix one of `M k m u n p f`. The units are
+/// checked in the reference's order, not the file's, so the first bad one in that order is named.
+fn check_units(toks: &[String]) -> Result<(), String> {
+    const UNITS: [(&str, &str, &str); 7] = [
+        ("time", "-time", "s"),
+        ("capacitance", "-capacitance", "f"),
+        ("resistance", "-resistance", "ohm"),
+        ("voltage", "-voltage", "v"),
+        ("current", "-current", "A"),
+        ("power", "-power", "W"),
+        ("distance", "-distance", "m"),
+    ];
+    for (unit, key, suffix) in UNITS {
+        let Some(value) = toks.iter().position(|t| t == key).and_then(|i| toks.get(i + 1)) else { continue };
+        let chars: Vec<char> = value.chars().collect();
+        let n = suffix.chars().count();
+        let split = chars.len().saturating_sub(n);
+        let arg_suffix: String = chars[split..].iter().collect();
+        if !arg_suffix.eq_ignore_ascii_case(suffix) {
+            return Err(format!("incorrect unit suffix '{arg_suffix}' (Error 501)"));
+        }
+        let prefix: String = chars[..split].iter().collect();
+        if !unit_prefix_ok(&prefix) {
+            return Err(format!("unknown unit {unit} prefix '{prefix}' (Error 343)"));
+        }
+    }
+    Ok(())
+}
+
+/// `^(10*\.?0*)?([Mkmunpf])?$`, the reference's unit prefix pattern.
+fn unit_prefix_ok(p: &str) -> bool {
+    let mut s = p;
+    if let Some(r) = s.strip_prefix('1') {
+        s = r.trim_start_matches('0');
+        s = s.strip_prefix('.').unwrap_or(s);
+        s = s.trim_start_matches('0');
+    }
+    let mut c = s.chars();
+    match (c.next(), c.next()) {
+        (None, _) => true,
+        (Some(ch), None) => "Mkmunpf".contains(ch),
+        _ => false,
+    }
+}
+
 #[derive(Debug)]
 pub struct SdcError(pub String);
 impl std::fmt::Display for SdcError {
@@ -1823,6 +1870,14 @@ fn unevaluated_query(toks: &[String]) -> Option<String> {
         let known = KNOWN_QUERIES.contains(&cmd.as_str()) || cmd == "expr" || (matches!(cmd.as_str(), "lsearch" | "remove_from_collection") && all_ports_except(t).is_some());
         if !known {
             return Some(format!("[{}] (a command this reader does not evaluate)", inner.trim()));
+        }
+        // `check_path_divider`: an `-hsc` divider is ONE of the SDC dividers, or the query errors
+        if cmd.starts_with("get_") {
+            if let Some(v) = parts.iter().position(|p| p == "-hsc").map(|i| parts.get(i + 1).map_or("", String::as_str)) {
+                if !(v.chars().count() == 1 && "/@^#.|".contains(v)) {
+                    return Some(format!("[{}] (hierarchy separator must be one of '/@^#.|' (Error 342))", inner.trim()));
+                }
+            }
         }
         if cmd.starts_with("get_") && parts.iter().any(|p| NEEDS_DESIGN.contains(&p.as_str())) {
             match with_design(|d| crate::sdc_query::eval(&parts, d)) {
@@ -3245,6 +3300,10 @@ impl Sdc {
                     // stays in the library's units. Applied as a scale, `set_units -time ps` on an
                     // ns library turned a 10 ns period into 0.01. Kept, for a consumer to check
                     // against its library.
+                    if let Err(why) = check_units(&toks) {
+                        sdc.rejected.push(format!("{}: {why}; not applied", toks[0]));
+                        continue;
+                    }
                     let mut k = 1;
                     while k + 1 < toks.len() {
                         if toks[k].starts_with('-') {
@@ -3391,6 +3450,14 @@ impl Sdc {
                     let default = objs.iter().any(|o| o == "*INPUTS*" || o == "*OUTPUTS*");
                     let ports: Vec<String> = objs.into_iter().filter(|o| !SENTINELS.contains(&o.as_str())).collect();
                     let valued = |f: &str| with.iter().find(|(k, _)| *k == f).and_then(|(_, v)| resolve_objs(v).into_iter().next());
+                    // `get_port_pin_error`: against a linked design the reference pin is a port or
+                    // an instance pin of it, else the command errors
+                    if let Some(r) = valued("-reference_pin") {
+                        if with_design(|d| d.has_port_or_pin(&r)) == Some(false) {
+                            sdc.rejected.push(format!("{}: -reference_pin: pin {r} not found (Error 130); not applied", toks[0]));
+                            continue;
+                        }
+                    }
                     let d = IoDelay {
                         value: val,
                         value_read: read.is_some(),
@@ -3443,6 +3510,11 @@ impl Sdc {
                     sdc.ignored.push("set_clock_transition".to_string());
                 }
                 "set_clock_latency" => {
+                    // `set_clock_latency`: `-early`/`-late` qualify a SOURCE latency only
+                    if toks.iter().any(|t| t == "-early" || t == "-late") && !toks.iter().any(|t| t == "-source") {
+                        sdc.rejected.push("set_clock_latency: -early/-late is only allowed with -source (Error 410); not applied".into());
+                        continue;
+                    }
                     if let Some(e) = env_cmd(&toks).map(|e| sdc.clocks_now(e)) {
                         // `Sdc::setClockLatency`: a NETWORK latency (not `-source`) removes
                         // `set_propagated_clock` on the same clock or pin — the later one wins
@@ -3572,6 +3644,12 @@ impl Sdc {
                 }
                 "set_disable_timing" | "unset_disable_timing" => {
                     match arc_cmd(&toks, &["-from", "-to"], &[]) {
+                        // `parse_disable_inst_ports`: on instances or library cells `-from`/`-to` is
+                        // a PORT NAME of the cell; an object query there evaluates to an object, whose
+                        // name is never a port name, so the reference errors (Error 431)
+                        Ok(c) if matches!(c.written.accessor.as_str(), "get_cells" | "get_lib_cells") && c.keys.iter().any(|(_, v)| v.starts_with('[')) => {
+                            sdc.rejected.push(format!("{}: -from/-to on cells is a port name, not an object (the reference's Error 431); not applied", toks[0]));
+                        }
                         Ok(c) => sdc.disabled_timing.push(c),
                         Err(why) => sdc.rejected.push(why),
                     }
@@ -3627,6 +3705,11 @@ impl Sdc {
                     // design's late derate.
                     let (_, flags, pos) = split_args(&toks, &[]);
                     let has = |f: &str| flags.iter().any(|x| x == f);
+                    // `parse_early_late_flags`: the two are exclusive (both = an error, not both)
+                    if has("-early") && has("-late") {
+                        sdc.rejected.push("set_timing_derate: only one of -early and -late can be specified (Error 110); not applied".into());
+                        continue;
+                    }
                     let Some(value) = pos.first().and_then(|v| v.parse::<f64>().ok()) else {
                         sdc.rejected.push("set_timing_derate without a value".into());
                         continue;
@@ -5821,5 +5904,125 @@ mod arc_tests {
         assert_eq!(s.rejected.len(), 1);
         let w = s.write(&crate::sdc_write::WriteOpts::default()).text;
         assert!(w.contains("set_disable_clock_gating_check [get_pins {cg1/B}]"), "{w}");
+    }
+}
+
+/// Commands the reference errors on (OpenSTA `sdc/Sdc.tcl`, `tcl/CmdArgs.tcl` at cc9027d6) and this
+/// reader once applied: found by the SDC spec matrix as LENIENT, each now rejected with the reason.
+#[cfg(test)]
+mod reference_error_tests {
+    use super::*;
+    use crate::liberty::LibGroups;
+
+    const CLK: &str = "create_clock -name clk -period 10 [get_ports clk]\n";
+
+    fn rejected(text: &str) -> Vec<String> {
+        Sdc::parse(&format!("{CLK}{text}\n")).unwrap().rejected
+    }
+
+    fn rejected_with(text: &str, d: &SdcDesign) -> Vec<String> {
+        Sdc::parse_with(&format!("{CLK}{text}\n"), d).unwrap().rejected
+    }
+
+    fn design() -> SdcDesign {
+        SdcDesign {
+            ports: vec![("clk".into(), "input".into()), ("din".into(), "input".into())],
+            insts: vec![("r".into(), "DFF".into())],
+            pins: vec![(0, "D".into(), "input".into(), Some("din".into())), (0, "CK".into(), "input".into(), Some("clk".into()))],
+            libs: vec![LibGroups {
+                name: "seq_demo".into(),
+                operating_conditions: vec!["tt".into()],
+                wire_loads: vec!["small".into()],
+                wire_load_selections: vec!["sel".into()],
+            }],
+        }
+    }
+
+    fn one(r: &[String], needle: &str) {
+        assert!(r.len() == 1 && r[0].contains(needle), "{r:?}");
+    }
+
+    /// Rule (`check_path_divider`): an `-hsc` divider is one character of `/@^#.|` (Error 342).
+    #[test]
+    fn an_hsc_divider_outside_the_sdc_set_is_refused() {
+        let s = Sdc::parse(&format!("{CLK}set_false_path -to [get_pins -hsc 1 r/D]\n")).unwrap();
+        assert!(s.exceptions.is_empty() && s.rejected.iter().any(|r| r.contains("Error 342")), "{:?}", s.rejected);
+        let s = Sdc::parse(&format!("{CLK}set_false_path -to [get_pins -hsc | r|D]\n")).unwrap();
+        assert!(!s.rejected.iter().any(|r| r.contains("Error 342")), "{:?}", s.rejected);
+    }
+
+    /// Rule (`set_units` / `check_unit`): the value ends in the unit's suffix, case aside (501), and
+    /// what precedes it is `[1 0* .? 0*][M k m u n p f]` (343).
+    #[test]
+    fn a_unit_without_its_suffix_or_with_an_unknown_prefix_is_refused() {
+        one(&rejected("set_units -time 1"), "Error 501");
+        one(&rejected("set_units -capacitance 1pX"), "Error 501");
+        one(&rejected("set_units -time 2ns"), "Error 343");
+        // the suffix is matched without case, the prefix is not
+        one(&rejected("set_units -time 1.0NS"), "Error 343");
+        for ok in ["set_units -time ns", "set_units -time 1.0ns", "set_units -time nS", "set_units -capacitance 1pF", "set_units -resistance kohm", "set_units -time 100ps"] {
+            assert!(rejected(ok).is_empty(), "{ok}: {:?}", rejected(ok));
+        }
+    }
+
+    /// Rule (`set_clock_latency`): `-early`/`-late` only with `-source` (Error 410).
+    #[test]
+    fn an_early_late_network_latency_is_refused() {
+        one(&rejected("set_clock_latency -early 1 [get_clocks clk]"), "Error 410");
+        assert!(rejected("set_clock_latency -source -early 1 [get_clocks clk]").is_empty());
+    }
+
+    /// Rule (`parse_early_late_flags`): `-early` and `-late` together are an error (Error 110).
+    #[test]
+    fn a_derate_both_early_and_late_is_refused() {
+        let s = Sdc::parse(&format!("{CLK}set_timing_derate -late -early 0.9\n")).unwrap();
+        assert!(s.late_derate.is_none() && s.early_derate.is_none());
+        one(&s.rejected, "Error 110");
+    }
+
+    /// Rule (`set_clock_gating_check1`): with -high/-low, a clock among the objects is an error (399).
+    #[test]
+    fn a_high_low_gating_check_on_a_clock_is_refused() {
+        one(&rejected("set_clock_gating_check -high -setup 0.1 [get_clocks clk]"), "Error 399");
+        assert!(rejected("set_clock_gating_check -high -setup 0.1 [get_pins r/CK]").is_empty());
+    }
+
+    /// Rule (`parse_op_cond`, `set_wire_load_model`, `set_wire_load_selection_group`): the group is
+    /// looked up by name in the `-library` library (one, found by name: Errors 113/115), else in
+    /// every library; not found is 474 in a named library, 475 otherwise; 480 and 481 either way.
+    #[test]
+    fn a_library_group_the_libraries_lack_is_refused() {
+        let d = design();
+        one(&rejected_with("set_operating_conditions typical", &d), "Error 475");
+        one(&rejected_with("set_operating_conditions -library seq_demo typical", &d), "Error 474");
+        one(&rejected_with("set_operating_conditions -max typical", &d), "Error 475");
+        one(&rejected_with("set_operating_conditions -library nolib tt", &d), "Error 115");
+        one(&rejected_with("set_wire_load_model -name wl", &d), "Error 480");
+        one(&rejected_with("set_wire_load_model -name wl -library [get_libs seq_demo]", &d), "Error 480");
+        one(&rejected_with("set_wire_load_selection_group sg", &d), "Error 481");
+        for ok in ["set_operating_conditions tt", "set_operating_conditions -library seq_demo -max tt -max_library seq_demo", "set_wire_load_model -name small -library seq_demo", "set_wire_load_selection_group sel"] {
+            assert!(rejected_with(ok, &d).is_empty(), "{ok}: {:?}", rejected_with(ok, &d));
+        }
+        // no library read: not checked
+        assert!(rejected("set_operating_conditions typical").is_empty());
+    }
+
+    /// Rule (`get_port_pin_error`): a `-reference_pin` the design lacks is an error (Error 130).
+    #[test]
+    fn a_reference_pin_the_design_lacks_is_refused() {
+        let d = design();
+        one(&rejected_with("set_input_delay -reference_pin 1 1 -clock clk [get_ports din]", &d), "Error 130");
+        assert!(rejected_with("set_input_delay -reference_pin [get_pins r/CK] 1 -clock clk [get_ports din]", &d).is_empty());
+    }
+
+    /// Rule (`parse_disable_inst_ports`): on cells, `-from`/`-to` is a port NAME; an object there
+    /// is never one, so the reference errors (Error 431).
+    #[test]
+    fn a_disable_timing_from_object_on_cells_is_refused() {
+        let s = Sdc::parse(&format!("{CLK}set_disable_timing -from [get_ports din] [get_cells r]\n")).unwrap();
+        assert!(s.disabled_timing.is_empty());
+        one(&s.rejected, "Error 431");
+        let s = Sdc::parse(&format!("{CLK}set_disable_timing -from D -to Q [get_cells r]\n")).unwrap();
+        assert_eq!(s.disabled_timing.len(), 1, "{:?}", s.rejected);
     }
 }

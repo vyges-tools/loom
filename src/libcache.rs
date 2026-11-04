@@ -15,11 +15,12 @@
 //! in-process cache) mean a changed library is a different entry — never a stale read.
 
 use crate::ccs::{CcsArc, CcsWaveform};
-use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, Lvf, OutEdges, Pin, PinCaps, RecvCap, Table};
+use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, LibGroups, Lvf, OutEdges, Pin, PinCaps, RecvCap, Table};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLCM"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLCN"; // Vyges Liberty Cache — bump the trailing digit on any format change
+                                 // VLCN: Lib gained `libraries` (name + operating_conditions, wire_load, wire_load_selection names).
                                  // VLCM: LVF early/late sigma and moments (Arc, Constraint).
                                  // VLCL: Cell gained `ports`.
                                  // VLCJ: Pin gained `clock_tree_paths`, Cell `is_macro`.
@@ -637,6 +638,16 @@ pub fn encode(lib: &Lib) -> Vec<u8> {
     ] {
         w.f64(v);
     }
+    w.u64(lib.libraries.len() as u64);
+    for g in &lib.libraries {
+        w.s(&g.name);
+        for names in [&g.operating_conditions, &g.wire_loads, &g.wire_load_selections] {
+            w.u64(names.len() as u64);
+            for n in names {
+                w.s(n);
+            }
+        }
+    }
     w.u64(lib.cells.len() as u64);
     for (k, c) in &lib.cells {
         w.s(k);
@@ -666,6 +677,14 @@ pub fn decode(bytes: &[u8]) -> Option<Lib> {
         slew_derate: r.f64()?,
     };
     let n = r.u64()? as usize;
+    let mut libraries = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name = r.s()?;
+        let mut names = || -> Option<Vec<String>> { (0..r.u64()?).map(|_| r.s()).collect() };
+        let (operating_conditions, wire_loads, wire_load_selections) = (names()?, names()?, names()?);
+        libraries.push(LibGroups { name, operating_conditions, wire_loads, wire_load_selections });
+    }
+    let n = r.u64()? as usize;
     let mut cells = BTreeMap::new();
     for _ in 0..n {
         let k = r.s()?;
@@ -676,6 +695,7 @@ pub fn decode(bytes: &[u8]) -> Option<Lib> {
         units,
         voltage,
         thresholds,
+        libraries,
     })
 }
 
@@ -893,6 +913,7 @@ library (neg) {
             assert_eq!(back.cells[cn].ports, c.ports, "{cn} ports lost across the cache");
         }
         assert!((back.voltage - lib.voltage).abs() < 1e-12);
+        assert_eq!(back.libraries, lib.libraries);
         assert_eq!(back.units, lib.units, "units lost across the cache");
         // Thresholds must survive the cache. A field parsed but not encoded works on the
         // FIRST load and silently reverts to the default on every one after — the worst

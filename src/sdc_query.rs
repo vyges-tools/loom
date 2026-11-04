@@ -37,6 +37,9 @@ pub struct SdcDesign {
     pub insts: Vec<(String, String)>,
     /// Instance pins: `(instance index, pin, direction, net)`.
     pub pins: Vec<(usize, String, String, Option<String>)>,
+    /// The libraries read, in read order, with the group names SDC looks up. Empty when no
+    /// library was given: a lookup is then not checked.
+    pub libs: Vec<crate::liberty::LibGroups>,
 }
 
 fn dir_name(d: Dir, tristate: bool) -> &'static str {
@@ -71,7 +74,12 @@ impl SdcDesign {
                 pins.push((k, p.clone(), dir(p), None));
             }
         }
-        SdcDesign { ports, insts, pins }
+        SdcDesign { ports, insts, pins, libs: lib.map(|l| l.libraries.clone()).unwrap_or_default() }
+    }
+
+    /// `name` is one of the design's ports or instance pins.
+    pub(crate) fn has_port_or_pin(&self, name: &str) -> bool {
+        self.ports.iter().any(|(p, _)| p == name) || (0..self.pins.len()).any(|k| self.pin_name(k) == name)
     }
 
     fn pin_name(&self, k: usize) -> String {

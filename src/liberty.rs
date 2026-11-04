@@ -695,6 +695,19 @@ pub struct Lib {
     /// builds a *waveform* from a Liberty slew: the number is only meaningful together
     /// with the two percentage points it was measured between.
     pub thresholds: Thresholds,
+    /// Each library read into this one, in read order (this file's first, then each merged one):
+    /// its name and the library-level groups SDC names (`set_operating_conditions`,
+    /// `set_wire_load_model`, `set_wire_load_selection_group` look them up by name).
+    pub libraries: Vec<LibGroups>,
+}
+
+/// One library's name and the names of its library-level groups SDC refers to.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LibGroups {
+    pub name: String,
+    pub operating_conditions: Vec<String>,
+    pub wire_loads: Vec<String>,
+    pub wire_load_selections: Vec<String>,
 }
 
 /// Waveform measurement conventions declared in the library header.
@@ -2610,12 +2623,17 @@ impl Lib {
     fn parse_lexed(text: &str, opts: LibOpts) -> Result<Lib, LibError> {
         // The library group, read once at its own level: its attributes, its templates, its
         // cells. A file with no `library` group is read as if its body were one.
-        let lib_body = top_group_spans(text)
-            .into_iter()
-            .find(|g| g.kw == "library")
-            .map(|g| &text[g.body])
-            .unwrap_or(text);
+        let lib_group = top_group_spans(text).into_iter().find(|g| g.kw == "library");
+        let lib_name = lib_group.as_ref().map(|g| g.args.clone()).unwrap_or_default();
+        let lib_body = lib_group.map(|g| &text[g.body]).unwrap_or(text);
         let (lib_own, lib_spans) = level(lib_body);
+        let named = |kw: &str| lib_spans.iter().filter(|g| g.kw == kw).map(|g| g.args.clone()).collect::<Vec<String>>();
+        let groups = LibGroups {
+            name: lib_name,
+            operating_conditions: named("operating_conditions"),
+            wire_loads: named("wire_load"),
+            wire_load_selections: named("wire_load_selection"),
+        };
         let units = Units::from_lib(&lib_own);
         let voltage = lib_voltage(&lib_own, text).unwrap_or(1.8);
         let thresholds = Thresholds::from_lib(&lib_own);
@@ -2639,6 +2657,7 @@ impl Lib {
             units: units.timing,
             voltage,
             thresholds,
+            libraries: vec![groups],
         })
     }
 
@@ -2687,6 +2706,7 @@ impl Lib {
             self.voltage = other.voltage;
         }
         other.rescale_to(self.units);
+        self.libraries.append(&mut other.libraries);
         let own = (other.thresholds != self.thresholds).then_some(other.thresholds);
         for (k, mut v) in other.cells {
             if v.thresholds.is_none() {

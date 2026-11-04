@@ -20,6 +20,7 @@
 //! reference never made.
 
 use super::{brace_word, exception_args, Objects, Sdc};
+use crate::liberty::LibGroups;
 
 /// The commands kept as [`KeptCmd`], each with the reference's keys (`-name value`), the keys
 /// whose value names objects, its flags, and how many positionals it takes (`min`, `max`) and
@@ -282,6 +283,15 @@ fn check(c: &KeptCmd) -> Result<(), String> {
             if (c.has("-high") || c.has("-low")) && c.args.is_empty() {
                 return Err("-high and -low only permitted for pins and instances (Error 398)".into());
             }
+            // `set_clock_gating_check1`: an object list holding a clock is refused with -high/-low
+            let clocks = |o: &Objects| matches!(o.accessor.as_str(), "get_clocks" | "all_clocks");
+            let holds_clock = c.args.iter().any(|a| match a {
+                KeptArg::Objects(o) => clocks(o) || o.items.iter().any(clocks),
+                KeptArg::Word(_) => false,
+            });
+            if (c.has("-high") || c.has("-low")) && holds_clock {
+                return Err("-high and -low only permitted for pins and instances (Error 399)".into());
+            }
             Ok(())
         }
         "set_data_check" | "unset_data_check" => {
@@ -298,13 +308,73 @@ fn check(c: &KeptCmd) -> Result<(), String> {
             Some("top" | "enclosed" | "segmented") => Ok(()),
             _ => Err("mode must be top, enclosed or segmented (Error 478)".into()),
         },
-        "set_wire_load_model" if c.key("-name").is_none() => Err("no wire load model specified (Error 479)".into()),
-        "set_operating_conditions" => match key("-analysis_type") {
-            None | Some("single" | "bc_wc" | "on_chip_variation") => Ok(()),
-            Some(_) => Err("-analysis_type must be single, bc_wc or on_chip_variation (Error 476)".into()),
+        "set_wire_load_model" => match key("-name") {
+            None => Err("no wire load model specified (Error 479)".into()),
+            Some(m) => lib_lookup(c, "-library", m, |g| &g.wire_loads, 480, 480, "wire load model"),
         },
+        "set_wire_load_selection_group" => match arg(0) {
+            Some(g) => lib_lookup(c, "-library", g, |l| &l.wire_load_selections, 481, 481, "wire load selection group"),
+            None => Ok(()),
+        },
+        "set_operating_conditions" => {
+            match key("-analysis_type") {
+                None | Some("single" | "bc_wc" | "on_chip_variation") => {}
+                Some(_) => return Err("-analysis_type must be single, bc_wc or on_chip_variation (Error 476)".into()),
+            }
+            // the positional, then -min, then -max, each in its own library key's library
+            for (name, lib_key) in [(arg(0), "-library"), (key("-min"), "-min_library"), (key("-max"), "-max_library")] {
+                if let Some(n) = name {
+                    lib_lookup(c, lib_key, n, |g| &g.operating_conditions, 474, 475, "operating condition")?;
+                }
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
+}
+
+/// A library-level group looked up by name as the reference does (`parse_op_cond`,
+/// `set_wire_load_model`, `set_wire_load_selection_group` in its `Sdc.tcl`): in the `lib_key`
+/// library when given (`get_liberty_error`: one library, found by name), else the first library
+/// that has it. Not checked when no library was read.
+fn lib_lookup(
+    c: &KeptCmd,
+    lib_key: &str,
+    name: &str,
+    names: fn(&LibGroups) -> &Vec<String>,
+    err_in_lib: u32,
+    err_any: u32,
+    what: &str,
+) -> Result<(), String> {
+    let lib_arg: Option<Vec<String>> = c.key(lib_key).map(|a| match a {
+        KeptArg::Word(w) if w.starts_with('[') => super::resolve_objs(w),
+        KeptArg::Word(w) => w.split_whitespace().map(String::from).collect(),
+        KeptArg::Objects(o) => o.names.clone(),
+    });
+    super::with_design(|d| {
+        if d.libs.is_empty() {
+            return Ok(());
+        }
+        match &lib_arg {
+            Some(libs) => {
+                if libs.len() > 1 {
+                    return Err("library must be a single library (Error 113)".to_string());
+                }
+                let l = libs.first().map_or("", String::as_str);
+                let Some(lib) = d.libs.iter().find(|g| g.name == l) else {
+                    return Err(format!("library '{l}' not found (Error 115)"));
+                };
+                if names(lib).iter().any(|n| n == name) {
+                    Ok(())
+                } else {
+                    Err(format!("{what} '{name}' not found (Error {err_in_lib})"))
+                }
+            }
+            None if d.libs.iter().any(|g| names(g).iter().any(|n| n == name)) => Ok(()),
+            None => Err(format!("{what} '{name}' not found (Error {err_any})")),
+        }
+    })
+    .unwrap_or(Ok(()))
 }
 
 /// `toks` read as the reference reads the command, or why the reference refuses it.
