@@ -35,6 +35,7 @@
 use std::collections::HashMap;
 
 mod kept;
+pub mod registry;
 mod scope;
 mod tcl;
 
@@ -1086,6 +1087,33 @@ impl Sdc {
         }
         out
     }
+}
+
+impl Sdc {
+    /// Every command read that is kept and written back but applied by no checker or timer here
+    /// ([`registry::Status::Kept`]), with how many times, in first-seen order. `vyges-sdc check`
+    /// reports each, so a file is not called clean while one of these goes unapplied.
+    pub fn kept_not_applied(&self) -> Vec<KeptNotApplied> {
+        let mut out: Vec<KeptNotApplied> = Vec::new();
+        for c in self.ignored.iter().filter(|c| registry::kept_not_applied(c)) {
+            match out.iter_mut().find(|k| &k.command == c) {
+                Some(k) => k.count += 1,
+                None => out.push(KeptNotApplied { command: c.clone(), count: 1, affects_timing: !BENIGN_FOR_TIMING.contains(&c.as_str()) }),
+            }
+        }
+        out
+    }
+}
+
+/// One kind of command kept and written back but applied by nothing here — see
+/// [`Sdc::kept_not_applied`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptNotApplied {
+    /// The command (or `command -option`), as the reader names it.
+    pub command: String,
+    pub count: usize,
+    /// Whether applying it could move a slack (everything not in [`BENIGN_FOR_TIMING`]).
+    pub affects_timing: bool,
 }
 
 /// Kinds the reader models but ALSO lists in [`Sdc::ignored`], for a consumer that does not model

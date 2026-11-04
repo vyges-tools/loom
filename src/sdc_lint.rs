@@ -534,6 +534,7 @@ pub fn lint_with_meta(
     });
 
     not_applied_findings(sdc, &mut f);
+    kept_not_applied_findings(sdc, &mut f);
     braced_variable_findings(sdc, &mut f);
     f.sort_by(|a, b| (a.severity as u8, a.code).cmp(&(b.severity as u8, b.code)));
     LintReport { findings: f }
@@ -692,6 +693,22 @@ fn not_applied_findings(sdc: &Sdc, f: &mut Vec<Finding>) {
     }
 }
 
+/// One finding per kind of command kept and written back that no checker or timer here applies
+/// ([`Sdc::kept_not_applied`]): a WARNING when applying it could move a slack, so the report is not
+/// called clean while it goes unapplied, and INFO when it could not (a power or area directive).
+/// Never an error: the command was read as the reference reads it, and `write` writes it back.
+fn kept_not_applied_findings(sdc: &Sdc, f: &mut Vec<Finding>) {
+    for k in sdc.kept_not_applied() {
+        let times = if k.count == 1 { String::new() } else { format!(" ({} commands)", k.count) };
+        let (severity, tail) = if k.affects_timing {
+            (Severity::Warning, "it can change timing, and no checker or timer here applies it")
+        } else {
+            (Severity::Info, "no checker or timer here applies it (no effect on timing)")
+        };
+        f.push(Finding { severity, code: "sdc-kept-not-applied", message: format!("`{}`{times}: kept and written back; {tail}", k.command) });
+    }
+}
+
 /// The checks that need no design: what the reader could not apply ([`Sdc::not_applied`]) and
 /// the clock definitions themselves (a non-positive period, one name defined twice). Every
 /// structural check — I/O coverage, clock reach, exception reachability, endpoint coverage —
@@ -744,6 +761,7 @@ pub fn lint_without_design(sdc: &Sdc) -> LintReport {
         }
     }
     not_applied_findings(sdc, &mut f);
+    kept_not_applied_findings(sdc, &mut f);
     braced_variable_findings(sdc, &mut f);
     f.push(Finding {
         severity: Severity::Info,
@@ -1085,6 +1103,31 @@ mod tests {
         assert_eq!(f.len(), 1, "{:?}", r.findings);
         assert_eq!(f[0].severity, Severity::Error);
         assert!(f[0].message.contains("set_assigned_delay"), "{}", f[0].message);
+    }
+
+    /// A command kept and written back that no checker or timer here applies is REPORTED, with its
+    /// count: a warning when applying it could move a slack (SDC's `set_clock_gating_check` adds a
+    /// setup/hold check on a gating enable), info when it could not (`set_max_area` steers
+    /// synthesis). Never an error, and never silence: before this, a file of kept-only commands
+    /// came back CLEAN. A command a timer here applies (`set_data_check`, by sta-si) is not one.
+    #[test]
+    fn a_kept_command_nothing_applies_is_reported_with_its_count() {
+        let text = format!(
+            "{CLEAN}set_clock_gating_check -setup 0.1 [get_clocks clk]\nset_clock_gating_check -hold 0.1 [get_clocks clk]\n\
+             set_max_area 0\nset_data_check -from [get_pins u1/A] -to [get_pins u2/A] 0.1\n"
+        );
+        let sdc = Sdc::parse(&text).unwrap();
+        let r = lint(&nl(), &sdc, &lib());
+        assert_eq!(r.errors(), 0, "{:?}", r.findings);
+        let f: Vec<_> = r.findings.iter().filter(|f| f.code == "sdc-kept-not-applied").collect();
+        assert_eq!(f.len(), 2, "{:?}", r.findings);
+        assert_eq!(f[0].severity, Severity::Warning);
+        assert!(f[0].message.contains("`set_clock_gating_check` (2 commands)"), "{}", f[0].message);
+        assert_eq!(f[1].severity, Severity::Info);
+        assert!(f[1].message.contains("`set_max_area`"), "{}", f[1].message);
+        // and without a design too
+        let r = lint_without_design(&sdc);
+        assert_eq!(r.findings.iter().filter(|f| f.code == "sdc-kept-not-applied").count(), 2, "{:?}", r.findings);
     }
 
     /// A query that needs the design and was not evaluated is a rejected command: an error too.
