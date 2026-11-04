@@ -2,8 +2,7 @@
 //! it (`src/sdc/tcl.rs`): procs that `return` a value or reach their caller with `upvar`, `dict`
 //! tables, `foreach_in_collection`, the tool-name test, `remove_*` / `reset_*`, abbreviations.
 //!
-//! The fixture is written here, in the style such files take (second field review, 2026-11: the
-//! largest group of field files the reader stopped on); it is no tool's output.
+//! The fixture is written here, in the style such files take; it is no tool's output.
 
 use vyges_loom::sdc::{ReadOpts, Sdc};
 
