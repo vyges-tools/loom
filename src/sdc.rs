@@ -6276,6 +6276,22 @@ mod reference_error_tests {
         assert!(r.len() == 1 && r[0].contains(needle), "{r:?}");
     }
 
+    /// Rule (`parse_key_args`, the reference's `tcl/Util.tcl`): a short option is the FIRST key
+    /// whose name it begins, keys tried before flags, with no ambiguity check. So `get_cells -h`
+    /// is `-hsc` (a key), not `-hierarchical` (a flag): its pattern becomes the divider, which is
+    /// Error 342 there and here (the pinned OpenSTA stops `read_sdc` at it; this reader refuses
+    /// the command and reads on, as at every reference error). The public SDC parser instead calls
+    /// `-h` ambiguous (two options begin with it): refused either way. `-hi` is `-hierarchical`.
+    #[test]
+    fn a_short_h_is_the_hsc_key_as_the_reference_reads_it() {
+        let s = Sdc::parse(&format!("{CLK}set_false_path -to [get_cells -h *u_pad*]\n")).unwrap();
+        assert!(s.exceptions.is_empty(), "{:?}", s.exceptions);
+        assert_eq!(s.rejected.len(), 1, "{:?}", s.rejected);
+        assert!(s.rejected[0].contains("hierarchy separator must be one of '/@^#.|' (Error 342)"), "{:?}", s.rejected);
+        let s = Sdc::parse(&format!("{CLK}set_false_path -to [get_cells -hi *u_pad*]\n")).unwrap();
+        assert!(!s.rejected.iter().any(|r| r.contains("Error 342")), "{:?}", s.rejected);
+    }
+
     /// Rule (`check_path_divider`): an `-hsc` divider is one character of `/@^#.|` (Error 342).
     #[test]
     fn an_hsc_divider_outside_the_sdc_set_is_refused() {
