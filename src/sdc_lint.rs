@@ -1181,6 +1181,8 @@ mod tests {
         );
         assert_eq!(r.errors(), 0, "{:?}", r.findings);
         assert!(s.senses.is_empty());
+        // refused, so not also counted as kept
+        assert!(s.kept_not_applied().is_empty(), "{:?}", s.kept_not_applied());
     }
 
     /// A command kept and written back that no checker or timer here applies is REPORTED, with its

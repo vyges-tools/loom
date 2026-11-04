@@ -235,7 +235,7 @@ pub const OTHER_COMMANDS: &[Command] = &[
     cmd("get_designs", Status::NotApplied, NONE, "set_false_path -through [get_designs top]"),
     cmd("get_object_name", Applied, R, "set_false_path -to [get_object_name [get_ports y]]"),
     cmd("index_collection", Status::NotApplied, NONE, "set_false_path -to [index_collection [get_ports y] 0]"),
-    cmd("load_of", Status::NotApplied, NONE, "set_load [load_of lib/BUF/A] [get_ports y]"),
+    note("with the libraries and a netlist: the library pin's capacitance; without them, not applied", cmd("load_of", Status::NotApplied, NONE, "set_load [load_of lib/BUF/A] [get_ports y]")),
     note("only as every input or output but some, the objects of an I/O delay", cmd("remove_from_collection", Applied, R, "set_input_delay 1 -clock c [remove_from_collection [all_inputs] [get_ports clk]]")),
     cmd("remove_propagated_clock", Applied, R, "remove_propagated_clock [get_clocks c]"),
     cmd("set_clock_jitter", Unhandled, NONE, "set_clock_jitter -cycle 0.1 [get_clocks c]"),

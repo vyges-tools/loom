@@ -1826,7 +1826,10 @@ fn subst_load_of(line: &str) -> String {
                     let arg = inner.trim().trim_matches(|c| c == '{' || c == '}').to_string();
                     if !arg.contains(['[', ' ']) {
                         if let Some(Ok(cap)) = with_design(|d| d.load_of(&arg)) {
-                            out.push_str(&cap.to_string());
+                            // the library holds capacitances as floats (as the reference's
+                            // Liberty reader does): written in the float's shortest form, the
+                            // library's own text (`0.0015`, not `0.001500000013038516`)
+                            out.push_str(&(cap as f32).to_string());
                             i += "[load_of ".len() + inner.len() + 1;
                             continue;
                         }
@@ -3975,16 +3978,18 @@ impl Sdc {
                     sdc.ignored.push(toks[0].clone());
                 }
                 "set_sense" | "set_clock_sense" => {
+                    // listed in `ignored` (so kept-not-applied) only when read: a refused one
+                    // is counted once, as not applied
                     match sense_cmd(&toks) {
                         Ok((c, defaulted)) => {
                             if defaulted {
                                 sdc.senses_type_defaulted.push(sdc.senses.len());
                             }
-                            sdc.senses.push(c)
+                            sdc.senses.push(c);
+                            sdc.ignored.push(toks[0].clone());
                         }
                         Err(why) => sdc.rejected.push(why),
                     }
-                    sdc.ignored.push(toks[0].clone());
                 }
                 "set_disable_clock_gating_check" | "unset_disable_clock_gating_check" => {
                     match arc_cmd(&toks, &[], &[]) {

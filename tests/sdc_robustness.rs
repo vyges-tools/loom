@@ -394,7 +394,8 @@ fn every_spec_command_is_either_modelled_or_classified() {
         }
         // A constraint is reviewed when injecting it produces a classification either way.
         let s = parse(&good_sdc(&format!("{c} 1.0 [get_ports a]\n")));
-        let affects = !s.ignored_affecting_timing().is_empty();
+        // a probe its command refuses is classified by the refusal: not applied, moving a slack
+        let affects = !s.ignored_affecting_timing().is_empty() || s.not_applied().iter().any(|n| n.command == c && n.affects_timing);
         let benign = vyges_loom::sdc::BENIGN_FOR_TIMING.contains(&c);
         if !affects && !benign {
             unreviewed.push(c);
