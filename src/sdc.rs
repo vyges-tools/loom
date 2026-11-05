@@ -1976,9 +1976,20 @@ fn expand_abbreviations(mut toks: Vec<String>) -> Vec<String> {
         k += 1;
     }
     // SDC spellings the model reads as another: the parser's `-substract_pin_load` is
-    // `-subtract_pin_load`; `get_ports -hierarchical` is `get_ports` (a port is at the top level,
-    // with no hierarchy below it to search), so the flag selects nothing more and is not kept
+    // `-subtract_pin_load`, and its `set_false_path -rise_throough` / `-fall_throough` (SDC 1.7
+    // on) are `-rise_through` / `-fall_through`; `get_ports -hierarchical` is `get_ports` (a port
+    // is at the top level, with no hierarchy below it to search), so the flag selects nothing
+    // more and is not kept
     match toks[0].as_str() {
+        "set_false_path" => {
+            for t in toks.iter_mut() {
+                match t.as_str() {
+                    "-rise_throough" => *t = "-rise_through".into(),
+                    "-fall_throough" => *t = "-fall_through".into(),
+                    _ => {}
+                }
+            }
+        }
         "set_load" => {
             for t in toks.iter_mut().filter(|t| *t == "-substract_pin_load") {
                 *t = "-subtract_pin_load".into();

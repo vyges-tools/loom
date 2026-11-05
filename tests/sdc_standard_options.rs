@@ -287,3 +287,18 @@ fn reference_extensions_are_named_at_info_level() {
     let s = read("set_input_delay 1 -clock c [get_ports -filter {direction==in} -quiet *]\nset_false_path -to [get_pins -quiet -of_objects [get_cells u1]]\nset_load -rise 0.1 [get_ports y]");
     assert!(s.extensions.is_empty(), "newer vendor SDC 1.8 options named as extensions: {:?}", s.extensions);
 }
+
+/// SDC 1.7 on declares `set_false_path -rise_throough` / `-fall_throough`, the public parser's
+/// spelling of `-rise_through` / `-fall_through`: read as them, applied, and written in the
+/// usual spelling.
+#[test]
+fn the_parsers_throough_spelling_is_through() {
+    for (o, as_) in [("-rise_throough", "-rise_through"), ("-fall_throough", "-fall_through")] {
+        let s = accepted(&format!("set_false_path {o} [get_pins u1/A] -to [get_ports y]"), &[]);
+        assert_eq!(s.exceptions.len(), 1, "{o}");
+        let text = written(&s);
+        assert!(text.contains(&format!("{as_} [get_pins {{u1/A}}]")), "{o}: {text}");
+        // and the coverage table lists it as a standard option the reference timer lacks
+        assert!(vyges_loom::sdc::registry::standard_options().iter().any(|(c, x, _)| *c == "set_false_path" && *x == o), "{o}");
+    }
+}

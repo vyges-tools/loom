@@ -98,6 +98,8 @@ pub(crate) const STANDARD_ONLY: &[(&str, &[&str], &[&str])] = &[
     ("get_ports", &[], &["-hierarchical"]),
     ("set_data_check", &[], &["-rise", "-fall"]),
     ("set_driving_cell", &["-clock"], &["-clock_fall"]),
+    // the parser's own spelling (1.7 on) of `-rise_through` / `-fall_through`, read as them
+    ("set_false_path", &["-rise_throough", "-fall_throough"], &[]),
     ("set_input_delay", &[], &["-level_sensitive"]),
     // the parser's own spelling of `-subtract_pin_load`, read as it
     ("set_load", &[], &["-substract_pin_load"]),
