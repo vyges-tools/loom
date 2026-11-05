@@ -192,6 +192,114 @@ fn glob(pat: &str, s: &str) -> bool {
     i == p.len()
 }
 
+/// `escapeChars(token, chars…, '\\')`: each of `chars` gets a backslash before it; a character
+/// already escaped is kept as it is.
+fn escape_chars(token: &str, chars: &[char]) -> String {
+    let mut out = String::with_capacity(token.len());
+    let mut it = token.chars();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            out.push(c);
+            if let Some(n) = it.next() {
+                out.push(n);
+            }
+        } else {
+            if chars.contains(&c) {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// One scan of a `get_pins` pattern (`SdcNetwork::visitMatches`): at each divider not escaped,
+/// the path before it with its earlier dividers escaped, whether a bracket (not escaped) came
+/// before it, and the rest of the pattern after it; then the whole path, its dividers escaped.
+fn pin_pattern_splits(pattern: &str) -> (Vec<(String, bool, &str)>, String, bool) {
+    let mut splits = Vec::new();
+    let mut path = String::new();
+    let mut brackets = false;
+    let mut chars = pattern.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => {
+                path.push(c);
+                if let Some((_, n)) = chars.next() {
+                    path.push(n);
+                }
+            }
+            '/' => {
+                splits.push((path.clone(), brackets, &pattern[i + 1..]));
+                path.push_str("\\/");
+            }
+            _ => {
+                brackets |= c == '[' || c == ']';
+                path.push(c);
+            }
+        }
+    }
+    (splits, path, brackets)
+}
+
+/// `get_pins <pattern>` over a flat netlist, as the reference's SDC network finds pins
+/// (`SdcNetwork::findPinsMatching` -> `visitMatches` -> `visitPinTail`). The netlist's names keep
+/// the database's escapes (`out\[1\]$_DFF_P_`); SDC names, as `write_sdc` writes them, do not.
+///
+/// At each divider of the pattern not escaped, the path before it (earlier dividers escaped) is
+/// matched against the instance names as a `*` / `?` glob; when NO instance matches and a bracket
+/// came before the divider, the path with its brackets escaped is matched instead. In each
+/// instance matched, the rest of the pattern (its dividers escaped) is matched against the port
+/// names, and against each port name with its dividers escaped; when no port of that instance
+/// matches and the rest has a bracket, the rest with its brackets escaped is tried. A pattern
+/// with no divider names no pin (top ports are not pins). `pins`: `(instance, port)`; the
+/// matches are returned in that order. The pattern `*` alone is every pin. Bus ports (a pattern naming every bit of a bus) are not
+/// read: a cell port here is one bit.
+pub fn pins_matching(pattern: &str, insts: &[&str], pins: &[(usize, &str)]) -> Vec<usize> {
+    // `*` alone: every instance's pins.
+    if pattern == "*" {
+        return (0..pins.len()).collect();
+    }
+    let mut hit = vec![false; pins.len()];
+    let mut by_inst: Vec<Vec<usize>> = vec![Vec::new(); insts.len()];
+    for (j, &(k, _)) in pins.iter().enumerate() {
+        if let Some(v) = by_inst.get_mut(k) {
+            v.push(j);
+        }
+    }
+    let (splits, _, _) = pin_pattern_splits(pattern);
+    for (path, brackets, tail) in splits {
+        let mut matched: Vec<usize> = (0..insts.len()).filter(|&k| glob(&path, insts[k])).collect();
+        if matched.is_empty() && brackets {
+            let escaped = escape_chars(&path, &['[', ']']);
+            matched = (0..insts.len()).filter(|&k| glob(&escaped, insts[k])).collect();
+        }
+        // `visitMatches(child, tail)` on a leaf: no children, so its whole tail goes to
+        // `visitPinTail`.
+        let (_, tail_path, tail_brackets) = pin_pattern_splits(tail);
+        for k in matched {
+            let ports = &by_inst[k];
+            let port_hit = |t: &str, p: &str| glob(t, p) || glob(t, &escape_chars(p, &['/']));
+            let mut found = false;
+            for &j in ports {
+                if port_hit(&tail_path, pins[j].1) {
+                    hit[j] = true;
+                    found = true;
+                }
+            }
+            if !found && tail_brackets {
+                let escaped = escape_chars(&tail_path, &['[', ']']);
+                for &j in ports {
+                    if port_hit(&escaped, pins[j].1) {
+                        hit[j] = true;
+                    }
+                }
+            }
+        }
+    }
+    (0..pins.len()).filter(|&j| hit[j]).collect()
+}
+
 impl Exception {
     /// Does this exception's `-from` set cover `name`?
     pub fn from_matches(&self, name: &str) -> bool {
@@ -5064,6 +5172,34 @@ mod exception_check_tests {
         .unwrap();
         let got: Vec<(bool, bool)> = s.exceptions.iter().map(|e| (e.applies_to(false), e.applies_to(true))).collect();
         assert_eq!(got, [(true, true), (false, true), (true, false), (true, true), (true, true), (false, true)]);
+    }
+}
+
+#[cfg(test)]
+mod pin_match_tests {
+    use super::*;
+
+    /// Rules (SdcNetwork::visitMatches / visitPinTail, ParseBus escapeChars): the database keeps
+    /// `\[` `\]` in a name (`dpath.b_reg.out\[1\]$_DFFE_PP_`) and `write_sdc` drops them, so an
+    /// instance path with a bracket that matches no instance as written is matched again with
+    /// its brackets escaped — ONLY when the written form matches none (an instance literally
+    /// named `x[2]` keeps `x\[2\]` out). A divider no instance takes is escaped and the scan
+    /// goes on (`h/u1/A` is pin A of the flat `h\/u1`). The port part is a glob on the port
+    /// name; a pattern with no divider names no pin.
+    #[test]
+    fn a_pin_pattern_escapes_brackets_only_when_nothing_matches() {
+        let insts = ["dpath.b_reg.out\\[1\\]$_DFFE_PP_", "x[2]", "x\\[2\\]", "h\\/u1", "u1", "u2"];
+        let pins: Vec<(usize, &str)> = vec![(0, "D"), (0, "CLK"), (1, "D"), (2, "D"), (3, "A"), (4, "A"), (4, "Q[0]"), (5, "A")];
+        let m = |p: &str| pins_matching(p, &insts, &pins);
+        assert_eq!(m("dpath.b_reg.out[1]$_DFFE_PP_/D"), [0]);
+        assert_eq!(m("dpath.b_reg.out\\[1\\]$_DFFE_PP_/CLK"), [1], "already escaped: matched as written");
+        assert_eq!(m("x[2]/D"), [2], "the literal x[2] matches, so x\\[2\\] is not tried");
+        assert_eq!(m("h/u1/A"), [4]);
+        assert_eq!(m("u*/A"), [5, 7]);
+        assert_eq!(m("u1/Q[0]"), [6]);
+        assert_eq!(m("u1/*"), [5, 6]);
+        assert!(m("u1").is_empty() && m("nope/A").is_empty());
+        assert_eq!(m("*").len(), pins.len(), "`*` alone is every instance pin");
     }
 }
 
