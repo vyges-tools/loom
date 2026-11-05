@@ -108,7 +108,7 @@ pub(crate) const STANDARD_ONLY: &[(&str, &[&str], &[&str])] = &[
     ("set_operating_conditions", &["-object_list"], &[]),
     ("set_output_delay", &[], &["-level_sensitive"]),
     ("set_timing_derate", &[], &["-min", "-max"]),
-    // SDC 1.1 to 1.9 name the group with `-group_name`; 2.0 makes it the positional
+    // SDC 1.1 and 1.2 name the group with `-group_name`; 1.3 on make it the positional
     ("set_wire_load_selection_group", &["-group_name"], &[]),
 ];
 

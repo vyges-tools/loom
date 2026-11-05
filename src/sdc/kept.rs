@@ -73,7 +73,7 @@ const SPECS: &[Spec] = &[
     },
     Spec { cmd: "set_wire_load_mode", keys: &[], object_keys: &[], flags: &[], argc: (1, 1), object_args: &[] },
     Spec { cmd: "set_wire_load_model", keys: &["-name", "-library"], object_keys: &[], flags: &["-min", "-max"], argc: (0, 1), object_args: &[0] },
-    // SDC 1.1 to 1.9's `-group_name` names the group the positional names in 2.0 and the reference
+    // SDC 1.1 and 1.2's `-group_name` names the group the positional names from 1.3 on and in the reference
     Spec { cmd: "set_wire_load_selection_group", keys: &["-library", "-group_name"], object_keys: &[], flags: &["-min", "-max"], argc: (0, 2), object_args: &[1] },
     Spec { cmd: "set_wire_load_min_block_size", keys: &[], object_keys: &[], flags: &[], argc: (1, 1), object_args: &[] },
     Spec { cmd: "set_voltage", keys: &["-min", "-object_list"], object_keys: &["-object_list"], flags: &[], argc: (1, 1), object_args: &[] },
