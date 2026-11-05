@@ -162,6 +162,7 @@ pub const SDC_COMMANDS: &[Command] = &[
     v("1.1", cmd("get_cells", Applied, R, "set_false_path -through [get_cells u1]")),
     v("1.5", spelling("get_clock", "get_clocks", "set_clock_uncertainty 0.1 [get_clock c]")),
     v("1.1", cmd("get_clocks", Applied, R, "set_clock_uncertainty 0.1 [get_clocks c]")),
+    vendor("1.5", cmd("get_designs", Status::NotApplied, NONE, "set_false_path -through [get_designs top]")),
     v("1.5", spelling("get_lib_cell", "get_lib_cells", "set_disable_timing [get_lib_cell lib/BUF]")),
     v("1.1", cmd("get_lib_cells", Applied, R, "set_disable_timing [get_lib_cells lib/BUF]")),
     v("1.5", spelling("get_lib_pin", "get_lib_pins", "set_disable_timing [get_lib_pin lib/BUF/A]")),
@@ -177,6 +178,7 @@ pub const SDC_COMMANDS: &[Command] = &[
     since(Since::Tcl, note("a condition the file alone decides (`info exists`, a variable); one on a query's result needs the design and is listed as not applied", cmd("if", Tcl, NONE, "if {1} { set_load 0.1 [get_ports y] }"))),
     since(Since::Tcl, cmd("list", Tcl, NONE, "set_false_path -to [list [get_ports y]]")),
     vendor("1.8", note("only as every input or output but some, the objects of an I/O delay", cmd("remove_from_collection", Applied, R, "set_input_delay 1 -clock c [remove_from_collection [all_inputs] [get_ports clk]]"))),
+    vendor("1.1", cmd("remove_propagated_clock", Applied, R, "remove_propagated_clock [get_clocks c]")),
     since(Since::Tcl, cmd("set", Tcl, NONE, "set p 10")),
     v("1.1", note("`sta`: through its logic simulation, with the design", cmd("set_case_analysis", Applied, STA, "set_case_analysis 0 [get_ports a]"))),
     v("1.2", kept("set_clock_gating_check", "set_clock_gating_check -setup 0.1 [get_clocks c]")),
@@ -186,8 +188,10 @@ pub const SDC_COMMANDS: &[Command] = &[
     v("1.7", kept("set_clock_sense", "set_clock_sense -positive [get_pins u1/Z]")),
     v("1.1", cmd("set_clock_transition", Applied, STA, "set_clock_transition 0.1 [get_clocks c]")),
     v("1.1", cmd("set_clock_uncertainty", Applied, STA, "set_clock_uncertainty 0.2 [get_clocks c]")),
+    vendor("1.1", cmd("set_current_design", Unhandled, NONE, "set_current_design top")),
     v("1.4", note("`-rise` / `-fall`: kept, not applied", cmd("set_data_check", Applied, STA_SI, "set_data_check -from [get_pins r/D] -to [get_pins s/D] 0.1"))),
     v("1.1", cmd("set_disable_timing", Applied, STA_SI, "set_disable_timing [get_cells u1]")),
+    vendor("1.1", cmd("set_dont_touch", ReadPast, NONE, "set_dont_touch [get_cells u1]")),
     v("1.1", kept("set_drive", "set_drive 1 [get_ports a]")),
     v("1.1", cmd("set_driving_cell", Applied, STA, "set_driving_cell -lib_cell BUF [get_ports a]")),
     v("1.1", cmd("set_false_path", Applied, CHECK_STA, "set_false_path -from [get_ports a]")),
@@ -244,15 +248,11 @@ pub const OTHER_COMMANDS: &[Command] = &[
     note("known, not run: it stops the read", cmd("derive_pll_clocks", Unhandled, NONE, "derive_pll_clocks")),
     cmd("foreach_in_collection", Applied, R, "foreach_in_collection p [get_ports y] { set_load 0.1 $p }"),
     cmd("get_attribute", Status::NotApplied, NONE, "set_load [get_attribute [get_ports y] capacitance] [get_ports y]"),
-    cmd("get_designs", Status::NotApplied, NONE, "set_false_path -through [get_designs top]"),
     cmd("get_object_name", Applied, R, "set_false_path -to [get_object_name [get_ports y]]"),
     cmd("index_collection", Status::NotApplied, NONE, "set_false_path -to [index_collection [get_ports y] 0]"),
     note("with the libraries and a netlist: the library pin's capacitance; without them, not applied", cmd("load_of", Status::NotApplied, NONE, "set_load [load_of lib/BUF/A] [get_ports y]")),
-    cmd("remove_propagated_clock", Applied, R, "remove_propagated_clock [get_clocks c]"),
     cmd("set_clock_jitter", Unhandled, NONE, "set_clock_jitter -cycle 0.1 [get_clocks c]"),
-    cmd("set_current_design", Unhandled, NONE, "set_current_design top"),
     kept("set_disable_clock_gating_check", "set_disable_clock_gating_check [get_cells u1]"),
-    cmd("set_dont_touch", ReadPast, NONE, "set_dont_touch [get_cells u1]"),
     kept("set_path_margin", "set_path_margin 0.1 -to [get_ports y]"),
     kept("set_pvt", "set_pvt -voltage 1.0 [get_cells u1]"),
     cmd("sizeof_collection", Status::NotApplied, NONE, "set_load [sizeof_collection [get_ports y]] [get_ports y]"),
@@ -458,6 +458,10 @@ mod tests {
         for c in OTHER_COMMANDS {
             assert_eq!(c.since, Since::Outside, "{}", c.name);
         }
+        // every vendor release declares these in SDC 1.1 (`get_designs` 1.5); the public one does not
+        for (q, v) in [("remove_propagated_clock", "1.1"), ("set_current_design", "1.1"), ("set_dont_touch", "1.1"), ("get_designs", "1.5")] {
+            assert_eq!(command(q).map(|c| c.since), Some(Since::Vendor(v)), "{q}");
+        }
         // newer vendor SDC 1.8 declares the collection commands and the fan-in/fan-out queries
         for q in ["add_to_collection", "all_fanin", "all_fanout", "append_to_collection", "filter_collection", "remove_from_collection"] {
             assert_eq!(command(q).map(|c| c.since), Some(Since::Vendor("1.8")), "{q}");
@@ -504,6 +508,18 @@ mod tests {
         for c in crate::sdc_flags::EXTENSION_COMMANDS {
             assert!(OTHER_COMMANDS.iter().any(|x| x.name == *c), "{c}: no row outside SDC");
             assert!(command(c).is_some_and(|x| !matches!(x.since, Since::Sdc(_))), "{c}: dated as SDC");
+        }
+    }
+
+    /// No command of the SDC set, a vendor release's included, is named a reference-timer
+    /// extension, under its own name or the one it is read as (`remove_propagated_clock` is read
+    /// as `unset_propagated_clock`).
+    #[test]
+    fn no_sdc_command_is_named_an_extension() {
+        for c in SDC_COMMANDS.iter().filter(|c| c.status != Status::Unhandled) {
+            let s = Sdc::parse(&format!("{PROBE_SETUP}{}\n", c.probe)).unwrap_or_else(|e| panic!("{}: {e:?}", c.name));
+            let named: Vec<&String> = s.extensions.iter().filter(|e| !e.contains(' ')).collect();
+            assert!(named.is_empty(), "{}: {named:?}", c.name);
         }
     }
 

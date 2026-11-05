@@ -96,13 +96,20 @@ pub(super) const EVERY_CLOCK: &str = "\u{4}every-clock ";
 /// `line` with its command word spelled as the reference's take-back command, when it is a
 /// signoff timer's alias of one. `remove_input_delay` / `remove_output_delay` with no `-clock`
 /// are marked [`EVERY_CLOCK`]: they take back the delays of every clock, on both edges.
+/// A take-back spelled as an SDC command (`remove_propagated_clock`, which vendor releases of the
+/// SDC parser declare in SDC 1.1) is marked [`SDC_SPELLING`], so the reference's command it is
+/// read as is not named a reference-timer extension.
 pub(super) fn rewrite_take_back(line: &str) -> Option<String> {
     let t = line.trim_start();
     let head = t.split_whitespace().next()?;
     let to = take_back_alias(head)?;
     let every = matches!(head, "remove_input_delay" | "remove_output_delay") && !tokenize(t).iter().any(|w| w == "-clock");
-    Some(format!("{}{to}{}", if every { EVERY_CLOCK } else { "" }, &t[head.len()..]))
+    let sdc = super::registry::command(head).is_some_and(|c| matches!(c.since, super::registry::Since::Sdc(_) | super::registry::Since::Vendor(_)));
+    Some(format!("{}{}{to}{}", if sdc { SDC_SPELLING } else { "" }, if every { EVERY_CLOCK } else { "" }, &t[head.len()..]))
 }
+
+/// The mark of a line [`rewrite_take_back`] read from an SDC command's spelling.
+pub(super) const SDC_SPELLING: &str = "\u{5}sdc ";
 
 /// An [`EVERY_CLOCK`] take-back as the reference's commands: the delay naming no clock, then each
 /// clock's, rising and falling edge.

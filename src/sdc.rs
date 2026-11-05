@@ -3326,6 +3326,12 @@ impl Sdc {
             if raw == SOURCE_END {
                 continue;
             }
+            // A take-back read from an SDC command's spelling: the command it is read as is not an
+            // extension in this file.
+            let (raw, sdc_spelling) = match raw.strip_prefix(tcl::SDC_SPELLING) {
+                Some(line) => (line.to_string(), true),
+                None => (raw, false),
+            };
             // A signoff timer's take-back of every clock's delay, as the reference's per clock.
             if let Some(line) = raw.strip_prefix(tcl::EVERY_CLOCK) {
                 let clocks: Vec<String> = sdc.clocks.iter().map(|c| c.name.clone()).collect();
@@ -3499,7 +3505,7 @@ impl Sdc {
             if toks.is_empty() {
                 continue;
             }
-            sdc.extensions.extend(extensions_in(&toks));
+            sdc.extensions.extend(extensions_in(&toks).into_iter().filter(|e| !sdc_spelling || *e != toks[0]));
             // A clock made INSIDE another command (`set_input_delay -clock [create_clock …] …`):
             // Tcl runs the substitution first, and the reference's `create_clock` returns nothing,
             // so the clock is made and the outer command sees an empty word.
