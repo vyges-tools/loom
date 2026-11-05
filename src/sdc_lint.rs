@@ -1115,6 +1115,14 @@ mod tests {
             assert_eq!(w[0].message, "`current_design other` names a design other than the netlist's top `t`; the constraints are applied to `t`");
             assert_eq!(r.errors(), 0, "{cmd}: {:?}", r.findings);
         }
+        // a quoted name is the name: Tcl strips the braces or quotes before the command sees it,
+        // so `{t}` is the top and gives no warning
+        for cmd in ["set_current_design {t}", "current_design {t}", "set_current_design \"t\"", "current_design \"t\""] {
+            let sdc = Sdc::parse(&format!("{cmd}\n{base}")).unwrap_or_else(|e| panic!("{cmd}: {e:?}"));
+            assert_eq!(sdc.current_design.as_deref(), Some("t"), "{cmd}");
+            let r = lint(&nl(), &sdc, &lib());
+            assert_eq!(r.warnings(), 0, "{cmd}: {:?}", r.findings);
+        }
         // written back in the reference timer's spelling
         let w = Sdc::parse(&format!("set_current_design t\n{base}")).unwrap().write(&crate::sdc_write::WriteOpts::default());
         assert!(w.text.contains("current_design t") && !w.text.contains("set_current_design"), "{}", w.text);
