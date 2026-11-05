@@ -5189,15 +5189,18 @@ mod pin_match_tests {
     #[test]
     fn a_pin_pattern_escapes_brackets_only_when_nothing_matches() {
         let insts = ["dpath.b_reg.out\\[1\\]$_DFFE_PP_", "x[2]", "x\\[2\\]", "h\\/u1", "u1", "u2"];
-        let pins: Vec<(usize, &str)> = vec![(0, "D"), (0, "CLK"), (1, "D"), (2, "D"), (3, "A"), (4, "A"), (4, "Q[0]"), (5, "A")];
+        let pins: Vec<(usize, &str)> = vec![(0, "D"), (0, "CLK"), (1, "D"), (2, "D"), (3, "A"), (4, "A"), (4, "Q[0]"), (5, "A"), (5, "B\\[1\\]"), (5, "x/y")];
         let m = |p: &str| pins_matching(p, &insts, &pins);
         assert_eq!(m("dpath.b_reg.out[1]$_DFFE_PP_/D"), [0]);
         assert_eq!(m("dpath.b_reg.out\\[1\\]$_DFFE_PP_/CLK"), [1], "already escaped: matched as written");
         assert_eq!(m("x[2]/D"), [2], "the literal x[2] matches, so x\\[2\\] is not tried");
         assert_eq!(m("h/u1/A"), [4]);
         assert_eq!(m("u*/A"), [5, 7]);
+        assert_eq!(m("u2/B[1]"), [8], "a port part with a bracket is tried escaped when no port matches it");
+        assert_eq!(m("u2/x/y"), [9], "a port name is matched with its dividers escaped too");
         assert_eq!(m("u1/Q[0]"), [6]);
         assert_eq!(m("u1/*"), [5, 6]);
+        assert_eq!(m("u2/*"), [7, 8, 9]);
         assert!(m("u1").is_empty() && m("nope/A").is_empty());
         assert_eq!(m("*").len(), pins.len(), "`*` alone is every instance pin");
     }
