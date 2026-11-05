@@ -90,7 +90,7 @@ fn group_path_is_kept_not_applied() {
 }
 
 #[test]
-fn its_extensions_are_quiet_queries_and_no_clocks() {
+fn its_extension_is_no_clocks() {
     let s = read();
     let mut seen: Vec<(&str, usize)> = Vec::new();
     for e in &s.extensions {
@@ -99,5 +99,6 @@ fn its_extensions_are_quiet_queries_and_no_clocks() {
             None => seen.push((e, 1)),
         }
     }
-    assert_eq!(seen, [("all_inputs -no_clocks", 6), ("get_ports -quiet", 7), ("get_pins -quiet", 1)]);
+    // its `-quiet` queries are newer vendor SDC 1.8, not extensions
+    assert_eq!(seen, [("all_inputs -no_clocks", 6)]);
 }

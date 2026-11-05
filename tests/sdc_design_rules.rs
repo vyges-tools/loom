@@ -1,7 +1,8 @@
-//! The design-rule limits are checked as SDC declares them: `set_max_capacitance` and
-//! `set_max_fanout` take `value object_list` and nothing else, `set_max_transition` takes
-//! `[-clock_path] [-rise] [-fall] value object_list` (the reference timer adds `-data_path`), and
-//! each REQUIRES both and a value that is a positive float (`$par>=0`). A missing value or object,
+//! The design-rule limits are checked as SDC declares them: the public SDC parser gives
+//! `set_max_capacitance` and `set_max_fanout` `value object_list` alone, and `set_max_transition`
+//! `[-clock_path] [-rise] [-fall] value object_list` (the reference timer adds `-data_path`; newer
+//! vendor SDC 1.8 adds options to `set_max_capacitance` and `set_max_transition`, read in
+//! `sdc_standard_options.rs`). Each REQUIRES both and a value that is a positive float (`$par>=0`). A missing value or object,
 //! a misplaced option, a negative or non-numeric value is refused with a message — never read as
 //! a limit with no value, never dropped without a word.
 
@@ -45,8 +46,8 @@ fn an_option_the_limit_does_not_have_is_refused() {
     refused("set_max_capacitance -min 0.2 [get_ports a]", "-min is not an option of set_max_capacitance");
     refused("set_max_fanout -max 8 [current_design]", "-max is not an option of set_max_fanout");
     refused("set_max_transition -min 0.2 [current_design]", "-min is not an option of set_max_transition");
-    // `-clock_path` is `set_max_transition`'s alone
-    refused("set_max_capacitance -clock_path 0.1 [get_clocks c]", "-clock_path is not an option of set_max_capacitance");
+    // `set_max_fanout` has no option in any SDC (newer vendor SDC 1.8 gives `set_max_capacitance`
+    // `-clock_path`: `sdc_standard_options.rs`)
     refused("set_max_fanout -clock_path 8 [get_clocks c]", "-clock_path is not an option of set_max_fanout");
 }
 

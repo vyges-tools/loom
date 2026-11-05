@@ -74,13 +74,20 @@ fn a_clock_scoped_driving_cell_is_kept_not_applied_unscoped() {
 }
 
 /// SDC 1.1+ `set_load` declares `-min -max -substract_pin_load -pin_load -wire_load`: the parser's
-/// spelling of `-subtract_pin_load`, read as it. SDC declares no `-internal`: still refused.
+/// spelling of `-subtract_pin_load`, read as it. Newer vendor SDC 1.8 adds `-internal` and
+/// `-allow_negative_cap`: read, and kept with the command (no timer here applies them). An option
+/// none of them declares is refused.
 #[test]
 fn set_load_reads_the_standard_spelling_and_refuses_what_it_lacks() {
     let s = accepted("set_load -substract_pin_load 0.1 [get_ports y]", &[]);
     assert!(s.env[0].flags.iter().any(|f| f == "-subtract_pin_load"), "{:?}", s.env[0].flags);
-    let s = read("set_load -internal 0.1 [get_ports y]");
-    assert!(!s.rejected.is_empty(), "-internal is not SDC: {:?}", s.env);
+    for o in ["-internal", "-allow_negative_cap"] {
+        let s = accepted(&format!("set_load {o} 0.1 [get_ports y]"), &[&format!("set_load {o}")]);
+        assert!(s.env.is_empty(), "{o}: applied as a load: {:?}", s.env);
+        assert!(written(&s).contains(&format!("set_load {o} 0.1 [get_ports {{y}}]")), "{o}: {}", written(&s));
+    }
+    let s = read("set_load -total 0.1 [get_ports y]");
+    assert!(!s.rejected.is_empty(), "-total is no SDC option: {:?}", s.env);
 }
 
 /// SDC 1.1+ `get_ports` declares `-hierarchical`. A port is at the top level, so it selects the
@@ -225,27 +232,58 @@ fn exception_and_clock_group_options_are_checked() {
 }
 
 /// Options no SDC version declares, and the reference timer lacks too: refused, as before.
-/// (`set_load` declares `-min -max -substract_pin_load -pin_load -wire_load`; `set_max_transition`
-/// `-clock_path -rise -fall`.)
+/// (`set_load` declares `-min -max -substract_pin_load -pin_load -wire_load`, and newer vendor SDC
+/// 1.8 `-rise -fall -internal -allow_negative_cap`; `set_max_fanout` declares no option.)
 #[test]
 fn options_neither_declares_are_refused() {
-    for line in ["set_load -allow_negative_cap 0.1 [get_ports y]", "set_max_transition -force 0.5 [current_design]"] {
+    for line in ["set_load -total 0.1 [get_ports y]", "set_max_fanout -force 8 [current_design]", "set_max_transition -min 0.5 [current_design]"] {
         assert!(!read(line).rejected.is_empty(), "{line}");
     }
 }
 
+/// Newer releases of the vendor's SDC parser declare more options in SDC 1.8 than its public
+/// release: on `set_max_capacitance` `-clock_path -data_path -rise -fall -force -scenarios`, on
+/// `set_max_transition` `-delay_penalty -force`. They are SDC 1.8 to a user of those releases, so
+/// they are read, not refused: the limit is kept as written (no repair here applies a limit
+/// scoped to clock or data paths, an edge or a scenario), written back, and reported.
+#[test]
+fn newer_sdc_18_design_rule_options_are_kept() {
+    for (line, opts, back) in [
+        ("set_max_capacitance -clock_path 0.1 [get_clocks c]", &["-clock_path"][..], "set_max_capacitance -clock_path 0.1 [get_clocks {c}]"),
+        ("set_max_capacitance -data_path -rise -fall 0.1 [current_design]", &["-data_path", "-rise", "-fall"][..], "set_max_capacitance -data_path -rise -fall 0.1 [current_design]"),
+        ("set_max_capacitance -force -scenarios {s1 s2} 0.1 [current_design]", &["-force", "-scenarios"][..], "set_max_capacitance -scenarios {s1 s2} -force 0.1 [current_design]"),
+        ("set_max_transition -force 0.5 [current_design]", &["-force"][..], "set_max_transition -force 0.5 [current_design]"),
+        ("set_max_transition -delay_penalty 2 0.5 [current_design]", &["-delay_penalty"][..], "set_max_transition -delay_penalty 2 0.5 [current_design]"),
+    ] {
+        let cmd = line.split(' ').next().unwrap();
+        let want: Vec<String> = opts.iter().map(|o| format!("{cmd} {o}")).collect();
+        let want: Vec<&str> = want.iter().map(String::as_str).collect();
+        let s = accepted(line, &want);
+        assert_eq!((s.max_capacitance, s.max_transition), (None, None), "{line}: applied as a design-wide limit");
+        assert!(s.max_capacitance_objects.is_empty() && s.max_transition_objects.is_empty(), "{line}: applied");
+        assert!(written(&s).contains(back), "{line}: {}", written(&s));
+    }
+    // still a limit: its value and objects are checked
+    let s = read("set_max_capacitance -clock_path 0.1");
+    assert!(s.rejected.iter().any(|r| r.contains("missing objects")), "{:?}", s.rejected);
+    assert!(s.kept.is_empty(), "{:?}", s.kept);
+}
+
 /// The reference timer's options and commands that no SDC version declares are read as it reads
 /// them, and `check` names each one used, with its count, at info level only. An option SDC does
-/// declare (`-comment`) is not named.
+/// declare (`-comment`), or newer vendor SDC 1.8 does (`get_ports -filter`, `get_ports -quiet`,
+/// `get_pins -of_objects`), is not named.
 #[test]
 fn reference_extensions_are_named_at_info_level() {
-    let s = read("set_input_delay 1 -clock c [get_ports -filter {direction==in} *]\nset_output_delay 1 -clock c [get_ports -quiet y]\n\
-                  set_output_delay 1 -clock c [get_ports -quiet z]\nset_false_path -to [get_ports y] -comment x\nset_pvt [get_cells u1] -voltage 1.0");
-    assert_eq!(s.extensions, ["get_ports -filter", "get_ports -quiet", "get_ports -quiet", "set_pvt"]);
+    let s = read("set_input_delay 1 -clock c [all_inputs -no_clocks]\nset_clock_uncertainty 0.1 [get_clocks -filter {name==c} *]\n\
+                  set_clock_uncertainty 0.1 [get_clocks -filter {name==c} *]\nset_false_path -to [get_ports y] -comment x\nset_pvt [get_cells u1] -voltage 1.0");
+    assert_eq!(s.extensions, ["all_inputs -no_clocks", "get_clocks -filter", "get_clocks -filter", "set_pvt"]);
     let r = vyges_loom::sdc_lint::lint_without_design(&s);
     let f: Vec<_> = r.findings.iter().filter(|f| f.code == "sdc-extension").collect();
     assert_eq!(f.len(), 3, "{:?}", r.findings);
     assert!(f.iter().all(|f| f.severity == vyges_loom::sdc_lint::Severity::Info), "{f:?}");
-    assert!(f[1].message.contains("`get_ports -quiet` (2 uses)"), "{}", f[1].message);
+    assert!(f[1].message.contains("`get_clocks -filter` (2 uses)"), "{}", f[1].message);
     assert!(read("create_clock -name d -period 5 -comment x [get_ports d]").extensions.is_empty());
+    let s = read("set_input_delay 1 -clock c [get_ports -filter {direction==in} -quiet *]\nset_false_path -to [get_pins -quiet -of_objects [get_cells u1]]\nset_load -rise 0.1 [get_ports y]");
+    assert!(s.extensions.is_empty(), "newer vendor SDC 1.8 options named as extensions: {:?}", s.extensions);
 }

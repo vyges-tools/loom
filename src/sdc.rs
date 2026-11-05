@@ -1222,19 +1222,21 @@ pub struct DesignRuleCmd {
     pub objects: Objects,
 }
 
-/// Why a design-rule limit's arguments are refused, by its definition: SDC declares
-/// `set_max_capacitance` and `set_max_fanout` as `value object_list` and nothing else, and
-/// `set_max_transition` as `[-clock_path] [-rise] [-fall] value object_list` (the reference
-/// adds `-data_path`; an option neither has is refused before here, Error 562). Each requires
-/// both, and a value that is a positive float (`$par>=0`; the reference's Error 572). The two
-/// fixed ones are Tcl procs of two parameters, so any other word count is `wrong # args`.
+/// Why a design-rule limit's arguments are refused, by its definition. The public SDC parser
+/// declares `set_max_capacitance` and `set_max_fanout` as `value object_list`, and
+/// `set_max_transition` as `[-clock_path] [-rise] [-fall] value object_list`; the reference timer
+/// adds `-data_path`, and newer vendor SDC 1.8 adds options to `set_max_capacitance` and
+/// `set_max_transition` ([`crate::sdc_flags::VENDOR_18_ONLY`]). An option none of them has is
+/// refused before here (Error 562); `set_max_fanout` has none. Each requires a value and
+/// objects, and a value that is a positive float (`$par>=0`; the reference's Error 572); any
+/// other word count is `wrong # args`.
 /// ⛔ Unchecked, `set_max_capacitance -min 0.2 [get_ports a]` read `0.2` as the objects of a limit
 /// with no value, and `set_max_capacitance 0.2` was dropped without a word.
 fn design_rule_fault(toks: &[String]) -> Option<String> {
-    let fixed = matches!(toks[0].as_str(), "set_max_capacitance" | "set_max_fanout");
-    let (_, flags, pos) = split_args(toks, &[]);
-    if fixed && !flags.is_empty() {
-        return Some(format!("{} is not an option of {} (it takes a value and objects only)", flags[0], toks[0]));
+    let (keys, known) = crate::sdc_flags::options(&toks[0]).unwrap_or_default();
+    let (_, flags, pos) = split_args(toks, &keys);
+    if let Some(f) = flags.iter().find(|f| !known.contains(&f.as_str())) {
+        return Some(format!("{f} is not an option of {}", toks[0]));
     }
     let Some(value) = pos.first() else { return Some("missing value".into()) };
     if pos.len() < 2 {
@@ -3560,6 +3562,13 @@ impl Sdc {
             // derate), else as written — and reported as kept-not-applied.
             let options = kept_options_in(&toks);
             if !options.is_empty() {
+                // a design-rule limit kept with its option is still checked as one
+                if matches!(toks[0].as_str(), "set_max_capacitance" | "set_max_transition") {
+                    if let Some(why) = design_rule_fault(&toks) {
+                        sdc.rejected.push(format!("{}: {why}; not applied", toks[0]));
+                        continue;
+                    }
+                }
                 sdc.ignored.extend(options.iter().cloned());
                 sdc.kept_options.extend(options.iter().cloned());
                 let typed = (matches!(toks[0].as_str(), "set_input_delay" | "set_output_delay" | "set_timing_derate") || kept::KEPT_COMMANDS.contains(&toks[0].as_str()))
@@ -4819,7 +4828,7 @@ mod exception_check_tests {
         let bad = [
             "set_clock_latency -dynamic 1 [get_clocks clk]",
             "set_timing_derate -increment 1.05",
-            "set_load -internal 1 [get_ports dout]",
+            "set_load -total 1 [get_ports dout]",
             "set_input_delay 1 -clock clk [all_inputs -bogus]",
             // a synthesis tool's query options that no SDC version declares (the public parser's
             // sdc1.1 … sdc2.0) and the reference does not read (its Error 562): refused, both
@@ -4840,6 +4849,8 @@ mod exception_check_tests {
             "set_input_delay 1 -clock clk -add_delay -max [get_ports din]",
             "set_clock_uncertainty -setup 0.1 [get_clocks clk]",
             "set_load 1 [all_outputs]",
+            // newer vendor SDC 1.8 declares it: read and kept
+            "set_load -internal 1 [get_ports dout]",
             "set_input_delay 1 -clock clk [all_inputs -no_clocks]",
             "set_false_path -through [get_pins r/Q] -to [get_ports dout]",
             "set_multicycle_path 2 -setup -from [get_ports din] -to [get_ports dout]",

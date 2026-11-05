@@ -50,12 +50,18 @@ impl Status {
 }
 
 /// The SDC version a command first appears in. The authority is the reference SDC parser that
-/// Synopsys published with the standard (one declaration file per version, 1.1 to 2.0): a command
-/// is dated by the first file that declares it. No public source declares SDC 2.1.
+/// Synopsys published with the standard (one declaration file per version, 1.1 to 2.0; its
+/// public release is the copy that ships in OpenTimer's `ot/sdc/`, whose declaration files the
+/// sdc README identifies by SHA-256): a command is dated by the first file that declares it.
+/// Newer releases of the vendor's parser declare more ([`Since::Vendor`]). No public source
+/// declares SDC 2.1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Since {
-    /// First declared by the reference parser's file for this version.
+    /// First declared by the public reference parser's file for this version.
     Sdc(&'static str),
+    /// Declared in this SDC version by newer releases of the vendor's SDC parser, and by none of
+    /// its public release's files. It is SDC to a user of those releases, so it is in the SDC set.
+    Vendor(&'static str),
     /// SDC 2.1, per the reference timer's own documentation (its SDC Tcl: `set_clock_sense` is
     /// deprecated as of SDC 2.1, use `set_sense -type clock`). No public SDC 2.1 document exists,
     /// so this is the one version not taken from the public parser.
@@ -68,12 +74,13 @@ pub enum Since {
 
 impl Since {
     /// The version as the coverage table writes it.
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            Since::Sdc(v) => v,
-            Since::Sdc21 => "2.1 ‡",
-            Since::Tcl => "Tcl",
-            Since::Outside => "—",
+            Since::Sdc(v) => v.to_string(),
+            Since::Vendor(v) => format!("{v} †"),
+            Since::Sdc21 => "2.1 ‡".to_string(),
+            Since::Tcl => "Tcl".to_string(),
+            Since::Outside => "—".to_string(),
         }
     }
 }
@@ -117,6 +124,10 @@ const fn kept(name: &'static str, probe: &'static str) -> Command {
 const fn v(v: &'static str, c: Command) -> Command {
     Command { since: Since::Sdc(v), ..c }
 }
+/// `c`, declared in SDC `v` by newer releases of the vendor's parser only ([`Since::Vendor`]).
+const fn vendor(v: &'static str, c: Command) -> Command {
+    Command { since: Since::Vendor(v), ..c }
+}
 const fn since(since: Since, c: Command) -> Command {
     Command { since, ..c }
 }
@@ -132,16 +143,21 @@ use Status::{Applied, ReadPast, Tcl, Unhandled};
 
 /// The SDC command set: every command the SDC versions declare, in name order.
 pub const SDC_COMMANDS: &[Command] = &[
+    vendor("1.8", cmd("add_to_collection", Applied, R, "set_false_path -to [add_to_collection [get_ports y] [get_ports a]]")),
     v("1.1", cmd("all_clocks", Applied, R, "set_propagated_clock [all_clocks]")),
+    vendor("1.8", cmd("all_fanin", Status::NotApplied, NONE, "set_false_path -to [all_fanin -to [get_ports y]]")),
+    vendor("1.8", cmd("all_fanout", Status::NotApplied, NONE, "set_false_path -from [all_fanout -from [get_ports a]]")),
     v("1.1", cmd("all_inputs", Applied, R, "set_input_delay 1 -clock c [all_inputs]")),
     v("1.1", cmd("all_outputs", Applied, R, "set_output_delay 1 -clock c [all_outputs]")),
     v("1.7", cmd("all_registers", Applied, R, "set_false_path -to [all_registers]")),
+    vendor("1.8", cmd("append_to_collection", Applied, R, "append_to_collection v [get_ports y]")),
     v("1.1", cmd("create_clock", Applied, CHECK_STA, "create_clock -name d -period 5 [get_ports clk2]")),
     v("1.3", cmd("create_generated_clock", Applied, CHECK_STA, "create_generated_clock -name g -source [get_ports clk] -divide_by 2 [get_pins r/Q]")),
     v("1.6", kept("create_voltage_area", "create_voltage_area -name va -coordinate {0 0 10 10} [get_cells u1]")),
     v("1.1", cmd("current_design", Applied, R, "current_design top")),
     v("1.1", note("`-instance` or the positional; an unqualified name under it, and `-hierarchical` under it, are refused", cmd("current_instance", Applied, R, "current_instance"))),
     since(Since::Tcl, cmd("expr", Tcl, NONE, "set x [expr 2 * 3]")),
+    vendor("1.8", cmd("filter_collection", Status::NotApplied, NONE, "set_false_path -to [filter_collection [get_ports y] direction==out]")),
     v("1.5", spelling("get_cell", "get_cells", "set_false_path -through [get_cell u1]")),
     v("1.1", cmd("get_cells", Applied, R, "set_false_path -through [get_cells u1]")),
     v("1.5", spelling("get_clock", "get_clocks", "set_clock_uncertainty 0.1 [get_clock c]")),
@@ -160,6 +176,7 @@ pub const SDC_COMMANDS: &[Command] = &[
     v("1.7", kept("group_path", "group_path -name g -to [get_ports y]")),
     since(Since::Tcl, note("a condition the file alone decides (`info exists`, a variable); one on a query's result needs the design and is listed as not applied", cmd("if", Tcl, NONE, "if {1} { set_load 0.1 [get_ports y] }"))),
     since(Since::Tcl, cmd("list", Tcl, NONE, "set_false_path -to [list [get_ports y]]")),
+    vendor("1.8", note("only as every input or output but some, the objects of an I/O delay", cmd("remove_from_collection", Applied, R, "set_input_delay 1 -clock c [remove_from_collection [all_inputs] [get_ports clk]]"))),
     since(Since::Tcl, cmd("set", Tcl, NONE, "set p 10")),
     v("1.1", note("`sta`: through its logic simulation, with the design", cmd("set_case_analysis", Applied, STA, "set_case_analysis 0 [get_ports a]"))),
     v("1.2", kept("set_clock_gating_check", "set_clock_gating_check -setup 0.1 [get_clocks c]")),
@@ -218,25 +235,19 @@ pub const SDC_COMMANDS: &[Command] = &[
 ];
 
 /// Commands found in constraint files written for other tools, outside the SDC command set: the
-/// reader's undo commands for SDC ones, and a synthesis tool's collection commands (SDC declares
-/// none of them).
+/// reader's undo commands for SDC ones, and a synthesis tool's collection commands that no SDC
+/// version declares (newer vendor SDC 1.8 declares some, which are in [`SDC_COMMANDS`]).
 pub const OTHER_COMMANDS: &[Command] = &[
-    cmd("add_to_collection", Applied, R, "set_false_path -to [add_to_collection [get_ports y] [get_ports a]]"),
-    cmd("all_fanin", Status::NotApplied, NONE, "set_false_path -to [all_fanin -to [get_ports y]]"),
-    cmd("all_fanout", Status::NotApplied, NONE, "set_false_path -from [all_fanout -from [get_ports a]]"),
-    cmd("append_to_collection", Applied, R, "append_to_collection v [get_ports y]"),
     cmd("delete_clock", Applied, R, "delete_clock [get_clocks c]"),
     cmd("delete_generated_clock", Applied, R, "create_generated_clock -name g -source [get_ports clk] -divide_by 2 [get_pins r/Q]\ndelete_generated_clock [get_clocks g]"),
     note("known, not run: it stops the read", cmd("derive_clock_uncertainty", Unhandled, NONE, "derive_clock_uncertainty")),
     note("known, not run: it stops the read", cmd("derive_pll_clocks", Unhandled, NONE, "derive_pll_clocks")),
-    cmd("filter_collection", Status::NotApplied, NONE, "set_false_path -to [filter_collection [get_ports y] direction==out]"),
     cmd("foreach_in_collection", Applied, R, "foreach_in_collection p [get_ports y] { set_load 0.1 $p }"),
     cmd("get_attribute", Status::NotApplied, NONE, "set_load [get_attribute [get_ports y] capacitance] [get_ports y]"),
     cmd("get_designs", Status::NotApplied, NONE, "set_false_path -through [get_designs top]"),
     cmd("get_object_name", Applied, R, "set_false_path -to [get_object_name [get_ports y]]"),
     cmd("index_collection", Status::NotApplied, NONE, "set_false_path -to [index_collection [get_ports y] 0]"),
     note("with the libraries and a netlist: the library pin's capacitance; without them, not applied", cmd("load_of", Status::NotApplied, NONE, "set_load [load_of lib/BUF/A] [get_ports y]")),
-    note("only as every input or output but some, the objects of an I/O delay", cmd("remove_from_collection", Applied, R, "set_input_delay 1 -clock c [remove_from_collection [all_inputs] [get_ports clk]]")),
     cmd("remove_propagated_clock", Applied, R, "remove_propagated_clock [get_clocks c]"),
     cmd("set_clock_jitter", Unhandled, NONE, "set_clock_jitter -cycle 0.1 [get_clocks c]"),
     cmd("set_current_design", Unhandled, NONE, "set_current_design top"),
@@ -286,6 +297,19 @@ pub fn standard_options() -> Vec<(&'static str, &'static str, Status)> {
     out
 }
 
+/// One option newer releases of the vendor's SDC parser declare in SDC 1.8 that its public release
+/// does not ([`crate::sdc_flags::VENDOR_18`]): whether a consumer here applies it or it is kept
+/// with its command, as for [`standard_options`].
+pub fn vendor_options() -> Vec<(&'static str, &'static str, Status)> {
+    crate::sdc_flags::VENDOR_18
+        .iter()
+        .map(|(c, o)| {
+            let kept = crate::sdc_flags::KEPT_OPTIONS.iter().any(|(kc, ko)| kc == c && ko == o);
+            (*c, *o, if kept { Status::Kept } else { Status::Applied })
+        })
+        .collect()
+}
+
 fn row(c: &Command, with_version: bool) -> String {
     let mut status = c.status.label().to_string();
     let mut notes: Vec<String> = Vec::new();
@@ -313,11 +337,12 @@ fn row(c: &Command, with_version: bool) -> String {
 pub fn coverage_markdown() -> String {
     let count = |st: Status| SDC_COMMANDS.iter().filter(|c| c.status == st).count();
     let mut t = format!(
-        "SDC 1.1 to 2.1: {} applied, {} kept, {} Tcl, {} read past, {} unhandled, of {} commands.\n\n",
+        "SDC 1.1 to 2.1: {} applied, {} kept, {} Tcl, {} read past, {} not applied, {} unhandled, of {} commands.\n\n",
         count(Status::Applied),
         count(Status::Kept),
         count(Status::Tcl),
         count(Status::ReadPast),
+        count(Status::NotApplied),
         count(Status::Unhandled),
         SDC_COMMANDS.len()
     );
@@ -334,6 +359,12 @@ pub fn coverage_markdown() -> String {
     t += "| Command | Option | Status |\n| --- | --- | --- |\n";
     for (cmd, o, st) in standard_options() {
         t += &format!("| `{cmd}` | `{o}` | {} |\n", st.label());
+    }
+    t += "\nOptions newer releases of the vendor's SDC parser declare in SDC 1.8, and its public release in no version (†). They are read, never refused:\n\n";
+    t += "| Command | Option | Reference timer | Status |\n| --- | --- | --- | --- |\n";
+    for (cmd, o, st) in vendor_options() {
+        let theirs = crate::sdc_flags::FLAGS.iter().any(|(c, k, f)| c == &cmd && (k.contains(&o) || f.contains(&o)));
+        t += &format!("| `{cmd}` | `{o}` | {} | {} |\n", if theirs { "has it" } else { "lacks it" }, st.label());
     }
     t += "\nReference-timer options no SDC version declares. They are read as the reference reads them, and `check` names each one a file uses, at info level (the file is not portable SDC):\n\n";
     t += "| Command | Option |\n| --- | --- |\n";
@@ -427,6 +458,10 @@ mod tests {
         for c in OTHER_COMMANDS {
             assert_eq!(c.since, Since::Outside, "{}", c.name);
         }
+        // newer vendor SDC 1.8 declares the collection commands and the fan-in/fan-out queries
+        for q in ["add_to_collection", "all_fanin", "all_fanout", "append_to_collection", "filter_collection", "remove_from_collection"] {
+            assert_eq!(command(q).map(|c| c.since), Some(Since::Vendor("1.8")), "{q}");
+        }
         for q in ["get_cell", "get_clock", "get_lib_cell", "get_lib_pin", "get_net", "get_pin", "get_port"] {
             assert_eq!(command(q).map(|c| c.since), Some(Since::Sdc("1.5")), "{q}");
         }
@@ -439,14 +474,20 @@ mod tests {
     fn the_coverage_table_has_a_row_for_everything() {
         let t = coverage_markdown();
         let (commands, rest) = t.split_once("Options SDC declares").expect("the options table follows the commands");
-        let (standard, extensions) = rest.split_once("Reference-timer options").expect("the extensions table follows");
+        let (standard, rest) = rest.split_once("Options newer releases").expect("the newer vendor SDC 1.8 table follows");
+        let (vendor, extensions) = rest.split_once("Reference-timer options").expect("the extensions table follows");
         for c in SDC_COMMANDS.iter().chain(OTHER_COMMANDS) {
             assert_eq!(commands.lines().filter(|l| l.starts_with(&format!("| `{}` |", c.name))).count(), 1, "{}", c.name);
         }
         let options = |s: &str| s.lines().filter(|l| l.split(" | ").nth(1).is_some_and(|o| o.starts_with("`-"))).count();
         assert_eq!(options(standard), standard_options().len());
+        assert_eq!(options(vendor), vendor_options().len());
         assert_eq!(options(extensions), crate::sdc_flags::EXTENSION_OPTIONS.len());
         assert!(t.contains(&format!("of {} commands", SDC_COMMANDS.len())), "{t}");
+        // and the counts add up to it: every status is counted
+        let head = t.lines().next().unwrap_or_default();
+        let counts: usize = head.split(", ").filter_map(|p| p.rsplit(": ").next()?.split(' ').next()?.parse::<usize>().ok()).sum();
+        assert_eq!(counts, SDC_COMMANDS.len(), "{head}");
     }
 
     /// An extension is the reference timer's and no SDC version's: never a standard option, every
@@ -463,6 +504,25 @@ mod tests {
         for c in crate::sdc_flags::EXTENSION_COMMANDS {
             assert!(OTHER_COMMANDS.iter().any(|x| x.name == *c), "{c}: no row outside SDC");
             assert!(command(c).is_some_and(|x| !matches!(x.since, Since::Sdc(_))), "{c}: dated as SDC");
+        }
+    }
+
+    /// Newer vendor SDC 1.8's options are read: every one is an option of its command here, none
+    /// is named a reference-timer extension, and none is the public parser's (so dated twice). Its
+    /// options that only it declares are kept, as no consumer here applies them.
+    #[test]
+    fn newer_vendor_sdc_18_options_are_read_and_not_extensions() {
+        for (c, o) in crate::sdc_flags::VENDOR_18 {
+            let (keys, flags) = crate::sdc_flags::options(c).unwrap_or_else(|| panic!("{c}: no options"));
+            assert!(keys.contains(o) || flags.contains(o), "{c} {o}: not read");
+            assert!(!crate::sdc_flags::EXTENSION_OPTIONS.contains(&(*c, *o)), "{c} {o}: named an extension");
+            assert!(!standard_options().iter().any(|(sc, so, _)| sc == c && so == o), "{c} {o}: also the public parser's");
+        }
+        for (c, k, f) in crate::sdc_flags::VENDOR_18_ONLY {
+            for o in k.iter().chain(f.iter()) {
+                assert!(crate::sdc_flags::VENDOR_18.contains(&(*c, *o)), "{c} {o}: not listed");
+                assert!(crate::sdc_flags::KEPT_OPTIONS.contains(&(*c, *o)), "{c} {o}: applied by nothing, yet not kept");
+            }
         }
     }
 

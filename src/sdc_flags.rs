@@ -53,7 +53,8 @@ pub(crate) const FLAGS: &[(&str, &[&str], &[&str])] = &[
     ("set_input_delay", &["-clock", "-reference_pin"], &["-rise", "-fall", "-max", "-min", "-clock_fall", "-add_delay", "-source_latency_included", "-network_latency_included"]),
     ("set_input_transition", &["-clock"], &["-rise", "-fall", "-max", "-min", "-clock_fall"]),
     ("set_load", &[], &["-rise", "-fall", "-min", "-max", "-subtract_pin_load", "-pin_load", "-wire_load"]),
-    // SDC and the reference: `value object_list`, no option
+    // the public SDC parser and the reference: `value object_list`, no option (newer vendor SDC
+    // 1.8 adds some: `VENDOR_18_ONLY`)
     ("set_max_capacitance", &[], &[]),
     ("set_max_delay", &["-from", "-rise_from", "-fall_from", "-to", "-rise_to", "-fall_to", "-comment"], &["-rise", "-fall", "-ignore_clock_latency", "-reset_path", "-probe"]),
     ("set_max_fanout", &[], &[]),
@@ -136,18 +137,74 @@ pub(crate) const KEPT_OPTIONS: &[(&str, &str)] = &[
     ("set_max_leakage_power", "-unit"),
     ("set_operating_conditions", "-object_list"),
     ("set_wire_load_selection_group", "-group_name"),
+    ("set_load", "-internal"),
+    ("set_load", "-allow_negative_cap"),
+    ("set_max_capacitance", "-clock_path"),
+    ("set_max_capacitance", "-data_path"),
+    ("set_max_capacitance", "-rise"),
+    ("set_max_capacitance", "-fall"),
+    ("set_max_capacitance", "-force"),
+    ("set_max_capacitance", "-scenarios"),
+    ("set_max_transition", "-delay_penalty"),
+    ("set_max_transition", "-force"),
 ];
 
-/// A command's keys and flags: the reference timer's ([`FLAGS`]) then the standard's
-/// ([`STANDARD_ONLY`]); `None` for a command neither lists.
+/// `(command, keys, flags)` that newer releases of the vendor's SDC parser declare in SDC 1.8 and
+/// that neither the public release ([`STANDARD_ONLY`]'s source) nor the reference timer
+/// ([`FLAGS`]) has. They are SDC 1.8 to a user of those releases, so they are read, not refused:
+/// each is kept with its command ([`KEPT_OPTIONS`]). Whether `-delay_penalty` takes a value is
+/// not public; it is read as taking one, its name being that of a quantity.
+pub(crate) const VENDOR_18_ONLY: &[(&str, &[&str], &[&str])] = &[
+    ("set_load", &[], &["-internal", "-allow_negative_cap"]),
+    ("set_max_capacitance", &["-scenarios"], &["-clock_path", "-data_path", "-rise", "-fall", "-force"]),
+    ("set_max_transition", &["-delay_penalty"], &["-force"]),
+];
+
+/// Every `(command, option)` newer releases of the vendor's SDC parser declare in SDC 1.8 that its
+/// public release declares in no version: the reference timer's own options among them (`get_pins
+/// -of_objects`, the queries' `-filter` and `-quiet`), which are therefore not
+/// [`EXTENSION_OPTIONS`], and [`VENDOR_18_ONLY`]'s. The coverage table marks each one †.
+pub(crate) const VENDOR_18: &[(&str, &str)] = &[
+    ("get_cells", "-filter"),
+    ("get_cells", "-quiet"),
+    ("get_clocks", "-quiet"),
+    ("get_lib_cells", "-quiet"),
+    ("get_lib_pins", "-quiet"),
+    ("get_libs", "-quiet"),
+    ("get_nets", "-filter"),
+    ("get_nets", "-quiet"),
+    ("get_pins", "-filter"),
+    ("get_pins", "-of_objects"),
+    ("get_pins", "-quiet"),
+    ("get_ports", "-filter"),
+    ("get_ports", "-quiet"),
+    ("set_load", "-rise"),
+    ("set_load", "-fall"),
+    ("set_load", "-internal"),
+    ("set_load", "-allow_negative_cap"),
+    ("set_max_capacitance", "-clock_path"),
+    ("set_max_capacitance", "-data_path"),
+    ("set_max_capacitance", "-rise"),
+    ("set_max_capacitance", "-fall"),
+    ("set_max_capacitance", "-force"),
+    ("set_max_capacitance", "-scenarios"),
+    ("set_max_transition", "-data_path"),
+    ("set_max_transition", "-delay_penalty"),
+    ("set_max_transition", "-force"),
+];
+
+/// A command's keys and flags: the reference timer's ([`FLAGS`]), then the standard's
+/// ([`STANDARD_ONLY`]), then newer vendor SDC 1.8's ([`VENDOR_18_ONLY`]); `None` for a command
+/// none lists.
 pub(crate) fn options(cmd: &str) -> Option<(Vec<&'static str>, Vec<&'static str>)> {
     let reference = FLAGS.iter().find(|(n, _, _)| *n == cmd);
     let standard = STANDARD_ONLY.iter().find(|(n, _, _)| *n == cmd);
-    if reference.is_none() && standard.is_none() {
+    let vendor = VENDOR_18_ONLY.iter().find(|(n, _, _)| *n == cmd);
+    if reference.is_none() && standard.is_none() && vendor.is_none() {
         return None;
     }
     let (mut keys, mut flags) = (Vec::new(), Vec::new());
-    for (_, k, f) in reference.into_iter().chain(standard) {
+    for (_, k, f) in reference.into_iter().chain(standard).chain(vendor) {
         keys.extend_from_slice(k);
         flags.extend_from_slice(f);
     }
@@ -159,42 +216,26 @@ pub(crate) fn keys(cmd: &str) -> Vec<&'static str> {
     options(cmd).map(|(k, _)| k).unwrap_or_default()
 }
 
-/// The reference timer's options that no SDC version declares (1.1 to 2.0 in the reference SDC
-/// parser), `(command, option)`. Read, as the reference reads them; `check` names each one a file
+/// The reference timer's options that no SDC version declares (1.1 to 2.0 in the public reference
+/// SDC parser, nor 1.8 in the vendor's newer releases: [`VENDOR_18`]), `(command, option)`. Read, as the reference reads them; `check` names each one a file
 /// uses, at info level, so a file that leans on them is known not to be portable SDC.
 pub(crate) const EXTENSION_OPTIONS: &[(&str, &str)] = &[
     ("all_inputs", "-no_clocks"),
-    ("get_cells", "-filter"),
-    ("get_cells", "-quiet"),
     ("get_clocks", "-filter"),
-    ("get_clocks", "-quiet"),
     ("get_lib_cells", "-filter"),
     ("get_lib_cells", "-of_objects"),
-    ("get_lib_cells", "-quiet"),
     ("get_lib_pins", "-filter"),
     ("get_lib_pins", "-of_objects"),
-    ("get_lib_pins", "-quiet"),
     ("get_libs", "-filter"),
-    ("get_libs", "-quiet"),
-    ("get_nets", "-filter"),
-    ("get_nets", "-quiet"),
-    ("get_pins", "-filter"),
-    ("get_pins", "-of_objects"),
-    ("get_pins", "-quiet"),
-    ("get_ports", "-filter"),
     ("get_ports", "-nocase"),
     ("get_ports", "-of_objects"),
-    ("get_ports", "-quiet"),
     ("group_path", "-critical_range"),
     ("set_clock_sense", "-clock"),
     ("set_driving_cell", "-cell"),
     ("set_false_path", "-reset_path"),
-    ("set_load", "-fall"),
-    ("set_load", "-rise"),
     ("set_max_delay", "-ignore_clock_latency"),
     ("set_max_delay", "-probe"),
     ("set_max_delay", "-reset_path"),
-    ("set_max_transition", "-data_path"),
     ("set_min_delay", "-ignore_clock_latency"),
     ("set_min_delay", "-probe"),
     ("set_min_delay", "-reset_path"),
