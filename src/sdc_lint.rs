@@ -186,6 +186,16 @@ pub fn lint_with_meta(
         }
     }
 
+    // --- the design the constraints name ---------------------------------
+    // `current_design` (or `set_current_design`, read as it) naming another design: the file's
+    // constraints are still applied to this one, as the current design
+    if let Some(d) = sdc.current_design.as_deref().filter(|d| *d != nl.module) {
+        f.push(Finding::warn(
+            "current-design-not-top",
+            format!("`current_design {d}` names a design other than the netlist's top `{}`; the constraints are applied to `{}`", nl.module, nl.module),
+        ));
+    }
+
     // --- clocks -------------------------------------------------------------
     let has_registers = nl
         .insts
@@ -1082,6 +1092,32 @@ mod tests {
         let r = lint(&nl(), &sdc, &lib());
         assert_eq!(r.errors(), 0, "{:?}", r.findings);
         assert_eq!(r.warnings(), 0, "{:?}", r.findings);
+    }
+
+    /// `set_current_design` (SDC 1.1 in the vendor releases of the parser) is read as
+    /// `current_design`: the file is read on, and `check` warns only when the design it names is
+    /// not the netlist's top. The constraints are applied to the top either way.
+    #[test]
+    fn set_current_design_is_current_design_and_warns_on_another_design() {
+        let base = "create_clock -name clk -period 10 [get_ports clk]\nset_input_delay 1 -clock clk [all_inputs]\nset_output_delay 1 -clock clk [all_outputs]\n";
+        for cmd in ["set_current_design", "current_design"] {
+            let sdc = Sdc::parse(&format!("{cmd} t\n{base}")).unwrap_or_else(|e| panic!("{cmd}: {e:?}"));
+            assert_eq!(sdc.current_design.as_deref(), Some("t"), "{cmd}");
+            assert_eq!(sdc.clocks.len(), 1, "{cmd}: the read stopped");
+            assert!(sdc.rejected.is_empty() && sdc.not_applied().is_empty() && sdc.extensions.is_empty(), "{cmd}: {:?}", sdc.not_applied());
+            let r = lint(&nl(), &sdc, &lib());
+            assert_eq!(r.warnings(), 0, "{cmd}: {:?}", r.findings);
+            let other = Sdc::parse(&format!("{cmd} other\n{base}")).unwrap();
+            let r = lint(&nl(), &other, &lib());
+            let w: Vec<_> = r.findings.iter().filter(|f| f.code == "current-design-not-top").collect();
+            assert_eq!(w.len(), 1, "{cmd}: {:?}", r.findings);
+            assert_eq!(w[0].severity, Severity::Warning);
+            assert_eq!(w[0].message, "`current_design other` names a design other than the netlist's top `t`; the constraints are applied to `t`");
+            assert_eq!(r.errors(), 0, "{cmd}: {:?}", r.findings);
+        }
+        // written back in the reference timer's spelling
+        let w = Sdc::parse(&format!("set_current_design t\n{base}")).unwrap().write(&crate::sdc_write::WriteOpts::default());
+        assert!(w.text.contains("current_design t") && !w.text.contains("set_current_design"), "{}", w.text);
     }
 
     #[test]

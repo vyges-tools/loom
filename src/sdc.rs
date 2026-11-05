@@ -4480,6 +4480,9 @@ fn dialect(
         "dict" => Ok(tcl::dict_statement(raw, vars)),
         // a signoff timer's `remove_*` / `reset_*`: the reference's `unset_*` / `delete_*` command
         w if tcl::take_back_alias(w).is_some() => Ok(tcl::rewrite_take_back(raw).map_or(Dialect::None, |l| Dialect::Run(vec![l]))),
+        // `set_current_design`, which the vendor releases of the SDC parser declare in SDC 1.1, is
+        // read as `current_design` (the reference timer does not know it, and stops there)
+        "set_current_design" => Ok(Dialect::Run(vec![format!("{}current_design{}", tcl::SDC_SPELLING, &raw.trim_start()["set_current_design".len()..])])),
         "source" => {
             let line = subst_command_vars(raw, vars);
             let toks = tokenize(&line);

@@ -188,7 +188,7 @@ pub const SDC_COMMANDS: &[Command] = &[
     v("1.7", kept("set_clock_sense", "set_clock_sense -positive [get_pins u1/Z]")),
     v("1.1", cmd("set_clock_transition", Applied, STA, "set_clock_transition 0.1 [get_clocks c]")),
     v("1.1", cmd("set_clock_uncertainty", Applied, STA, "set_clock_uncertainty 0.2 [get_clocks c]")),
-    vendor("1.1", cmd("set_current_design", Unhandled, NONE, "set_current_design top")),
+    vendor("1.1", note("read as `current_design`; `check` warns when it names a design other than the netlist's top", cmd("set_current_design", Applied, R, "set_current_design top"))),
     v("1.4", note("`-rise` / `-fall`: kept, not applied", cmd("set_data_check", Applied, STA_SI, "set_data_check -from [get_pins r/D] -to [get_pins s/D] 0.1"))),
     v("1.1", cmd("set_disable_timing", Applied, STA_SI, "set_disable_timing [get_cells u1]")),
     vendor("1.1", cmd("set_dont_touch", ReadPast, NONE, "set_dont_touch [get_cells u1]")),
