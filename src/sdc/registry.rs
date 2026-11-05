@@ -544,6 +544,26 @@ mod tests {
         }
     }
 
+    /// The declared-options list's vendor rows (`tests/data/sdc_declared_options.txt`, each read
+    /// by a test that fails on a refusal) are exactly [`crate::sdc_flags::VENDOR_18`]: an option
+    /// vendor SDC 1.8 declares that is missing here is still named a reference-timer extension
+    /// (`get_libs -filter` was), one listed here and not there is read by no test.
+    #[test]
+    fn the_vendor_sdc_18_options_are_the_declared_lists_vendor_rows() {
+        let mut rows: Vec<(&str, &str)> = include_str!("../../tests/data/sdc_declared_options.txt")
+            .lines()
+            .filter(|l| !l.starts_with('#') && l.ends_with(" vendor"))
+            .map(|l| {
+                let w: Vec<&str> = l.split_whitespace().collect();
+                (w[0], w[1])
+            })
+            .collect();
+        let mut ours = crate::sdc_flags::VENDOR_18.to_vec();
+        rows.sort();
+        ours.sort();
+        assert_eq!(ours, rows);
+    }
+
     #[test]
     fn names_are_sorted_and_unique() {
         for list in [SDC_COMMANDS, OTHER_COMMANDS] {

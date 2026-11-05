@@ -283,7 +283,7 @@ fn newer_sdc_18_design_rule_options_are_kept() {
 /// The reference timer's options and commands that no SDC version declares are read as it reads
 /// them, and `check` names each one used, with its count, at info level only. An option SDC does
 /// declare (`-comment`), or newer vendor SDC 1.8 does (`get_ports -filter`, `get_ports -quiet`,
-/// `get_pins -of_objects`), is not named.
+/// `get_pins -of_objects`, and `-filter` on the library queries), is not named.
 #[test]
 fn reference_extensions_are_named_at_info_level() {
     let s = read("set_input_delay 1 -clock c [all_inputs -no_clocks]\nset_clock_uncertainty 0.1 [get_clocks -filter {name==c} *]\n\
@@ -297,6 +297,9 @@ fn reference_extensions_are_named_at_info_level() {
     assert!(read("create_clock -name d -period 5 -comment x [get_ports d]").extensions.is_empty());
     let s = read("set_input_delay 1 -clock c [get_ports -filter {direction==in} -quiet *]\nset_false_path -to [get_pins -quiet -of_objects [get_cells u1]]\nset_load -rise 0.1 [get_ports y]");
     assert!(s.extensions.is_empty(), "newer vendor SDC 1.8 options named as extensions: {:?}", s.extensions);
+    let s = read("set_disable_timing [get_lib_cells -filter {name==BUF} lib/*]\nset_disable_timing [get_lib_pins -filter {name==A} lib/BUF/*]\n\
+                  set_driving_cell -lib_cell BUF -library [get_libs -filter {name==lib} *] [get_ports a]");
+    assert!(s.extensions.is_empty(), "vendor SDC 1.8's library-query -filter named as an extension: {:?}", s.extensions);
 }
 
 /// SDC 1.7 on declares `set_false_path -rise_throough` / `-fall_throough`, the public parser's
