@@ -146,7 +146,7 @@ pub(crate) const KEPT_OPTIONS: &[(&str, &str)] = &[
     ("set_max_capacitance", "-rise"),
     ("set_max_capacitance", "-fall"),
     ("set_max_capacitance", "-force"),
-    ("set_max_capacitance", "-scenarios"),
+    ("set_max_capacitance", "-sms_scenarios"),
     ("set_max_transition", "-delay_penalty"),
     ("set_max_transition", "-force"),
 ];
@@ -158,7 +158,7 @@ pub(crate) const KEPT_OPTIONS: &[(&str, &str)] = &[
 /// not public; it is read as taking one, its name being that of a quantity.
 pub(crate) const VENDOR_18_ONLY: &[(&str, &[&str], &[&str])] = &[
     ("set_load", &[], &["-internal", "-allow_negative_cap"]),
-    ("set_max_capacitance", &["-scenarios"], &["-clock_path", "-data_path", "-rise", "-fall", "-force"]),
+    ("set_max_capacitance", &["-sms_scenarios"], &["-clock_path", "-data_path", "-rise", "-fall", "-force"]),
     ("set_max_transition", &["-delay_penalty"], &["-force"]),
 ];
 
@@ -189,7 +189,7 @@ pub(crate) const VENDOR_18: &[(&str, &str)] = &[
     ("set_max_capacitance", "-rise"),
     ("set_max_capacitance", "-fall"),
     ("set_max_capacitance", "-force"),
-    ("set_max_capacitance", "-scenarios"),
+    ("set_max_capacitance", "-sms_scenarios"),
     ("set_max_transition", "-data_path"),
     ("set_max_transition", "-delay_penalty"),
     ("set_max_transition", "-force"),

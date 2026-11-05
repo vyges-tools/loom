@@ -242,7 +242,7 @@ fn options_neither_declares_are_refused() {
 }
 
 /// Newer releases of the vendor's SDC parser declare more options in SDC 1.8 than its public
-/// release: on `set_max_capacitance` `-clock_path -data_path -rise -fall -force -scenarios`, on
+/// release: on `set_max_capacitance` `-clock_path -data_path -rise -fall -force -sms_scenarios`, on
 /// `set_max_transition` `-delay_penalty -force`. They are SDC 1.8 to a user of those releases, so
 /// they are read, not refused: the limit is kept as written (no repair here applies a limit
 /// scoped to clock or data paths, an edge or a scenario), written back, and reported.
@@ -251,7 +251,7 @@ fn newer_sdc_18_design_rule_options_are_kept() {
     for (line, opts, back) in [
         ("set_max_capacitance -clock_path 0.1 [get_clocks c]", &["-clock_path"][..], "set_max_capacitance -clock_path 0.1 [get_clocks {c}]"),
         ("set_max_capacitance -data_path -rise -fall 0.1 [current_design]", &["-data_path", "-rise", "-fall"][..], "set_max_capacitance -data_path -rise -fall 0.1 [current_design]"),
-        ("set_max_capacitance -force -scenarios {s1 s2} 0.1 [current_design]", &["-force", "-scenarios"][..], "set_max_capacitance -scenarios {s1 s2} -force 0.1 [current_design]"),
+        ("set_max_capacitance -force -sms_scenarios {s1 s2} 0.1 [current_design]", &["-force", "-sms_scenarios"][..], "set_max_capacitance -sms_scenarios {s1 s2} -force 0.1 [current_design]"),
         ("set_max_transition -force 0.5 [current_design]", &["-force"][..], "set_max_transition -force 0.5 [current_design]"),
         ("set_max_transition -delay_penalty 2 0.5 [current_design]", &["-delay_penalty"][..], "set_max_transition -delay_penalty 2 0.5 [current_design]"),
     ] {
@@ -263,6 +263,10 @@ fn newer_sdc_18_design_rule_options_are_kept() {
         assert!(s.max_capacitance_objects.is_empty() && s.max_transition_objects.is_empty(), "{line}: applied");
         assert!(written(&s).contains(back), "{line}: {}", written(&s));
     }
+    // vendor SDC 1.8 names the scenario list `-sms_scenarios` (a list); no release declares a
+    // `-scenarios`, so it is an option no SDC version has: refused, not kept
+    let s = read("set_max_capacitance -scenarios {s1 s2} 0.1 [current_design]");
+    assert!(s.rejected.iter().any(|r| r.contains("-scenarios")), "{:?}", s.rejected);
     // still a limit: its value and objects are checked
     let s = read("set_max_capacitance -clock_path 0.1");
     assert!(s.rejected.iter().any(|r| r.contains("missing objects")), "{:?}", s.rejected);

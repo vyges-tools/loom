@@ -357,7 +357,7 @@ set_max_capacitance -data_path Flag 1.8 vendor
 set_max_capacitance -rise Flag 1.8 vendor
 set_max_capacitance -fall Flag 1.8 vendor
 set_max_capacitance -force Flag 1.8 vendor
-set_max_capacitance -scenarios List 1.8 vendor
+set_max_capacitance -sms_scenarios List 1.8 vendor
 set_max_transition -data_path Flag 1.8 vendor
 set_max_transition -delay_penalty Float 1.8 vendor
 set_max_transition -force Flag 1.8 vendor

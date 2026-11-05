@@ -48,7 +48,7 @@ fn value(cmd: &str, o: &str, kind: &str) -> String {
         (_, "-edge_shift") => "{0 0 0}",
         (_, "-coordinate") => "{0 0 10 10}",
         (_, "-object_list") => "[get_cells u1]",
-        (_, "-scenarios") => "{s1 s2}",
+        (_, "-sms_scenarios") => "{s1 s2}",
         (_, "-library" | "-min_library" | "-max_library") => "lib",
         (_, "-lib_cell") => "BUF",
         (_, "-pin") => "Z",
