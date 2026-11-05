@@ -154,12 +154,12 @@ pub(crate) const KEPT_OPTIONS: &[(&str, &str)] = &[
 /// `(command, keys, flags)` that newer releases of the vendor's SDC parser declare in SDC 1.8 and
 /// that neither the public release ([`STANDARD_ONLY`]'s source) nor the reference timer
 /// ([`FLAGS`]) has. They are SDC 1.8 to a user of those releases, so they are read, not refused:
-/// each is kept with its command ([`KEPT_OPTIONS`]). Whether `-delay_penalty` takes a value is
-/// not public; it is read as taking one, its name being that of a quantity.
+/// each is kept with its command ([`KEPT_OPTIONS`]). `set_max_transition -delay_penalty` is a
+/// flag there (it takes no value), so the word after it is the limit.
 pub(crate) const VENDOR_18_ONLY: &[(&str, &[&str], &[&str])] = &[
     ("set_load", &[], &["-internal", "-allow_negative_cap"]),
     ("set_max_capacitance", &["-sms_scenarios"], &["-clock_path", "-data_path", "-rise", "-fall", "-force"]),
-    ("set_max_transition", &["-delay_penalty"], &["-force"]),
+    ("set_max_transition", &[], &["-delay_penalty", "-force"]),
 ];
 
 /// Every `(command, option)` newer releases of the vendor's SDC parser declare in SDC 1.8 that its

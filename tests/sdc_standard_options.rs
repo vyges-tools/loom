@@ -253,7 +253,8 @@ fn newer_sdc_18_design_rule_options_are_kept() {
         ("set_max_capacitance -data_path -rise -fall 0.1 [current_design]", &["-data_path", "-rise", "-fall"][..], "set_max_capacitance -data_path -rise -fall 0.1 [current_design]"),
         ("set_max_capacitance -force -sms_scenarios {s1 s2} 0.1 [current_design]", &["-force", "-sms_scenarios"][..], "set_max_capacitance -sms_scenarios {s1 s2} -force 0.1 [current_design]"),
         ("set_max_transition -force 0.5 [current_design]", &["-force"][..], "set_max_transition -force 0.5 [current_design]"),
-        ("set_max_transition -delay_penalty 2 0.5 [current_design]", &["-delay_penalty"][..], "set_max_transition -delay_penalty 2 0.5 [current_design]"),
+        // `-delay_penalty` is a flag in vendor SDC 1.8 (it takes no value): 0.5 is the limit
+        ("set_max_transition -delay_penalty 0.5 [current_design]", &["-delay_penalty"][..], "set_max_transition -delay_penalty 0.5 [current_design]"),
     ] {
         let cmd = line.split(' ').next().unwrap();
         let want: Vec<String> = opts.iter().map(|o| format!("{cmd} {o}")).collect();
@@ -267,6 +268,12 @@ fn newer_sdc_18_design_rule_options_are_kept() {
     // `-scenarios`, so it is an option no SDC version has: refused, not kept
     let s = read("set_max_capacitance -scenarios {s1 s2} 0.1 [current_design]");
     assert!(s.rejected.iter().any(|r| r.contains("-scenarios")), "{:?}", s.rejected);
+    // and kept with that limit, not a design-wide one
+    let s = read("set_max_transition -delay_penalty 0.5 [current_design]");
+    let k = s.kept.iter().find(|k| k.cmd == "set_max_transition").expect("kept");
+    assert_eq!((k.number(0), k.has("-delay_penalty"), k.keys.is_empty()), (Some(0.5), true, true), "{k:?}");
+    // a value after it is a second positional: `wrong # args`, not a penalty
+    assert!(!read("set_max_transition -delay_penalty 2 0.5 [current_design]").rejected.is_empty());
     // still a limit: its value and objects are checked
     let s = read("set_max_capacitance -clock_path 0.1");
     assert!(s.rejected.iter().any(|r| r.contains("missing objects")), "{:?}", s.rejected);
