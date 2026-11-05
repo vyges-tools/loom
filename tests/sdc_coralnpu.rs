@@ -5,7 +5,8 @@
 //! - each command it uses is applied, kept or run as Tcl, as the command registry says;
 //! - the two `if` blocks whose condition is the length of an object query (`llength [get_ports
 //!   -quiet io_te]`) need the design, so without one they are listed as not applied;
-//! - `group_path` (×3) is kept and reported as kept-not-applied;
+//! - `group_path` (×3) is carried in its records for the `sta` timer, which applies it, and is
+//!   not reported as kept-not-applied;
 //! - its reference-timer extensions are `-quiet` on the queries and `all_inputs -no_clocks`.
 //!
 //! The file takes its period from `$::env(CLK_PERIOD_PS)` when that is set, as Tcl does, else
@@ -82,10 +83,9 @@ fn query_conditions_are_not_evaluated_without_a_design() {
 }
 
 #[test]
-fn group_path_is_kept_not_applied() {
+fn group_path_is_carried_for_the_timer() {
     let s = read();
-    let k: Vec<(String, usize, bool)> = s.kept_not_applied().into_iter().map(|k| (k.command, k.count, k.affects_timing)).collect();
-    assert_eq!(k, [("group_path".to_string(), 3, true)]);
+    assert!(s.kept_not_applied().is_empty(), "{:?}", s.kept_not_applied());
     assert_eq!(s.other_exceptions.iter().filter(|e| e.cmd == "group_path").count(), 3);
 }
 

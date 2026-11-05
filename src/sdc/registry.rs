@@ -108,6 +108,7 @@ const R: &[&str] = &["reader"];
 const CHECK_STA: &[&str] = &["check", "sta", "sta-si"];
 const STA: &[&str] = &["sta", "sta-si"];
 const STA_SI: &[&str] = &["sta-si"];
+const STA_ONLY: &[&str] = &["sta"];
 const RSZ: &[&str] = &["rsz"];
 const NONE: &[&str] = &[];
 
@@ -174,7 +175,7 @@ pub const SDC_COMMANDS: &[Command] = &[
     v("1.1", cmd("get_pins", Applied, R, "set_false_path -to [get_pins r/D]")),
     v("1.5", spelling("get_port", "get_ports", "set_input_delay 1 -clock c [get_port a]")),
     v("1.1", cmd("get_ports", Applied, R, "set_input_delay 1 -clock c [get_ports a]")),
-    v("1.7", kept("group_path", "group_path -name g -to [get_ports y]")),
+    v("1.7", note("`sta`: `-name` groups, their path ends reported; no slack moves with it", cmd("group_path", Applied, STA_ONLY, "group_path -name g -to [get_ports y]"))),
     since(Since::Tcl, note("a condition the file alone decides (`info exists`, a variable); one on a query's result needs the design and is listed as not applied", cmd("if", Tcl, NONE, "if {1} { set_load 0.1 [get_ports y] }"))),
     since(Since::Tcl, cmd("list", Tcl, NONE, "set_false_path -to [list [get_ports y]]")),
     vendor("1.8", note("only as every input or output but some, the objects of an I/O delay", cmd("remove_from_collection", Applied, R, "set_input_delay 1 -clock c [remove_from_collection [all_inputs] [get_ports clk]]"))),
@@ -392,9 +393,10 @@ mod tests {
         assert!(faults.is_empty(), "{} command(s) whose status is not what the reader does:\n{}", faults.len(), faults.join("\n"));
     }
 
-    /// The commands kept as written ([`crate::sdc::KeptCmd`]) that a consumer applies from those
-    /// words: sta-si builds its data checks from them.
-    const READ_FROM_KEPT: [&str; 2] = ["set_data_check", "unset_data_check"];
+    /// The commands kept as written ([`crate::sdc::KeptCmd`], [`crate::sdc::ExceptionCmd`]) that a
+    /// consumer applies from those words: sta-si builds its data checks from them, sta its path
+    /// groups.
+    const READ_FROM_KEPT: [&str; 3] = ["set_data_check", "unset_data_check", "group_path"];
 
     fn probe(c: &Command) {
         {
