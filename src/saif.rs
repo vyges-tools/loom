@@ -63,10 +63,10 @@ impl Saif {
         }
     }
 
-    /// Transitions / second for a netlist net by the reference's rule — only a dump entry that
-    /// names a port or an instance pin counts ([`crate::names::PinPaths`]).
+    /// Transitions / second for a netlist net by the reference's rule — an entry naming the net,
+    /// else one naming a port or an instance pin of it ([`crate::names::PinPaths::resolve_saif`]).
     pub fn pin_rate(&self, pins: &crate::names::PinPaths, net: &str) -> f64 {
-        match pins.resolve(&self.idx, net) {
+        match pins.resolve_saif(&self.idx, net) {
             Some(n) if self.sim_time_s > 0.0 => n / self.sim_time_s,
             _ => 0.0,
         }
@@ -374,6 +374,16 @@ mod tests {
         assert!((s.toggle_rate("n1") - 8.0e7).abs() < 1.0);
         assert!((s.toggle_rate("q") - 4.0e7).abs() < 1.0);
         assert_eq!(s.toggle_rate("absent"), 0.0);
+    }
+
+    /// Rule (OpenSTA 9e1fe015, in the pin's cc9027d6: the SAIF lexer takes a backslash before any
+    /// non-blank character in an identifier, and `unescaped` drops it): a flat net with a literal
+    /// divider, written `u_a\/n1`, is the net `u_a/n1`.
+    #[test]
+    fn an_escaped_divider_names_the_flat_net() {
+        let s = Saif::parse("(SAIFILE (DURATION 100) (TIMESCALE 1 ns) (INSTANCE top (NET (u_a\\/n1 (T0 50) (T1 50) (TC 4)))))").unwrap();
+        assert_eq!(s.idx.toggles.get("top.u_a/n1"), Some(&4.0), "{:?}", s.idx.toggles);
+        assert!((s.toggle_rate("u_a/n1") - 4.0e7).abs() < 1.0);
     }
 
     #[test]

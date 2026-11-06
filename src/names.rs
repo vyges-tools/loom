@@ -149,11 +149,11 @@ impl NetIndex {
 /// The dumped names that may carry a netlist net's activity: the reference's rule for which
 /// dump entries annotate the design.
 ///
-/// 🔑 **The reference annotates PINS.** Its SAIF reader looks each `NET` entry up as a pin of the
-/// enclosing instance, so a SAIF entry counts only when it names a **top-level port** or a
-/// **leaf instance's pin** (`inst/pin`, spelled `inst.pin` in a dump path); an entry naming a
-/// bare internal net — `n1` between `u1/X` and `u2/A` — is dropped, and so is a power/ground pin
-/// ([`PinPaths::resolve`]). Its VCD reader does the same, and since OpenSTA d3d25c59 a VCD
+/// 🔑 **The reference annotates PINS.** Its SAIF reader looks each `NET` entry up first as a net
+/// of the enclosing instance — every pin of that net is annotated (OpenSTA 21ae0932,
+/// [`PinPaths::resolve_saif`]) — else as a pin, a **top-level port** or a **leaf instance's pin**
+/// (`inst/pin`, spelled `inst.pin` in a dump path); a power/ground pin never is
+/// ([`PinPaths::resolve`] is the pin-only rule). Its VCD reader keys pins, and since OpenSTA d3d25c59 a VCD
 /// variable that names a NET also annotates every pin of that net without a variable of its
 /// own (`VcdCountReader::addVarPin`) — [`PinPaths::resolve_vcd`]. Keyed by net here because the consumers are:
 /// a net's rate is the first of its candidates the dump carries — its port, then its instance
@@ -191,6 +191,25 @@ impl PinPaths {
     /// The transition count of `net` in `idx` by this rule.
     pub fn resolve(&self, idx: &NetIndex, net: &str) -> Option<f64> {
         let path = self.resolve_path(idx, net)?;
+        Some(idx.toggles.get(path).copied().unwrap_or(0.0))
+    }
+
+    /// [`PinPaths::resolve_path`] by the SAIF reader's rule (OpenSTA 21ae0932, in the pin's
+    /// cc9027d6): an entry naming the net itself annotates every annotatable pin of the net and
+    /// overwrites what an earlier pin entry set, so it decides the net; else a port or pin entry.
+    /// A net with no annotatable pin annotates nothing. (A pin entry AFTER the net entry
+    /// overwrites that one pin only: the reference's pins then disagree, and the net keeps the
+    /// value most of them carry.)
+    pub fn resolve_path_saif<'a>(&self, idx: &'a NetIndex, net: &str) -> Option<&'a str> {
+        let cands = self.by_net.get(net)?;
+        idx.resolve_path(net).or_else(|| cands.iter().find_map(|cand| idx.resolve_path(cand)))
+    }
+
+    /// The transition count of `net` in `idx` by the SAIF reader's rule ([`resolve_path_saif`]).
+    ///
+    /// [`resolve_path_saif`]: PinPaths::resolve_path_saif
+    pub fn resolve_saif(&self, idx: &NetIndex, net: &str) -> Option<f64> {
+        let path = self.resolve_path_saif(idx, net)?;
         Some(idx.toggles.get(path).copied().unwrap_or(0.0))
     }
 
@@ -348,10 +367,14 @@ mod tests {
         assert_eq!(vcd.toggle_rate("n1"), 0.0, "the net-keyed reading misses it");
     }
 
-    /// SAIF (reference `setNetDurations`: `findPin(parent, name)`): a top-level `NET` entry for an
-    /// internal net is no pin of the top instance; one inside the leaf instance `u2` is its pin.
+    /// SAIF (reference `setNetDurations` at cc9027d6, OpenSTA 21ae0932): a name that is a net of
+    /// the enclosing instance annotates every pin of the net (each later entry for a pin
+    /// overwriting it), a name that is only a pin annotates that pin. Witness: the reference on
+    /// `upstream-saif-net` (internal activity corpus) — the net entry `n1` alone annotates `u1/X`
+    /// and `u2/A`; `n2` overwrites the earlier `u2/X` entry and is overwritten at `u3/A` by the
+    /// later one, so `u2/X` (the driver) carries the net entry.
     #[test]
-    fn a_saif_net_entry_annotates_only_a_port_or_an_instance_pin() {
+    fn a_saif_net_entry_annotates_the_pins_of_its_net() {
         let nl = crate::netlist::parse(PROBE_V).unwrap();
         let pins = PinPaths::new(&nl, |_, _| false);
         let s = crate::saif::Saif::parse(
@@ -362,7 +385,16 @@ mod tests {
         .unwrap()
         .with_scope(Some("top".into()));
         assert!((s.pin_rate(&pins, "a") - 4.0e7).abs() < 1.0);
-        assert!((s.pin_rate(&pins, "n1") - 2.0e7).abs() < 1.0, "u2/A carries n1, not the NET n1 entry");
+        assert!((s.pin_rate(&pins, "n1") - 6.0e7).abs() < 1.0, "the NET n1 entry decides n1");
+        let only_net = crate::saif::Saif::parse("(SAIFILE (DURATION 100) (TIMESCALE 1 ns) (INSTANCE top (NET (n1 (T0 50) (T1 50) (TC 6)))))")
+            .unwrap()
+            .with_scope(Some("top".into()));
+        assert!((only_net.pin_rate(&pins, "n1") - 6.0e7).abs() < 1.0, "a net entry alone annotates its pins");
+        let only_pin = crate::saif::Saif::parse("(SAIFILE (DURATION 100) (TIMESCALE 1 ns) (INSTANCE top (INSTANCE u2 (NET (A (T0 50) (T1 50) (TC 2))))))")
+            .unwrap()
+            .with_scope(Some("top".into()));
+        assert!((only_pin.pin_rate(&pins, "n1") - 2.0e7).abs() < 1.0, "a pin entry alone annotates its net");
+        assert_eq!(pins.resolve_saif(&only_net.idx, "no_such_net"), None, "a net with no pin annotates nothing");
     }
 
     /// A power/ground pin never annotates, even when the dump names it.
