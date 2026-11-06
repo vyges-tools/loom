@@ -39,10 +39,9 @@ const ANY: usize = usize::MAX;
 
 /// Procs with fixed parameters (`proc set_max_area { area }`): no option parse, so every word is
 /// a parameter and a count other than theirs is Tcl's wrong # args.
-const FIXED: [&str; 8] = [
-    "set_max_time_borrow", "set_min_capacitance", "set_fanout_load", "set_max_area", "set_max_dynamic_power",
-    "set_max_leakage_power", "set_wire_load_min_block_size", "set_wire_load_mode",
-];
+const FIXED: [&str; 6] = ["set_max_time_borrow", "set_min_capacitance", "set_fanout_load", "set_max_area", "set_wire_load_min_block_size", "set_wire_load_mode"];
+/// The units `power_arg_sta` scales (`GW` … `aW`), in its order.
+const POWER_UNITS: [&str; 11] = ["GW", "MW", "KW", "kW", "W", "mW", "uW", "nW", "pW", "fW", "aW"];
 const DATA_CHECK_KEYS: [&str; 7] = ["-from", "-rise_from", "-fall_from", "-to", "-rise_to", "-fall_to", "-clock"];
 
 const SPECS: &[Spec] = &[
@@ -271,7 +270,18 @@ fn check(c: &KeptCmd) -> Result<(), String> {
         "set_drive" | "set_resistance" => positive_float("resistance", arg(0)),
         "set_min_capacitance" => positive_float("limit", arg(0)),
         "set_max_area" => positive_float("area", arg(0)),
-        "set_max_dynamic_power" | "set_max_leakage_power" => positive_float("power", arg(0)),
+        // `power_arg_sta` (OpenSTA 260c63e3): `-unit` takes the one positional's place (Error 565),
+        // then the power, then the unit, one of the SDC power units (Error 487).
+        "set_max_dynamic_power" | "set_max_leakage_power" => {
+            if c.key("-unit").is_some() && c.args.len() != 1 {
+                return Err("requires one positional argument (Error 565)".into());
+            }
+            positive_float("power", arg(0))?;
+            match key("-unit").or(arg(1)) {
+                Some(u) if !POWER_UNITS.contains(&u) => Err(format!("{} unit '{u}' is not one of {} (Error 487)", c.cmd, POWER_UNITS.join(" "))),
+                _ => Ok(()),
+            }
+        }
         "set_port_fanout_number" => match arg(0) {
             Some(v) if !v.trim().parse::<i64>().is_ok_and(|n| n >= 0) => Err(format!("fanout '{v}' is not a positive integer (Error 574)")),
             _ => Ok(()),
@@ -523,6 +533,29 @@ mod tests {
 
     fn read(t: &str) -> Sdc {
         Sdc::parse(t).expect("reads")
+    }
+
+    /// Rule (`power_arg_sta`, OpenSTA 260c63e3 in the pin's cc9027d6): a power limit takes its
+    /// unit positionally or as `-unit`, one of GW MW KW kW W mW uW nW pW fW aW (Error 487);
+    /// `-unit` beside a positional unit is Error 565; no unit or one is Error 568. Witness: the
+    /// reference's `max_power_area.ok` (`set_max_leakage_power unit 'uA' is not one of …`, and
+    /// `requires one positional argument` for `8 uW -unit uW`).
+    #[test]
+    fn a_power_limit_unit_is_one_of_the_sdc_power_units() {
+        for ok in ["set_max_dynamic_power 1.25", "set_max_leakage_power 0.75 uW", "set_max_dynamic_power 4 -unit aW", "set_max_leakage_power 2 -unit KW"] {
+            let s = read(ok);
+            assert_eq!(s.kept.len(), 1, "{ok}: {:?}", s.rejected);
+        }
+        for (bad, why) in [
+            ("set_max_leakage_power 8 uA", "set_max_leakage_power unit 'uA' is not one of GW MW KW kW W mW uW nW pW fW aW (Error 487)"),
+            ("set_max_leakage_power 8 uW -unit uW", "Error 565"),
+            ("set_max_dynamic_power", "Error 568"),
+            ("set_max_dynamic_power -1 W", "Error 572"),
+        ] {
+            let s = read(bad);
+            assert!(s.kept.is_empty(), "{bad}: kept");
+            assert!(s.rejected.iter().any(|r| r.contains(why)), "{bad}: {:?}", s.rejected);
+        }
     }
 
     /// Each kept command is carried with its words, and written back as read.
