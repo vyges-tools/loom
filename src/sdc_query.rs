@@ -238,7 +238,20 @@ fn by_pattern(cmd: &str, patterns: &[String], _hier: bool, d: &SdcDesign) -> Res
     Ok(match cmd {
         // ports are the netlist's bits; a pattern naming a bus names each of them
         "get_ports" => Objs::Ports(pick(d.ports.len(), &|k| d.ports[k].0.clone(), &crate::sdc::object_matches)),
-        "get_cells" => Objs::Cells(pick(d.insts.len(), &|k| d.insts[k].0.clone(), &glob)),
+        // `SdcNetwork::findInstancesMatching`: dividers escaped, brackets escaped when nothing
+        // matches as written
+        "get_cells" => {
+            let insts: Vec<&str> = d.insts.iter().map(|i| i.0.as_str()).collect();
+            let mut out: Vec<usize> = Vec::new();
+            for p in patterns {
+                for k in crate::sdc::insts_matching(p, &insts) {
+                    if !out.contains(&k) {
+                        out.push(k);
+                    }
+                }
+            }
+            Objs::Cells(out)
+        }
         // `SdcNetwork::findPinsMatching`: the instance part with its brackets escaped when
         // nothing matches it as written (the database keeps `\[`, written SDC does not)
         "get_pins" => {

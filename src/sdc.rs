@@ -300,6 +300,24 @@ pub fn pins_matching(pattern: &str, insts: &[&str], pins: &[(usize, &str)]) -> V
     (0..pins.len()).filter(|&j| hit[j]).collect()
 }
 
+/// `get_cells <pattern>` over a flat netlist, as the reference's SDC network finds instances
+/// (`SdcNetwork::findInstancesMatching` -> `visitMatches` with the children finder as its tail).
+/// In a flat netlist no instance has children, so a split at a divider never finds one: what
+/// matches is the WHOLE pattern, its dividers not escaped now escaped (`h/u1` names the
+/// instance `h\/u1`), as a `*` / `?` glob against the instance names; when NO instance matches
+/// and the pattern has a bracket not escaped, the pattern with its brackets escaped is matched
+/// instead (`out[1]$_DFF_P_` names the database's `out\[1\]$_DFF_P_`, a literal `x[2]`
+/// preventing the retry). The matches are returned in `insts` order.
+pub fn insts_matching(pattern: &str, insts: &[&str]) -> Vec<usize> {
+    let (_, path, brackets) = pin_pattern_splits(pattern);
+    let matched: Vec<usize> = (0..insts.len()).filter(|&k| glob(&path, insts[k])).collect();
+    if !matched.is_empty() || !brackets {
+        return matched;
+    }
+    let escaped = escape_chars(&path, &['[', ']']);
+    (0..insts.len()).filter(|&k| glob(&escaped, insts[k])).collect()
+}
+
 impl Exception {
     /// Does this exception's `-from` set cover `name`?
     pub fn from_matches(&self, name: &str) -> bool {
@@ -5203,6 +5221,25 @@ mod pin_match_tests {
         assert_eq!(m("u2/*"), [7, 8, 9]);
         assert!(m("u1").is_empty() && m("nope/A").is_empty());
         assert_eq!(m("*").len(), pins.len(), "`*` alone is every instance pin");
+    }
+
+    /// Rules (SdcNetwork::findInstancesMatching1 / visitMatches, Network::findChildrenMatching):
+    /// on a flat netlist the instance is the whole pattern with its dividers escaped, a glob on
+    /// the instance name; a bracket not escaped retries the pattern with its brackets escaped,
+    /// ONLY when the written form matches no instance.
+    #[test]
+    fn an_instance_pattern_escapes_dividers_and_retries_brackets() {
+        let insts = ["dpath.b_reg.out\\[1\\]$_DFFE_PP_", "x[2]", "x\\[2\\]", "h\\/u1", "u1", "u2"];
+        let m = |p: &str| insts_matching(p, &insts);
+        assert_eq!(m("dpath.b_reg.out[1]$_DFFE_PP_"), [0]);
+        assert_eq!(m("dpath.b_reg.out\\[1\\]$_DFFE_PP_"), [0], "already escaped: matched as written");
+        assert_eq!(m("x[2]"), [1], "the literal x[2] matches, so x\\[2\\] is not tried");
+        assert_eq!(m("h/u1"), [3], "a divider is escaped: the flat instance h\\/u1");
+        assert_eq!(m("h/*"), [3]);
+        assert_eq!(m("u*"), [4, 5]);
+        assert_eq!(m("*"), [0, 1, 2, 3, 4, 5]);
+        assert_eq!(m("*out[1]*"), [0], "a glob with a bracket is retried escaped too");
+        assert!(m("u3").is_empty() && m("u1/A").is_empty());
     }
 }
 
