@@ -1,7 +1,7 @@
 //! Structural (gate-level) Verilog reader — the connectivity STA and placement need.
 //!
 //! Reads every module in a file — header, `input`/`output`/`inout` ports (scalar and bussed),
-//! net declarations (`wire`/`tri`/`wand`/`wor`, `supply0`/`supply1`), `assign` statements and cell
+//! net declarations (`wire`/`tri`, `supply0`/`supply1`; `wand`/`wor` fail the read), `assign` statements and cell
 //! or module instances, by name (`.PIN(net)`) or by position — then picks the top module (the one
 //! nothing instantiates).
 //!
@@ -1397,6 +1397,9 @@ fn parse_compact_reader_top<R: std::io::BufRead>(r: R, top: Option<&str>) -> Res
                     }
                 };
                 reader.statement(&toks, &mut pool);
+                if let Some(kind) = reader.unsupported_net {
+                    return Err(NetlistError(format!("unsupported net type '{kind}' (the reference's verilog error 171)")));
+                }
                 arena.clear();
                 spans.clear();
                 depth = 0;
@@ -1645,6 +1648,8 @@ struct ModuleReader {
     pos_tagged: bool,
     /// a named connection waits for a later declaration — see [`named_tag`]
     named_deferred: bool,
+    /// the first `wand` / `wor` declaration (`VerilogReader::unsupportedNetType`)
+    unsupported_net: Option<&'static str>,
 }
 
 impl ModuleReader {
@@ -1878,9 +1883,17 @@ impl ModuleReader {
                         declare(&mut self.dirs, &x, PortDir::Inout);
                     }
                 }
-                // `tri`, `wand` and `wor` declare nets as `wire` does (the reference grammar's
-                // `dcl_type`); skipped, a `tri [3:0] t` connected whole was one bit
-                kw @ ("wire" | "reg" | "parameter" | "localparam" | "supply0" | "supply1" | "tri" | "wand" | "wor") => {
+                // A `wand` / `wor` declaration: the reference keeps the first one and fails the
+                // read (OpenSTA 274b2e8e, b3e1b398: error 171, unsupported net type).
+                kw @ ("wand" | "wor") => {
+                    self.unsupported_net.get_or_insert(if kw == "wand" { "wand" } else { "wor" });
+                    while i < n && t[i] != ";" {
+                        i += 1;
+                    }
+                }
+                // `tri` declares nets as `wire` does (the reference grammar's `dcl_type`);
+                // skipped, a `tri [3:0] t` connected whole was one bit
+                kw @ ("wire" | "reg" | "parameter" | "localparam" | "supply0" | "supply1" | "tri") => {
                     let is_net = !matches!(kw, "reg" | "parameter" | "localparam");
                     i += 1;
                     // an optional `[ msb:lsb ]` range, then the names it applies to
@@ -2846,14 +2859,28 @@ endmodule
         assert_eq!(nl.insts[0].conns[0], ("A[2]".to_string(), "a[1]".to_string()));
     }
 
-    /// Rule (the reference grammar's `dcl_type`): `tri`, `wand` and `wor` declare nets with a
-    /// range, as `wire` does.
+    /// Rule (the reference grammar's `dcl_type`): `tri` declares nets with a range, as `wire`
+    /// does.
     #[test]
-    fn tri_wand_and_wor_declare_a_range() {
-        let src = "module top (output [1:0] y);\n  tri [1:0] t;\n  wand [1:0] a;\n  wor [1:0] o;\n  B u0 (.A(t), .B(a), .C(o), .Y(y));\nendmodule";
+    fn tri_declares_a_range() {
+        let src = "module top (output [1:0] y);\n  tri [1:0] t;\n  wire [1:0] a;\n  B u0 (.A(t), .B(a), .Y(y));\nendmodule";
         let nl = parse(src).unwrap();
         let pins: Vec<&str> = nl.insts[0].conns.iter().map(|(p, _)| p.as_str()).collect();
-        assert_eq!(pins, ["A[1]", "A[0]", "B[1]", "B[0]", "C[1]", "C[0]", "Y[1]", "Y[0]"]);
+        assert_eq!(pins, ["A[1]", "A[0]", "B[1]", "B[0]", "Y[1]", "Y[0]"]);
+    }
+
+    /// Rule (OpenSTA 274b2e8e, b3e1b398, in the pin's cc9027d6: `dcl_type` WAND / WOR →
+    /// `unsupportedNetType`, error 171 at the end of the read): a `wand` or `wor` declaration
+    /// fails the whole read, naming the first one. Witness: the reference's `verilog_wor.ok`,
+    /// `Error: 171 verilog_wor.v line 5, unsupported net type 'wor'.`
+    #[test]
+    fn a_wand_or_wor_declaration_fails_the_read() {
+        let wor = "module top (a, b, y);\n  input a;\n  input b;\n  output y;\n  wor w;\n  assign w = a;\n  assign w = b;\n  B g (.A(w), .Y(y));\nendmodule";
+        let e = parse(wor).unwrap_err().0;
+        assert!(e.contains("unsupported net type 'wor'"), "{e}");
+        let both = "module top (y);\n  output y;\n  wand [1:0] a;\n  wor o;\n  B u0 (.A(a), .Y(y));\nendmodule";
+        assert!(parse(both).unwrap_err().0.contains("'wand'"), "the first one is named");
+        assert!(parse("module top (y);\n  output y;\n  wire w;\n  B u0 (.A(w), .Y(y));\nendmodule").is_ok());
     }
 
     /// Rule (the reference's `mergeAssignNet`): an assignment merges its two sides BIT FOR BIT —
