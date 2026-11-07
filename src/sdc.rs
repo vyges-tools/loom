@@ -1762,7 +1762,7 @@ pub struct GeneratedClock {
 /// a multiply SCALES the master's waveform (or applies `-duty_cycle`); `-edges` picks master edges
 /// (1-based, counting through the master's edge list cycle after cycle), shifted by `-edge_shift`;
 /// `-invert` then rotates the edges by one. `None` when the request cannot be built.
-fn generate(master: &SdcClock, g: &GeneratedClock) -> Option<(f64, Vec<f64>)> {
+pub(crate) fn generate(master: &SdcClock, g: &GeneratedClock) -> Option<(f64, Vec<f64>)> {
     let mp = master.period;
     let mw: Vec<f64> = match &master.waveform {
         Some(w) if w.len() >= 2 => w.clone(),

@@ -9,7 +9,10 @@
 //!   (`ClkTreeSearchPred::searchThru`). The first pin reached with a clock defined on it gives the
 //!   master, and the search stops there.
 //!
-//! Witnessed by `correlation/harness/sdc/genclk-master-probe.py` in the internal repo (8 cases).
+//! [`update_generated_clks`] then derives each one's waveform from that master, as the reference's
+//! `Sta::updateGeneratedClks` does after the read.
+//!
+//! Witnessed by `correlation/harness/sdc/genclk-master-probe.py` in the internal repo (10 cases).
 //!
 //! ⚠️ What is NOT reproduced, and so is reported [`Master::Undecided`] rather than guessed:
 //! - **The reference's edge order.** When two clocks are reached at the same depth (a clock mux:
@@ -241,6 +244,55 @@ pub fn divider_driver(gclk: &SdcClock, nl: &Netlist, lib: &Lib) -> Option<Divide
     Some(worst)
 }
 
+/// Each generated clock's period and waveform from the master the design gives — the reference's
+/// `Sta::updateGeneratedClks`, run after the whole file is read: a fixed point over the clocks in
+/// definition order, where a generated clock whose waveform is not yet valid is generated from
+/// its master ([`master`]) once that master's waveform is valid. A chain resolves whatever order
+/// its clocks are defined in.
+///
+/// As in the reference, every generated clock starts invalid (a `create_clock` is valid when made)
+/// and is generated once (`Clock::generate` sets it valid whatever period comes out), so the loop
+/// ends. The read ([`Sdc::parse`]) has already generated a clock whose master is `-master_clock`
+/// or a clock on its `-source`, perhaps from a master the read could not yet know; this generates
+/// it again from that master's final waveform. A clock whose master is not decided here keeps
+/// what the read gave it; one with no master keeps period 0. Returns the names of the clocks it
+/// generated, in the order it generated them.
+pub fn update_generated_clks(sdc: &mut Sdc, nl: &Netlist, lib: &Lib) -> Vec<String> {
+    // `Clock::waveformValid()`, by clock index
+    let mut valid: Vec<bool> = sdc.clocks.iter().map(|c| c.generated.is_none()).collect();
+    let mut generated = Vec::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in 0..sdc.clocks.len() {
+            if valid[i] {
+                continue;
+            }
+            let m = match master(sdc, &sdc.clocks[i], nl, lib) {
+                Master::Clock(m) => m,
+                Master::Undecided(_) if sdc.clocks[i].period > 0.0 => {
+                    // not decided here: what the read generated stands, and is what a clock
+                    // generated from this one is generated from
+                    valid[i] = true;
+                    changed = true;
+                    continue;
+                }
+                _ => continue,
+            };
+            let Some(mi) = sdc.clocks.iter().position(|c| c.name == m).filter(|&mi| valid[mi]) else { continue };
+            let spec = sdc.clocks[i].generated.as_ref().expect("an invalid clock is a generated one");
+            let Some((p, w)) = crate::sdc::generate(&sdc.clocks[mi], spec) else { continue };
+            let c = &mut sdc.clocks[i];
+            c.period = p;
+            c.waveform = Some(w);
+            generated.push(c.name.clone());
+            valid[i] = true;
+            changed = true;
+        }
+    }
+    generated
+}
+
 impl Fanin<'_> {
     /// The first cell back from `v` that is not a buffer or inverter, judged.
     fn driving_cell(&self, v: Vertex) -> DividerDriver {
@@ -327,6 +379,72 @@ mod tests {
              endmodule\n",
         )
         .expect("netlist")
+    }
+
+    /// `Sta::updateGeneratedClks` (witnessed by the probe's chain cases): H's master A is found
+    /// only through the design (ub/X), G's is H (on G's -source); G = 10 x 2 x 2 = 40 whichever is
+    /// defined first. A clock with no master (N) keeps period 0.
+    #[test]
+    fn a_generated_clock_takes_its_waveform_from_the_master_the_design_gives() {
+        for (first, second) in [("H", "G"), ("G", "H")] {
+            let def = |n: &str| match n {
+                "H" => "create_generated_clock -name H -divide_by 2 -source [get_pins ub/X] [get_pins rdiv/CLK]\n",
+                _ => "create_generated_clock -name G -divide_by 2 -source [get_pins rdiv/CLK] [get_pins r1/CLK]\n",
+            };
+            let mut s = Sdc::parse(&format!(
+                "create_clock -name A -period 10 [get_ports clka]\n{}{}\
+                 create_generated_clock -name N -divide_by 2 -source [get_pins ux/X] [get_pins r2/CLK]\n",
+                def(first),
+                def(second)
+            ))
+            .expect("sdc");
+            assert!(s.clocks.iter().filter(|c| c.generated.is_some()).all(|c| c.period == 0.0), "the read alone finds none");
+            let done = update_generated_clks(&mut s, &nl(), &lib());
+            let period = |n: &str| s.clocks.iter().find(|c| c.name == n).expect("clock").period;
+            assert_eq!((period("H"), period("G"), period("N")), (20.0, 40.0, 0.0), "{first} first");
+            assert_eq!(done, ["H", "G"], "a clock waits for its master: {first} first");
+            let w = s.clocks.iter().find(|c| c.name == "G").and_then(|c| c.waveform.clone());
+            assert_eq!(w, Some(vec![0.0, 20.0]));
+        }
+    }
+
+    /// `Clock::generate` sets the waveform valid whatever period comes out: a clock generated to
+    /// no period (edges shifted onto each other) is generated once and the loop ends, and one the
+    /// read generated is generated again from its master's final waveform.
+    #[test]
+    fn each_generated_clock_is_generated_once() {
+        let mut s = Sdc::parse(
+            "create_clock -name A -period 10 [get_ports clka]\n\
+             create_generated_clock -name Z -edges {1 2 3} -edge_shift {0 0 -10} -source [get_ports clka] [get_pins r3/CLK]\n\
+             create_generated_clock -name G -divide_by 2 -source [get_pins rdiv/CLK] -master_clock H [get_pins r1/CLK]\n\
+             create_generated_clock -name H -divide_by 2 -source [get_pins ub/X] [get_pins rdiv/CLK]\n",
+        )
+        .expect("sdc");
+        let period = |s: &Sdc, n: &str| s.clocks.iter().find(|c| c.name == n).expect("clock").period;
+        assert_eq!((period(&s, "Z"), period(&s, "G")), (0.0, 0.0), "the read: Z spans nothing, G's master H is not yet known");
+        let done = update_generated_clks(&mut s, &nl(), &lib());
+        assert_eq!(done, ["Z", "H", "G"]);
+        assert_eq!((period(&s, "Z"), period(&s, "H"), period(&s, "G")), (0.0, 20.0, 40.0));
+    }
+
+    /// A clock whose master is not decided here (two clocks on its -source) keeps the read's
+    /// waveform, and a clock generated from it is generated from that.
+    #[test]
+    fn a_clock_not_decided_here_keeps_what_the_read_gave_it() {
+        let mut s = Sdc::parse(
+            "create_clock -name A -period 10 [get_ports clka]\n\
+             create_clock -name A2 -period 4 -add [get_ports clka]\n\
+             create_generated_clock -name V -divide_by 2 -source [get_pins rdiv/CLK] -master_clock U [get_pins r1/CLK]\n\
+             create_generated_clock -name U -divide_by 2 -source [get_ports clka] [get_pins rdiv/CLK]\n",
+        )
+        .expect("sdc");
+        let u = s.clocks.iter().find(|c| c.name == "U").expect("U");
+        assert!(matches!(master(&s, u, &nl(), &lib()), Master::Undecided(_)), "two clocks on the -source");
+        let read_u = u.period;
+        assert!(read_u > 0.0, "the read generated U from one of them");
+        assert_eq!(update_generated_clks(&mut s, &nl(), &lib()), ["V"]);
+        let period = |n: &str| s.clocks.iter().find(|c| c.name == n).expect("clock").period;
+        assert_eq!((period("U"), period("V")), (read_u, read_u * 2.0));
     }
 
     fn master_of(extra: &str, src: &str) -> Master {
