@@ -212,8 +212,11 @@ fn current_instance_takes_the_instance_option() {
 }
 
 /// The exceptions and `set_clock_groups` take their lists (`-through`, `-rise_through`,
-/// `-fall_through`; `-group`) after the options; SDC declares nothing else on them, so an option
-/// that is neither is refused, not passed through unread.
+/// `-fall_through`; `-group`) after the options; SDC declares nothing else on them. On an
+/// exception an option that is neither is refused, not passed through unread. `set_clock_groups`
+/// is different in the reference (sdc/Sdc.tcl; probe `clock-groups-probe.py`, 2026-11-07): it
+/// warns on the word (STA-0402, a stray word STA-0403), ignores it and applies the groups — so
+/// it is applied here too, with the words listed as ignored.
 #[test]
 fn exception_and_clock_group_options_are_checked() {
     let s = read("set_false_path -from [get_ports a] -through [get_pins u/A] -fall_through [get_pins u/B] -rise_through [get_pins u/C] -to [get_ports y]");
@@ -225,10 +228,13 @@ fn exception_and_clock_group_options_are_checked() {
         "set_false_path -bogus x -to [get_ports y]",
         "set_multicycle_path 2 -setup -thru_all [get_pins u/A]",
         "group_path -name g -bogus -to [get_ports y]",
-        "set_clock_groups -asynchronous -group c -bogus c",
     ] {
         assert!(!read(line).rejected.is_empty(), "{line}");
     }
+    let s = read("set_clock_groups -asynchronous -group c -bogus c");
+    assert!(s.rejected.is_empty(), "{:?}", s.rejected);
+    assert_eq!(s.clock_groups.len(), 1);
+    assert_eq!(s.ignored_words, ["set_clock_groups -bogus", "set_clock_groups c"]);
 }
 
 /// Options no SDC version declares, and the reference timer lacks too: refused, as before.

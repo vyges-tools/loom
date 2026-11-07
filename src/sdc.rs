@@ -907,6 +907,12 @@ pub struct Sdc {
     /// [`crate::sdc_flags::EXTENSION_COMMANDS`]), as `command` or `command -option`, in file
     /// order. Read as the reference reads it; `check` names each at info level (portability only).
     pub extensions: Vec<String>,
+    /// Each word the reference warns about and IGNORES while still applying its command, as
+    /// `command word`, in file order: `set_clock_groups` takes only its flags and `-group`, and
+    /// warns on any other option (STA-0402 "unknown keyword argument", e.g.
+    /// `-include_generated_clocks`) and on a stray word (STA-0403 "extra positional argument").
+    /// Its groups are applied without them. `check` reports each at warning level.
+    pub ignored_words: Vec<String>,
     pub ignored: Vec<String>, // commands we recognised but do not model
     /// Per entry of [`Sdc::ignored`], index for index: `(the entry, the command it came from)`,
     /// the command's text as read with its variables substituted (a whole `if` or `foreach` block
@@ -2197,6 +2203,29 @@ fn misplaced_except(toks: &[String]) -> Option<String> {
     find(&toks[1..])
 }
 
+/// The words of a `set_clock_groups` the reference warns about and ignores (sdc/Sdc.tcl
+/// `set_clock_groups`): after its keys (`-name`, `-comment`) and flags are taken, it walks the
+/// rest — `-group` takes the next word; any other option is STA-0402 "unknown keyword argument"
+/// and any other word STA-0403 "extra positional argument", each skipped alone. The command is
+/// still applied.
+fn clock_groups_ignored_words(toks: &[String]) -> Vec<String> {
+    let (keys, flags) = crate::sdc_flags::options("set_clock_groups").unwrap_or_default();
+    let mut out = Vec::new();
+    let mut k = 1;
+    while k < toks.len() {
+        let t = toks[k].as_str();
+        if keys.contains(&t) || t == "-group" {
+            k += 2;
+            continue;
+        }
+        if !flags.contains(&t) {
+            out.push(t.to_string());
+        }
+        k += 1;
+    }
+    out
+}
+
 /// The first option in `toks` (at any depth of `[...]`) that is not one of its command's options,
 /// as the reference's argument parser decides it: a word is an option when it is `-` and a letter
 /// (`-0.5` is a value); it is one of the command's keys (which takes the next word as its value)
@@ -2214,13 +2243,15 @@ fn unknown_option(toks: &[String]) -> Option<String> {
     // it: those lists are their options too (SDC declares `-through` and its edge forms on the
     // exceptions, `-group` on `set_clock_groups`), and anything else is not one. The senses keep
     // the reference's rule: SDC declares neither.
+    // `set_clock_groups` is not judged here: the reference warns on an option it does not know
+    // and applies the command without it ([`clock_groups_ignored_words`]).
     let own: &[&str] = match cmd {
-        "set_clock_groups" => &["-group"],
+        "set_clock_groups" => &[],
         "set_sense" | "set_clock_sense" => &[],
         c if PASSES_UNKNOWN.contains(&c) => &["-through", "-rise_through", "-fall_through"],
         _ => &[],
     };
-    let judged = !PASSES_UNKNOWN.contains(&cmd) || !own.is_empty();
+    let judged = cmd != "set_clock_groups" && (!PASSES_UNKNOWN.contains(&cmd) || !own.is_empty());
     if let Some((mut keys, flags)) = crate::sdc_flags::options(cmd).filter(|_| judged) {
         keys.extend_from_slice(own);
         let mut k = 1;
@@ -4266,6 +4297,9 @@ impl Sdc {
                         .map(|f| f.trim_start_matches('-').to_string());
                     match kind {
                         Some(kind) => {
+                            for w in clock_groups_ignored_words(&toks) {
+                                sdc.ignored_words.push(format!("set_clock_groups {w}"));
+                            }
                             let name = flag_val(&toks, "-name").and_then(|n| resolve_objs(n).into_iter().next());
                             // `Sdc::makeClockGroups`: a name already defined is REPLACED
                             if name.is_some() {
@@ -5994,6 +6028,28 @@ mod per_command_tests {
 #[cfg(test)]
 mod clock_group_tests {
     use super::*;
+
+    /// Rule (sdc/Sdc.tcl `set_clock_groups`; probe `clock-groups-probe.py`
+    /// include-generated-dropped, 2026-11-07): an option the command does not have is warned
+    /// (STA-0402) and ignored, a stray word too (STA-0403), and the groups ARE applied — the
+    /// command is not refused. `-include_generated_clocks` therefore puts no generated clock in a
+    /// group: the reference times A's generated clock against B.
+    #[test]
+    fn clock_groups_warn_on_an_unknown_word_and_still_apply() {
+        let s = Sdc::parse(
+            "create_clock -name A -period 10 [get_ports a]\n\
+             create_clock -name B -period 7 [get_ports b]\n\
+             create_generated_clock -name G -source [get_ports a] -divide_by 2 [get_pins d/Q]\n\
+             set_clock_groups -asynchronous -include_generated_clocks -group A -group B stray\n",
+        )
+        .expect("parse");
+        assert!(s.rejected.is_empty(), "{:?}", s.rejected);
+        assert_eq!(s.ignored_words, ["set_clock_groups -include_generated_clocks", "set_clock_groups stray"]);
+        let u = |a, b| clocks_unrelated(&s.clock_groups, a, b);
+        assert!(u("A", "B") && !u("G", "B") && !u("A", "G"));
+        let w = s.write(&crate::sdc_write::WriteOpts::default()).text;
+        assert!(w.contains("set_clock_groups") && !w.contains("include_generated"), "{w}");
+    }
 
     /// Clocks are separated only by the command that separates them; one group separates its
     /// clocks from all others; `-allow_paths` separates nothing.

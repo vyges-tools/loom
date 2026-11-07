@@ -548,6 +548,7 @@ pub fn lint_with_meta(
     crate::sdc_overlap::overlap_findings(sdc, &mut f);
     sense_type_default_findings(sdc, &mut f);
     extension_findings(sdc, &mut f);
+    ignored_word_findings(sdc, &mut f);
     braced_variable_findings(sdc, &mut f);
     f.sort_by(|a, b| (a.severity as u8, a.code).cmp(&(b.severity as u8, b.code)));
     LintReport { findings: f }
@@ -731,6 +732,32 @@ fn extension_findings(sdc: &Sdc, f: &mut Vec<Finding>) {
     }
 }
 
+/// Each word the reference warns about and ignores while applying its command
+/// ([`Sdc::ignored_words`]), with its count. A WARNING: the file says something the reference
+/// does not do — `-include_generated_clocks` puts no generated clock in any group, so those
+/// clocks stay timed against the other groups.
+fn ignored_word_findings(sdc: &Sdc, f: &mut Vec<Finding>) {
+    let mut seen: Vec<(&str, usize)> = Vec::new();
+    for e in &sdc.ignored_words {
+        match seen.iter_mut().find(|(n, _)| n == e) {
+            Some((_, c)) => *c += 1,
+            None => seen.push((e, 1)),
+        }
+    }
+    for (e, n) in seen {
+        let times = if n == 1 { String::new() } else { format!(" ({n} uses)") };
+        let what = match e.rsplit(' ').next() {
+            Some("-include_generated_clocks") => {
+                "ignored by the reference timer, which applies the groups without it: each group holds only the clocks \
+                 it names, and their generated clocks are timed against the other groups"
+            }
+            Some(w) if w.starts_with('-') => "not an option; the reference timer warns, ignores it and applies the rest",
+            _ => "an extra word; the reference timer warns, ignores it and applies the rest",
+        };
+        f.push(Finding::warn("sdc-word-ignored", format!("`{e}`{times}: {what}")));
+    }
+}
+
 /// The `set_sense` commands written without `-type` ([`Sdc::senses_type_defaulted`]), with their
 /// count: read as clock, the SDC 2.1 default, where the reference timer applies none of them.
 /// Info only — the file is SDC as written; the note is that the two readings differ.
@@ -815,6 +842,7 @@ pub fn lint_without_design(sdc: &Sdc) -> LintReport {
     crate::sdc_overlap::overlap_findings(sdc, &mut f);
     sense_type_default_findings(sdc, &mut f);
     extension_findings(sdc, &mut f);
+    ignored_word_findings(sdc, &mut f);
     braced_variable_findings(sdc, &mut f);
     f.push(Finding {
         severity: Severity::Info,
