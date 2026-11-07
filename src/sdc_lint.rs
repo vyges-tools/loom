@@ -432,7 +432,7 @@ pub fn lint_with_meta(
         // Every named endpoint, not the first — an exception can cut a whole bus, and each
         // member is separately capable of being a typo or of naming a path that is not there.
         let known_object = |o: &String| {
-            g.knows(o)
+            g.knows_pattern(o)
                 || clock_srcs.contains_key(o.as_str())
                 || sdc.clocks.iter().any(|c| &c.name == o)
         };
@@ -952,6 +952,28 @@ impl Graph {
         let inst = instance_of(obj);
         let Some(&i) = self.inst_index.get(inst).filter(|_| inst != obj) else { return false };
         obj.get(inst.len() + 1..).is_some_and(|pin| self.pins[i].contains(pin))
+    }
+
+    /// Whether an SDC object PATTERN names anything in the design: a name as [`Graph::knows`]
+    /// reads it, else a `*` / `?` glob matched as the reference's object finders match it
+    /// (`get_ports io_b*` names every bit of the bus `io_b`, escaped `\io_b[0] ` included). A
+    /// wildcard PIN pattern never gets here: the read refuses it (`reduce_exception_objects`).
+    /// The kind the query named (`get_ports` or `get_cells`) is not kept on the exception, so a
+    /// pattern is known when ANY port, net or instance matches it: never a false alarm, though
+    /// a pattern of the wrong kind is not caught here.
+    fn knows_pattern(&self, pat: &str) -> bool {
+        use std::ops::Bound::{Included, Unbounded};
+        if self.knows(pat) {
+            return true;
+        }
+        if !pat.contains(['*', '?']) {
+            return false;
+        }
+        // every name a glob can match starts with its literal prefix; `[` too, as a bus subscript
+        // is matched apart from the name before it
+        let lit = &pat[..pat.find(['*', '?', '[']).unwrap_or(pat.len())];
+        let named = self.known.range::<str, _>((Included(lit), Unbounded)).take_while(|n| n.starts_with(lit));
+        named.into_iter().any(|n| crate::sdc::object_matches(pat, n))
     }
 
     /// The instance an SDC object names: the object ITSELF when it is an instance (an exception
@@ -1518,6 +1540,33 @@ mod depth_tests {
         assert_eq!(m.len(), 1, "{:?}", r.findings);
         assert!(m[0].message.contains("STA-0471") && m[0].message.contains("set_false_path"), "{}", m[0].message);
         assert_eq!(m[0].severity, Severity::Warning);
+    }
+
+    /// A glob in an exception names what the reference's object finders match with it (probe
+    /// `correlation/harness/sdc/escaped-port-probe.py`): `get_ports io_b*` returns both escaped
+    /// bits `\io_b[0] ` and `\io_b[1] `, and a `-quiet` false path from them leaves the path
+    /// untimed; `io_c*` returns the escaped `\io_c.x `. So a glob that matches is not reported as
+    /// naming nothing; a glob that matches no object still is.
+    #[test]
+    fn an_exception_glob_names_what_it_matches_in_the_design() {
+        let n = crate::netlist::parse(
+            "module t(clk, \\io_b[0] , \\io_b[1] , \\io_c.x , dout);\ninput clk, \\io_b[0] , \\io_b[1] , \\io_c.x ; output dout;\n\
+             wire w;\nBUF g(.A(\\io_b[0] ),.Y(w));\nDFF ra(.CK(clk),.D(w),.Q(dout));\nendmodule\n",
+        )
+        .unwrap();
+        let sdc = Sdc::parse(
+            "create_clock -name c -period 10 [get_ports clk]\n\
+             set_false_path -from [get_ports io_b*]\n\
+             set_false_path -from [get_ports io_c*]\n\
+             set_false_path -to [get_cells r*]\n\
+             set_false_path -from [get_ports zz*]\n",
+        )
+        .unwrap();
+        let r = lint(&n, &sdc, &lib());
+        let unknown: Vec<&str> =
+            r.findings.iter().filter(|x| x.code == "exception-unknown-object").map(|x| x.message.as_str()).collect();
+        assert_eq!(unknown.len(), 1, "{unknown:?}");
+        assert!(unknown[0].contains("`zz*`"), "{unknown:?}");
     }
 
     #[test]
