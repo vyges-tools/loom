@@ -1510,7 +1510,7 @@ fn logical_lines(text: &str) -> Vec<String> {
 /// Split one command into tokens, keeping `{...}` and `[...]` groups whole
 /// (nesting-aware) and respecting `"..."`. Braces are stripped from the token;
 /// brackets are kept so accessors can be post-processed.
-fn tokenize(line: &str) -> Vec<String> {
+pub(crate) fn tokenize(line: &str) -> Vec<String> {
     let mut toks = Vec::new();
     let cs: Vec<char> = line.chars().collect();
     let mut i = 0;

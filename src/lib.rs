@@ -50,6 +50,9 @@ pub mod yosys_json;
 pub mod spice;
 pub mod sdc;
 pub mod sdc_write;
+/// Two SDC sets compared as constraints, not text: added, removed and changed, each loosening or
+/// tightening.
+pub mod sdc_diff;
 /// SDC constraint linter — completeness and consistency of a design's constraints, from the
 /// same SDC + netlist (+ Liberty) a timer loads (`vyges sdc check`; moved from `vyges-sta-si`).
 pub mod sdc_lint;
