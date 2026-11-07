@@ -375,10 +375,12 @@ pub fn lint_with_meta(
 
     // --- depth passes: clock reach, exception reachability, coverage ---------
     let g = Graph::build(nl, lib);
+    // Every object each clock is defined on: a port (its net's name) or a pin (`inst/pin`), as
+    // the reference seeds a clock at each of its leaf pins (`Search::seedClkArrivals`).
     let clock_srcs: BTreeMap<&str, &str> = sdc
         .clocks
         .iter()
-        .map(|c| (c.source.as_str(), c.name.as_str()))
+        .flat_map(|c| c.sources.iter().chain(std::iter::once(&c.source)).map(move |s| (s.as_str(), c.name.as_str())))
         .collect();
 
     // Which clock actually reaches each register. Declared is not reaching.
@@ -391,11 +393,10 @@ pub fn lint_with_meta(
         if !cell.is_seq {
             continue;
         }
-        let reached = cell
-            .clock_pin
-            .as_ref()
-            .and_then(|cp| g.net_at(i, cp))
-            .and_then(|cn| g.trace_to_source(cn, &clock_srcs));
+        // a clock defined on the register's own clock pin, else one traced back from its net
+        let reached = cell.clock_pin.as_ref().and_then(|cp| {
+            clock_srcs.get(format!("{}/{cp}", inst.name).as_str()).copied().or_else(|| g.net_at(i, cp).and_then(|cn| g.trace_to_source(cn, &clock_srcs)))
+        });
         match reached {
             Some(_) => clocked += 1,
             None => unclocked.push(inst.name.as_str()),
@@ -874,6 +875,7 @@ struct Graph {
     inputs: BTreeSet<String>,
     outputs: BTreeSet<String>,
     inst_index: BTreeMap<String, usize>,
+    inst_names: Vec<String>,
     conns: Vec<Vec<(String, String)>>,
     out_pins: Vec<Vec<String>>,
     /// Per instance, the pins it has: the ones it connects and, for a library cell, every pin
@@ -891,6 +893,7 @@ impl Graph {
             inputs: nl.inputs.iter().cloned().collect(),
             outputs: nl.outputs.iter().cloned().collect(),
             inst_index: BTreeMap::new(),
+            inst_names: Vec::new(),
             conns: Vec::new(),
             out_pins: Vec::new(),
             pins: Vec::new(),
@@ -903,6 +906,7 @@ impl Graph {
             let cell = lib.cells.get(&inst.cell);
             g.is_seq.push(cell.map(|c| c.is_seq).unwrap_or(false));
             g.inst_index.insert(inst.name.clone(), i);
+            g.inst_names.push(inst.name.clone());
             g.known.insert(inst.name.clone());
             g.conns.push(inst.conns.clone());
             let mut pins: BTreeSet<String> = inst.conns.iter().map(|(p, _)| p.clone()).collect();
@@ -972,6 +976,12 @@ impl Graph {
             let Some(Some(i)) = self.driver.get(&n).copied() else {
                 continue; // a primary input that is not a clock source, or undriven
             };
+            // a clock defined on the driving pin: a generated clock on a divider's Q, a clock on
+            // a buffer's output
+            let on_pin = self.conns[i].iter().filter(|(p, nn)| *nn == n && self.out_pins[i].contains(p));
+            if let Some(d) = on_pin.filter_map(|(p, _)| srcs.get(format!("{}/{p}", self.inst_names[i]).as_str())).next() {
+                return Some(d);
+            }
             if self.is_seq[i] {
                 continue; // divided/gated off a flop — not traced in v0
             }
@@ -1501,6 +1511,33 @@ mod depth_tests {
             !has(&r, "no-clock"),
             "a clock IS defined — the old check stays quiet"
         );
+    }
+
+    /// The reference seeds a clock at each pin it is defined on (`Search::seedClkArrivals`), so a
+    /// clock on a pin reaches the registers that pin drives: a generated clock on a divider's Q
+    /// (through a buffer too), and one defined on a register's own clock pin. A register a clock
+    /// only reaches through another register's data path stays untimed.
+    #[test]
+    fn a_clock_defined_on_a_pin_reaches_the_registers_it_drives() {
+        let n = crate::netlist::parse(
+            "module t(clk,din,o1,o2,o3,o4);\ninput clk,din; output o1,o2,o3,o4;\nwire gq,nd,gb,q3;\n\
+             DFF rdiv(.CK(clk),.D(nd),.Q(gq));\nINV udiv(.A(gq),.Y(nd));\nBUF ub(.A(gq),.Y(gb));\n\
+             DFF r1(.CK(gq),.D(din),.Q(o1));\nDFF r2(.CK(gb),.D(din),.Q(o2));\n\
+             DFF r3(.CK(o4),.D(din),.Q(o3));\nDFF r4(.CK(o1),.D(din),.Q(o4));\nendmodule\n",
+        )
+        .unwrap();
+        let unclocked = |sdc: &str| -> Vec<String> {
+            let r = lint(&n, &Sdc::parse(sdc).unwrap(), &lib());
+            r.findings.iter().filter(|x| x.code == "register-no-clock-reaches").map(|x| x.message.clone()).collect()
+        };
+        let base = "create_clock -name c -period 10 [get_ports clk]\n";
+        let none = unclocked(base);
+        assert_eq!(none.len(), 4, "only rdiv is on the port's clock: {none:?}");
+        let g = unclocked(&format!("{base}create_generated_clock -name g -divide_by 2 -source [get_ports clk] [get_pins rdiv/Q]\n"));
+        assert!(g.iter().all(|m| !m.contains("`r1`") && !m.contains("`r2`")), "g reaches r1 and r2: {g:?}");
+        assert!(g.iter().any(|m| m.contains("`r4`")) && g.iter().any(|m| m.contains("`r3`")), "r4 is clocked off r1's Q: {g:?}");
+        let own = unclocked(&format!("{base}create_clock -name k -period 5 [get_pins {{r4/CK r3/CK}}]\n"));
+        assert!(own.iter().all(|m| !m.contains("`r4`") && !m.contains("`r3`")), "k is on r4's and r3's own clock pins: {own:?}");
     }
 
     #[test]
