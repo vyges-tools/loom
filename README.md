@@ -125,7 +125,14 @@ built `abi3-py39`) is a thin, additive layer over it — see [`python/README.md`
 | `netlist` | structural (gate-level) Verilog |
 | `yosys_json` | Yosys `write_json` netlist → same `netlist` model |
 | `liberty` + `ccs` | Liberty timing/power libraries (NLDM + CCS data model) |
-| `sdc` | SDC timing constraints (self-contained model) |
+| `sdc` | SDC timing constraints (self-contained model), read as the reference timer reads them |
+| `sdc_write` | the model written back as SDC, so that the reference timer builds the same constraints from it as from the original |
+| `sdc_lint` | constraint checks: completeness and consistency against a netlist, and the file-only checks below |
+| `sdc_overlap` | overlapping timing exceptions: shadowed, conflicting and redundant ones, by the reference's exception priority |
+| `sdc_clock_relations` | `set_clock_groups` that cut what they do not mean to: generated clocks left out of their master's groups, related clocks declared asynchronous |
+| `sdc_diff` | two constraint sets compared by meaning: each change, and whether it loosens or tightens what is timed |
+| `sdc_waivers` | waivers for constraint findings: a Tcl file of `waive_finding` commands with stable ids, applied to findings, exported by template |
+| `sdc_query` | object queries (`-filter`, `-of_objects`) evaluated against a loaded design |
 | `spef` | parasitic RC |
 | `design` | the in-memory `Design` DB + cross-step state |
 | `verbosity` | shared `-q`/`-v` / `VYGES_LOG` plumbing engines reuse |
