@@ -327,7 +327,9 @@ pub fn apply(r: &LintReport, file: &WaiverFile, today: &str) -> Applied {
 /// - `command`: the line written per waiver. Placeholders: `@rule@` (the target's rule ids,
 ///   space-separated), `@objects@`, `@reason@`, `@owner@`, `@expires@`, `@id@`, `@code@`. A part in
 ///   `[[…]]` is written only when every placeholder in it has a value.
-/// - `object`: how one of the waiver's `-objects` is written (`@object@`); `join` goes between
+/// - `object`: how one of the waiver's `-objects` is written: `@object@` as written, `@object_re@`
+///   with every regular-expression metacharacter escaped (for a target that matches by regexp:
+///   `[get_pins a]` is a character class there, not text); `join` goes between
 ///   them (`\s`, `\t`, `\n` are a blank, a tab, a newline). Defaults: `@object@` and one blank.
 /// - `rule <our code> <their rule ids…>`: the mapping. `*` maps every code not mapped otherwise,
 ///   and `@code@` in it is our own code. ⛔ A waiver whose code has no mapping is NOT written: it
@@ -394,11 +396,23 @@ pub fn parse_template(text: &str) -> Result<ExportTemplate, String> {
         }
     }
     for p in placeholders(&t.object) {
-        if p != "object" {
-            return Err(format!("`@{p}@` in `object` is not a placeholder (only @object@)"));
+        if p != "object" && p != "object_re" {
+            return Err(format!("`@{p}@` in `object` is not a placeholder (@object@, @object_re@)"));
         }
     }
     Ok(t)
+}
+
+/// `s` with every regular-expression metacharacter backslash-escaped, so it matches itself.
+fn regex_escaped(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if "\\.+*?()|[]{}^$".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// A value as inserted: its braces escaped when they do not balance.
@@ -454,7 +468,12 @@ pub fn export(file: &WaiverFile, t: &ExportTemplate, header: &str) -> Exported {
             continue;
         }
         let rule = ids.iter().map(|r| r.replace("@code@", &w.code)).collect::<Vec<_>>().join(" ");
-        let objects = w.objects.iter().map(|o| t.object.replace("@object@", &tcl_safe(o))).collect::<Vec<_>>().join(&t.join);
+        let objects = w
+            .objects
+            .iter()
+            .map(|o| t.object.replace("@object_re@", &tcl_safe(&regex_escaped(o))).replace("@object@", &tcl_safe(o)))
+            .collect::<Vec<_>>()
+            .join(&t.join);
         let vals = [
             ("rule", rule),
             ("reason", w.reason.clone()),
@@ -664,6 +683,15 @@ mod tests {
         );
         assert_eq!(e.skipped.len(), 1, "{:?}", e.skipped);
         assert!(e.skipped[0].contains("clock-period"), "{:?}", e.skipped);
+    }
+
+    #[test]
+    fn a_regexp_object_matches_itself() {
+        let t = parse_template("command w -regexp {@objects@}\nobject .*@object_re@.*\nrule * R\n").expect("template");
+        let file = parse("waive_finding -id x:1 -code x -objects {{set_false_path -from [get_pins r1/CK]}} -reason {r}\n");
+        let e = export(&file, &t, "");
+        assert_eq!(e.text, "w -regexp {.*set_false_path -from \\[get_pins r1/CK\\].*}\n", "{}", e.text);
+        assert_eq!(regex_escaped("a.b(c)|d"), "a\\.b\\(c\\)\\|d");
     }
 
     #[test]
