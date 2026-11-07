@@ -421,10 +421,10 @@ fn singular_and_plural_command_spellings_are_equivalent() {
     // that the unit reaches the period. A loop over two dissimilar cases hides that.
     let (plural, singular) = ("set_clock_groups", "set_clock_group");
     let p = parse(&good_sdc(&format!(
-        "{plural} -asynchronous -group {{clk}} -group {{clk2}}\n"
+        "create_clock -name clk2 -period 7 [get_ports clk2]\n{plural} -asynchronous -group {{clk}} -group {{clk2}}\n"
     )));
     let s = parse(&good_sdc(&format!(
-        "{singular} -asynchronous -group {{clk}} -group {{clk2}}\n"
+        "create_clock -name clk2 -period 7 [get_ports clk2]\n{singular} -asynchronous -group {{clk}} -group {{clk2}}\n"
     )));
     assert_eq!(p.async_groups, s.async_groups, "{plural} vs {singular}");
     assert_eq!(p.async_groups.len(), 2, "both groups read: {:?}", p.async_groups);
@@ -457,6 +457,9 @@ fn a_file_of_constraints_never_yields_nothing() {
             + s.output_delays.len()
             + s.exceptions.len()
             + s.async_groups.len()
+            // a group of undefined clocks: the command is kept, its names reported as left out
+            + s.clock_groups.len()
+            + s.ignored_words.len()
             + s.ignored.len();
         assert!(got > 0, "{label}: parsed cleanly and extracted nothing from:\n{text}");
     }

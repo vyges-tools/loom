@@ -751,6 +751,10 @@ fn ignored_word_findings(sdc: &Sdc, f: &mut Vec<Finding>) {
                 "ignored by the reference timer, which applies the groups without it: each group holds only the clocks \
                  it names, and their generated clocks are timed against the other groups"
             }
+            _ if e.starts_with("set_clock_groups -group ") => {
+                "names no clock defined before it; the reference timer leaves it out of the group (a group left \
+                 empty is not made, and one group left alone separates its clocks from every other clock)"
+            }
             Some(w) if w.starts_with('-') => "not an option; the reference timer warns, ignores it and applies the rest",
             _ => "an extra word; the reference timer warns, ignores it and applies the rest",
         };

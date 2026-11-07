@@ -2203,6 +2203,25 @@ fn misplaced_except(toks: &[String]) -> Option<String> {
     find(&toks[1..])
 }
 
+/// The clocks `patterns` name, as `get_clocks` matches them (`*`, `?`; an exact name always) in
+/// definition order, each once; and the patterns that match no clock.
+fn clocks_matching(patterns: &[String], clocks: &[SdcClock]) -> (Vec<String>, Vec<String>) {
+    let (mut found, mut missing) = (Vec::<String>::new(), Vec::new());
+    for p in patterns {
+        let hit: Vec<&SdcClock> =
+            clocks.iter().filter(|c| c.name == *p || (p.contains(['*', '?']) && glob(p, &c.name))).collect();
+        if hit.is_empty() {
+            missing.push(p.clone());
+        }
+        for c in hit {
+            if !found.contains(&c.name) {
+                found.push(c.name.clone());
+            }
+        }
+    }
+    (found, missing)
+}
+
 /// The words of a `set_clock_groups` the reference warns about and ignores (sdc/Sdc.tcl
 /// `set_clock_groups`): after its keys (`-name`, `-comment`) and flags are taken, it walks the
 /// rest — `-group` takes the next word; any other option is STA-0402 "unknown keyword argument"
@@ -4275,6 +4294,19 @@ impl Sdc {
                                     .into_iter()
                                     .filter(|o| !o.starts_with('*'))
                                     .collect();
+                                // `get_clocks_warn`: each word is a clock PATTERN, matched against
+                                // the clocks defined so far; one that matches none is warned
+                                // (STA-0351) and left out. A `-regexp` / `-nocase` query is kept
+                                // as written (not matched here).
+                                let names = if v.contains("-regexp") || v.contains("-nocase") {
+                                    names
+                                } else {
+                                    let (found, missing) = clocks_matching(&names, &sdc.clocks);
+                                    for m in missing {
+                                        sdc.ignored_words.push(format!("set_clock_groups -group {m}"));
+                                    }
+                                    found
+                                };
                                 if !names.is_empty() {
                                     groups.push(names);
                                 }
@@ -6051,16 +6083,42 @@ mod clock_group_tests {
         assert!(w.contains("set_clock_groups") && !w.contains("include_generated"), "{w}");
     }
 
+    /// Rule (`get_clocks_warn` -> `get_clocks`; probe `clock-groups-probe.py` pattern-*,
+    /// undefined-name-dropped, all-undefined-leaves-one, defined-after-not-included, 2026-11-07):
+    /// a `-group` word is a clock pattern matched against the clocks defined when the command is
+    /// read; a word matching none is warned (STA-0351) and left out; a group left empty is not
+    /// made — so the one group left separates its clocks from every other clock.
+    #[test]
+    fn clock_group_words_are_patterns_over_the_clocks_defined_so_far() {
+        let s = Sdc::parse(
+            "create_clock -name clk_a -period 10 [get_ports a]\n\
+             create_clock -name clk_b -period 7 [get_ports b]\n\
+             create_clock -name c -period 7 [get_ports c]\n\
+             set_clock_groups -asynchronous -group [get_clocks clk_*] -group {c clk_late}\n\
+             set_clock_groups -asynchronous -group clk_a -group [get_clocks -quiet zz*]\n\
+             create_clock -name clk_late -period 5 [get_ports d]\n",
+        )
+        .expect("parse");
+        let got: Vec<&Vec<Vec<String>>> = s.clock_groups.iter().map(|g| &g.groups).collect();
+        assert_eq!(got, [&vec![vec!["clk_a".to_string(), "clk_b".into()], vec!["c".into()]], &vec![vec!["clk_a".to_string()]]]);
+        assert_eq!(s.ignored_words, ["set_clock_groups -group clk_late", "set_clock_groups -group zz*"]);
+        let u = |a, b| clocks_unrelated(&s.clock_groups, a, b);
+        // the first command: clk_b is separated from c; the second, left with one group, separates
+        // clk_a from every clock, the later clk_late too
+        assert!(u("clk_b", "c") && u("clk_a", "clk_late") && !u("clk_b", "clk_late"));
+    }
+
     /// Clocks are separated only by the command that separates them; one group separates its
     /// clocks from all others; `-allow_paths` separates nothing.
     #[test]
     fn clock_groups_are_per_command() {
-        let s = Sdc::parse(
-            "set_clock_groups -asynchronous -group [get_clocks c1] -group [get_clocks c2]\n\
+        let clocks: String = (1..=6).map(|i| format!("create_clock -name c{i} -period 10 [get_ports p{i}]\n")).collect();
+        let s = Sdc::parse(&format!(
+            "{clocks}set_clock_groups -asynchronous -group [get_clocks c1] -group [get_clocks c2]\n\
              set_clock_groups -asynchronous -group [get_clocks c1] -group [get_clocks c3]\n\
              set_clock_groups -logically_exclusive -group [get_clocks c4]\n\
              set_clock_groups -asynchronous -allow_paths -group [get_clocks c5] -group [get_clocks c6]\n",
-        )
+        ))
         .unwrap();
         let u = |a, b| clocks_unrelated(&s.clock_groups, a, b);
         assert!(u("c1", "c2") && u("c1", "c3"));
