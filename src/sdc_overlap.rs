@@ -520,12 +520,14 @@ pub(crate) fn overlap_findings(sdc: &Sdc, f: &mut Vec<Finding>) {
         };
         f.push(Finding { severity, code, message });
     }
-    if let Some(first) = unclassified.first() {
+    // the smallest by text, not the first in the file: a finding's waiver id must not move when
+    // the file is reordered
+    if let Some(first) = unclassified.iter().min() {
         f.push(Finding {
             severity: Severity::Info,
             code: "exception-overlap-not-checked",
             message: format!(
-                "{} exception(s) name objects by a query or bare name the overlap check cannot classify, and were not checked for overlap (the first: `{first}`)",
+                "{} exception(s) name objects by a query or bare name the overlap check cannot classify, and were not checked for overlap (one of them: `{first}`)",
                 unclassified.len()
             ),
         });

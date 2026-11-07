@@ -1455,7 +1455,7 @@ impl std::error::Error for SdcError {}
 /// ran as though unconditional (a clock the file never creates was created), a `foreach` body
 /// was read without its loop, and a brace list written across lines became fragments. A control
 /// structure now arrives whole, as one command this reader does not run — and says so.
-fn logical_lines(text: &str) -> Vec<String> {
+pub(crate) fn logical_lines(text: &str) -> Vec<String> {
     let cs: Vec<char> = text.chars().filter(|&c| c != '\r').collect();
     let mut out = Vec::new();
     let mut cur = String::new();

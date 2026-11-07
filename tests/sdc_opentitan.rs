@@ -146,7 +146,7 @@ fn check_reports_its_findings() {
         (Severity::Warning, "sdc-kept-not-applied", "`set_sense` (4 commands): kept and written back; it can change timing, and no checker or timer here applies it"),
         (Severity::Info, "design-checks-not-run", "no netlist: I/O coverage, clock reach, exception reachability and endpoint coverage were not checked"),
         // bare name lists (`-from {SPI_HOST_D*}`): their kind is the design's to resolve
-        (Severity::Info, "exception-overlap-not-checked", "13 exception(s) name objects by a query or bare name the overlap check cannot classify, and were not checked for overlap (the first: `set_false_path -from {SPI_HOST_D*} -to {SPI_HOST_D*}`)"),
+        (Severity::Info, "exception-overlap-not-checked", "13 exception(s) name objects by a query or bare name the overlap check cannot classify, and were not checked for overlap (one of them: `set_false_path -from {SPI_DEV_CS_L} -to {SPI_DEV_D*}`)"),
         (Severity::Info, "sdc-extension", "`set_clock_sense -clock` (7 uses): a reference-timer extension no SDC version declares"),
         (Severity::Info, "sdc-extension", "`set_disable_clock_gating_check`: a reference-timer extension no SDC version declares"),
         (Severity::Info, "sdc-sense-type-default", "`set_sense` (4 commands) no -type: applied as clock (SDC 2.1 default); the reference timer ignores it without -type"),

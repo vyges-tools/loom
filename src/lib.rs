@@ -59,6 +59,9 @@ pub mod sdc_lint;
 /// Overlapping timing exceptions: which one wins on the paths they share, by the reference's
 /// exception priority (`exception-shadowed`, `-conflict`, `-redundant` in the lint).
 pub mod sdc_overlap;
+/// Waivers for constraint findings, as a Tcl file of `waive_finding` commands: stable finding
+/// ids, a template writer, the reader, and applying them (waived, active, stale).
+pub mod sdc_waivers;
 /// The `clock_domains` slice of `vyges-metadata.json` the constraint linter reads.
 pub mod ipmeta;
 mod sdc_query;
