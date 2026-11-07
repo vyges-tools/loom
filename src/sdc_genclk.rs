@@ -204,6 +204,77 @@ pub fn master(sdc: &Sdc, gclk: &SdcClock, nl: &Netlist, lib: &Lib) -> Master {
     Master::None
 }
 
+/// What drives a dividing generated clock's pin, traced back through buffers and inverters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DividerDriver {
+    /// A register (or a cell with a state group: a clock gate, a latch).
+    Register,
+    /// A combinational cell other than a buffer or inverter: `(instance, cell)`.
+    Logic(String, String),
+    /// A port, a cell outside the library, or a pin not in the design: not judged.
+    Unknown,
+}
+
+/// The cell that drives `gclk`'s pins, through buffers and inverters (a cell with one input
+/// that its output's arcs come from). For a clock that DIVIDES (`-divide_by` above 1, or
+/// `-edges`); `None` for any other (a multiply is a PLL, a divide by 1 a mux or a gate).
+pub fn divider_driver(gclk: &SdcClock, nl: &Netlist, lib: &Lib) -> Option<DividerDriver> {
+    let g = gclk.generated.as_ref()?;
+    // (`-multiply_by` excludes `-divide_by` and `-edges` in the reference's argument check)
+    let divides = (g.divide_by.is_some_and(|d| d > 1) || !g.edges.is_empty()) && !g.combinational;
+    if !divides {
+        return None;
+    }
+    let f = Fanin::new(nl, lib);
+    let mut worst = DividerDriver::Register;
+    for src in &gclk.sources {
+        let d = match f.vertex(src) {
+            Some(v) => f.driving_cell(v),
+            None => DividerDriver::Unknown,
+        };
+        match (&worst, &d) {
+            (_, DividerDriver::Logic(..)) => return Some(d),
+            (DividerDriver::Register, DividerDriver::Unknown) => worst = d,
+            _ => {}
+        }
+    }
+    Some(worst)
+}
+
+impl Fanin<'_> {
+    /// The first cell back from `v` that is not a buffer or inverter, judged.
+    fn driving_cell(&self, v: Vertex) -> DividerDriver {
+        let mut v = v;
+        let mut seen = BTreeSet::new();
+        loop {
+            if !seen.insert(v.clone()) {
+                return DividerDriver::Unknown;
+            }
+            let Vertex::Pin(i, pin) = &v else { return DividerDriver::Unknown };
+            let inst = &self.nl.insts[*i];
+            let Some(cell) = self.lib.cells.get(&inst.cell) else { return DividerDriver::Unknown };
+            let Some(p) = cell.pins.get(pin) else { return DividerDriver::Unknown };
+            if p.direction != Dir::Out {
+                // a load pin: its net's one driver
+                let drivers = self.net_of.get(&(*i, pin.as_str())).and_then(|n| self.drivers.get(n));
+                match drivers.map(Vec::as_slice) {
+                    Some([d]) => v = d.clone(),
+                    _ => return DividerDriver::Unknown,
+                }
+                continue;
+            }
+            if cell.is_seq {
+                return DividerDriver::Register;
+            }
+            let from: BTreeSet<&str> = p.arcs.iter().map(|a| a.related_pin.as_str()).collect();
+            match from.into_iter().collect::<Vec<_>>().as_slice() {
+                [one] => v = Vertex::Pin(*i, one.to_string()),
+                _ => return DividerDriver::Logic(inst.name.clone(), inst.cell.clone()),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +390,32 @@ mod tests {
         let got: Vec<&str> = with.iter().map(|x| x.0).collect();
         assert_eq!(got, ["clock-generated-no-master", "clock-generated-ungrouped"], "{with:?}");
         assert!(with[0].1.contains("`N` (`ux/X`)") && with[1].1.contains("`G` is generated from `A`"), "{with:?}");
+    }
+
+    /// A dividing generated clock is judged by the cell that drives its pin, through buffers:
+    /// a register is right, logic (a mux) can glitch; a multiply or a divide by 1 is not judged.
+    #[test]
+    fn a_divider_is_judged_by_its_driving_cell() {
+        let s = Sdc::parse(
+            "create_clock -name A -period 10 [get_ports clka]\n\
+             create_generated_clock -name R -divide_by 2 -source [get_ports clka] [get_pins rdiv/Q]\n\
+             create_generated_clock -name RB -divide_by 2 -source [get_ports clka] [get_pins r1/CLK]\n\
+             create_generated_clock -name M -divide_by 2 -source [get_ports clka] [get_pins um/X]\n\
+             create_generated_clock -name M1 -divide_by 1 -source [get_ports clka] [get_pins um/X]\n\
+             create_generated_clock -name P -multiply_by 2 -source [get_ports clka] [get_pins um/X]\n",
+        )
+        .expect("sdc");
+        let n = crate::netlist::parse(
+            "module d (clka, clkb, sel);\n input clka, clkb, sel;\n wire gq, gb, mx;\n\
+             dff rdiv (.CLK(clka), .D(clkb), .Q(gq));\n bf ub (.A(gq), .X(gb));\n dff r1 (.CLK(gb), .D(sel), .Q(q1));\n\
+             mux um (.A0(clka), .A1(clkb), .S(sel), .X(mx));\nendmodule\n",
+        )
+        .expect("netlist");
+        let at = |name: &str| divider_driver(s.clocks.iter().find(|c| c.name == name).expect("clock"), &n, &lib());
+        assert_eq!(at("R"), Some(DividerDriver::Register));
+        assert_eq!(at("RB"), Some(DividerDriver::Register), "through the buffer on the divider's output");
+        assert_eq!(at("M"), Some(DividerDriver::Logic("um".into(), "mux".into())));
+        assert_eq!((at("M1"), at("P")), (None, None));
     }
 
     /// What the search does not reproduce is said, not guessed: two clocks at one depth (the

@@ -137,6 +137,21 @@ fn findings(sdc: &Sdc, design: Option<(&Netlist, &Lib)>, f: &mut Vec<Finding>) {
             ),
         });
     }
+    if let Some((nl, lib)) = design {
+        for c in clocks {
+            if let Some(crate::sdc_genclk::DividerDriver::Logic(inst, cell)) = crate::sdc_genclk::divider_driver(c, nl, lib) {
+                f.push(Finding {
+                    severity: Severity::Warning,
+                    code: "clock-divider-not-register",
+                    message: format!(
+                        "`{}` divides its master at a pin driven by `{inst}` (`{cell}`), combinational logic: a divided \
+                         clock taken from logic can glitch; divide in a register",
+                        c.name
+                    ),
+                });
+            }
+        }
+    }
     let mut unknown: Vec<(&str, &str)> = Vec::new();
     for (index, g) in sdc.clock_groups.iter().enumerate().filter(|(_, g)| !g.allow_paths) {
         let at = |n: &str| g.groups.iter().position(|grp| grp.iter().any(|x| x == n));
