@@ -312,6 +312,165 @@ pub fn apply(r: &LintReport, file: &WaiverFile, today: &str) -> Applied {
     out
 }
 
+/// How to write our waivers as another tool's Tcl waiver commands: an export template.
+///
+/// A template is a small text file, one directive per line (`#` starts a comment):
+///
+/// ```text
+/// command  my_waive -rule {@rule@} -match {@objects@} -comment {@reason@}[[ -owner {@owner@}]]
+/// object   name=~"@object@"
+/// join     \s||\s
+/// rule     exception-shadowed   OVERLAP_SHADOW
+/// rule     exception-conflict   OVERLAP_CONFLICT OVERLAP_VALUE
+/// ```
+///
+/// - `command`: the line written per waiver. Placeholders: `@rule@` (the target's rule ids,
+///   space-separated), `@objects@`, `@reason@`, `@owner@`, `@expires@`, `@id@`, `@code@`. A part in
+///   `[[…]]` is written only when every placeholder in it has a value.
+/// - `object`: how one of the waiver's `-objects` is written (`@object@`); `join` goes between
+///   them (`\s`, `\t`, `\n` are a blank, a tab, a newline). Defaults: `@object@` and one blank.
+/// - `rule <our code> <their rule ids…>`: the mapping. `*` maps every code not mapped otherwise,
+///   and `@code@` in it is our own code. ⛔ A waiver whose code has no mapping is NOT written: it
+///   is listed as skipped. A guessed rule id would be a waiver the target silently ignores.
+///
+/// Every value is inserted as written, except that a value whose braces do not balance has them
+/// escaped, so the command still parses as Tcl.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportTemplate {
+    pub command: String,
+    pub object: String,
+    pub join: String,
+    pub rules: Vec<(String, Vec<String>)>,
+}
+
+const PLACEHOLDERS: [&str; 7] = ["rule", "objects", "reason", "owner", "expires", "id", "code"];
+
+/// The `@name@` placeholders in `t`.
+fn placeholders(t: &str) -> Vec<String> {
+    let parts: Vec<&str> = t.split('@').collect();
+    let mut out = Vec::new();
+    // an odd-indexed part between two `@` is a candidate name
+    for (k, p) in parts.iter().enumerate() {
+        if k % 2 == 1 && k + 1 < parts.len() && !p.is_empty() && p.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+            out.push(p.to_string());
+        }
+    }
+    out
+}
+
+/// Read an export template. An unknown directive or placeholder is an error: a typo must not
+/// become text in another tool's waiver file.
+pub fn parse_template(text: &str) -> Result<ExportTemplate, String> {
+    let mut t = ExportTemplate { command: String::new(), object: "@object@".into(), join: " ".into(), rules: Vec::new() };
+    for (n, raw) in text.lines().enumerate() {
+        let line = raw.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        let rest = rest.trim_start();
+        match key {
+            "command" => t.command = rest.trim_end().to_string(),
+            "object" => t.object = rest.trim_end().to_string(),
+            "join" => t.join = rest.trim_end().replace("\\s", " ").replace("\\t", "\t").replace("\\n", "\n"),
+            "rule" => {
+                let mut w = rest.split_whitespace();
+                let code = w.next().ok_or(format!("line {}: `rule` needs our code and the target's rule ids", n + 1))?;
+                let ids: Vec<String> = w.map(str::to_string).collect();
+                if ids.is_empty() {
+                    return Err(format!("line {}: `rule {code}` names no rule id of the target", n + 1));
+                }
+                t.rules.push((code.to_string(), ids));
+            }
+            other => return Err(format!("line {}: `{other}` is not a template directive (command, object, join, rule)", n + 1)),
+        }
+    }
+    if t.command.is_empty() {
+        return Err("the template has no `command` line".into());
+    }
+    for p in placeholders(&t.command) {
+        if !PLACEHOLDERS.contains(&p.as_str()) {
+            return Err(format!("`@{p}@` in `command` is not a placeholder ({})", PLACEHOLDERS.join(", ")));
+        }
+    }
+    for p in placeholders(&t.object) {
+        if p != "object" {
+            return Err(format!("`@{p}@` in `object` is not a placeholder (only @object@)"));
+        }
+    }
+    Ok(t)
+}
+
+/// A value as inserted: its braces escaped when they do not balance.
+fn tcl_safe(v: &str) -> String {
+    let b = brace(v);
+    b[1..b.len() - 1].to_string()
+}
+
+/// `[[…]]` parts kept when all their placeholders have values, dropped otherwise; then every
+/// placeholder replaced.
+fn render(t: &str, vals: &[(&str, String)]) -> String {
+    let get = |k: &str| vals.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_str()).unwrap_or("");
+    let mut out = String::new();
+    let mut rest = t;
+    while let Some(a) = rest.find("[[") {
+        let Some(b) = rest[a..].find("]]").map(|b| a + b) else { break };
+        out += &rest[..a];
+        let part = &rest[a + 2..b];
+        if placeholders(part).iter().all(|p| !get(p).is_empty()) {
+            out += part;
+        }
+        rest = &rest[b + 2..];
+    }
+    out += rest;
+    for (k, v) in vals {
+        out = out.replace(&format!("@{k}@"), &tcl_safe(v));
+    }
+    out
+}
+
+/// Our waivers written as the template's commands, and those not written, with why.
+#[derive(Debug, Clone, Default)]
+pub struct Exported {
+    pub text: String,
+    pub skipped: Vec<String>,
+}
+
+/// Write `file`'s waivers with `t`. The header lines are written as `#` comments first.
+#[must_use]
+pub fn export(file: &WaiverFile, t: &ExportTemplate, header: &str) -> Exported {
+    let mut out = Exported::default();
+    for l in header.lines() {
+        out.text += &format!("# {l}\n");
+    }
+    for w in &file.waivers {
+        let ids = t.rules.iter().find(|(c, _)| *c == w.code).or_else(|| t.rules.iter().find(|(c, _)| c == "*"));
+        let Some((_, ids)) = ids else {
+            out.skipped.push(format!("`{}`: no rule of the target is mapped to `{}`", w.id, w.code));
+            continue;
+        };
+        if w.reason.trim().is_empty() {
+            out.skipped.push(format!("`{}`: no -reason", w.id));
+            continue;
+        }
+        let rule = ids.iter().map(|r| r.replace("@code@", &w.code)).collect::<Vec<_>>().join(" ");
+        let objects = w.objects.iter().map(|o| t.object.replace("@object@", &tcl_safe(o))).collect::<Vec<_>>().join(&t.join);
+        let vals = [
+            ("rule", rule),
+            ("reason", w.reason.clone()),
+            ("owner", w.owner.clone().unwrap_or_default()),
+            ("expires", w.expires.clone().unwrap_or_default()),
+            ("id", w.id.clone()),
+            ("code", w.code.clone()),
+        ];
+        // objects last and unescaped again: each was made safe as it was rendered
+        let line = render(&t.command.replace("@objects@", "\u{0}OBJECTS\u{0}"), &vals).replace("\u{0}OBJECTS\u{0}", &objects);
+        out.text += &line;
+        out.text += "\n";
+    }
+    out
+}
+
 /// Today's date in UTC, `YYYY-MM-DD`: what `-expires` is compared with.
 #[must_use]
 pub fn utc_today() -> String {
@@ -454,6 +613,77 @@ mod tests {
             _ => (d, false),
         });
         assert_eq!(depth.0, 0, "{cmd}");
+    }
+
+    /// Our own command as a template: exporting with it and reading the result back gives the
+    /// same waivers (the export round-trips through its own reader).
+    const SELF: &str = "# our own format\n\
+        command waive_finding -id @id@ -code @code@ -objects {@objects@} -reason {@reason@}[[ -owner {@owner@}]][[ -expires @expires@]]\n\
+        object {@object@}\n\
+        rule * @code@\n";
+
+    #[test]
+    fn an_export_with_our_own_template_reads_back_as_the_same_waivers() {
+        let r = report(SDC);
+        let filled = accepted(&r).replacen("-reason {accepted in review}", "-reason {first {one}} -owner {qa team} -expires 2027-01-31", 1);
+        let file = parse(&filled);
+        let t = parse_template(SELF).expect("template");
+        let e = export(&file, &t, "exported");
+        assert!(e.skipped.is_empty(), "{:?}", e.skipped);
+        let back = parse(&e.text);
+        assert!(back.malformed.is_empty(), "{:?}\n{}", back.malformed, e.text);
+        let strip = |w: &Waiver| Waiver { index: 0, ..w.clone() };
+        assert_eq!(back.waivers.iter().map(strip).collect::<Vec<_>>(), file.waivers.iter().map(strip).collect::<Vec<_>>(), "{}", e.text);
+        assert_eq!(apply(&r, &back, "2026-11-07").waived.len(), waivable(&r).len());
+    }
+
+    /// Golden text for a template in another tool's form: rule ids mapped per code, objects as
+    /// match expressions, an optional part dropped when its value is absent, and an unmapped code
+    /// skipped with a reason, never written with a guessed rule.
+    #[test]
+    fn an_export_in_another_form_maps_rules_and_skips_what_it_cannot_map() {
+        let t = parse_template(
+            "command my_waive -status {Waived} -rule {@rule@} -match {@objects@} -comment {@reason@}[[ -owner {@owner@}]]\n\
+             object name=~\"@object@\"\n\
+             join \\s||\\s\n\
+             rule exception-shadowed OVERLAP_SHADOW\n\
+             rule exception-conflict OVERLAP_CONFLICT OVERLAP_VALUE\n",
+        )
+        .expect("template");
+        let file = parse(
+            "waive_finding -id exception-shadowed:aaaaaaaaaaaa -code exception-shadowed -objects {{a/b} {c d}} -reason {intended} -owner {qa}\n\
+             waive_finding -id exception-conflict:bbbbbbbbbbbb -code exception-conflict -objects {{x}} -reason {later one wins}\n\
+             waive_finding -id clock-period:cccccccccccc -code clock-period -objects {} -reason {r}\n",
+        );
+        let e = export(&file, &t, "h");
+        assert_eq!(
+            e.text,
+            "# h\n\
+             my_waive -status {Waived} -rule {OVERLAP_SHADOW} -match {name=~\"a/b\" || name=~\"c d\"} -comment {intended} -owner {qa}\n\
+             my_waive -status {Waived} -rule {OVERLAP_CONFLICT OVERLAP_VALUE} -match {name=~\"x\"} -comment {later one wins}\n"
+        );
+        assert_eq!(e.skipped.len(), 1, "{:?}", e.skipped);
+        assert!(e.skipped[0].contains("clock-period"), "{:?}", e.skipped);
+    }
+
+    #[test]
+    fn a_template_typo_is_an_error_not_text() {
+        assert!(parse_template("command w -r {@rul@}\nrule * X\n").is_err());
+        assert!(parse_template("comand w\n").is_err());
+        assert!(parse_template("command w\nrule exception-shadowed\n").is_err());
+        assert!(parse_template("object @object@\n").is_err(), "no command line");
+        assert!(parse_template("command w -o {@objects@}\nobject @thing@\n").is_err());
+    }
+
+    #[test]
+    fn a_value_with_unbalanced_braces_keeps_the_command_parseable() {
+        let t = parse_template(SELF).expect("template");
+        let file = parse("waive_finding -id x:1 -code x -objects {} -reason {a \\} b}\n");
+        assert_eq!(file.waivers[0].reason, "a } b");
+        let e = export(&file, &t, "");
+        let back = parse(&e.text);
+        assert!(back.malformed.is_empty(), "{:?}\n{}", back.malformed, e.text);
+        assert_eq!(back.waivers[0].reason, "a } b", "{}", e.text);
     }
 
     #[test]
