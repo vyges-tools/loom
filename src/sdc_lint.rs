@@ -97,6 +97,9 @@ fn glob_match(pat: &str, name: &str) -> bool {
 /// count. The findings that matter are lost in a list of hundreds, and the count is what a
 /// reader acts on anyway.
 const PORT_LIST_CAP: usize = 20;
+/// Most member pairs an exception's `-from` and `-to` globs are tried pairwise for a structural
+/// path; past it the pair is not decided (each try is a graph search).
+const MEMBER_PAIR_CAP: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct Finding {
@@ -465,12 +468,24 @@ pub fn lint_with_meta(
             e.to.iter()
                 .filter(|o| o.as_str() != "*" && known_object(o))
                 .collect();
+        // A glob is dead only when NONE of the objects it names lies on a path: the reference cuts
+        // every path from any member (`set_false_path -from [get_ports io_b*]` cuts the paths from
+        // each bit). Checked over its members, not by the pattern as one name. A pair of globs
+        // whose members are too many to try pairwise is not decided here, so nothing is said.
+        let members = |o: &String| -> Vec<String> {
+            if clock_srcs.contains_key(o.as_str()) || sdc.clocks.iter().any(|c| &c.name == o) { vec![o.clone()] } else { g.members(o) }
+        };
         let mut dead = Vec::new();
         match (named_from.is_empty(), named_to.is_empty()) {
             (false, false) => {
                 for from in &named_from {
+                    let fs = members(from);
                     for to in &named_to {
-                        if !g.reaches(from, to) {
+                        let ts = members(to);
+                        if fs.len() * ts.len() > MEMBER_PAIR_CAP {
+                            continue;
+                        }
+                        if !fs.iter().any(|x| ts.iter().any(|y| g.reaches(x, y))) {
                             dead.push(format!("`{from}` -> `{to}`: no structural path"));
                         }
                     }
@@ -478,14 +493,14 @@ pub fn lint_with_meta(
             }
             (false, true) => {
                 for from in &named_from {
-                    if !g.launches_anything(from) {
+                    if !members(from).iter().any(|x| g.launches_anything(x)) {
                         dead.push(format!("`{from}` launches no timing path"));
                     }
                 }
             }
             (true, false) => {
                 for to in &named_to {
-                    if !g.captures_anything(to) {
+                    if !members(to).iter().any(|y| g.captures_anything(y)) {
                         dead.push(format!("`{to}` captures no timing path"));
                     }
                 }
@@ -975,6 +990,19 @@ impl Graph {
         let lit = &pat[..pat.find(['*', '?', '[']).unwrap_or(pat.len())];
         let named = self.known.range::<str, _>((Included(lit), Unbounded)).take_while(|n| n.starts_with(lit));
         named.into_iter().any(|n| crate::sdc::object_matches(pat, n))
+    }
+
+    /// The design objects an SDC object PATTERN names, for asking whether any of them lies on a
+    /// path: the name itself when [`Graph::knows`] reads it, else every port, net or instance a
+    /// `*` / `?` glob matches ([`Graph::knows_pattern`]'s rule), in name order.
+    fn members(&self, pat: &str) -> Vec<String> {
+        use std::ops::Bound::{Included, Unbounded};
+        if self.knows(pat) || !pat.contains(['*', '?']) {
+            return vec![pat.to_string()];
+        }
+        let lit = &pat[..pat.find(['*', '?', '[']).unwrap_or(pat.len())];
+        let named = self.known.range::<str, _>((Included(lit), Unbounded)).take_while(|n| n.starts_with(lit));
+        named.into_iter().filter(|n| crate::sdc::object_matches(pat, n)).cloned().collect()
     }
 
     /// The instance an SDC object names: the object ITSELF when it is an instance (an exception
@@ -1560,7 +1588,8 @@ mod depth_tests {
              set_false_path -from [get_ports io_b*]\n\
              set_false_path -from [get_ports io_c*]\n\
              set_false_path -to [get_cells r*]\n\
-             set_false_path -from [get_ports zz*]\n",
+             set_false_path -from [get_ports zz*]\n\
+             set_false_path -from [get_ports io_b*] -to [get_cells r*]\n",
         )
         .unwrap();
         let r = lint(&n, &sdc, &lib());
@@ -1568,6 +1597,12 @@ mod depth_tests {
             r.findings.iter().filter(|x| x.code == "exception-unknown-object").map(|x| x.message.as_str()).collect();
         assert_eq!(unknown.len(), 1, "{unknown:?}");
         assert!(unknown[0].contains("`zz*`"), "{unknown:?}");
+        // and it is dead only when none of what it names is on a path: `io_b*` launches through
+        // `io_b[0]`, `r*` captures at `ra`; `io_c*` names only `io_c.x`, which drives nothing
+        let dead: Vec<&str> =
+            r.findings.iter().filter(|x| x.code == "exception-unreachable").map(|x| x.message.as_str()).collect();
+        assert_eq!(dead.len(), 1, "{dead:?}");
+        assert!(dead[0].contains("`io_c*`"), "{dead:?}");
     }
 
     /// A virtual clock (`create_clock` with no object) has no source to find in the design, and
