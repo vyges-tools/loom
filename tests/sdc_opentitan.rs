@@ -142,6 +142,10 @@ fn check_reports_its_findings() {
         .map(|f| (f.severity, f.code, f.message.clone()))
         .collect();
     let want: Vec<(Severity, &str, &str)> = vec![
+        // IO_CLK and its dividers in separate -async groups: the file says so itself ("internal
+        // CDCs that are not timed as a result of this set_clock_groups ... are being checked
+        // post-route"), so the finding is right, and the file's owner would waive it
+        (Severity::Warning, "clock-related-declared-async", "`IO_CLK` and `IO_DIV2_CLK` both derive from `IO_CLK`, but `set_clock_groups -asynchronous -name group1` puts them in different groups (9 pairs in all): paths between them go untimed, which is right only if every crossing between them is synchronized"),
         (Severity::Warning, "sdc-kept-not-applied", "`set_ideal_network`: kept and written back; it can change timing, and no checker or timer here applies it"),
         (Severity::Warning, "sdc-kept-not-applied", "`set_sense` (4 commands): kept and written back; it can change timing, and no checker or timer here applies it"),
         (Severity::Info, "design-checks-not-run", "no netlist: I/O coverage, clock reach, exception reachability and endpoint coverage were not checked"),

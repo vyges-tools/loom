@@ -546,6 +546,7 @@ pub fn lint_with_meta(
     not_applied_findings(sdc, &mut f);
     kept_not_applied_findings(sdc, &mut f);
     crate::sdc_overlap::overlap_findings(sdc, &mut f);
+    crate::sdc_clock_relations::clock_relation_findings(sdc, &mut f);
     sense_type_default_findings(sdc, &mut f);
     extension_findings(sdc, &mut f);
     ignored_word_findings(sdc, &mut f);
@@ -844,6 +845,7 @@ pub fn lint_without_design(sdc: &Sdc) -> LintReport {
     not_applied_findings(sdc, &mut f);
     kept_not_applied_findings(sdc, &mut f);
     crate::sdc_overlap::overlap_findings(sdc, &mut f);
+    crate::sdc_clock_relations::clock_relation_findings(sdc, &mut f);
     sense_type_default_findings(sdc, &mut f);
     extension_findings(sdc, &mut f);
     ignored_word_findings(sdc, &mut f);
