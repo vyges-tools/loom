@@ -908,6 +908,11 @@ pub struct Sdc {
     /// order. Read as the reference reads it; `check` names each at info level (portability only).
     pub extensions: Vec<String>,
     pub ignored: Vec<String>, // commands we recognised but do not model
+    /// Per entry of [`Sdc::ignored`], index for index: `(the entry, the command it came from)`,
+    /// the command's text as read with its variables substituted (a whole `if` or `foreach` block
+    /// for one the reader did not evaluate). Two files whose unmodelled commands have the same
+    /// text have the same unmodelled constraints: `sdc_diff` compares them so.
+    pub unmodelled_text: Vec<(String, String)>,
 }
 
 /// SDC commands that CHANGE A TIMING ANSWER when they are not modelled.
@@ -3444,7 +3449,10 @@ impl Sdc {
         // its front, so it runs in place and in order — and its variables are substituted when
         // each of its commands runs, as Tcl does, not when the `if` was read.
         let mut queue: std::collections::VecDeque<String> = logical_lines(text).into();
+        // the command being read, as text, for each `ignored` entry it adds (`unmodelled_text`)
+        let mut current_text = String::new();
         while let Some(raw) = queue.pop_front() {
+            record_unmodelled(&mut sdc, &current_text);
             // A proc's call ends: its local variables go, the ones it declared `global` stay.
             if raw == PROC_RETURN {
                 if let Some((mut outer, links)) = frames.pop() {
@@ -3469,6 +3477,7 @@ impl Sdc {
                 Some(line) => (line.to_string(), true),
                 None => (raw, false),
             };
+            current_text = format!("{}{}", subst_exprs(&subst_command_vars(&raw, &vars), &vars), referenced_values(&raw, &vars));
             // A signoff timer's take-back of every clock's delay, as the reference's per clock.
             if let Some(line) = raw.strip_prefix(tcl::EVERY_CLOCK) {
                 let clocks: Vec<String> = sdc.clocks.iter().map(|c| c.name.clone()).collect();
@@ -4320,6 +4329,7 @@ impl Sdc {
                 other => sdc.ignored.push(other.to_string()),
             }
         }
+        record_unmodelled(&mut sdc, &current_text);
 
         Ok(sdc)
     }
@@ -4778,6 +4788,43 @@ fn with_design<T>(f: impl FnOnce(&SdcDesign) -> T) -> Option<T> {
 /// A bracketed query's words, abbreviations expanded.
 pub(crate) fn query_words(inner: &str) -> Vec<String> {
     expand_abbreviations(tokenize(inner.trim()))
+}
+
+/// The values of the variables `raw` names (`$v`, `${v}`), as ` ;# v=…` in name order. A braced
+/// body (an `if` the reader did not evaluate) is not substituted, as in Tcl, so the same text can
+/// mean different constraints under different values: the values make the text say which.
+fn referenced_values(raw: &str, vars: &HashMap<String, String>) -> String {
+    let mut names: Vec<String> = Vec::new();
+    let cs: Vec<char> = raw.chars().collect();
+    let mut i = 0;
+    while i < cs.len() {
+        if cs[i] == '$' {
+            let mut j = i + 1;
+            let name: String = if cs.get(j) == Some(&'{') {
+                j += 1;
+                let n: String = cs[j..].iter().take_while(|c| **c != '}').collect();
+                n
+            } else {
+                cs[j..].iter().take_while(|c| c.is_alphanumeric() || **c == '_' || **c == ':').collect()
+            };
+            if !name.is_empty() && vars.contains_key(&name) && !names.contains(&name) {
+                names.push(name);
+            }
+            i = j;
+        }
+        i += 1;
+    }
+    names.sort();
+    names.iter().map(|n| format!(" ;# {n}={}", vars[n])).collect()
+}
+
+/// Pairs each [`Sdc::ignored`] entry added since the last call with `text`, the command that
+/// added it, keeping [`Sdc::unmodelled_text`] index for index with `ignored`.
+fn record_unmodelled(sdc: &mut Sdc, text: &str) {
+    while sdc.unmodelled_text.len() < sdc.ignored.len() {
+        let entry = sdc.ignored[sdc.unmodelled_text.len()].clone();
+        sdc.unmodelled_text.push((entry, text.to_string()));
+    }
 }
 
 /// Extract `-from`/`-to` object names (first object of each), `*` if absent.

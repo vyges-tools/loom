@@ -26,11 +26,18 @@
 //! against a design here. Read both sides against the same design (`Sdc::load_with`) for what
 //! the reader resolves; queries it evaluates are then compared by the objects they resolved to.
 //!
-//! **What cannot be compared is said.** A command the writer did not write (see
-//! [`crate::sdc_write::Written::not_written`]) is listed in [`SdcDiff::not_compared`], and the
-//! two sets are never [`SdcDiff::equivalent`] while either list is non-empty.
+//! **Commands the model does not carry are compared by their text.** The reader keeps each one's
+//! text with its variables substituted ([`Sdc::unmodelled_text`]): an `if` block it did not
+//! evaluate, a command it reads past. The same text on both sides, against the same design, is
+//! the same constraint; a text on one side only is an `Added` or `Removed` change of direction
+//! `Unknown`, keyed `text: …`.
+//!
+//! **What cannot be compared is said.** A command the writer did not write and whose text is not
+//! known (a rejected command; any unmodelled one when a rename map is given, since a raw text
+//! cannot be renamed faithfully) is listed in [`SdcDiff::not_compared`], and the two sets are
+//! never [`SdcDiff::equivalent`] while either list is non-empty.
 
-use crate::sdc::{tokenize, Objects, Sdc};
+use crate::sdc::{tokenize, Objects, Sdc, MODELLED_BUT_LISTED};
 use crate::sdc_write::WriteOpts;
 
 /// Whether a change makes the constraints looser (fewer or easier checks) or tighter.
@@ -480,10 +487,35 @@ fn presence_direction(command: &str, added: bool) -> Direction {
     }
 }
 
+/// The prefix the writer gives a command it did not write because the model does not carry it.
+const NOT_MODELLED: &str = "not modelled: ";
+
+/// A side's unmodelled commands as `(command, text)`, whitespace collapsed, sorted, and what is
+/// left of `not_written` once they are taken out. `None` for the texts when they cannot be
+/// compared (a rename map, or a model whose texts do not cover every entry).
+fn unmodelled(s: &Sdc, not_written: Vec<String>, renaming: bool) -> (Option<Vec<(String, String)>>, Vec<String>) {
+    if renaming || s.unmodelled_text.len() != s.ignored.len() {
+        return (None, not_written);
+    }
+    let rest: Vec<String> = not_written.into_iter().filter(|n| !n.starts_with(NOT_MODELLED)).collect();
+    // the writer's own filter: what it lists as not modelled
+    let mut texts: Vec<(String, String)> = s
+        .unmodelled_text
+        .iter()
+        .filter(|(c, _)| !MODELLED_BUT_LISTED.contains(&c.as_str()) && !s.kept_options.contains(c))
+        .map(|(c, t)| (c.clone(), t.split_whitespace().collect::<Vec<_>>().join(" ")))
+        .collect();
+    texts.sort();
+    (Some(texts), rest)
+}
+
 /// `a` against `b`: see the module documentation.
 pub fn diff(a: &Sdc, b: &Sdc, opts: &DiffOpts) -> SdcDiff {
     let (ra, sa, na) = records(a, opts);
     let (rb, sb, nb) = records(b, &DiffOpts::default());
+    let renaming = !opts.rename.is_empty();
+    let (ua, na) = unmodelled(a, na, renaming);
+    let (ub, nb) = unmodelled(b, nb, renaming);
     let mut changes = Vec::new();
     for r in &rb {
         match ra.iter().find(|x| x.key == r.key) {
@@ -527,8 +559,54 @@ pub fn diff(a: &Sdc, b: &Sdc, opts: &DiffOpts) -> SdcDiff {
             });
         }
     }
+    let (na, nb) = match (ua, ub) {
+        (Some(ua), Some(ub)) => {
+            changes.extend(text_changes(&ua, &ub));
+            (na, nb)
+        }
+        // texts on one side only: the other side's unmodelled commands cannot be matched, so
+        // both sides' stay uncompared
+        (ua, ub) => (with_texts_back(na, ua), with_texts_back(nb, ub)),
+    };
     let units_differ = a.declared_units != b.declared_units;
     SdcDiff { changes, not_compared: [na, nb], superseded: [sa, sb], units_differ }
+}
+
+/// The unmodelled commands put back as not compared, in the writer's words.
+fn with_texts_back(mut not_written: Vec<String>, texts: Option<Vec<(String, String)>>) -> Vec<String> {
+    for (c, _) in texts.unwrap_or_default() {
+        not_written.push(format!("{NOT_MODELLED}{c}"));
+    }
+    not_written
+}
+
+/// Two sorted lists of unmodelled texts, as changes: each text on one side more often than on the
+/// other is an `Added` or `Removed` of direction `Unknown`.
+fn text_changes(a: &[(String, String)], b: &[(String, String)]) -> Vec<Change> {
+    let count = |v: &[(String, String)], x: &(String, String)| v.iter().filter(|y| *y == x).count();
+    let mut out = Vec::new();
+    let mut seen: Vec<&(String, String)> = Vec::new();
+    for x in a.iter().chain(b) {
+        if seen.contains(&x) {
+            continue;
+        }
+        seen.push(x);
+        let (ca, cb) = (count(a, x), count(b, x));
+        let (kind, n) = if cb > ca { (ChangeKind::Added, cb - ca) } else { (ChangeKind::Removed, ca - cb) };
+        for _ in 0..n {
+            let text = Some(x.1.clone());
+            out.push(Change {
+                kind,
+                command: x.0.clone(),
+                key: format!("text: {}", x.1),
+                fields: Vec::new(),
+                a: if kind == ChangeKind::Removed { text.clone() } else { None },
+                b: if kind == ChangeKind::Added { text } else { None },
+                direction: Direction::Unknown,
+            });
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -689,6 +767,53 @@ set_clock_groups -asynchronous -group [get_clocks clk] -group [get_clocks vclk]
         let opts = DiffOpts { rename: vec![("u_cfg/q_reg".into(), "u17".into()), ("u_dp".into(), "u_dp_0".into())] };
         assert!(diff(&p(rtl), &p(&net), &opts).equivalent());
         assert!(!d(rtl, &net).equivalent());
+    }
+
+    /// An `if` the reader cannot evaluate without a design is compared by its text: the same
+    /// block on both sides is not a difference, a changed block is, and with a rename map (which
+    /// cannot rename raw text) it is not compared at all.
+    #[test]
+    fn unmodelled_commands_are_compared_by_their_text() {
+        let a = "create_clock -name clk -period 10 [get_ports clk]\nset te [get_ports -quiet te]\nif {[llength $te] > 0} {\n  set_case_analysis 0 $te\n}\n";
+        let same = d(a, a);
+        assert!(same.equivalent(), "{:?} {:?}", same.changes, same.not_compared);
+        let b = a.replace("set_case_analysis 0", "set_case_analysis 1");
+        let r = d(a, &b);
+        assert_eq!(r.changes.len(), 2, "one text removed, one added: {:?}", r.changes);
+        assert!(r.changes.iter().all(|c| c.direction == Direction::Unknown && c.key.starts_with("text: if")), "{:?}", r.changes);
+        let opts = DiffOpts { rename: vec![("x".into(), "y".into())] };
+        let renamed = diff(&p(a), &p(a), &opts);
+        assert!(!renamed.equivalent());
+        assert!(renamed.not_compared[0].iter().any(|n| n == "not modelled: if"), "{:?}", renamed.not_compared);
+    }
+
+    /// Indentation and line layout inside an unmodelled block are not a difference.
+    #[test]
+    fn an_unmodelled_block_reindented_is_the_same() {
+        let a = "create_clock -name clk -period 10 [get_ports clk]\nset te [get_ports -quiet te]\nif {[llength $te] > 0} {\n  set_case_analysis 0 $te\n}\n";
+        let b = a.replace("  set_case_analysis", "        set_case_analysis").replace("> 0} {", ">   0}   {");
+        let r = d(a, &b);
+        assert!(r.equivalent(), "{:?} {:?}", r.changes, r.not_compared);
+    }
+
+    /// The text is read with variables substituted: the same `if` under a different variable
+    /// value is a different constraint.
+    #[test]
+    fn an_unmodelled_text_is_compared_after_substitution() {
+        let a = "set v 0\ncreate_clock -name clk -period 10 [get_ports clk]\nset te [get_ports -quiet te]\nif {[llength $te] > 0} {\n  set_case_analysis $v $te\n}\n";
+        let b = a.replace("set v 0", "set v 1");
+        assert!(!d(a, &b).equivalent());
+    }
+
+    /// The reader keeps one text per `ignored` entry, index for index.
+    #[test]
+    fn every_ignored_entry_has_its_text() {
+        let s = p("create_clock -name clk -period 10 [get_ports clk]\nset_driving_cell -lib_cell BUF [get_ports a]\nset te [get_ports -quiet te]\nif {[llength $te] > 0} { set_false_path -from $te }\nset_dont_touch [get_cells u1]\n");
+        assert_eq!(s.unmodelled_text.len(), s.ignored.len(), "{:?} {:?}", s.ignored, s.unmodelled_text);
+        for ((entry, text), ign) in s.unmodelled_text.iter().zip(&s.ignored) {
+            assert_eq!(entry, ign);
+            assert!(!text.is_empty(), "{entry}");
+        }
     }
 
     #[test]
