@@ -102,6 +102,37 @@ fn root<'a>(c: &'a str, masters: &'a BTreeMap<String, Master>) -> &'a str {
     ancestors(c, masters).0.last().copied().unwrap_or(c)
 }
 
+/// Each clock's family: the clock its chain of masters starts from (a `create_clock`), by name,
+/// for every clock of the file. A generated clock whose master is not decided (from the file
+/// alone, or through the design when `design` is given: [`crate::sdc_genclk::master`]) is its own
+/// family, and is not in `decided`.
+///
+/// Two clocks of one family are synchronous by construction: one is derived from the other, or
+/// both from one clock. A CDC check uses this to tell a crossing from a synchronous path.
+pub struct Families {
+    pub root: BTreeMap<String, String>,
+    /// The clocks whose family is known (every `create_clock`, and each generated clock whose
+    /// chain reaches one).
+    pub decided: std::collections::BTreeSet<String>,
+}
+
+/// [`Families`] of `sdc`'s clocks.
+pub fn families(sdc: &Sdc, design: Option<(&Netlist, &Lib)>) -> Families {
+    let m = masters(sdc, design);
+    let mut root = BTreeMap::new();
+    let mut decided = std::collections::BTreeSet::new();
+    for c in &sdc.clocks {
+        let (up, stopped) = ancestors(&c.name, &m);
+        let r = up.last().copied().unwrap_or(&c.name);
+        let reached_create = stopped.is_none() && m.get(r) == Some(&Master::None);
+        root.insert(c.name.clone(), if reached_create { r.to_string() } else { c.name.clone() });
+        if reached_create {
+            decided.insert(c.name.clone());
+        }
+    }
+    Families { root, decided }
+}
+
 fn label(g: &ClockGroups, index: usize) -> String {
     let kind = format!("set_clock_groups -{}", g.kind);
     match &g.name {
@@ -299,6 +330,21 @@ mod tests {
         );
         let codes: Vec<&str> = f.iter().map(|x| x.0).collect();
         assert_eq!(codes, ["clock-relations-not-checked"], "{f:?}");
+    }
+
+    /// Families: a generated clock of a generated clock reaches its create_clock; one whose
+    /// master is not decided is its own family, and not decided.
+    #[test]
+    fn families_follow_the_chain_to_a_create_clock() {
+        let s = Sdc::parse(&format!(
+            "{CLOCKS}create_generated_clock -name G4 -source [get_pins rdiv/Q] -divide_by 2 [get_pins r4/Q]\n\
+             create_generated_clock -name P -source [get_pins pll/CLKIN] -divide_by 2 [get_pins pll/OUT]\n"
+        ))
+        .expect("parse");
+        let f = families(&s, None);
+        let roots: Vec<(&str, &str)> = f.root.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(roots, [("A", "A"), ("B", "B"), ("G", "A"), ("G4", "A"), ("P", "P")]);
+        assert!(f.decided.contains("G4") && !f.decided.contains("P"));
     }
 
     /// A generated clock whose master is found only through the design is counted, not guessed.
