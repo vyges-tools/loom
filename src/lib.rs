@@ -56,6 +56,9 @@ pub mod sdc_diff;
 /// SDC constraint linter — completeness and consistency of a design's constraints, from the
 /// same SDC + netlist (+ Liberty) a timer loads (`vyges sdc check`; moved from `vyges-sta-si`).
 pub mod sdc_lint;
+/// Overlapping timing exceptions: which one wins on the paths they share, by the reference's
+/// exception priority (`exception-shadowed`, `-conflict`, `-redundant` in the lint).
+pub mod sdc_overlap;
 /// The `clock_domains` slice of `vyges-metadata.json` the constraint linter reads.
 pub mod ipmeta;
 mod sdc_query;

@@ -545,6 +545,7 @@ pub fn lint_with_meta(
 
     not_applied_findings(sdc, &mut f);
     kept_not_applied_findings(sdc, &mut f);
+    crate::sdc_overlap::overlap_findings(sdc, &mut f);
     sense_type_default_findings(sdc, &mut f);
     extension_findings(sdc, &mut f);
     braced_variable_findings(sdc, &mut f);
@@ -811,6 +812,7 @@ pub fn lint_without_design(sdc: &Sdc) -> LintReport {
     }
     not_applied_findings(sdc, &mut f);
     kept_not_applied_findings(sdc, &mut f);
+    crate::sdc_overlap::overlap_findings(sdc, &mut f);
     sense_type_default_findings(sdc, &mut f);
     extension_findings(sdc, &mut f);
     braced_variable_findings(sdc, &mut f);
@@ -1854,7 +1856,12 @@ mod hierarchical_name_tests {
         )
         .expect("sdc");
         let r = lint(&nl, &sdc, &lib);
-        assert!(r.findings.iter().all(|f| !f.code.starts_with("exception-")), "{:?}", r.findings);
+        // the one exception finding is the overlap check's: the -from/-to false path is inside
+        // the -to one, which already cuts every path it names
+        let exc: Vec<&Finding> = r.findings.iter().filter(|f| f.code.starts_with("exception-")).collect();
+        assert_eq!(exc.len(), 1, "{:?}", r.findings);
+        assert_eq!(exc[0].code, "exception-redundant", "{:?}", exc);
+        assert!(exc[0].message.starts_with("`set_false_path -from"), "{}", exc[0].message);
     }
 }
 

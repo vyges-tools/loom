@@ -43,7 +43,7 @@ pub struct WriteOpts {
 }
 
 /// A number, in the shortest form that reads back to the same value.
-fn num(v: f64) -> String {
+pub(crate) fn num(v: f64) -> String {
     let s = format!("{v}");
     if s == "-0" {
         "0".into()
@@ -81,7 +81,7 @@ fn sentinel_accessor(name: &str) -> Option<&'static str> {
 
 /// An object list as written: `[get_pins -hierarchical {a/b c/d}]`, `[all_inputs -no_clocks]`,
 /// `[list [get_ports {a}] [get_pins {r/CK}]]`, `[current_design]`, or a bare brace list.
-fn objects(o: &Objects) -> Option<String> {
+pub(crate) fn objects(o: &Objects) -> Option<String> {
     let opts = || -> String {
         let mut t = String::new();
         for f in &o.flags {
