@@ -551,6 +551,7 @@ pub fn lint_with_meta(
     sense_type_default_findings(sdc, &mut f);
     extension_findings(sdc, &mut f);
     ignored_word_findings(sdc, &mut f);
+    empty_exception_findings(sdc, &mut f);
     braced_variable_findings(sdc, &mut f);
     f.sort_by(|a, b| (a.severity as u8, a.code).cmp(&(b.severity as u8, b.code)));
     LintReport { findings: f }
@@ -764,6 +765,15 @@ fn ignored_word_findings(sdc: &Sdc, f: &mut Vec<Finding>) {
     }
 }
 
+/// Each exception command the reference makes no exception from ([`Sdc::empty_exceptions`]): a
+/// side whose objects resolve to nothing. The constraint does nothing, which is seldom what it was
+/// written for (a renamed instance, a filter that no longer matches).
+fn empty_exception_findings(sdc: &Sdc, f: &mut Vec<Finding>) {
+    for e in &sdc.empty_exceptions {
+        f.push(Finding::warn("exception-matches-nothing", format!("`{e}`")));
+    }
+}
+
 /// The `set_sense` commands written without `-type` ([`Sdc::senses_type_defaulted`]), with their
 /// count: read as clock, the SDC 2.1 default, where the reference timer applies none of them.
 /// Info only — the file is SDC as written; the note is that the two readings differ.
@@ -850,6 +860,7 @@ pub fn lint_without_design(sdc: &Sdc) -> LintReport {
     sense_type_default_findings(sdc, &mut f);
     extension_findings(sdc, &mut f);
     ignored_word_findings(sdc, &mut f);
+    empty_exception_findings(sdc, &mut f);
     braced_variable_findings(sdc, &mut f);
     f.push(Finding {
         severity: Severity::Info,
@@ -1483,6 +1494,30 @@ mod depth_tests {
         assert!(has(&lint(&n, &sdc, &lib()), "exception-unreachable"));
         let sdc = Sdc::parse(&format!("{}set_max_delay 2 -to dout\n", base_sdc())).unwrap();
         assert!(!has(&lint(&n, &sdc, &lib()), "exception-unreachable"));
+    }
+
+    /// A false path whose `-from` query matches nothing on the design makes no exception, and
+    /// says so; it does not cut every path into its `-to` (the reference's
+    /// `delete_from_thrus_to`).
+    #[test]
+    fn an_exception_whose_query_matches_nothing_is_reported_and_cuts_nothing() {
+        let n = crate::netlist::parse(
+            "module t(clk,din,dout);\ninput clk,din; output dout;\nDFF ra(.CK(clk),.D(din),.Q(dout));\nendmodule\n",
+        )
+        .unwrap();
+        let d = crate::sdc::SdcDesign::from_netlist(&n, Some(&lib()));
+        let sdc = Sdc::parse_with(
+            "create_clock -name c -period 10 [get_ports clk]\n\
+             set_false_path -from [get_ports -quiet -filter {direction == inout} *] -to [get_cells ra]\n",
+            &d,
+        )
+        .unwrap();
+        assert!(sdc.exceptions.is_empty(), "{:?}", sdc.exceptions);
+        let r = lint(&n, &sdc, &lib());
+        let m: Vec<&Finding> = r.findings.iter().filter(|x| x.code == "exception-matches-nothing").collect();
+        assert_eq!(m.len(), 1, "{:?}", r.findings);
+        assert!(m[0].message.contains("STA-0471") && m[0].message.contains("set_false_path"), "{}", m[0].message);
+        assert_eq!(m[0].severity, Severity::Warning);
     }
 
     #[test]

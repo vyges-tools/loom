@@ -913,6 +913,16 @@ pub struct Sdc {
     /// `-include_generated_clocks`) and on a stray word (STA-0403 "extra positional argument").
     /// Its groups are applied without them. `check` reports each at warning level.
     pub ignored_words: Vec<String>,
+    /// Exception commands (`set_false_path`, `set_multicycle_path`, `set_max_delay` /
+    /// `set_min_delay`, `set_path_margin`, `group_path`) that make NO exception, as the reference
+    /// reads them: a `-from`, `-through` or `-to` whose objects resolve to nothing (a `-quiet`
+    /// query that matched nothing, a query evaluated on the design to nothing, `{}`) is warned
+    /// (STA-0471 / 0472 / 0473) and the whole command is dropped (`delete_from_thrus_to`). Each
+    /// entry is the command, then why. `check` reports each at warning level.
+    ///
+    /// ⛔ Kept with that side empty, the side read as "any": `set_false_path -from [get_cells
+    /// -quiet -filter …] -to c1`, its query matching nothing, cut EVERY path into `c1`.
+    pub empty_exceptions: Vec<String>,
     pub ignored: Vec<String>, // commands we recognised but do not model
     /// Per entry of [`Sdc::ignored`], index for index: `(the entry, the command it came from)`,
     /// the command's text as read with its variables substituted (a whole `if` or `foreach` block
@@ -4136,6 +4146,10 @@ impl Sdc {
                     sdc.ignored.push("set_propagated_clock".to_string());
                 }
                 "set_max_delay" | "set_min_delay" => {
+                    if let Some(why) = empty_exception_side(&toks) {
+                        sdc.empty_exceptions.push(format!("{}: {why}", toks[0]));
+                        continue;
+                    }
                     let valued = ["-from", "-to", "-through", "-rise_from", "-rise_to", "-fall_from", "-fall_to", "-rise_through", "-fall_through", "-comment"];
                     let (with, flags, pos) = split_args(&toks, &valued);
                     let value = pos.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(f64::NAN);
@@ -4345,6 +4359,10 @@ impl Sdc {
                     sdc.async_groups.extend(groups);
                 }
                 "set_false_path" => {
+                    if let Some(why) = empty_exception_side(&toks) {
+                        sdc.empty_exceptions.push(format!("{}: {why}", toks[0]));
+                        continue;
+                    }
                     let (from, to, refused) = from_to(&toks);
                     let (args, flags) = exception_args(&toks);
                     sdc.reset_path_first(&toks, &args, &flags, false);
@@ -4352,6 +4370,10 @@ impl Sdc {
                     sdc.exceptions.push(Exception { kind: ExcKind::FalsePath, from, to, refused, args, flags, comment: comment_of(&toks), ..Default::default() });
                 }
                 "set_multicycle_path" => {
+                    if let Some(why) = empty_exception_side(&toks) {
+                        sdc.empty_exceptions.push(format!("{}: {why}", toks[0]));
+                        continue;
+                    }
                     // The multiplier is THE positional left after the flags, wherever it is
                     // written (`-setup 3 -from …` as often as `3 -setup -from …`); it must be an
                     // integer, as the reference requires. `-hold` makes it a hold multicycle, and
@@ -4391,6 +4413,10 @@ impl Sdc {
                     sdc.ignored.push(cmd.to_string());
                 }
                 cmd if kept::EXCEPTION_COMMANDS.contains(&cmd) => {
+                    if let Some(why) = empty_exception_side(&toks) {
+                        sdc.empty_exceptions.push(format!("{}: {why}", toks[0]));
+                        continue;
+                    }
                     match kept::exception_cmd(&toks) {
                         Ok(x) => sdc.other_exceptions.push(x),
                         Err(why) => sdc.rejected.push(format!("{cmd}: {why}; not applied")),
@@ -4910,6 +4936,24 @@ fn record_unmodelled(sdc: &mut Sdc, text: &str) {
 const EXC_VALUED: [&str; 10] =
     ["-from", "-to", "-through", "-rise_from", "-rise_to", "-fall_from", "-fall_to", "-rise_through", "-fall_through", "-comment"];
 
+/// The first `-from` / `-through` / `-to` of an exception command whose objects resolve to
+/// nothing, with the reference's warning for it (`parse_from_arg` STA-0471, `parse_thrus_arg`
+/// STA-0472, `parse_to_arg1` STA-0473): the command then makes no exception at all.
+fn empty_exception_side(toks: &[String]) -> Option<String> {
+    let (with, _, _) = split_args(toks, &EXC_VALUED);
+    with.iter().find_map(|(k, v)| {
+        let code = match k.trim_start_matches("-rise_").trim_start_matches("-fall_").trim_start_matches('-') {
+            "from" => "STA-0471",
+            "through" => "STA-0472",
+            "to" => "STA-0473",
+            _ => return None,
+        };
+        // a brace list arrives without its braces (`tokenize`), so `{}` is an empty word
+        let objs = if v.starts_with('[') { resolve_objs(v) } else { v.split_whitespace().map(str::to_string).collect() };
+        objs.is_empty().then(|| format!("{k} {v} resolves to no object; the reference warns ({code}) and makes no exception from the command"))
+    })
+}
+
 /// An exception's two sides, and why it cannot be applied at instance level, if it cannot.
 fn from_to(toks: &[String]) -> (Vec<String>, Vec<String>, Option<String>) {
     let [from, to] = exception_sides(toks);
@@ -5408,6 +5452,42 @@ mod bus_match_tests {
         let d = SdcDesign { ports: (0..3).map(|k| (format!("d[{k}]"), "input".into())).chain([("clk".into(), "input".into())]).collect(), ..Default::default() };
         let parts: Vec<String> = ["get_ports", "-filter", "direction==input", "d"].iter().map(|s| s.to_string()).collect();
         assert_eq!(crate::sdc_query::eval(&parts, &d).unwrap(), ["d[0]", "d[1]", "d[2]"]);
+    }
+
+    /// Rule (`parse_from_arg` / `parse_thrus_arg` / `parse_to_arg1`, then `delete_from_thrus_to`;
+    /// witnessed by `crossing-fate-probe.py`'s `empty-*` cases): a side whose objects resolve to
+    /// nothing is warned and the WHOLE command makes no exception, for every exception command. A
+    /// list with one member that matches still applies; a name that matches nothing is kept as a
+    /// name (it matches no path).
+    #[test]
+    fn an_exception_side_that_resolves_to_nothing_makes_no_exception() {
+        let d = SdcDesign { ports: vec![("a".into(), "input".into())], ..Default::default() };
+        let read = |c: &str| Sdc::parse_with(&format!("create_clock -name c -period 1 [get_ports a]\n{c}\n"), &d).unwrap();
+        for (c, code) in [
+            ("set_false_path -from [get_ports -quiet -filter {direction == output} *] -to [get_ports a]", "STA-0471"),
+            ("set_false_path -from {} -to [get_ports a]", "STA-0471"),
+            ("set_false_path -through [get_ports -quiet -filter {direction == output} *]", "STA-0472"),
+            ("set_false_path -from [get_ports a] -rise_to [get_ports -quiet -filter {direction == output} *]", "STA-0473"),
+            ("set_multicycle_path 2 -from [get_ports -quiet -filter {direction == output} *]", "STA-0471"),
+            ("set_max_delay 3 -to [get_ports -quiet -filter {direction == output} *]", "STA-0473"),
+            ("set_min_delay 1 -from {}", "STA-0471"),
+            ("set_path_margin 0.1 -to [get_ports -quiet -filter {direction == output} *]", "STA-0473"),
+            ("group_path -name g -from [get_ports -quiet -filter {direction == output} *]", "STA-0471"),
+        ] {
+            let s = read(c);
+            assert!(s.exceptions.is_empty() && s.path_delays.is_empty() && s.other_exceptions.is_empty(), "{c}: made one");
+            assert_eq!(s.empty_exceptions.len(), 1, "{c}: {:?}", s.empty_exceptions);
+            assert!(s.empty_exceptions[0].contains(code), "{c}: {:?}", s.empty_exceptions);
+            assert!(s.rejected.is_empty(), "the reference reads it; nothing was refused: {:?}", s.rejected);
+        }
+        for c in [
+            "set_false_path -from [list [get_ports -quiet -filter {direction == output} *] [get_ports a]]",
+            "set_false_path -from [get_cells -quiet nomatch]",
+        ] {
+            let s = read(c);
+            assert_eq!(s.exceptions.len(), 1, "{c}");
+            assert!(s.empty_exceptions.is_empty(), "{c}: {:?}", s.empty_exceptions);
+        }
     }
 
     /// Rule (Tcl `llength` on the collection a `-quiet` query returns, empty when nothing
