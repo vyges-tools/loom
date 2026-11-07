@@ -3292,13 +3292,18 @@ fn subst_vars(line: &str, vars: &HashMap<String, String>) -> String {
                     if c == '}' {
                         break;
                     }
+                } else if c == ':' && cs.get(j + 1) == Some(&':') {
+                    // a namespace separator is part of a Tcl variable name (`$::x`)
+                    j += 2;
+                    continue;
                 } else if !(c.is_alphanumeric() || c == '_') {
                     break;
                 }
                 j += 1;
             }
             let name: String = cs[start..j].iter().collect();
-            match vars.get(&name) {
+            // at the top level `::x` is the global `x`, which is how `set` stores it
+            match vars.get(name.trim_start_matches("::")) {
                 Some(val) => out.push_str(val),
                 // See the note above: an unresolved variable keeps its text rather than
                 // vanishing and letting the next argument take its place.
@@ -3733,7 +3738,12 @@ impl Sdc {
             match toks[0].as_str() {
                 "set" => {
                     if toks.len() >= 3 {
-                        vars.insert(toks[1].clone(), toks[2].clone());
+                        // At the top level `::x` IS `x` (the global namespace), and a read looks
+                        // the name up with its `::` taken off: store it the same way. Inside a
+                        // proc the qualified name stays as written (a global from a proc body is
+                        // not modelled here).
+                        let name = if frames.is_empty() { toks[1].trim_start_matches("::") } else { toks[1].as_str() };
+                        vars.insert(name.to_string(), toks[2].clone());
                     }
                 }
                 // SDC accepts the singular and plural spellings interchangeably, and tools
@@ -6147,6 +6157,16 @@ mod clock_state_rules {
 #[cfg(test)]
 mod unevaluable_is_refused {
     use super::*;
+
+    /// Tcl: at the top level `::x` names the global `x`, so `set ::x v` then `$::x` or `$x` reads
+    /// `v`. The reference's own SDC test (`sdc_variables`) sets `::sta_crpr_mode` and reads it back;
+    /// storing the name with its `::` made that read an undefined variable and stopped the file.
+    #[test]
+    fn a_global_qualified_variable_is_the_same_variable() {
+        let s = Sdc::parse("set ::p 7\nset q $::p\ncreate_clock -name c -period $q [get_ports clk]\nset ::r 3\ncreate_clock -name d -period $r [get_ports clk2]\n")
+            .expect("`::p` set at the top level reads back as `$::p` and `::r` as `$r`");
+        assert_eq!(s.clocks.iter().map(|c| c.period).collect::<Vec<_>>(), vec![7.0, 3.0]);
+    }
 
     /// Rule (Tcl, so the reference): reading an undefined variable is an error, and an error in a
     /// sourced file stops `source` there — the reference's `read_sdc` reads nothing after it (the
