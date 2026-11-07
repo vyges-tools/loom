@@ -61,6 +61,7 @@ pub mod sdc_lint;
 pub mod sdc_clock_relations;
 pub mod sdc_genclk;
 pub mod sdc_overlap;
+pub mod sdc_path_fate;
 /// Waivers for constraint findings, as a Tcl file of `waive_finding` commands: stable finding
 /// ids, a template writer, the reader, and applying them (waived, active, stale).
 pub mod sdc_waivers;

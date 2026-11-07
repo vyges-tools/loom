@@ -47,7 +47,7 @@ use crate::sdc::{object_matches, ExcKind, Objects, Sdc};
 use crate::sdc_lint::{Finding, Severity};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Ty {
+pub(crate) enum Ty {
     False,
     Delay,
     Multicycle,
@@ -83,14 +83,14 @@ impl Ty {
 
 /// The analysis an exception names: -setup (max), -hold (min), or both.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Mm {
+pub(crate) enum Mm {
     Max,
     Min,
     All,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Class {
+pub(crate) enum Class {
     /// Pins, ports, cells and register or port queries: the -from/-to "pin/instance" kind.
     Pins,
     Clocks,
@@ -98,7 +98,7 @@ enum Class {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Rf {
+pub(crate) enum Rf {
     Both,
     Rise,
     Fall,
@@ -106,31 +106,31 @@ enum Rf {
 
 /// One -from, -through or -to: its kind, its object lists (a `[list …]` flattened), and its edge.
 #[derive(Clone, Debug)]
-struct Pt {
-    class: Class,
-    objs: Vec<Objects>,
-    rf: Rf,
+pub(crate) struct Pt {
+    pub(crate) class: Class,
+    pub(crate) objs: Vec<Objects>,
+    pub(crate) rf: Rf,
 }
 
 /// One exception as the reference holds it, after the mixed-kind split.
 #[derive(Clone, Debug)]
-struct Exc {
+pub(crate) struct Exc {
     /// The command it came from (several when a mixed -from/-to was split).
-    src: usize,
-    ty: Ty,
+    pub(crate) src: usize,
+    pub(crate) ty: Ty,
     /// File order within its type: what "read later" compares.
-    order: usize,
-    mm: Mm,
+    pub(crate) order: usize,
+    pub(crate) mm: Mm,
     /// `-rise` / `-fall`: the path's end edge.
-    end_rf: Rf,
-    from: Option<Pt>,
-    thrus: Vec<Pt>,
-    to: Option<Pt>,
+    pub(crate) end_rf: Rf,
+    pub(crate) from: Option<Pt>,
+    pub(crate) thrus: Vec<Pt>,
+    pub(crate) to: Option<Pt>,
     /// What it does: two exceptions of one type with the same effect are interchangeable.
-    effect: String,
+    pub(crate) effect: String,
     /// The multiplier or the delay, for `tighterThan`.
-    value: f64,
-    text: String,
+    pub(crate) value: f64,
+    pub(crate) text: String,
 }
 
 impl Exc {
@@ -172,7 +172,7 @@ impl Exc {
 
     /// Does it apply in analysis `an` (`Max` or `Min`)? A multicycle that names -setup also
     /// applies to hold: its multiplier moves the hold check.
-    fn applies(&self, an: Mm) -> bool {
+    pub(crate) fn applies(&self, an: Mm) -> bool {
         match self.ty {
             Ty::Multicycle => an == Mm::Min || self.mm != Mm::Min,
             _ => self.mm == Mm::All || self.mm == an,
@@ -268,7 +268,7 @@ fn replaces(a: &Exc, b: &Exc) -> bool {
 /// On a path both match, in analysis `an` where both apply: does `a` decide it? `Some(true)` for
 /// `a`, `Some(false)` when `b` is still applied (it wins, or the two combine), `None` when the
 /// reference's choice is not defined.
-fn wins(a: &Exc, b: &Exc, an: Mm) -> Option<bool> {
+pub(crate) fn wins(a: &Exc, b: &Exc, an: Mm) -> Option<bool> {
     let (pa, pb) = (a.priority(an), b.priority(an));
     let replaces = || replaces(a, b);
     match b.ty {
@@ -374,7 +374,7 @@ fn text_of(cmd: &str, value: &str, flags: &[String], args: &[(String, Objects)])
 
 /// Every exception the file states, split by kind as the reference splits it, and the commands
 /// that could not be classified.
-fn exceptions(sdc: &Sdc) -> (Vec<Exc>, Vec<String>) {
+pub(crate) fn exceptions(sdc: &Sdc) -> (Vec<Exc>, Vec<String>) {
     struct Src<'a> {
         ty: Ty,
         mm: Mm,
