@@ -25,58 +25,81 @@
 //!   netlist: those generated clocks are not checked here, and are counted in
 //!   `clock-relations-not-checked` (info) when a command could concern them.
 
+use crate::liberty::Lib;
+use crate::netlist::Netlist;
 use crate::sdc::{ClockGroups, Sdc, SdcClock};
 use crate::sdc_lint::{Finding, Severity};
+use std::collections::BTreeMap;
 
-/// What a generated clock's master is, without the design.
+/// What a generated clock's master is.
 #[derive(Debug, PartialEq)]
-enum Master<'a> {
+enum Master {
     /// A `create_clock`.
     None,
-    Known(&'a str),
-    /// No `-master_clock` and no clock (or several) defined on its `-source`.
-    Unknown,
+    Known(String),
+    /// Not decided: without the design, no `-master_clock` and not exactly one clock on its
+    /// `-source`; with it, what [`crate::sdc_genclk::master`] leaves undecided.
+    Unknown(String),
+    /// With the design: the search reached no clock, so the reference finds no master.
+    Absent,
 }
 
-fn master<'a>(c: &'a SdcClock, clocks: &'a [SdcClock]) -> Master<'a> {
-    let Some(g) = &c.generated else { return Master::None };
-    if let Some(m) = &g.master_clock {
-        return Master::Known(m);
+/// Every clock's master, once: from the file alone, or through the design when one is given.
+fn masters(sdc: &Sdc, design: Option<(&Netlist, &Lib)>) -> BTreeMap<String, Master> {
+    let clocks = &sdc.clocks;
+    let mut out = BTreeMap::new();
+    for c in clocks {
+        let Some(g) = &c.generated else {
+            out.insert(c.name.clone(), Master::None);
+            continue;
+        };
+        let m = if let Some((nl, lib)) = design {
+            match crate::sdc_genclk::master(sdc, c, nl, lib) {
+                crate::sdc_genclk::Master::Clock(m) => Master::Known(m),
+                crate::sdc_genclk::Master::None => Master::Absent,
+                crate::sdc_genclk::Master::Undecided(why) => Master::Unknown(why),
+            }
+        } else if let Some(m) = &g.master_clock {
+            Master::Known(m.clone())
+        } else {
+            let on_source: Vec<&SdcClock> =
+                clocks.iter().filter(|m| m.name != c.name && m.sources.iter().any(|s| g.source.names.contains(s))).collect();
+            match on_source.as_slice() {
+                [m] => Master::Known(m.name.clone()),
+                _ => Master::Unknown("its master is found through the design".into()),
+            }
+        };
+        out.insert(c.name.clone(), m);
     }
-    let on_source: Vec<&SdcClock> =
-        clocks.iter().filter(|m| m.name != c.name && m.sources.iter().any(|s| g.source.names.contains(s))).collect();
-    match on_source.as_slice() {
-        [m] => Master::Known(&m.name),
-        _ => Master::Unknown,
-    }
+    out
 }
 
 /// `c`'s ancestors, nearest first (its master, its master's master, …), stopping at a cycle or
-/// an unknown master; and whether the chain ended at an unknown master.
-fn ancestors<'a>(c: &'a SdcClock, clocks: &'a [SdcClock]) -> (Vec<&'a str>, bool) {
+/// an undecided master; and that undecided master's reason, when the chain stopped there.
+fn ancestors<'a>(c: &'a str, masters: &'a BTreeMap<String, Master>) -> (Vec<&'a str>, Option<&'a str>) {
     let mut out: Vec<&str> = Vec::new();
     let mut cur = c;
     loop {
-        match master(cur, clocks) {
-            Master::None => return (out, false),
-            Master::Unknown => return (out, true),
-            Master::Known(m) => {
-                if m == c.name || out.contains(&m) {
-                    return (out, false);
+        match masters.get(cur) {
+            Some(Master::Known(m)) => {
+                if m == c || out.contains(&m.as_str()) {
+                    return (out, None);
                 }
                 out.push(m);
-                match clocks.iter().find(|x| x.name == m) {
-                    Some(x) => cur = x,
-                    None => return (out, true),
+                if !masters.contains_key(m.as_str()) {
+                    return (out, Some("its master is not a clock of the file"));
                 }
+                cur = m;
             }
+            Some(Master::Unknown(why)) => return (out, Some(why)),
+            _ => return (out, None),
         }
     }
 }
 
 /// The clock a family is named by: the last ancestor (a `create_clock`, or where the chain stops).
-fn root<'a>(c: &'a SdcClock, clocks: &'a [SdcClock]) -> &'a str {
-    ancestors(c, clocks).0.last().copied().unwrap_or(&c.name)
+fn root<'a>(c: &'a str, masters: &'a BTreeMap<String, Master>) -> &'a str {
+    ancestors(c, masters).0.last().copied().unwrap_or(c)
 }
 
 fn label(g: &ClockGroups, index: usize) -> String {
@@ -87,19 +110,43 @@ fn label(g: &ClockGroups, index: usize) -> String {
     }
 }
 
-/// Every clock-relations finding for `sdc` (see the module documentation).
+/// Every clock-relations finding for `sdc`, from the file alone (see the module documentation).
 pub fn clock_relation_findings(sdc: &Sdc, f: &mut Vec<Finding>) {
+    findings(sdc, None, f);
+}
+
+/// [`clock_relation_findings`] with the design: each generated clock's master found as the
+/// reference finds it ([`crate::sdc_genclk::master`]), and `clock-generated-no-master` for one
+/// whose search reaches no clock.
+pub fn clock_relation_findings_with_design(sdc: &Sdc, nl: &Netlist, lib: &Lib, f: &mut Vec<Finding>) {
+    findings(sdc, Some((nl, lib)), f);
+}
+
+fn findings(sdc: &Sdc, design: Option<(&Netlist, &Lib)>, f: &mut Vec<Finding>) {
     let clocks = &sdc.clocks;
-    let mut unknown: Vec<&str> = Vec::new();
+    let masters = masters(sdc, design);
+    for c in clocks.iter().filter(|c| masters.get(&c.name) == Some(&Master::Absent)) {
+        let src = c.generated.as_ref().map(|g| g.source.names.join(" ")).unwrap_or_default();
+        f.push(Finding {
+            severity: Severity::Warning,
+            code: "clock-generated-no-master",
+            message: format!(
+                "no clock reaches the -source of `{}` (`{src}`) through the design: the reference finds no master \
+                 for it and derives no waveform",
+                c.name
+            ),
+        });
+    }
+    let mut unknown: Vec<(&str, &str)> = Vec::new();
     for (index, g) in sdc.clock_groups.iter().enumerate().filter(|(_, g)| !g.allow_paths) {
         let at = |n: &str| g.groups.iter().position(|grp| grp.iter().any(|x| x == n));
         let what = label(g, index);
         for c in clocks.iter().filter(|c| c.generated.is_some() && at(&c.name).is_none()) {
-            let (up, stopped) = ancestors(c, clocks);
+            let (up, stopped) = ancestors(&c.name, &masters);
             let grouped = up.iter().find_map(|m| at(m).map(|i| (*m, i)));
             let Some((m, i)) = grouped else {
-                if stopped && !unknown.contains(&c.name.as_str()) {
-                    unknown.push(&c.name);
+                if let Some(why) = stopped.filter(|_| !unknown.iter().any(|(n, _)| *n == c.name)) {
+                    unknown.push((&c.name, why));
                 }
                 continue;
             };
@@ -130,10 +177,10 @@ pub fn clock_relation_findings(sdc: &Sdc, f: &mut Vec<Finding>) {
             for gj in &g.groups[i + 1..] {
                 for a in gi {
                     for b in gj {
-                        let (Some(ca), Some(cb)) = (clocks.iter().find(|c| c.name == *a), clocks.iter().find(|c| c.name == *b)) else {
+                        if !masters.contains_key(a) || !masters.contains_key(b) {
                             continue;
-                        };
-                        let (ra, rb) = (root(ca, clocks), root(cb, clocks));
+                        }
+                        let (ra, rb) = (root(a, &masters), root(b, &masters));
                         if a != b && ra == rb {
                             pairs.push((a.clone(), b.clone(), ra.to_string()));
                         }
@@ -153,13 +200,13 @@ pub fn clock_relation_findings(sdc: &Sdc, f: &mut Vec<Finding>) {
             });
         }
     }
-    if let Some(first) = unknown.iter().min() {
+    if let Some((first, why)) = unknown.iter().min() {
         f.push(Finding {
             severity: Severity::Info,
             code: "clock-relations-not-checked",
             message: format!(
-                "{} generated clock(s) have no -master_clock and no clock defined on their -source; their master \
-                 is found through the design, so their place in the clock groups was not checked (one of them: `{first}`)",
+                "{} generated clock(s) whose master was not decided, so their place in the clock groups was not \
+                 checked (one of them: `{first}`: {why})",
                 unknown.len()
             ),
         });
@@ -250,6 +297,6 @@ mod tests {
         );
         assert_eq!(f.len(), 1, "{f:?}");
         assert_eq!(f[0].0, "clock-relations-not-checked");
-        assert!(f[0].1.contains("(one of them: `P`)"));
+        assert!(f[0].1.contains("(one of them: `P`: its master is found through the design)"), "{}", f[0].1);
     }
 }

@@ -59,6 +59,7 @@ pub mod sdc_lint;
 /// Overlapping timing exceptions: which one wins on the paths they share, by the reference's
 /// exception priority (`exception-shadowed`, `-conflict`, `-redundant` in the lint).
 pub mod sdc_clock_relations;
+pub mod sdc_genclk;
 pub mod sdc_overlap;
 /// Waivers for constraint findings, as a Tcl file of `waive_finding` commands: stable finding
 /// ids, a template writer, the reader, and applying them (waived, active, stale).
