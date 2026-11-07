@@ -228,9 +228,10 @@ pub fn lint_with_meta(
             ));
         }
         // a clock whose source is neither a port nor any known net (and not an
-        // unresolved inst/pin path) is almost certainly a typo.
+        // unresolved inst/pin path) is almost certainly a typo. A virtual clock has no source
+        // by definition (`create_clock` with no object): the reference says nothing of it.
         let s = c.source.as_str();
-        if !s.contains('/') && !nets.contains(s) {
+        if !c.is_virtual() && !s.contains('/') && !nets.contains(s) {
             f.push(Finding::warn(
                 "clock-source",
                 format!(
@@ -1567,6 +1568,27 @@ mod depth_tests {
             r.findings.iter().filter(|x| x.code == "exception-unknown-object").map(|x| x.message.as_str()).collect();
         assert_eq!(unknown.len(), 1, "{unknown:?}");
         assert!(unknown[0].contains("`zz*`"), "{unknown:?}");
+    }
+
+    /// A virtual clock (`create_clock` with no object) has no source to find in the design, and
+    /// the reference warns of nothing (probe `escaped-port-probe.py`, virtual-clock-no-warning);
+    /// a clock on a port the design does not have is still reported.
+    #[test]
+    fn a_virtual_clock_has_no_source_to_check() {
+        let sdc = Sdc::parse(
+            "create_clock -name clk -period 10 [get_ports clk]\n\
+             create_clock -name vclk -period 10\n\
+             create_clock -name typo -period 10 [get_ports clkk]\n",
+        )
+        .unwrap();
+        let n = crate::netlist::parse(
+            "module t(clk,din,dout);\ninput clk,din; output dout;\nDFF ra(.CK(clk),.D(din),.Q(dout));\nendmodule\n",
+        )
+        .unwrap();
+        let r = lint(&n, &sdc, &lib());
+        let src: Vec<&str> = r.findings.iter().filter(|x| x.code == "clock-source").map(|x| x.message.as_str()).collect();
+        assert_eq!(src.len(), 1, "{src:?}");
+        assert!(src[0].contains("`typo`"), "{src:?}");
     }
 
     #[test]
