@@ -68,6 +68,8 @@ pub struct ElabNames {
     pub cells: BTreeMap<String, Vec<String>>,
     pub nets: BTreeSet<String>,
     pub clocks: BTreeSet<String>,
+    /// The output pins of the register cells (`Q`, `QN`): what an RTL name may end in.
+    pub register_outputs: BTreeSet<String>,
 }
 
 /// One object list in the file: the canonical line it is on, the query that named it
@@ -100,6 +102,24 @@ pub struct Resolved {
     pub members: Vec<Member>,
     /// What the declared range did to the pattern's bit index.
     pub bits: BitIndex,
+    /// How an RTL form of a register's name matched the elaborated one, when it did not match
+    /// as written.
+    pub alias: Alias,
+}
+
+/// What [`alias`] did to a pattern that named nothing as written.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Alias {
+    /// Not tried (the pattern matched as written), or nothing matched.
+    #[default]
+    None,
+    /// Matched the elaborated registers by these rules: `separator` (`/` read as `.`),
+    /// `reg-suffix` (the register name's `_reg` dropped), `output-pin` (a trailing register
+    /// output pin, `/Q`, read as the register).
+    Matched { rules: Vec<&'static str> },
+    /// The RTL form matches more than one elaborated register that a name could mean (two
+    /// elaborated names with the same alias): reported, never guessed.
+    Ambiguous { candidates: Vec<String> },
 }
 
 /// Each vector's range AS DECLARED in the RTL, `(left, right)` of `[left:right]`, by the name
@@ -161,10 +181,17 @@ pub fn rtl_map(sdc: &Sdc, elab: &Netlist, lib: &Lib, ranges: &DeclaredRanges, ma
             BitIndex::Translated { to, .. } => ObjectRef { pattern: Some(to.clone()), ..r.clone() },
             _ => r.clone(),
         };
-        match (&bits, resolve(&elab_ref, &names)) {
-            (BitIndex::OutOfRange { .. }, _) => out.resolved.push(Resolved { members: Vec::new(), object: r, bits }),
-            (_, Some(members)) => out.resolved.push(Resolved { members: carry(members, map, revised), object: r, bits }),
-            (_, None) => out.not_resolved.push(r),
+        let (members, bits, alias) = match (bits, resolve(&elab_ref, &names)) {
+            (bits @ BitIndex::OutOfRange { .. }, _) => (Some(Vec::new()), bits, Alias::None),
+            (bits, Some(m)) if !m.is_empty() => (Some(m), bits, Alias::None),
+            (bits, found) => match alias(&r, &names, ranges) {
+                Some((m, a, b)) => (Some(m), b, a),
+                None => (found, bits, Alias::None),
+            },
+        };
+        match members {
+            Some(m) => out.resolved.push(Resolved { members: carry(m, map, revised), object: r, bits, alias }),
+            None => out.not_resolved.push(r),
         }
     }
     out
@@ -202,6 +229,88 @@ pub fn translate_bits(pattern: &str, ranges: &DeclaredRanges) -> BitIndex {
     BitIndex::Translated { to: format!("{base}[{}]{pin}", to.join(":")), declared: (left, right) }
 }
 
+/// An RTL register name's alias key: `/` read as `.`, the register name's `_reg` dropped (the
+/// last name, before its index), and the rules that changed it.
+fn alias_key(name: &str) -> (String, Vec<&'static str>) {
+    let mut rules = Vec::new();
+    let mut k = name.to_string();
+    if k.contains('/') {
+        k = k.replace('/', ".");
+        rules.push("separator");
+    }
+    let last = k.rfind('.').map_or(0, |i| i + 1);
+    let (head, tail) = k.split_at(last);
+    let (stem, index) = tail.find('[').map_or((tail, ""), |i| tail.split_at(i));
+    if let Some(s) = stem.strip_suffix("_reg").filter(|s| !s.is_empty()) {
+        k = format!("{head}{s}{index}");
+        rules.push("reg-suffix");
+    }
+    (k, rules)
+}
+
+/// Stage 3b: a pattern that named nothing as written, read as an RTL form of an elaborated
+/// register's name (decided 2026-11-08): `/` or `.` as the hierarchy separator, with or without
+/// the register name's `_reg` (on either side: the elaborated name may be the one that has it),
+/// and, on a cell or bare query, with or without a trailing register output pin (`r_reg[1]/Q`;
+/// `get_pins` keeps its pin). Both sides are compared by that key, after the bit index is
+/// translated by the declared range. Only queries that can name a register (`get_cells`,
+/// `get_pins`, a bare name) are read this way. When
+/// two elaborated registers share the key a name matches, it is [`Alias::Ambiguous`], with no
+/// members. `None`: nothing matched.
+pub fn alias(r: &ObjectRef, n: &ElabNames, ranges: &DeclaredRanges) -> Option<(Vec<Member>, Alias, BitIndex)> {
+    let pat = r.pattern.as_deref()?;
+    let pins = r.accessor == "get_pins";
+    if !(pins || r.accessor == "get_cells" || r.accessor.is_empty()) {
+        return None;
+    }
+    // the register part, the pin a get_pins pattern names, and the output-pin rule
+    let (reg, pin, mut rules) = match pat.rsplit_once('/') {
+        Some((inst, p)) if pins => (inst, Some(p), Vec::new()),
+        Some((inst, p)) if n.register_outputs.contains(p) => (inst, None, vec!["output-pin"]),
+        _ if pins => return None,
+        _ => (pat, None, Vec::new()),
+    };
+    let (key, more) = alias_key(reg);
+    rules.extend(more);
+    let (key, bits) = match translate_bits(&key, ranges) {
+        BitIndex::Translated { to, declared } => (to, BitIndex::Translated { to: String::new(), declared }),
+        b => (key, b),
+    };
+    if matches!(bits, BitIndex::OutOfRange { .. }) {
+        return Some((Vec::new(), Alias::Matched { rules }, bits));
+    }
+    let mut by_key: BTreeMap<String, Vec<&String>> = BTreeMap::new();
+    for e in n.registers.keys() {
+        by_key.entry(alias_key(e).0).or_default().push(e);
+    }
+    let hits: Vec<(&String, &Vec<&String>)> = by_key.iter().filter(|(k, _)| object_matches(&key, k)).collect();
+    if hits.is_empty() {
+        return None;
+    }
+    // the `_reg` may be on the elaborated side only (`a.t_reg[0]` named `a/t[0]`)
+    if !rules.contains(&"reg-suffix") && hits.iter().flat_map(|(k, v)| v.iter().map(move |e| (k, e))).any(|(k, e)| k.as_str() != e.as_str()) {
+        rules.push("reg-suffix");
+    }
+    let shared: Vec<String> = hits.iter().filter(|(_, v)| v.len() > 1).flat_map(|(_, v)| v.iter().map(|e| e.to_string())).collect();
+    if !shared.is_empty() {
+        return Some((Vec::new(), Alias::Ambiguous { candidates: shared }, bits));
+    }
+    let member = |name: String, kind| Member { name, kind, carried: None, reason: None };
+    let members: Vec<Member> = hits
+        .iter()
+        .flat_map(|(_, v)| v.iter())
+        .flat_map(|e| match pin {
+            None => vec![member(e.to_string(), ObjKind::Register)],
+            Some(p) => n.registers[*e].iter().filter(|x| object_matches(p, x)).map(|x| member(format!("{e}/{x}"), ObjKind::RegisterPin)).collect(),
+        })
+        .collect();
+    let bits = match bits {
+        BitIndex::Translated { declared, .. } => BitIndex::Translated { to: key, declared },
+        b => b,
+    };
+    Some((members, Alias::Matched { rules }, bits))
+}
+
 /// Stage 1: the elaborated name space. A register is a cell with an `ff` / `latch` group, named
 /// by the net on its output whose function is the group's stored value (`IQ`), else by its
 /// instance.
@@ -218,6 +327,9 @@ pub fn elab_names(nl: &Netlist, lib: &Lib, sdc: &Sdc) -> ElabNames {
             continue;
         };
         let pins: Vec<String> = cell.pins.keys().cloned().collect();
+        if cell.is_seq {
+            n.register_outputs.extend(cell.pins.iter().filter(|(_, x)| x.direction == Dir::Out).map(|(p, _)| p.clone()));
+        }
         let q = cell.seq_group.as_ref().filter(|_| cell.is_seq).and_then(|g| {
             inst.conns.iter().find(|(p, _)| {
                 cell.pins.get(p).is_some_and(|x| x.direction == Dir::Out && x.function.as_deref().map(str::trim) == Some(g.iq.as_str()))
@@ -496,7 +608,7 @@ mod tests {
 
     /// A flattened name keeps its hierarchy separator: the register `blk/cnt[0]` has the pin
     /// `blk/cnt[0]/D`. The pin is the part after the LAST `/`, so the register is found and the
-    /// pin carried as the mapped cell's pin.
+    /// pin carried as the mapped cell's pin, as written (no alias).
     #[test]
     fn a_pin_is_split_at_the_last_separator() {
         let elab = "module t(clk,a,y);\ninput clk,a; output y;\nwire \\blk/cnt[0] ;\n\
@@ -505,6 +617,8 @@ mod tests {
         let r = run_on(elab, imp, "set_false_path -to [get_pins {blk/cnt[0]/D}]\n", &[("blk/cnt[0]", "_10_")]);
         assert!(r.complete(), "{r:?}");
         assert_eq!(carried(&r), [("blk/cnt[0]/D".to_string(), "_10_/D".to_string())]);
+        // matched as written: not an RTL alias (no separator rule)
+        assert_eq!(r.resolved[0].alias, Alias::None, "{r:?}");
     }
 
     /// A port is carried as itself only when the implementation has it (`port-not-in-revised`
@@ -688,6 +802,124 @@ mod tests {
             None,
         );
         assert_eq!(r.unknown().map(|x| x.bits.clone()).collect::<Vec<_>>(), [BitIndex::OutOfRange { declared: (2, 1) }]);
+    }
+
+    fn aliased(r: &RtlMap) -> Vec<(String, Vec<&'static str>, Vec<String>)> {
+        r.resolved
+            .iter()
+            .filter_map(|x| match &x.alias {
+                Alias::Matched { rules } => Some((x.object.pattern.clone().unwrap(), rules.clone(), x.members.iter().map(|m| m.name.clone()).collect())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The RTL forms of a register's name (decided 2026-11-08): `/` for `.`, the register name
+    /// with `_reg`, and a trailing output pin (`/Q`) all name the elaborated register `cnt[1]`;
+    /// a `get_pins` pattern keeps its pin; a glob names every register it matches. Each says
+    /// which rules matched it, and every one is carried through the map.
+    #[test]
+    fn rtl_forms_of_a_register_name_match_the_elaborated_one() {
+        let r = run(
+            "set_false_path -to [get_cells {cnt_reg[0]}]\n\
+             set_false_path -from [get_cells {cnt_reg[1]/Q}]\n\
+             set_false_path -to [get_pins {cnt_reg[1]/D}]\n\
+             set_multicycle_path 2 -setup -to [get_cells {cnt_reg[*]}]\n",
+            &MAP,
+        );
+        assert!(r.complete(), "{r:?}");
+        let mut a = aliased(&r);
+        a.sort();
+        assert_eq!(
+            a,
+            [
+                ("cnt_reg[*]".to_string(), vec!["reg-suffix"], vec!["cnt[0]".to_string(), "cnt[1]".to_string()]),
+                ("cnt_reg[0]".to_string(), vec!["reg-suffix"], vec!["cnt[0]".to_string()]),
+                ("cnt_reg[1]/D".to_string(), vec!["reg-suffix"], vec!["cnt[1]/D".to_string()]),
+                ("cnt_reg[1]/Q".to_string(), vec!["output-pin", "reg-suffix"], vec!["cnt[1]".to_string()]),
+            ]
+        );
+    }
+
+    /// A hierarchy written with `/` names the elaborated `.` path; with the declared range, the
+    /// RTL bit index is translated after the alias (`u_sub/t_reg[5]` of `[5:4]` is `u_sub.t[1]`).
+    #[test]
+    fn a_slash_hierarchy_and_a_declared_range_together() {
+        let elab = "module t(clk,a,y);\ninput clk,a; output y;\nwire \\u_sub.t[0] , \\u_sub.t[1] ;\n\
+          DFF u1(.CK(clk),.D(a),.Q(\\u_sub.t[0] ));\nDFF u2(.CK(clk),.D(\\u_sub.t[0] ),.Q(\\u_sub.t[1] ));\nINV u3(.A(\\u_sub.t[1] ),.Y(y));\nendmodule\n";
+        let lib = Lib::parse(LIB).unwrap();
+        let m: Vec<(String, String)> = vec![("u_sub.t[0]".into(), "_10_".into()), ("u_sub.t[1]".into(), "_11_".into())];
+        let rg: DeclaredRanges = [("u_sub.t".to_string(), (5, 4))].into_iter().collect();
+        let sdc = Sdc::parse("set_false_path -to [get_cells {u_sub/t_reg[5]}]\n").unwrap();
+        let r = rtl_map(&sdc, &crate::netlist::parse(elab).unwrap(), &lib, &rg, &m, None);
+        assert!(r.complete(), "{r:?}");
+        assert_eq!(aliased(&r), [("u_sub/t_reg[5]".to_string(), vec!["separator", "reg-suffix"], vec!["u_sub.t[1]".to_string()])]);
+        assert_eq!(r.resolved[0].bits, BitIndex::Translated { to: "u_sub.t[1]".into(), declared: (5, 4) });
+        let sdc = Sdc::parse("set_false_path -to [get_cells {u_sub/t_reg[6]}]\n").unwrap();
+        let r = rtl_map(&sdc, &crate::netlist::parse(elab).unwrap(), &lib, &rg, &m, None);
+        assert!(matches!(r.resolved[0].bits, BitIndex::OutOfRange { .. }) && r.resolved[0].members.is_empty(), "{r:?}");
+    }
+
+    /// Two elaborated registers that share an alias (`a.t[0]` and `a.t_reg[0]`): an RTL form
+    /// that could mean either is reported ambiguous with both, and names neither. A name that
+    /// matches as written is not read as an alias at all.
+    #[test]
+    fn an_alias_two_registers_share_is_ambiguous() {
+        let elab = "module t(clk,a,y);\ninput clk,a; output y;\nwire \\a.t[0] , \\a.t_reg[0] ;\n\
+          DFF u1(.CK(clk),.D(a),.Q(\\a.t[0] ));\nDFF u2(.CK(clk),.D(\\a.t[0] ),.Q(\\a.t_reg[0] ));\nINV u3(.A(\\a.t_reg[0] ),.Y(y));\nendmodule\n";
+        let lib = Lib::parse(LIB).unwrap();
+        let go = |sdc: &str| rtl_map(&Sdc::parse(sdc).unwrap(), &crate::netlist::parse(elab).unwrap(), &lib, &DeclaredRanges::new(), &[], None);
+        let r = go("set_false_path -to [get_cells {a/t[0]}]\n");
+        assert_eq!(r.resolved[0].alias, Alias::Ambiguous { candidates: vec!["a.t[0]".into(), "a.t_reg[0]".into()] });
+        assert!(r.resolved[0].members.is_empty() && !r.complete());
+        let r = go("set_false_path -to [get_cells {a.t_reg[0]}]\n");
+        assert_eq!((r.resolved[0].alias.clone(), r.resolved[0].members.len()), (Alias::None, 1));
+    }
+
+    /// Only a query that can name a register is read as an alias: `get_ports cnt_reg[0]` and
+    /// `get_nets cnt_reg[0]` name nothing.
+    #[test]
+    fn a_port_or_net_query_is_not_read_as_a_register_alias() {
+        let r = run("set_input_delay 1 -clock clk [get_ports {cnt_reg[0]}]\ncreate_clock -name clk -period 10 [get_ports clk]\nset_false_path -through [get_nets {cnt_reg[0]}]\n", &MAP);
+        assert_eq!(r.unknown().count(), 2, "{r:?}");
+        assert!(aliased(&r).is_empty());
+    }
+
+    /// The `_reg` is on whichever side has it: an RTL `a/t[0]` names the elaborated `a.t_reg[0]`.
+    /// The `_reg` is the register name's, after the last separator, even under a generate
+    /// element whose name has an index (`g[0].u_in.t_reg[4]`).
+    #[test]
+    fn the_reg_suffix_is_matched_on_either_side_and_only_on_the_last_name() {
+        let lib = Lib::parse(LIB).unwrap();
+        let elab = "module t(clk,a,y);\ninput clk,a; output y;\nwire \\a.t_reg[0] , \\g[0].u_in.t[0] ;\n\
+          DFF u1(.CK(clk),.D(a),.Q(\\a.t_reg[0] ));\nDFF u2(.CK(clk),.D(\\a.t_reg[0] ),.Q(\\g[0].u_in.t[0] ));\nINV u3(.A(\\g[0].u_in.t[0] ),.Y(y));\nendmodule\n";
+        let rg: DeclaredRanges = [("g[0].u_in.t".to_string(), (5, 4))].into_iter().collect();
+        let r = rtl_map(
+            &Sdc::parse("set_false_path -to [get_cells {a/t[0]}]\nset_false_path -from [get_cells {g[0]/u_in/t_reg[4]}]\n").unwrap(),
+            &crate::netlist::parse(elab).unwrap(),
+            &lib,
+            &rg,
+            &[],
+            None,
+        );
+        let mut a = aliased(&r);
+        a.sort();
+        assert_eq!(
+            a,
+            [
+                ("a/t[0]".to_string(), vec!["separator", "reg-suffix"], vec!["a.t_reg[0]".to_string()]),
+                ("g[0]/u_in/t_reg[4]".to_string(), vec!["separator", "reg-suffix"], vec!["g[0].u_in.t[0]".to_string()]),
+            ],
+            "{r:?}"
+        );
+    }
+
+    /// A `get_pins` pattern names pins only: `get_pins {cnt_reg[0]}`, with no pin, names
+    /// nothing, as it does as written.
+    #[test]
+    fn a_pin_query_without_a_pin_is_not_read_as_a_register() {
+        let r = run("set_false_path -to [get_pins {cnt_reg[0]}]\n", &MAP);
+        assert_eq!(r.unknown().count(), 1, "{r:?}");
     }
 }
 
