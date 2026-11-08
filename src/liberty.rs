@@ -492,6 +492,14 @@ pub struct Cell {
     /// `is_macro_cell : true` (`LibertyCell::isMacro`): a hard macro, whose clock-tree-path delays
     /// the reference takes out on an ideal clock — see [`Pin::clk_tree_delay`].
     pub is_macro: bool,
+    /// `LibertyCell::isMemory`: `is_memory : true`, or a `memory` group at the cell's own level
+    /// (which sets it whatever the attribute says).
+    pub is_memory: bool,
+    /// `LibertyCell::isPad`: `is_pad`, then `pad_cell` (read after it, so it wins when both are
+    /// stated); each a cell boolean, an attribute other than `true`/`false` leaving it as it was.
+    pub is_pad: bool,
+    /// `is_level_shifter : true` (`LibertyCell::isLevelShifter`).
+    pub is_level_shifter: bool,
     /// Its own library's slew and delay thresholds, when they are not the merged library's
     /// ([`Lib::merge`] sets it on a later library's cells whose thresholds differ). The reference
     /// times a driver with its own library's thresholds and converts each wire delay and load
@@ -669,6 +677,48 @@ fn interchangeable(a: &Cell, b: &Cell) -> bool {
 }
 
 impl Cell {
+    /// `LibertyCell::bufferPorts`: the one input and the one output among the cell's own ports
+    /// (a bus is one port), in port order; `None` when there is a second input or output, or a
+    /// port of any other direction. A power or ground pin is passed over.
+    pub fn buffer_ports(&self) -> Option<(&CellPort, &CellPort)> {
+        let (mut input, mut output) = (None, None);
+        for p in &self.ports {
+            match p.direction {
+                PortDirection::Input if input.is_none() => input = Some(p),
+                PortDirection::Output if output.is_none() => output = Some(p),
+                _ if p.pwr_gnd => {}
+                _ => return None,
+            }
+        }
+        Some((input?, output?))
+    }
+
+    /// The buffer ports' output function, parsed over the cell's own ports.
+    fn buffer_function(&self) -> Option<(&CellPort, crate::liberty_func::Func)> {
+        let (i, o) = self.buffer_ports()?;
+        let f = self.pins.get(&o.name)?.function.as_deref()?;
+        Some((i, crate::liberty_func::Func::parse_in(f, |n| self.ports.iter().any(|p| p.name == n))?))
+    }
+
+    /// `LibertyCell::isBuffer`: buffer ports, the output's function the input port itself, and
+    /// neither a level shifter nor a pad.
+    pub fn is_buffer(&self) -> bool {
+        use crate::liberty_func::Func;
+        self.buffer_function().is_some_and(|(i, f)| f == Func::Port(i.name.clone())) && !self.is_level_shifter && !self.is_pad
+    }
+
+    /// `LibertyCell::isInverter`: buffer ports, the output's function the input port negated
+    /// (`!A`, `A'`), and neither a level shifter nor a pad.
+    pub fn is_inverter(&self) -> bool {
+        use crate::liberty_func::Func;
+        self.buffer_function().is_some_and(|(i, f)| f == Func::Not(Box::new(Func::Port(i.name.clone())))) && !self.is_level_shifter && !self.is_pad
+    }
+
+    /// `LibertyCell::isClockGate`: a `clock_gating_integrated_cell` of any type.
+    pub fn is_clock_gate(&self) -> bool {
+        self.clock_gating.is_some()
+    }
+
     /// Every pin a register clock-to-Q or latch enable-to-Q arc launches from
     /// ([`Pin::is_reg_clk`]), in name order — none, one, or several, with or without `clock : true`.
     pub fn reg_clk_pins(&self) -> Vec<&str> {
@@ -976,6 +1026,19 @@ fn idents_in(expr: &str) -> Vec<String> {
 /// which says `dont_use : TRUE;`.
 fn bool_attr(body: &str, key: &str) -> bool {
     simple_attr(body, key).is_some_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
+/// A cell boolean as the reference reads it (`readCellAttrBool`): `true` / `false`, compared
+/// case-blind; absent, or any other value (a warning there), is `None`: the value is unchanged.
+fn bool_attr_set(body: &str, key: &str) -> Option<bool> {
+    let v = simple_attr(body, key)?;
+    if v.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if v.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn simple_attr(body: &str, key: &str) -> Option<String> {
@@ -2376,6 +2439,9 @@ fn parse_cell(
         .unwrap_or(0.0);
     let dont_use = bool_attr(&own, "dont_use");
     let is_macro = bool_attr(&own, "is_macro_cell");
+    let is_memory = bool_attr(&own, "is_memory") || groups.iter().any(|(k, _, _)| k == "memory");
+    let is_pad = bool_attr_set(&own, "pad_cell").or(bool_attr_set(&own, "is_pad")).unwrap_or(false);
+    let is_level_shifter = bool_attr(&own, "is_level_shifter");
     let seq_group = seq_group(&groups);
     Cell {
         name,
@@ -2391,6 +2457,9 @@ fn parse_cell(
         scan_pins,
         dont_use,
         is_macro,
+        is_memory,
+        is_pad,
+        is_level_shifter,
         thresholds: None,
         seq_group,
         ports,
@@ -4324,6 +4393,83 @@ mod unit_tests {
         let cap = first.cells["INV_a"].pins["A"].capacitance;
         first.merge(second);
         assert_eq!(first.cells["INV_a"].pins["A"].capacitance, cap);
+    }
+}
+
+#[cfg(test)]
+mod buffer_inverter_cells {
+    use super::Lib;
+    const LIB: &str = r#"library(t) {
+  cell (BUF) { pg_pin (VDD) { pg_type : primary_power; } pin (A) { direction : input; }
+    pin (Z) { direction : output; function : "(A)"; } }
+  cell (INV) { pin (A) { direction : input; } pin (Z) { direction : output; function : "A'"; } }
+  cell (INV2) { pin (A) { direction : input; } pin (Z) { direction : output; function : "!A"; } }
+  cell (NN) { pin (A) { direction : input; } pin (Z) { direction : output; function : "!!A"; } }
+  cell (AND2) { pin (A) { direction : input; } pin (B) { direction : input; } pin (Z) { direction : output; function : "A & B"; } }
+  cell (TWOIN) { pin (A) { direction : input; } pin (B) { direction : input; } pin (Z) { direction : output; function : "B"; } }
+  cell (NAA) { pin (A) { direction : input; } pin (Z) { direction : output; function : "!(A & A)"; } }
+  cell (LSI) { is_level_shifter : true; pin (A) { direction : input; } pin (Z) { direction : output; function : "!A"; } }
+  cell (PADI) { pad_cell : true; pin (A) { direction : input; } pin (Z) { direction : output; function : "!A"; } }
+  cell (TWO) { pin (A) { direction : input; } pin (Y) { direction : output; function : "A"; }
+    pin (Z) { direction : output; function : "A"; } }
+  cell (TRI) { pin (A) { direction : input; } pin (EN) { direction : internal; }
+    pin (Z) { direction : output; function : "A"; } }
+  cell (TBUF) { pin (A) { direction : input; } pin (Z) { direction : output; function : "A"; three_state : "EN"; } }
+  cell (NOFN) { pin (A) { direction : input; } pin (Z) { direction : output; } }
+  cell (LS1) { is_level_shifter : true; pin (A) { direction : input; } pin (Z) { direction : output; function : "A"; } }
+  cell (PAD1) { pad_cell : true; pin (PAD) { direction : inout; function : "A"; } pin (A) { direction : input; } }
+  cell (PADB) { is_pad : true; pad_cell : false; pin (A) { direction : input; } pin (Z) { direction : output; function : "A"; } }
+  cell (PADC) { pad_cell : true; is_pad : false; pin (A) { direction : input; } pin (Z) { direction : output; function : "A"; } }
+  cell (PADY) { is_pad : yes; pin (A) { direction : input; } pin (Z) { direction : output; function : "A"; } }
+  cell (MEM1) { is_memory : true; pin (A) { direction : input; } pin (Z) { direction : output; function : "A"; } }
+  cell (MEM2) { is_memory : false; memory () { type : ram; } pin (A) { direction : input; } }
+  cell (CG) { clock_gating_integrated_cell : "latch_negedge"; pin (A) { direction : input; } }
+  cell (MAC) { is_macro_cell : true; pin (A) { direction : input; } }
+}"#;
+
+    /// Reference rules (`LibertyCell::bufferPorts` / `isBuffer` / `isInverter`, and the cell
+    /// booleans as `LibertyReader` reads them; cases after the upstream liberty gtests): buffer
+    /// ports are the one input and the one output, a power pin passed over and any other
+    /// direction (internal, inout, a tri-state output) or a second input or output meaning none;
+    /// a buffer's output function is the input port itself (parentheses read away), an
+    /// inverter's that port negated, a double negation neither; a level shifter or a pad is
+    /// neither. `pad_cell` is read after `is_pad` and wins; a value other than true/false
+    /// changes nothing. A `memory` group makes a memory whatever `is_memory` says.
+    #[test]
+    fn cell_kinds_read_as_the_reference_reads_them() {
+        let l = Lib::parse(LIB).unwrap();
+        let kinds = |n: &str| {
+            let c = &l.cells[n];
+            (c.is_buffer(), c.is_inverter())
+        };
+        for (n, want) in [
+            ("BUF", (true, false)),
+            ("INV", (false, true)),
+            ("INV2", (false, true)),
+            ("NN", (false, false)),
+            ("AND2", (false, false)),
+            ("TWOIN", (false, false)),
+            ("NAA", (false, false)),
+            ("LSI", (false, false)),
+            ("PADI", (false, false)),
+            ("TWO", (false, false)),
+            ("TRI", (false, false)),
+            ("TBUF", (false, false)),
+            ("NOFN", (false, false)),
+            ("LS1", (false, false)),
+            ("PAD1", (false, false)),
+            ("PADB", (true, false)),
+            ("PADC", (false, false)),
+            ("PADY", (true, false)),
+            ("MEM1", (true, false)),
+        ] {
+            assert_eq!(kinds(n), want, "{n}");
+        }
+        assert!(l.cells["PAD1"].is_pad && !l.cells["PADB"].is_pad && l.cells["PADC"].is_pad && !l.cells["PADY"].is_pad);
+        assert!(l.cells["LS1"].is_level_shifter && !l.cells["BUF"].is_level_shifter);
+        assert!(l.cells["MEM1"].is_memory && l.cells["MEM2"].is_memory && !l.cells["BUF"].is_memory);
+        assert!(l.cells["CG"].is_clock_gate() && !l.cells["BUF"].is_clock_gate());
+        assert!(l.cells["MAC"].is_macro && !l.cells["MEM2"].is_macro);
     }
 }
 

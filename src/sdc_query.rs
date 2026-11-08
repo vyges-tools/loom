@@ -12,7 +12,9 @@
 //!     `prop == 1`), `defined(prop)` / `undefined(prop)`, `!` over `&&` over `||`, parentheses;
 //!     a bool property compares as `1`/`0` (`true`/`false` accepted). The result is sorted by name;
 //!   * properties: a port's `name` `full_name` `direction`; an instance's `name` `full_name`
-//!     `ref_name` `cell` `is_hierarchical`; a pin's `name` `lib_pin_name` `full_name` `direction`
+//!     `ref_name` `cell` `is_hierarchical`, and its library cell's `is_buffer` `is_inverter`
+//!     `is_clock_gate` `is_macro` `is_memory` (false for a cell no library defines; not evaluated
+//!     with no library at all); a pin's `name` `lib_pin_name` `full_name` `direction`
 //!     `is_port` `is_hierarchical`; a net's `name` `full_name`.
 //!
 //!   * `-regexp`: each pattern is a regular expression ANCHORED as the reference anchors it, a
@@ -48,6 +50,26 @@ pub struct SdcDesign {
     /// it (a declared bit index, an RTL form of a register name), by the rules `sdc map` uses
     /// ([`crate::sdc_rtl_map::RtlNaming`]). `None`: every pattern as written.
     pub rtl: Option<crate::sdc_rtl_map::RtlNaming>,
+    /// The instance booleans the reference reads from an instance's library cell, by cell name,
+    /// for the cells the libraries define. `None`: no library was given, so they are not known.
+    pub cell_bools: Option<std::collections::BTreeMap<String, CellBools>>,
+}
+
+/// A library cell's booleans as an instance property reads them (`Properties::getProperty` of an
+/// instance: `liberty_cell && liberty_cell->isBuffer()` and so on).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CellBools {
+    pub is_buffer: bool,
+    pub is_inverter: bool,
+    pub is_clock_gate: bool,
+    pub is_macro: bool,
+    pub is_memory: bool,
+}
+
+impl CellBools {
+    pub fn of(c: &crate::liberty::Cell) -> CellBools {
+        CellBools { is_buffer: c.is_buffer(), is_inverter: c.is_inverter(), is_clock_gate: c.is_clock_gate(), is_macro: c.is_macro, is_memory: c.is_memory }
+    }
 }
 
 fn dir_name(d: Dir, tristate: bool) -> &'static str {
@@ -86,7 +108,16 @@ impl SdcDesign {
         for (cell, c) in lib.map(|l| &l.cells).into_iter().flatten() {
             lib_pins.extend(c.pins.iter().map(|(p, q)| (cell.clone(), p.clone(), q.capacitance)));
         }
-        SdcDesign { ports, insts, pins, libs: lib.map(|l| l.libraries.clone()).unwrap_or_default(), lib_pins, rtl: None }
+        let cell_bools = lib.map(|l| {
+            let mut m = std::collections::BTreeMap::new();
+            for i in &n.insts {
+                if let Some(c) = l.cells.get(&i.cell) {
+                    m.entry(i.cell.clone()).or_insert_with(|| CellBools::of(c));
+                }
+            }
+            m
+        });
+        SdcDesign { ports, insts, pins, libs: lib.map(|l| l.libraries.clone()).unwrap_or_default(), lib_pins, rtl: None, cell_bools }
     }
 
     /// `load_of lib/cell/pin`: the library pin's capacitance, in the library's unit. `Err` says
@@ -465,6 +496,20 @@ fn property(o: &Objs, k: usize, prop: &str, d: &SdcDesign) -> Result<(String, bo
                 "name" | "full_name" => s(name),
                 "ref_name" | "cell" => s(cell),
                 "is_hierarchical" => b(false),
+                "is_buffer" | "is_inverter" | "is_clock_gate" | "is_macro" | "is_memory" => {
+                    let Some(m) = &d.cell_bools else {
+                        return Err(format!("instance property {prop} is not evaluated: no library was given"));
+                    };
+                    // a cell no library defines has no liberty cell: every one of these is false
+                    let c = m.get(cell).copied().unwrap_or_default();
+                    b(match prop {
+                        "is_buffer" => c.is_buffer,
+                        "is_inverter" => c.is_inverter,
+                        "is_clock_gate" => c.is_clock_gate,
+                        "is_macro" => c.is_macro,
+                        _ => c.is_memory,
+                    })
+                }
                 p => Err(format!("instance property {p} is not evaluated")),
             }
         }
@@ -770,6 +815,71 @@ endmodule
         assert_eq!(ok("get_pins *").split(" ").count(), 16);
     }
 
+    /// Instance booleans read from the library cell (`Properties::getProperty` of an instance:
+    /// `liberty_cell && liberty_cell->isBuffer()` and so on), with the bool forms the filter takes.
+    /// Every answer is the reference's (box probe `filter-probe-20261108T083952Z`, Nangate45 +
+    /// fakeram45_64x7: these cells mirror the ones it read): a clock buffer is a buffer, a memory
+    /// group makes a memory but not a macro, an ICG is a clock gate; `is_sequential` is not an
+    /// instance property in the reference (an error there), so it stays refused here.
+    #[test]
+    fn instance_booleans_answer_as_the_reference_does() {
+        const L: &str = r#"library(p) {
+  cell (DFF_X1) { ff (IQ, IQN) { next_state : "D"; clocked_on : "CK"; }
+    pin (D) { direction : input; } pin (CK) { direction : input; clock : true; }
+    pin (Q) { direction : output; function : "IQ"; } }
+  cell (BUF_X1) { pin (A) { direction : input; } pin (Z) { direction : output; function : "A"; } }
+  cell (CLKBUF_X1) { pin (A) { direction : input; } pin (Z) { direction : output; function : "A"; } }
+  cell (INV_X1) { pin (A) { direction : input; } pin (ZN) { direction : output; function : "!A"; } }
+  cell (AND2_X1) { pin (A1) { direction : input; } pin (A2) { direction : input; }
+    pin (ZN) { direction : output; function : "(A1 & A2)"; } }
+  cell (CLKGATETST_X1) { clock_gating_integrated_cell : "latch_posedge_precontrol";
+    statetable ("CK E SE", "IQ") { table : "L L L : - : L"; }
+    pin (CK) { direction : input; clock_gate_clock_pin : true; } pin (E) { direction : input; }
+    pin (SE) { direction : input; } pin (GCK) { direction : output; state_function : "(CK * IQ)"; } }
+  cell (DLH_X1) { latch (IQ, IQN) { enable : "G"; data_in : "D"; }
+    pin (D) { direction : input; } pin (G) { direction : input; } pin (Q) { direction : output; function : "IQ"; } }
+  cell (fakeram45_64x7) { memory () { type : ram; address_width : 6; word_width : 7; }
+    pin (clk) { direction : input; clock : true; } }
+}"#;
+        const N: &str = "module top(clk, a, en, y1, y2, y3, y4, q, z);\ninput clk, a, en; output y1, y2, y3, y4, q, z;\nwire gclk;\n\
+          DFF_X1 r1(.D(a), .CK(clk), .Q(q));\nBUF_X1 b1(.A(a), .Z(y1));\nINV_X1 i1(.A(a), .ZN(y2));\n\
+          CLKGATETST_X1 cg(.CK(clk), .E(en), .SE(1'b0), .GCK(gclk));\nAND2_X1 n1(.A1(a), .A2(en), .ZN(y3));\n\
+          CLKBUF_X1 cb(.A(clk), .Z(y4));\nDLH_X1 l1(.D(a), .G(gclk), .Q(z));\nfakeram45_64x7 m1(.clk(clk));\nendmodule\n";
+        let lib = Lib::parse(L).unwrap();
+        let d = SdcDesign::from_netlist(&crate::netlist::parse(N).unwrap(), Some(&lib));
+        let f = |e: &str| eval(&crate::sdc::query_words(&format!("get_cells -filter {{{e}}} *")), &d).map(|mut v| {
+            v.sort();
+            v.join(" ")
+        });
+        for (e, want) in [
+            ("is_buffer", "b1 cb"),
+            ("is_buffer == true", "b1 cb"),
+            ("is_buffer == TRUE", "b1 cb"),
+            ("is_buffer == 1", "b1 cb"),
+            ("is_buffer != false", "b1 cb"),
+            ("!is_buffer", "cg i1 l1 m1 n1 r1"),
+            ("is_buffer =~ 1", "b1 cb"),
+            ("is_buffer =~ tr*", ""),
+            ("is_buffer == yes", ""),
+            ("is_inverter", "i1"),
+            ("is_clock_gate", "cg"),
+            ("is_macro", ""),
+            ("is_memory", "m1"),
+            ("is_hierarchical", ""),
+            ("defined(is_buffer)", "b1 cb"),
+            ("undefined(is_memory)", "b1 cb cg i1 l1 n1 r1"),
+            ("is_buffer || is_inverter", "b1 cb i1"),
+            ("is_buffer && ref_name =~ CLK*", "cb"),
+            ("is_memory == false", "b1 cb cg i1 l1 n1 r1"),
+        ] {
+            assert_eq!(f(e).as_deref(), Ok(want), "{e}");
+        }
+        assert!(f("is_sequential").is_err());
+        // no library at all: not known, so not evaluated (never read as false)
+        let bare = SdcDesign::from_netlist(&crate::netlist::parse(N).unwrap(), None);
+        assert!(eval(&crate::sdc::query_words("get_cells -filter is_buffer *"), &bare).unwrap_err().contains("no library"));
+    }
+
     /// The reference's answer is a SET for these; ours lists the same members.
     #[test]
     fn of_objects_members_match_the_reference() {
@@ -821,7 +931,8 @@ endmodule
     #[test]
     fn what_cannot_be_evaluated_says_why() {
         assert!(q("get_ports -filter is_clock *").unwrap_err().contains("do not have a is_clock"));
-        assert!(q("get_cells -filter is_buffer *").unwrap_err().contains("not evaluated"));
+        assert!(q("get_cells -filter is_sequential *").unwrap_err().contains("not evaluated"));
+        assert_eq!(q("get_cells -filter is_buffer *").unwrap(), Vec::<String>::new(), "evaluated now: no buffer here");
         assert!(q("get_ports -regexp {y\\b}").is_err());
     }
 

@@ -19,7 +19,8 @@ use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, LibGroups, Lvf, O
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLCN"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLCO"; // Vyges Liberty Cache — bump the trailing digit on any format change
+                                 // VLCO: Cell gained `is_memory`, `is_pad`, `is_level_shifter`.
                                  // VLCN: Lib gained `libraries` (name + operating_conditions, wire_load, wire_load_selection names).
                                  // VLCM: LVF early/late sigma and moments (Arc, Constraint).
                                  // VLCL: Cell gained `ports`.
@@ -489,6 +490,9 @@ fn enc_cell(w: &mut W, c: &Cell) {
     }
     w.u8(c.dont_use as u8);
     w.u8(c.is_macro as u8);
+    w.u8(c.is_memory as u8);
+    w.u8(c.is_pad as u8);
+    w.u8(c.is_level_shifter as u8);
     match &c.seq_group {
         Some(g) => {
             w.u8(1);
@@ -557,6 +561,7 @@ fn dec_cell(r: &mut R) -> Option<Cell> {
     }
     let dont_use = r.u8()? != 0;
     let is_macro = r.u8()? != 0;
+    let (is_memory, is_pad, is_level_shifter) = (r.u8()? != 0, r.u8()? != 0, r.u8()? != 0);
     let seq_group = match r.u8()? {
         0 => None,
         1 => {
@@ -607,6 +612,9 @@ fn dec_cell(r: &mut R) -> Option<Cell> {
         scan_pins,
         dont_use,
         is_macro,
+        is_memory,
+        is_pad,
+        is_level_shifter,
         // a cached file is one library: its cells carry their own thresholds only once merged
         thresholds: None,
         seq_group,
@@ -935,6 +943,20 @@ library (neg) {
                 assert_eq!(b.removal.len(), p.removal.len(), "{cn}/{pn} removal lost");
             }
         }
+    }
+
+    /// The cell kinds a filter reads (`is_memory`, `is_pad`, `is_level_shifter`) survive the cache.
+    #[test]
+    fn cell_kind_flags_survive_the_cache() {
+        let lib = Lib::parse(
+            "library(k) { cell (M) { memory () { type : ram; } pin (A) { direction : input; } }\n\
+             cell (P) { pad_cell : true; pin (A) { direction : input; } }\n\
+             cell (L) { is_level_shifter : true; pin (A) { direction : input; } } }",
+        )
+        .unwrap();
+        let back = decode(&encode(&lib)).expect("decode");
+        let f = |n: &str| (back.cells[n].is_memory, back.cells[n].is_pad, back.cells[n].is_level_shifter);
+        assert_eq!((f("M"), f("P"), f("L")), ((true, false, false), (false, true, false), (false, false, true)));
     }
 
     #[test]

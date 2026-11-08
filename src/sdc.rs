@@ -6801,6 +6801,7 @@ mod reference_error_tests {
             }],
             lib_pins: vec![("DFF".into(), "D".into(), 0.0021)],
             rtl: None,
+            cell_bools: None,
         }
     }
 
