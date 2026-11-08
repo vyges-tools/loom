@@ -65,6 +65,9 @@ pub mod sdc_path_fate;
 /// Waivers for constraint findings, as a Tcl file of `waive_finding` commands: stable finding
 /// ids, a template writer, the reader, and applying them (waived, active, stale).
 pub mod sdc_waivers;
+/// An RTL constraint file's objects resolved against the elaborated names, and carried to an
+/// implementation netlist through a proved register map.
+pub mod sdc_rtl_map;
 /// The `clock_domains` slice of `vyges-metadata.json` the constraint linter reads.
 pub mod ipmeta;
 mod sdc_query;
