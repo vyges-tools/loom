@@ -130,7 +130,8 @@ impl RtlMap {
 /// implementation cell), checked against the implementation `revised` when given.
 pub fn rtl_map(sdc: &Sdc, elab: &Netlist, lib: &Lib, map: &[(String, String)], revised: Option<&Netlist>) -> RtlMap {
     let names = elab_names(elab, lib, sdc);
-    let (refs, not_written) = object_refs(sdc);
+    let (mut refs, not_written) = object_refs(sdc);
+    refs.extend(dropped_group_members(sdc));
     let mut out = RtlMap { not_written, ..RtlMap::default() };
     for r in refs {
         match resolve(&r, &names) {
@@ -219,6 +220,17 @@ pub fn object_refs(sdc: &Sdc) -> (Vec<ObjectRef>, Vec<String>) {
         }
     }
     (out, w.not_written)
+}
+
+/// Stage 2b: each `set_clock_groups -group` member the reader left out because it names no clock
+/// defined before it (the reference's own behaviour, a warning). The canonical write holds the
+/// group without it, so [`object_refs`] never sees it; it is a pattern that names nothing.
+pub fn dropped_group_members(sdc: &Sdc) -> Vec<ObjectRef> {
+    sdc.ignored_words
+        .iter()
+        .filter_map(|w| w.strip_prefix("set_clock_groups -group ").map(|m| (w, m)))
+        .map(|(w, m)| ObjectRef { line: w.clone(), accessor: "get_clocks".into(), pattern: Some(m.to_string()) })
+        .collect()
 }
 
 /// A bare name or brace list, as names with no query.
@@ -503,5 +515,18 @@ mod tests {
         let r = run_on(elab, imp, "set_false_path -to {a/D}\n", &[("a", "_10_"), ("a/D", "_11_")]);
         assert!(r.complete(), "{r:?}");
         assert_eq!(carried(&r), [("a/D".to_string(), "_11_".to_string())]);
+    }
+
+    /// A `set_clock_groups -group` member that names no clock is left out by the reader (as the
+    /// reference does, with a warning), so the canonical write never shows it; it is still a
+    /// pattern that names nothing, and is reported. A stray option the reader ignores is not.
+    #[test]
+    fn a_clock_group_member_naming_no_clock_is_reported() {
+        let r = run(
+            "create_clock -name clk -period 10 [get_ports clk]\nset_clock_groups -asynchronous -group clk -group {clkx} -include_generated_clocks\n",
+            &MAP,
+        );
+        let unknown: Vec<(&str, Option<&str>)> = r.unknown().map(|x| (x.object.accessor.as_str(), x.object.pattern.as_deref())).collect();
+        assert_eq!(unknown, [("get_clocks", Some("clkx"))], "{r:?}");
     }
 }
