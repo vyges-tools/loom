@@ -176,23 +176,120 @@ pub fn rtl_map(sdc: &Sdc, elab: &Netlist, lib: &Lib, ranges: &DeclaredRanges, ma
     refs.extend(dropped_group_members(sdc));
     let mut out = RtlMap { not_written, ..RtlMap::default() };
     for r in refs {
-        let bits = r.pattern.as_deref().map_or(BitIndex::Same, |p| translate_bits(p, ranges));
-        let elab_ref = match &bits {
-            BitIndex::Translated { to, .. } => ObjectRef { pattern: Some(to.clone()), ..r.clone() },
-            _ => r.clone(),
-        };
-        let (members, bits, alias) = match (bits, resolve(&elab_ref, &names)) {
-            (bits @ BitIndex::OutOfRange { .. }, _) => (Some(Vec::new()), bits, Alias::None),
-            (bits, Some(m)) if !m.is_empty() => (Some(m), bits, Alias::None),
-            (bits, found) => match alias(&r, &names, ranges) {
-                Some((m, a, b)) => (Some(m), b, a),
-                None => (found, bits, Alias::None),
-            },
-        };
+        let (members, bits, alias) = resolve_rtl(&r, &names, ranges);
         match members {
             Some(m) => out.resolved.push(Resolved { members: carry(m, map, revised), object: r, bits, alias }),
             None => out.not_resolved.push(r),
         }
+    }
+    out
+}
+
+/// Stage 3 for one pattern: [`translate_bits`] by the declared range, then [`resolve`], then,
+/// when that names nothing, [`alias`]. `None` members: the list cannot be resolved without
+/// evaluating it. An index outside its range names nothing (empty members), whatever the alias.
+/// Shared by [`rtl_map`] and [`RtlNaming`] (the `--rtl` checks), so both read a name alike.
+pub fn resolve_rtl(r: &ObjectRef, names: &ElabNames, ranges: &DeclaredRanges) -> (Option<Vec<Member>>, BitIndex, Alias) {
+    let bits = r.pattern.as_deref().map_or(BitIndex::Same, |p| translate_bits(p, ranges));
+    let elab_ref = match &bits {
+        BitIndex::Translated { to, .. } => ObjectRef { pattern: Some(to.clone()), ..r.clone() },
+        _ => r.clone(),
+    };
+    match (bits, resolve(&elab_ref, names)) {
+        (bits @ BitIndex::OutOfRange { .. }, _) => (Some(Vec::new()), bits, Alias::None),
+        (bits, Some(m)) if !m.is_empty() => (Some(m), bits, Alias::None),
+        (bits, found) => match alias(r, names, ranges) {
+            Some((m, a, b)) => (Some(m), b, a),
+            None => (found, bits, Alias::None),
+        },
+    }
+}
+
+/// The RTL names a constraint file uses, read as [`rtl_map`] reads them, for checks that run on
+/// the elaborated netlist itself (`--rtl`): the elaborated name space, the declared ranges, and
+/// a log of each pattern it read differently from how it is written. Carried by the
+/// [`crate::sdc::SdcDesign`] the file is read against, which asks it for every object pattern
+/// of a `get_cells` / `get_pins` / `get_ports` query or a bare name list.
+#[derive(Debug, Clone, Default)]
+pub struct RtlNaming {
+    pub names: ElabNames,
+    pub ranges: DeclaredRanges,
+    /// Each pattern translated (bits), matched by an alias, out of its declared range, or
+    /// ambiguous, once, in the order first read. `object.line` is empty: the query is read
+    /// before its command is.
+    pub log: std::cell::RefCell<Vec<Resolved>>,
+}
+
+impl RtlNaming {
+    /// For the elaborated netlist (registers by the net on their stored-value output, as
+    /// [`rtl_view`] names their instances) and the declared ranges (empty: no translation).
+    pub fn new(nl: &Netlist, lib: &Lib, ranges: DeclaredRanges) -> RtlNaming {
+        RtlNaming { names: elab_names(nl, lib, &Sdc::default()), ranges, log: Default::default() }
+    }
+
+    /// The elaborated names `pattern` stands for, when the RTL reading differs from the written
+    /// one: a translated bit index or an alias that matched, each logged. `None`: read it as
+    /// written (it resolves as written, a query this does not read, or a pattern out of its
+    /// range or ambiguous, which is logged and then names nothing, never a guess).
+    pub fn rewrite(&self, accessor: &str, pattern: &str) -> Option<Vec<String>> {
+        if !matches!(accessor, "" | "get_cells" | "get_pins" | "get_ports") {
+            return None;
+        }
+        let r = ObjectRef { line: String::new(), accessor: accessor.to_string(), pattern: Some(pattern.to_string()) };
+        let (members, bits, alias) = resolve_rtl(&r, &self.names, &self.ranges);
+        if bits == BitIndex::Same && alias == Alias::None {
+            return None;
+        }
+        let members = members.unwrap_or_default();
+        let names: Vec<String> = members.iter().map(|m| m.name.clone()).collect();
+        let mut log = self.log.borrow_mut();
+        if !log.iter().any(|x| x.object == r) {
+            log.push(Resolved { object: r, members, bits, alias });
+        }
+        (!names.is_empty()).then_some(names)
+    }
+}
+
+/// One line of how RTL names were read, as `map` and `--rtl` both report it: `kind` is `BIT` (a
+/// bit index translated by its declared range), `ALIAS` (an RTL form matched by an alias, with
+/// the rules) or `UNKNOWN` (names nothing, with why); `warn` for `UNKNOWN`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadNote {
+    pub kind: &'static str,
+    pub warn: bool,
+    pub message: String,
+}
+
+/// `accessor pattern` as the notes name an object reference: `(bare)` for a bare name list,
+/// `(all)` for a query with no pattern.
+pub fn pattern_text(o: &ObjectRef) -> String {
+    format!("{} {}", if o.accessor.is_empty() { "(bare)" } else { o.accessor.as_str() }, o.pattern.as_deref().unwrap_or("(all)"))
+}
+
+/// The notes for a run's resolutions ([`RtlMap::resolved`] or [`RtlNaming::log`]): every `BIT`
+/// and `ALIAS` in order, then every `UNKNOWN` (out of its declared range, an ambiguous alias with
+/// its candidates, or nothing of that name), each with its SDC line when it has one.
+pub fn read_notes(resolved: &[Resolved]) -> Vec<ReadNote> {
+    let range = |d: &(i64, i64)| format!("[{}:{}]", d.0, d.1);
+    let mut out = Vec::new();
+    for x in resolved {
+        if let BitIndex::Translated { to, declared } = &x.bits {
+            out.push(ReadNote { kind: "BIT", warn: false, message: format!("{} is elaborated {to} (declared {})", pattern_text(&x.object), range(declared)) });
+        }
+        if let Alias::Matched { rules } = &x.alias {
+            let names: Vec<&str> = x.members.iter().map(|m| m.name.as_str()).collect();
+            let message = format!("{} matched {} by alias ({})", pattern_text(&x.object), names.join(" "), rules.join(", "));
+            out.push(ReadNote { kind: "ALIAS", warn: false, message });
+        }
+    }
+    for u in resolved.iter().filter(|x| x.members.is_empty()) {
+        let why = match (&u.bits, &u.alias) {
+            (BitIndex::OutOfRange { declared }, _) => format!("index outside the declared range {}", range(declared)),
+            (_, Alias::Ambiguous { candidates }) => format!("ambiguous alias, not guessed: matches {}", candidates.join(" ")),
+            _ => "names nothing in the elaborated design".to_string(),
+        };
+        let line = if u.object.line.is_empty() { String::new() } else { format!(": {}", u.object.line) };
+        out.push(ReadNote { kind: "UNKNOWN", warn: true, message: format!("{} {why}{line}", pattern_text(&u.object)) });
     }
     out
 }
@@ -1154,5 +1251,63 @@ mod tests {
         assert!(parse_ranges(r#"{"r":[11]}"#).is_err());
         assert!(parse_ranges(r#"{"r":[11.5,8]}"#).is_err());
         assert!(parse_ranges("[1,2]").is_err());
+    }
+
+    /// `--rtl`: a constraint file read against the RTL view with [`RtlNaming`] reads each
+    /// object pattern as `map` does: a declared bit index translated (`cnt[9]` of `[9:8]` is
+    /// `cnt[1]`), an RTL form matched by its alias (`cnt_reg[8]` is `cnt[0]`), in a plain query, a
+    /// bare list, and a query the design evaluates (`-of_objects`) alike; each logged once. A
+    /// pattern out of its range is logged and left as written (it names nothing); a clock name
+    /// and a `-regexp` pattern are not RTL names and are read as written; without the naming,
+    /// everything is read as written.
+    #[test]
+    fn rtl_naming_reads_patterns_as_map_does() {
+        let lib = Lib::parse(LIB).unwrap();
+        let elab = crate::netlist::parse(ELAB).unwrap();
+        let ranges: DeclaredRanges = [("cnt".to_string(), (9, 8))].into_iter().collect();
+        let mut d = crate::sdc::SdcDesign::from_netlist(&rtl_view(&elab, &lib).netlist, Some(&lib));
+        let text = "create_clock -name clk -period 10 [get_ports clk]\n\
+          set_false_path -to [get_cells {cnt_reg[8]}]\n\
+          set_false_path -from {cnt[9]} -to [get_cells {cnt[12]}]\n\
+          set_max_delay 3 -to [get_pins -of_objects [get_cells {cnt_reg[9]}] -filter {direction == input}]\n\
+          create_clock -name {cnt[9]} -period 5\n\
+          set_false_path -from [get_clocks {cnt[9]}] -to [get_cells {cnt[8]}]\n\
+          set_false_path -to [get_cells -regexp {cnt_reg[8]}]\n\
+          set_false_path -to [get_cells -regexp {cnt[9]} -filter {ref_name == DFF}]\n";
+        let plain = Sdc::parse_with(text, &d).unwrap();
+        assert_eq!(plain.exceptions[0].to, ["cnt_reg[8]"]);
+        d.rtl = Some(RtlNaming::new(&elab, &lib, ranges));
+        let sdc = Sdc::parse_with(text, &d).unwrap();
+        assert_eq!(sdc.exceptions[0].to, ["cnt[0]"]);
+        assert_eq!((sdc.exceptions[1].from.clone(), sdc.exceptions[1].to.clone()), (vec!["cnt[1]".to_string()], vec!["cnt[12]".to_string()]));
+        let log = d.rtl.as_ref().unwrap().log.borrow();
+        let seen: Vec<(&str, &BitIndex, &Alias)> = log.iter().map(|x| (x.object.pattern.as_deref().unwrap(), &x.bits, &x.alias)).collect();
+        assert!(seen.iter().any(|(p, b, a)| *p == "cnt_reg[8]" && matches!(b, BitIndex::Translated { .. }) && **a == Alias::Matched { rules: vec!["reg-suffix"] }), "{seen:?}");
+        assert!(seen.iter().any(|(p, b, _)| *p == "cnt[12]" && matches!(b, BitIndex::OutOfRange { declared: (9, 8) })), "{seen:?}");
+        assert!(seen.iter().any(|(p, _, _)| *p == "cnt_reg[9]"), "the evaluated query was read too: {seen:?}");
+        assert_eq!(log.iter().filter(|x| x.object.pattern.as_deref() == Some("cnt_reg[8]")).count(), 1, "logged once");
+        // a clock is named by the file, not the design: never read as an RTL name
+        assert_eq!((sdc.exceptions[2].from.clone(), sdc.exceptions[2].to.clone()), (vec!["cnt[9]".to_string()], vec!["cnt[0]".to_string()]));
+        // nor is a regular expression, in a plain query or an evaluated one
+        assert_eq!(sdc.exceptions[3].to, ["cnt_reg[8]"]);
+        assert_eq!(sdc.exceptions.len(), 4, "the evaluated regexp names nothing as written: {:?}", sdc.exceptions);
+        assert!(!seen.iter().any(|(p, _, _)| *p == "clk"), "read as written, not logged: {seen:?}");
+        assert_eq!(seen.len(), 5, "{seen:?}");
+        let delay = format!("{:?}", sdc.path_delays);
+        assert!(delay.contains("cnt[1]/D"), "{delay}");
+        // reported as `map` reports it
+        let notes = read_notes(&log);
+        assert_eq!(
+            notes.iter().map(|n| (n.kind, n.warn, n.message.as_str())).collect::<Vec<_>>(),
+            [
+                ("BIT", false, "get_cells cnt_reg[8] is elaborated cnt[0] (declared [9:8])"),
+                ("ALIAS", false, "get_cells cnt_reg[8] matched cnt[0] by alias (reg-suffix)"),
+                ("BIT", false, "(bare) cnt[9] is elaborated cnt[1] (declared [9:8])"),
+                ("BIT", false, "get_cells cnt_reg[9] is elaborated cnt[1] (declared [9:8])"),
+                ("ALIAS", false, "get_cells cnt_reg[9] matched cnt[1] by alias (reg-suffix)"),
+                ("BIT", false, "get_cells cnt[8] is elaborated cnt[0] (declared [9:8])"),
+                ("UNKNOWN", true, "get_cells cnt[12] index outside the declared range [9:8]"),
+            ]
+        );
     }
 }

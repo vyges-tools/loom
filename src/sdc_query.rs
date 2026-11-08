@@ -44,6 +44,10 @@ pub struct SdcDesign {
     /// the libraries merged ([`crate::liberty::Pin::capacitance`]). Empty with no library. What
     /// `[load_of lib/cell/pin]` reads.
     pub lib_pins: Vec<(String, String, f64)>,
+    /// `--rtl`: the design is an RTL elaboration, and an object pattern is read as the RTL names
+    /// it (a declared bit index, an RTL form of a register name), by the rules `sdc map` uses
+    /// ([`crate::sdc_rtl_map::RtlNaming`]). `None`: every pattern as written.
+    pub rtl: Option<crate::sdc_rtl_map::RtlNaming>,
 }
 
 fn dir_name(d: Dir, tristate: bool) -> &'static str {
@@ -82,7 +86,7 @@ impl SdcDesign {
         for (cell, c) in lib.map(|l| &l.cells).into_iter().flatten() {
             lib_pins.extend(c.pins.iter().map(|(p, q)| (cell.clone(), p.clone(), q.capacitance)));
         }
-        SdcDesign { ports, insts, pins, libs: lib.map(|l| l.libraries.clone()).unwrap_or_default(), lib_pins }
+        SdcDesign { ports, insts, pins, libs: lib.map(|l| l.libraries.clone()).unwrap_or_default(), lib_pins, rtl: None }
     }
 
     /// `load_of lib/cell/pin`: the library pin's capacitance, in the library's unit. `Err` says
@@ -103,6 +107,12 @@ impl SdcDesign {
             .find(|(c, p, _)| c == cell && p == pin)
             .map(|(_, _, cap)| *cap)
             .ok_or_else(|| format!("library `{lib}` has no pin {cell}/{pin}"))
+    }
+
+    /// One object pattern as the design reads it: under `rtl`, the RTL reading's names when it
+    /// differs from the written one ([`crate::sdc_rtl_map::RtlNaming::rewrite`]); else as written.
+    pub(crate) fn read_pattern(&self, accessor: &str, pattern: &str) -> Vec<String> {
+        self.rtl.as_ref().and_then(|r| r.rewrite(accessor, pattern)).unwrap_or_else(|| vec![pattern.to_string()])
     }
 
     /// `name` is one of the design's ports or instance pins.
@@ -211,6 +221,9 @@ fn objects(parts: &[String], d: &SdcDesign) -> Result<Objs, String> {
     }
     if patterns.is_empty() {
         patterns.push("*".into());
+    }
+    if !regexp {
+        patterns = patterns.iter().flat_map(|p| d.read_pattern(cmd, p)).collect();
     }
     let base = match of {
         Some(of) => of_objects(cmd, &of, d)?,

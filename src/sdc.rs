@@ -1706,6 +1706,8 @@ fn resolve_objs(tok: &str) -> Vec<String> {
                     }
                 }
                 let keys = crate::sdc_flags::keys(&parts[0]);
+                // a regular expression is not a name: never read as an RTL one
+                let regexp = parts.iter().any(|p| p == "-regexp");
                 let mut names = Vec::new();
                 let mut k = 1;
                 while k < parts.len() {
@@ -1718,8 +1720,10 @@ fn resolve_objs(tok: &str) -> Vec<String> {
                         // names computed by a nested `[concat …]` (a `get_object_name`, see
                         // `dialect_queries`) are this query's patterns
                         names.extend(resolve_objs(p));
-                    } else if !p.starts_with('-') {
+                    } else if regexp && !p.starts_with('-') {
                         names.extend(p.split_whitespace().map(|s| s.to_string()));
+                    } else if !p.starts_with('-') {
+                        names.extend(p.split_whitespace().flat_map(|s| read_pattern(&parts[0], s)));
                     }
                     k += 1;
                 }
@@ -1729,7 +1733,13 @@ fn resolve_objs(tok: &str) -> Vec<String> {
         }
     }
     // brace list or bare name -> split on whitespace
-    tok.split_whitespace().map(|s| s.to_string()).collect()
+    tok.split_whitespace().flat_map(|s| read_pattern("", s)).collect()
+}
+
+/// One object pattern as the design in scope reads it ([`SdcDesign::read_pattern`]: under
+/// `--rtl`, the RTL reading `sdc map` uses); as written with no design, or none of that kind.
+fn read_pattern(accessor: &str, pattern: &str) -> Vec<String> {
+    with_design(|d| d.read_pattern(accessor, pattern)).unwrap_or_else(|| vec![pattern.to_string()])
 }
 
 /// A clock period: a POSITIVE number, in the file's time unit — standard SDC, and the reference's
@@ -6790,6 +6800,7 @@ mod reference_error_tests {
                 wire_load_selections: vec!["sel".into()],
             }],
             lib_pins: vec![("DFF".into(), "D".into(), 0.0021)],
+            rtl: None,
         }
     }
 
