@@ -14,18 +14,28 @@
 //!   * properties: a port's `name` `full_name` `direction`; an instance's `name` `full_name`
 //!     `ref_name` `cell` `is_hierarchical`, and its library cell's `is_buffer` `is_inverter`
 //!     `is_clock_gate` `is_macro` `is_memory` (false for a cell no library defines; not evaluated
-//!     with no library at all); a pin's `name` `lib_pin_name` `full_name` `direction`
-//!     `is_port` `is_hierarchical`; a net's `name` `full_name`.
+//!     with no library at all), and `is_sequential`, an EXTENSION (below); a pin's `name`
+//!     `lib_pin_name` `full_name` `direction` `is_port` `is_hierarchical`; a net's `name`
+//!     `full_name`.
 //!
 //!   * `-regexp`: each pattern is a regular expression ANCHORED as the reference anchors it, a
 //!     `^` before and a `$` after with no group (so `a|b` is "starts with a, or ends with b"),
 //!     `-nocase` making it case-blind; a bus port or a pin is matched the way a glob is (see
 //!     [`tcl_regex`]).
 //!
+//!   * EXTENSION (user 2026-11-08): an instance's `is_sequential` is true when its library cell
+//!     holds state as this engine's registers do ([`crate::liberty::Cell::is_seq`]: an `ff` or
+//!     `latch` group or bank, a `statetable`, or a clock pin on a cell that is not a clock gate).
+//!     The reference has no such instance property: it errors there and stops the file.
+//!
 //! What this cannot answer it says so ([`Err`]) and the command is not applied: a `-regexp`
-//! pattern the reference's dialect reads differently ([`tcl_regex`]), a property the reference
-//! has but this view does not carry (timing, Liberty attributes), and a property the reference
-//! does not know (an error there too).
+//! pattern the reference's dialect reads differently ([`tcl_regex`]), and a property the
+//! reference has but this view does not carry (timing, Liberty attributes).
+//!
+//! A property the reference does not know at all ([`known_property`]) is the reference's error
+//! when the filter is applied to at least one object: the query fails, and `read_sdc` stops at
+//! that command (decided 2026-11-08: as the reference does). Its [`Err`] carries
+//! [`UNKNOWN_PROPERTY`], and the reader stops on it.
 
 use crate::liberty::{Dir, Lib};
 use crate::netlist::Netlist;
@@ -64,12 +74,55 @@ pub struct CellBools {
     pub is_clock_gate: bool,
     pub is_macro: bool,
     pub is_memory: bool,
+    /// EXTENSION, not the reference's: the cell holds state ([`crate::liberty::Cell::is_seq`]).
+    pub is_sequential: bool,
 }
 
 impl CellBools {
     pub fn of(c: &crate::liberty::Cell) -> CellBools {
-        CellBools { is_buffer: c.is_buffer(), is_inverter: c.is_inverter(), is_clock_gate: c.is_clock_gate(), is_macro: c.is_macro, is_memory: c.is_memory }
+        CellBools {
+            is_buffer: c.is_buffer(),
+            is_inverter: c.is_inverter(),
+            is_clock_gate: c.is_clock_gate(),
+            is_macro: c.is_macro,
+            is_memory: c.is_memory,
+            is_sequential: c.is_seq,
+        }
     }
+}
+
+/// Marks the [`Err`] of a filter naming a property the reference does not know for its objects;
+/// the reader stops the file on it ([`crate::sdc::Sdc::parse_with`]).
+pub(crate) const UNKNOWN_PROPERTY: &str = "a property the reference timer does not know";
+
+/// Whether the reference knows `prop` for the objects of `o` (`Properties::getProperty` per
+/// object type, at the pin, plus what OpenROAD registers: `src` on instances and pins), and the
+/// extension `is_sequential` on instances. Known is not evaluated: see [`property`].
+fn known_property(o: &Objs, prop: &str) -> bool {
+    const PORT: &[&str] = &["name", "full_name", "direction", "port_direction", "liberty_port", "activity"];
+    const INST: &[&str] = &[
+        "name", "full_name", "ref_name", "liberty_cell", "cell", "is_hierarchical", "is_buffer", "is_clock_gate",
+        "is_inverter", "is_macro", "is_memory", "src",
+    ];
+    const PIN: &[&str] = &[
+        "name", "lib_pin_name", "full_name", "direction", "pin_direction", "is_hierarchical", "is_port", "is_clock",
+        "is_register_clock", "clocks", "clock_domains", "activity", "arrival_max_rise", "arrival_max_fall",
+        "arrival_min_rise", "arrival_min_fall", "src",
+    ];
+    const TIMING: &[&str] = &["max", "max_fall", "max_rise", "min", "min_fall", "min_rise"];
+    let timed = |p: &str| ["slack_", "slew_"].iter().any(|k| p.strip_prefix(k).is_some_and(|t| TIMING.contains(&t)));
+    match o {
+        Objs::Ports(_) => PORT.contains(&prop) || timed(prop),
+        // the extension (module doc)
+        Objs::Cells(_) => INST.contains(&prop) || prop == "is_sequential",
+        Objs::Pins(_) => PIN.contains(&prop) || timed(prop),
+        Objs::Nets(_) => matches!(prop, "name" | "full_name"),
+        Objs::Clocks => true,
+    }
+}
+
+fn unknown_property(o: &Objs, prop: &str) -> String {
+    format!("-filter: `{prop}` is not a property of {} ({UNKNOWN_PROPERTY})", kind(o))
 }
 
 fn dir_name(d: Dir, tristate: bool) -> &'static str {
@@ -473,9 +526,9 @@ fn dedup_s(it: impl Iterator<Item = String>) -> Vec<String> {
     v
 }
 
-/// A property's value as the filter compares it, `Ok(None)` for an object kind that has the
-/// property in the reference but not in this view (cannot evaluate), `Err` for one the
-/// reference does not know.
+/// A property's value as the filter compares it, and whether it is a bool. `Err` for a property
+/// the reference has but this view does not carry (not evaluated); one the reference does not
+/// know was stopped before this ([`known_property`]).
 fn property(o: &Objs, k: usize, prop: &str, d: &SdcDesign) -> Result<(String, bool), String> {
     let s = |v: &str| Ok((v.to_string(), false));
     let b = |v: bool| Ok((if v { "1" } else { "0" }.to_string(), true));
@@ -485,9 +538,7 @@ fn property(o: &Objs, k: usize, prop: &str, d: &SdcDesign) -> Result<(String, bo
             match prop {
                 "name" | "full_name" => s(name),
                 "direction" | "port_direction" => s(dir),
-                "liberty_port" | "activity" => Err(format!("port property {prop} is not evaluated")),
-                p if p.starts_with("slack_") || p.starts_with("slew_") => Err(format!("port property {prop} is not evaluated")),
-                p => Err(format!("port objects do not have a {p} property")),
+                p => Err(format!("port property {p} is not evaluated")),
             }
         }
         Objs::Cells(v) => {
@@ -496,7 +547,7 @@ fn property(o: &Objs, k: usize, prop: &str, d: &SdcDesign) -> Result<(String, bo
                 "name" | "full_name" => s(name),
                 "ref_name" | "cell" => s(cell),
                 "is_hierarchical" => b(false),
-                "is_buffer" | "is_inverter" | "is_clock_gate" | "is_macro" | "is_memory" => {
+                "is_buffer" | "is_inverter" | "is_clock_gate" | "is_macro" | "is_memory" | "is_sequential" => {
                     let Some(m) = &d.cell_bools else {
                         return Err(format!("instance property {prop} is not evaluated: no library was given"));
                     };
@@ -507,6 +558,8 @@ fn property(o: &Objs, k: usize, prop: &str, d: &SdcDesign) -> Result<(String, bo
                         "is_inverter" => c.is_inverter,
                         "is_clock_gate" => c.is_clock_gate,
                         "is_macro" => c.is_macro,
+                        // EXTENSION (module doc): the reference errors on it
+                        "is_sequential" => c.is_sequential,
                         _ => c.is_memory,
                     })
                 }
@@ -673,7 +726,21 @@ fn apply_filter(expr: &str, base: Objs, d: &SdcDesign) -> Result<Objs, String> {
     };
     let all: BTreeSet<usize> = (0..n).collect();
     let mut stack: Vec<BTreeSet<usize>> = Vec::new();
-    for t in postfix(lex(expr)?)? {
+    let toks = postfix(lex(expr)?)?;
+    // Rule (`filterObjects`, `Properties::getProperty`): each predicate looks its property up on
+    // every object, in postfix order, and one the object type lacks throws; so a filter over NO
+    // object never errors, and an unknown property errors even after (or beside) one this view
+    // cannot evaluate, which the reference evaluates fine.
+    if n > 0 {
+        for t in &toks {
+            if let FTok::Pred(prop, ..) | FTok::Defined(prop, _) = t {
+                if !known_property(&base, prop) {
+                    return Err(unknown_property(&base, prop));
+                }
+            }
+        }
+    }
+    for t in toks {
         match t {
             FTok::Pred(prop, op, mut arg) => {
                 let mut set = BTreeSet::new();
@@ -819,8 +886,9 @@ endmodule
     /// `liberty_cell && liberty_cell->isBuffer()` and so on), with the bool forms the filter takes.
     /// Every answer is the reference's (box probe `filter-probe-20261108T083952Z`, Nangate45 +
     /// fakeram45_64x7: these cells mirror the ones it read): a clock buffer is a buffer, a memory
-    /// group makes a memory but not a macro, an ICG is a clock gate; `is_sequential` is not an
-    /// instance property in the reference (an error there), so it stays refused here.
+    /// group makes a memory but not a macro, an ICG is a clock gate. `is_sequential` is the
+    /// EXTENSION (module doc; the reference errors on it): `Cell::is_seq`, so the flop, the latch,
+    /// the clocked memory and the ICG (its `statetable`), not a buffer or gate.
     #[test]
     fn instance_booleans_answer_as_the_reference_does() {
         const L: &str = r#"library(p) {
@@ -874,7 +942,14 @@ endmodule
         ] {
             assert_eq!(f(e).as_deref(), Ok(want), "{e}");
         }
-        assert!(f("is_sequential").is_err());
+        for (e, want) in [
+            ("is_sequential", "cg l1 m1 r1"),
+            ("is_sequential == true", "cg l1 m1 r1"),
+            ("!is_sequential", "b1 cb i1 n1"),
+            ("is_sequential && !is_clock_gate && !is_memory", "l1 r1"),
+        ] {
+            assert_eq!(f(e).as_deref(), Ok(want), "extension: {e}");
+        }
         // no library at all: not known, so not evaluated (never read as false)
         let bare = SdcDesign::from_netlist(&crate::netlist::parse(N).unwrap(), None);
         assert!(eval(&crate::sdc::query_words("get_cells -filter is_buffer *"), &bare).unwrap_err().contains("no library"));
@@ -926,14 +1001,88 @@ endmodule
         assert_eq!(sorted("get_cells -regexp -nocase {U[12]}"), "u1 u2");
     }
 
-    /// What this cannot answer it says so: an unknown property (an error in the reference too),
-    /// one the view does not carry, and a -regexp pattern Rust would read differently.
+    /// What this cannot answer it says so: one the view does not carry, and a -regexp pattern
+    /// Rust would read differently.
     #[test]
     fn what_cannot_be_evaluated_says_why() {
-        assert!(q("get_ports -filter is_clock *").unwrap_err().contains("do not have a is_clock"));
-        assert!(q("get_cells -filter is_sequential *").unwrap_err().contains("not evaluated"));
+        assert!(q("get_cells -filter liberty_cell *").unwrap_err().contains("not evaluated"));
         assert_eq!(q("get_cells -filter is_buffer *").unwrap(), Vec::<String>::new(), "evaluated now: no buffer here");
         assert!(q("get_ports -regexp {y\\b}").is_err());
+    }
+
+    /// Rule (`Properties::getProperty` per object type, OpenSTA at the 4155ac3 pin): a property
+    /// the object type does not have THROWS (`PropertyUnknown`, no message id), which fails the
+    /// query; `filterObjects` looks it up per object, so over no object it never throws. Every
+    /// case is the reference's (box probe `unknown-prop-probe-20261108T155720Z`): an unknown
+    /// property on ports, pins, nets and instances errors (port `is_clock` too, a pin property),
+    /// inside `defined()`, and after a known predicate; `src` is known on instances and pins
+    /// (OpenROAD registers it), not on nets; a known timing property is not an unknown one.
+    #[test]
+    fn an_unknown_property_is_the_references_error() {
+        let unknown = |s: &str| q(s).unwrap_err().contains(UNKNOWN_PROPERTY);
+        for s in [
+            "get_ports -filter is_bogus *",
+            "get_ports -filter is_clock *",
+            "get_ports -filter slack_bogus *",
+            "get_pins -filter is_bogus */*",
+            "get_nets -filter is_bogus *",
+            "get_nets -filter src *",
+            "get_cells -filter is_bogus *",
+            "get_cells -filter {defined(is_bogus)} *",
+            "get_cells -filter {ref_name =~ AND* && is_bogus} *",
+            // after (and beside) a property this view cannot evaluate: the reference evaluates it
+            "get_cells -filter {liberty_cell == x || is_bogus} *",
+            "get_pins -of_objects [get_cells -filter is_bogus *]",
+        ] {
+            assert!(unknown(s), "{s}: {:?}", q(s));
+        }
+        for s in [
+            "get_pins -filter src */*",
+            "get_cells -filter src *",
+            "get_pins -filter is_clock */*",
+            "get_ports -filter slack_max *",
+            "get_ports -filter activity *",
+        ] {
+            let e = q(s).unwrap_err();
+            assert!(e.contains("not evaluated") && !e.contains(UNKNOWN_PROPERTY), "{s}: {e}");
+        }
+        // no object to look the property up on: no error, nothing
+        assert_eq!(q("get_cells -filter is_bogus nomatch*").unwrap(), Vec::<String>::new());
+        assert_eq!(q("get_nets -filter src nomatch*").unwrap(), Vec::<String>::new());
+    }
+
+    /// Rule (`include_file`, OpenSTA `tcl/Util.tcl` at the pin, `sta_continue_on_error` 0 by
+    /// default): the query's error ends the read at that command and `read_sdc` errors; an
+    /// unknown property over no object is no error, so the file reads on. The reference on the
+    /// probe (`unknown-prop-probe-20261108T155720Z`): a mid-file `set_false_path -to [get_cells
+    /// -filter is_bogus *]` kept the `set_max_delay` before it, never applied the one after, and
+    /// `read_sdc` returned the error (uncaught, the run exits 1); a `set v [...]` stopped at the
+    /// `set`; over `nomatch*` the next command was applied. This reader stops as it does at a
+    /// command the reference does not know: the file is not read. Without a design the query is
+    /// refused as before (not evaluated), the file read on.
+    #[test]
+    fn an_unknown_filter_property_stops_the_file() {
+        let head = "create_clock -name c -period 10 [get_ports s]\nset_max_delay 3 -to [get_ports y1]\n";
+        for bad in [
+            "set_false_path -to [get_cells -filter is_bogus *]",
+            "set v [get_cells -filter is_bogus *]",
+            "set_false_path -to [get_pins -of_objects [get_cells -filter {ref_name =~ AND* && is_bogus} *]]",
+            "set_input_delay 1 -clock c [get_ports -filter is_clock *]",
+            "set_false_path -to [list [get_cells -filter is_bogus *]]",
+        ] {
+            let sdc = format!("{head}{bad}\nset_max_delay 4 -to [get_ports y2]\n");
+            let e = crate::sdc::Sdc::parse_with(&sdc, &design()).unwrap_err().0;
+            assert!(e.contains(UNKNOWN_PROPERTY) && e.contains("not read"), "{bad}: {e}");
+            let without = crate::sdc::Sdc::parse(&sdc).unwrap();
+            assert_eq!(without.unevaluated_queries.len(), usize::from(!bad.starts_with("set ")), "{bad}");
+        }
+        let empty = format!("{head}set_false_path -from [get_ports a] -to [get_cells -quiet -filter is_bogus nomatch*]\nset_max_delay 4 -to [get_ports y2]\n");
+        let read = crate::sdc::Sdc::parse_with(&empty, &design()).unwrap();
+        assert_eq!(read.path_delays.len(), 2, "{:?}", read.rejected);
+        // a property the reference has but this view does not carry: refused, the file read on
+        let unread = format!("{head}set_false_path -to [get_cells -filter liberty_cell *]\nset_max_delay 4 -to [get_ports y2]\n");
+        let read = crate::sdc::Sdc::parse_with(&unread, &design()).unwrap();
+        assert_eq!((read.path_delays.len(), read.unevaluated_queries.len()), (2, 1), "{:?}", read.rejected);
     }
 
     /// The command is applied once a design is in scope, and still refused without one.

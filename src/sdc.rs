@@ -2203,6 +2203,27 @@ fn unevaluated_query(toks: &[String]) -> Option<String> {
     None
 }
 
+/// The first object query in `toks` (at any depth of `[...]`) whose `-filter` names a property
+/// the reference does not know for its objects ([`crate::sdc_query::UNKNOWN_PROPERTY`]): why.
+/// Only with a design in scope, as the reference always has one.
+fn filter_stop(toks: &[String]) -> Option<String> {
+    for t in toks {
+        let Some(inner) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else { continue };
+        let parts = query_words(inner);
+        if parts.first().is_some_and(|c| c.starts_with("get_")) && parts.iter().any(|p| p == "-filter" || p == "-of_objects") {
+            if let Some(Err(why)) = with_design(|d| crate::sdc_query::eval(&parts, d)) {
+                if why.contains(crate::sdc_query::UNKNOWN_PROPERTY) {
+                    return Some(why);
+                }
+            }
+        }
+        if let Some(why) = filter_stop(parts.get(1..).unwrap_or_default()) {
+            return Some(why);
+        }
+    }
+    None
+}
+
 /// An every-port-but collection ([`all_ports_except`]) anywhere but as the ports of
 /// `set_input_delay` / `set_output_delay`, the one place it is read: elsewhere its words were
 /// taken as object names (`-from [remove_from_collection [all_inputs] clk]` cut paths from a port
@@ -3768,6 +3789,16 @@ impl Sdc {
                     sdc.rejected.push(format!("{}: {why}; not applied", toks[0]));
                     continue;
                 }
+            }
+            // ⛔ A -filter PROPERTY THE REFERENCE DOES NOT KNOW STOPS THE READ, as it stops the
+            // reference's `read_sdc` (user 2026-11-08: keep its behaviour): the query throws,
+            // `include_file` stops at that command, and `read_sdc` errors. A `set` too: Tcl runs
+            // the query when it stores the value.
+            if let Some(why) = filter_stop(&toks) {
+                return Err(SdcError(format!(
+                    "{why} in `{}`: the reference stops reading the file at that command, so this file is not read",
+                    line.trim()
+                )));
             }
             // An object query this reader cannot evaluate: the command is NOT applied, and says
             // so (a `set` only stores the text; it is checked where the variable is used).
