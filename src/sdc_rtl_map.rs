@@ -10,7 +10,9 @@
 //!    output), the other cells, their pins, and the nets.
 //! 2. [`object_refs`]: every object list in the file, from its canonical write (the form `diff`
 //!    compares), with the query that named it.
-//! 3. [`resolve`]: each list's pattern matched against the names its query can name.
+//! 3. [`translate_bits`]: an RTL bit index turned into the elaborated one by the vector's
+//!    declared range (elaboration numbers every vector's bits from 0), then [`resolve`]: each
+//!    list's pattern matched against the names its query can name.
 //! 4. [`carry`]: each object it names carried to the implementation: a port as itself, a clock as
 //!    itself, a register (or a register's pin) through the register map; anything else is not
 //!    carried, and why is said.
@@ -23,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::liberty::{Dir, Lib};
 use crate::netlist::Netlist;
-use crate::sdc::{object_matches, tokenize, Objects, Sdc};
+use crate::sdc::{bus_form, object_matches, tokenize, Objects, Sdc};
 use crate::sdc_write::WriteOpts;
 
 /// What an elaborated object is.
@@ -96,6 +98,26 @@ pub struct Member {
 pub struct Resolved {
     pub object: ObjectRef,
     pub members: Vec<Member>,
+    /// What the declared range did to the pattern's bit index.
+    pub bits: BitIndex,
+}
+
+/// Each vector's range AS DECLARED in the RTL, `(left, right)` of `[left:right]`, by the name
+/// the elaborated netlist gives the vector (the instance path joined by `.`, then the name:
+/// `u_sub.t`, `g[0].u_in.t`; a top-level port or variable by its name alone).
+pub type DeclaredRanges = BTreeMap<String, (i64, i64)>;
+
+/// What [`translate_bits`] did to a pattern.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum BitIndex {
+    /// No declared range applies (no index, a glob index, a vector the ranges do not list), or
+    /// the index is the same after elaboration (`[3:0]`).
+    #[default]
+    Same,
+    /// The RTL index named another elaborated bit: the pattern resolved is `to`.
+    Translated { to: String, declared: (i64, i64) },
+    /// An index outside the declared range: it names nothing, and no bit is guessed.
+    OutOfRange { declared: (i64, i64) },
 }
 
 /// The whole file's resolution.
@@ -128,18 +150,56 @@ impl RtlMap {
 /// The thin sequence of the stages the module doc names: `sdc` against the elaborated netlist
 /// `elab` (with `lib` for the registers), carried through `map` (elaborated register name ->
 /// implementation cell), checked against the implementation `revised` when given.
-pub fn rtl_map(sdc: &Sdc, elab: &Netlist, lib: &Lib, map: &[(String, String)], revised: Option<&Netlist>) -> RtlMap {
+pub fn rtl_map(sdc: &Sdc, elab: &Netlist, lib: &Lib, ranges: &DeclaredRanges, map: &[(String, String)], revised: Option<&Netlist>) -> RtlMap {
     let names = elab_names(elab, lib, sdc);
     let (mut refs, not_written) = object_refs(sdc);
     refs.extend(dropped_group_members(sdc));
     let mut out = RtlMap { not_written, ..RtlMap::default() };
     for r in refs {
-        match resolve(&r, &names) {
-            Some(members) => out.resolved.push(Resolved { members: carry(members, map, revised), object: r }),
-            None => out.not_resolved.push(r),
+        let bits = r.pattern.as_deref().map_or(BitIndex::Same, |p| translate_bits(p, ranges));
+        let elab_ref = match &bits {
+            BitIndex::Translated { to, .. } => ObjectRef { pattern: Some(to.clone()), ..r.clone() },
+            _ => r.clone(),
+        };
+        match (&bits, resolve(&elab_ref, &names)) {
+            (BitIndex::OutOfRange { .. }, _) => out.resolved.push(Resolved { members: Vec::new(), object: r, bits }),
+            (_, Some(members)) => out.resolved.push(Resolved { members: carry(members, map, revised), object: r, bits }),
+            (_, None) => out.not_resolved.push(r),
         }
     }
     out
+}
+
+/// Stage 3a: an RTL bit index as the elaborated netlist numbers it. Elaboration (ours and the
+/// reference's `synthesize` alike) numbers every vector's bits from 0 at the RIGHT bound of its
+/// declaration, ports included: bit `i` of `[left:right]` is elaborated bit `|i - right|`
+/// (`logic [11:8] r`: `r[8]` is `r[0]`; `logic [8:11] s`: `s[11]` is `s[0]`, `s[8]` is `s[3]`;
+/// witnessed on the reference, `correlation/harness/sdc/register-map/ranges-probe/`). The
+/// index is the pattern's LAST `[n]` or `[n:m]` (an SDC bus range), or, in a pin pattern
+/// `reg[n]/D`, the instance part's. An index outside the declared range is
+/// [`BitIndex::OutOfRange`]: reported, never moved to a bit that exists. A glob index (`[*]`)
+/// names every bit either way, and is left as written.
+pub fn translate_bits(pattern: &str, ranges: &DeclaredRanges) -> BitIndex {
+    let (head, pin) = match (bus_form(pattern), pattern.rsplit_once('/')) {
+        (Some(_), _) => (pattern, ""),
+        (None, Some((inst, _))) if bus_form(inst).is_some() => (inst, &pattern[inst.len()..]),
+        _ => return BitIndex::Same,
+    };
+    let Some((base, sub)) = bus_form(head) else { return BitIndex::Same };
+    let Some(&(left, right)) = ranges.get(base) else { return BitIndex::Same };
+    let idx: Vec<i64> = match sub.split(':').map(|t| t.parse::<i64>()).collect::<Result<Vec<_>, _>>() {
+        Ok(v) if (1..=2).contains(&v.len()) => v,
+        _ => return BitIndex::Same,
+    };
+    let (lo, hi) = (left.min(right), left.max(right));
+    if idx.iter().any(|i| *i < lo || *i > hi) {
+        return BitIndex::OutOfRange { declared: (left, right) };
+    }
+    let to: Vec<String> = idx.iter().map(|i| (i - right).abs().to_string()).collect();
+    if idx.iter().map(|i| (i - right).abs()).eq(idx.iter().copied()) {
+        return BitIndex::Same;
+    }
+    BitIndex::Translated { to: format!("{base}[{}]{pin}", to.join(":")), declared: (left, right) }
 }
 
 /// Stage 1: the elaborated name space. A register is a cell with an `ff` / `latch` group, named
@@ -366,7 +426,7 @@ mod tests {
         let imp = crate::netlist::parse(imp).unwrap();
         let s = Sdc::parse(sdc).unwrap();
         let m: Vec<(String, String)> = map.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
-        rtl_map(&s, &elab, &lib, &m, Some(&imp))
+        rtl_map(&s, &elab, &lib, &DeclaredRanges::new(), &m, Some(&imp))
     }
     const MAP: [(&str, &str); 2] = [("cnt[0]", "_10_"), ("cnt[1]", "_11_")];
 
@@ -529,4 +589,105 @@ mod tests {
         let unknown: Vec<(&str, Option<&str>)> = r.unknown().map(|x| (x.object.accessor.as_str(), x.object.pattern.as_deref())).collect();
         assert_eq!(unknown, [("get_clocks", Some("clkx"))], "{r:?}");
     }
+
+    fn ranges(r: &[(&str, i64, i64)]) -> DeclaredRanges {
+        r.iter().map(|(n, l, rt)| (n.to_string(), (*l, *rt))).collect()
+    }
+
+    /// The rule, as the reference elaborates: bit `i` of `[left:right]` is elaborated bit
+    /// `|i - right|`. `[11:8]`: 8 -> 0, 11 -> 3. `[8:11]` (ascending): 11 -> 0, 8 -> 3. A bus
+    /// range is translated end by end, a pin pattern by its instance part. `[3:0]` changes
+    /// nothing; a glob index, or a vector the ranges do not list, is left as written.
+    #[test]
+    fn a_bit_index_is_counted_from_the_declared_right_bound() {
+        let rg = ranges(&[("r", 11, 8), ("s", 8, 11), ("z", 3, 0), ("u_sub.t", 5, 4)]);
+        let to = |p: &str| match translate_bits(p, &rg) {
+            BitIndex::Translated { to, .. } => to,
+            other => format!("{other:?}"),
+        };
+        assert_eq!(to("r[8]"), "r[0]");
+        assert_eq!(to("r[11]"), "r[3]");
+        assert_eq!(to("s[11]"), "s[0]");
+        assert_eq!(to("s[8]"), "s[3]");
+        assert_eq!(to("r[9:8]"), "r[1:0]");
+        assert_eq!(to("r[10]/D"), "r[2]/D");
+        assert_eq!(to("u_sub.t[5]"), "u_sub.t[1]");
+        for same in ["z[2]", "r[*]", "r", "w[9]", "r/D"] {
+            assert_eq!(translate_bits(same, &rg), BitIndex::Same, "{same}");
+        }
+    }
+
+    /// An index outside the declared range names nothing and is reported with the range, on
+    /// either side of it; it is never moved to a bit that exists (`r[12]` of `[11:8]` is not
+    /// `r[4]`, and `r[7]` is not `r[1]`).
+    #[test]
+    fn an_index_outside_the_declared_range_is_reported() {
+        let rg = ranges(&[("r", 11, 8), ("z", 3, 0)]);
+        for p in ["r[12]", "r[7]", "r[7:8]", "z[4]", "r[12]/D"] {
+            assert!(matches!(translate_bits(p, &rg), BitIndex::OutOfRange { .. }), "{p}");
+        }
+    }
+
+    /// A non-zero-based register vector and port (`logic [9:8] r`, `output [9:8] q`): the
+    /// elaborated netlist numbers both from 0. `r[9]` names elaborated `r[1]` and is carried
+    /// through the map; `q[8]` names port `q[0]`; each says it was translated. Without the
+    /// declared ranges `r[9]` and `q[8]` name nothing: RTL indices the netlist does not have.
+    #[test]
+    fn rtl_bits_of_a_register_and_a_port_are_translated_by_the_declared_range() {
+        let elab = "module t(clk,a,q);\ninput clk; input [1:0] a; output [1:0] q;\nwire [1:0] r;\n\
+          DFF u1(.CK(clk),.D(a[0]),.Q(r[0]));\nDFF u2(.CK(clk),.D(a[1]),.Q(r[1]));\n\
+          INV u3(.A(r[0]),.Y(q[0]));\nINV u4(.A(r[1]),.Y(q[1]));\nendmodule\n";
+        let imp = "module t(clk,a,q);\ninput clk; input [1:0] a; output [1:0] q;\nwire q0, q1;\n\
+          DFF _10_(.CK(clk),.D(a[0]),.Q(q0));\nDFF _11_(.CK(clk),.D(a[1]),.Q(q1));\n\
+          INV _5_(.A(q0),.Y(q[0]));\nINV _6_(.A(q1),.Y(q[1]));\nendmodule\n";
+        let sdc = "create_clock -name clk -period 10 [get_ports clk]\nset_false_path -to [get_cells {r[9]}]\nset_output_delay 1 -clock clk [get_ports {q[8]}]\n";
+        let go = |rg: &DeclaredRanges| {
+            let lib = Lib::parse(LIB).unwrap();
+            let m: Vec<(String, String)> = [("r[0]", "_10_"), ("r[1]", "_11_")].iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+            rtl_map(&Sdc::parse(sdc).unwrap(), &crate::netlist::parse(elab).unwrap(), &lib, rg, &m, Some(&crate::netlist::parse(imp).unwrap()))
+        };
+        let r = go(&ranges(&[("r", 9, 8), ("q", 9, 8)]));
+        assert!(r.complete(), "{r:?}");
+        assert_eq!(carried(&r), [("clk".to_string(), "clk".to_string()), ("q[0]".to_string(), "q[0]".to_string()), ("r[1]".to_string(), "_11_".to_string())]);
+        let translated: Vec<(&str, &str)> = r
+            .resolved
+            .iter()
+            .filter_map(|x| match &x.bits {
+                BitIndex::Translated { to, .. } => Some((x.object.pattern.as_deref().unwrap(), to.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(translated, [("q[8]", "q[0]"), ("r[9]", "r[1]")]);
+        let r = go(&DeclaredRanges::new());
+        assert_eq!(r.unknown().count(), 2, "{r:?}");
+    }
+
+    /// Out of range inside the whole flow: `r[10]` of `[9:8]` names nothing even though the
+    /// elaborated netlist could have a bit that number would land on.
+    #[test]
+    fn an_out_of_range_bit_names_nothing_in_the_map() {
+        let r = run_on(ELAB, IMPL, "set_false_path -to [get_cells {cnt[2]}]\n", &MAP);
+        assert_eq!(r.unknown().count(), 1);
+        let lib = Lib::parse(LIB).unwrap();
+        let m: Vec<(String, String)> = MAP.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+        let r = rtl_map(
+            &Sdc::parse("set_false_path -to [get_cells {cnt[2]}]\n").unwrap(),
+            &crate::netlist::parse(ELAB).unwrap(),
+            &lib,
+            &ranges(&[("cnt", 2, 1)]),
+            &m,
+            None,
+        );
+        assert!(r.complete(), "[2:1]: cnt[2] is elaborated cnt[1] {r:?}");
+        let r = rtl_map(
+            &Sdc::parse("set_false_path -to [get_cells {cnt[0]}]\n").unwrap(),
+            &crate::netlist::parse(ELAB).unwrap(),
+            &lib,
+            &ranges(&[("cnt", 2, 1)]),
+            &m,
+            None,
+        );
+        assert_eq!(r.unknown().map(|x| x.bits.clone()).collect::<Vec<_>>(), [BitIndex::OutOfRange { declared: (2, 1) }]);
+    }
 }
+
