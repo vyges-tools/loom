@@ -111,6 +111,9 @@ mod lz4;
 /// Unified tech-LEF reader (per-layer width/thickness/resistance/EM limits) —
 /// the superset of the extraction and PDN/EM views.
 pub mod lef;
+/// LEF58 same-mask spacing rules (the SAMEMASK forms odb drops), read from a layer's raw
+/// `PROPERTY LEF58_*` strings; kept per layer by [`lef`].
+pub mod lef58_samemask;
 /// Unified DEF reader — signal `NETS` (µm, extraction) + `SPECIALNETS` power grid
 /// (DBU, PDN) + `COMPONENTS`, parsed once.
 pub mod def;

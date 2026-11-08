@@ -29,6 +29,8 @@ pub struct Layer {
     pub dc_jmax: f64,      // DC average current-density limit (mA/um) — EM
     pub ac_rms: f64,       // AC RMS current-density limit (mA/um)
     pub ac_peak: f64,      // AC peak current-density limit (mA/um)
+    /// Same-mask spacing rules from `PROPERTY LEF58_*` strings (the forms odb drops).
+    pub same_mask: crate::lef58_samemask::SameMaskRules,
 }
 
 /// Accumulate a layer's tokens to its `;`-terminated statements and apply each one; a quoted
@@ -178,6 +180,12 @@ fn apply_layer_stmt(stmt: &[String], l: &mut Layer) {
             if let Some(x) = num(v) {
                 l.ac_rms = x;
             }
+        }
+        // `PROPERTY LEF58_x "…"`: the value is the quoted string, keywords and semicolons
+        // inside it; the raw tokens are used, since the reader matches keywords itself
+        ["PROPERTY", name, ..] if name.starts_with("LEF58_") => {
+            let value = stmt[2..].join(" ");
+            l.same_mask.read_property(name, value.trim().trim_matches('"'));
         }
         ["ACCURRENTDENSITY", "PEAK", v] => {
             if let Some(x) = num(v) {
@@ -764,5 +772,22 @@ mod reference_rule_tests {
         let l = Lef::parse(&format!("{TECH}{ndr}")).unwrap();
         assert_eq!(l.widths.get("met1"), Some(&0.14));
         assert!(l.routing_order.contains(&"met1".to_string()));
+    }
+
+    /// Same-mask rules come from the layer's quoted LEF58 strings, which may span lines and hold
+    /// several statements; the rest of the layer reads as before.
+    #[test]
+    fn same_mask_rules_are_read_from_the_layer_properties() {
+        let lef = "LAYER M1\n  TYPE ROUTING ;\n  MASK 2 ;\n  WIDTH 0.05 ;\n\
+                   \x20 PROPERTY LEF58_SPACING \"\n    SPACING 0.12 SAMEMASK ;\n    SPACING 0.07 ENDOFLINE 0.06 WITHIN 0.02 SAMEMASK ;\n  \" ;\n\
+                   \x20 PROPERTY LEF58_SPACINGTABLE \"SPACINGTABLE TWOWIDTHS SAMEMASK WIDTH 0 0.13 0.15 WIDTH 0.08 PRL 0.2 0.15 0.17 ;\" ;\n\
+                   \x20 SPACING 0.05 ;\nEND M1\n";
+        let l = Lef::parse(lef).unwrap();
+        let m1 = &l.layers["M1"];
+        assert_eq!(m1.width_um, 0.05);
+        assert_eq!(m1.same_mask.spacing, vec![0.12]);
+        assert_eq!(m1.same_mask.two_widths.len(), 1);
+        assert_eq!(m1.same_mask.min_spacing(), Some(0.13));
+        assert!(m1.same_mask.unread.is_empty());
     }
 }
