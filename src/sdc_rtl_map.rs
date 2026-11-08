@@ -330,13 +330,8 @@ pub fn elab_names(nl: &Netlist, lib: &Lib, sdc: &Sdc) -> ElabNames {
         if cell.is_seq {
             n.register_outputs.extend(cell.pins.iter().filter(|(_, x)| x.direction == Dir::Out).map(|(p, _)| p.clone()));
         }
-        let q = cell.seq_group.as_ref().filter(|_| cell.is_seq).and_then(|g| {
-            inst.conns.iter().find(|(p, _)| {
-                cell.pins.get(p).is_some_and(|x| x.direction == Dir::Out && x.function.as_deref().map(str::trim) == Some(g.iq.as_str()))
-            })
-        });
-        match (cell.is_seq, q) {
-            (true, Some((_, net))) => n.registers.insert(net.clone(), pins),
+        match (cell.is_seq, stored_value_net(inst, cell)) {
+            (true, Some(net)) => n.registers.insert(net.to_string(), pins),
             (true, None) => n.registers.insert(inst.name.clone(), pins),
             (false, _) => n.cells.insert(inst.name.clone(), pins),
         };
@@ -356,6 +351,65 @@ const OBJECT_OPTIONS: [&str; 14] = [
 /// What the `all_*` queries read as (`[all_registers]` is the name `*REGS*`): the whole kind,
 /// not a pattern.
 const ALL_OF_A_KIND: [&str; 3] = ["*INPUTS*", "*OUTPUTS*", "*REGS*"];
+
+/// The net on a register's stored-value output: the output pin whose function is the `ff` /
+/// `latch` group's state variable (`IQ`), not its complement. `None` for a cell that is not a
+/// register, or a register whose `IQ` output is not connected.
+pub fn stored_value_net<'a>(inst: &'a crate::netlist::Inst, cell: &crate::liberty::Cell) -> Option<&'a str> {
+    let g = cell.seq_group.as_ref()?;
+    inst.conns
+        .iter()
+        .find(|(p, _)| cell.pins.get(p).is_some_and(|x| x.direction == Dir::Out && x.function.as_deref().map(str::trim) == Some(g.iq.as_str())))
+        .map(|(_, net)| net.as_str())
+}
+
+/// The elaborated netlist as an RTL constraint file names it, and what was not renamed.
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct RtlView {
+    pub netlist: Netlist,
+    /// Register instances renamed to their RTL name.
+    pub renamed: usize,
+    /// Registers that keep their instance name, `(instance, why)`: `no-stored-value-output`
+    /// (its `IQ` output is not connected) or `name-taken` (another instance has that name, or
+    /// another register's output net is the same name).
+    pub kept: Vec<(String, &'static str)>,
+}
+
+/// The RTL view of an elaborated netlist: each register INSTANCE renamed to the net on its
+/// stored-value output, where a synthesis front end that keeps RTL names puts the register's RTL
+/// name (its cell is `u<n>`). Everything else is unchanged, so every check that reads a netlist
+/// reads this one as it reads a gate netlist, and `[get_cells r]` / `[get_pins r/D]` in an RTL
+/// constraint file name the register. Nothing is renamed by a name heuristic, and a name that
+/// would not be unique is not taken.
+pub fn rtl_view(nl: &Netlist, lib: &Lib) -> RtlView {
+    let proposed: Vec<Option<String>> = nl
+        .insts
+        .iter()
+        .map(|i| lib.cells.get(&i.cell).filter(|c| c.is_seq).map(|c| stored_value_net(i, c).map(str::to_string).unwrap_or_default()))
+        .collect();
+    let mut count: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, p) in nl.insts.iter().zip(&proposed) {
+        *count.entry(i.name.as_str()).or_default() += 1;
+        if let Some(p) = p.as_deref().filter(|p| !p.is_empty()) {
+            *count.entry(p).or_default() += 1;
+        }
+    }
+    let mut v = RtlView { netlist: nl.clone(), renamed: 0, kept: Vec::new() };
+    for (inst, p) in v.netlist.insts.iter_mut().zip(&proposed) {
+        match p.as_deref() {
+            None => {}
+            Some("") => v.kept.push((inst.name.clone(), "no-stored-value-output")),
+            Some(p) if p == inst.name => {}
+            Some(p) if count[p] > 1 => v.kept.push((inst.name.clone(), "name-taken")),
+            Some(p) => {
+                inst.name = p.to_string();
+                v.renamed += 1;
+            }
+        }
+    }
+    v
+}
 
 /// Stage 2: every object list on every canonical line: an option's value (a bracketed query, or,
 /// for an [`OBJECT_OPTIONS`] option, bare names), and each positional list (a bracketed query, or
@@ -517,7 +571,10 @@ mod tests {
       cell (INV) { pin (A) { direction : input; } pin (Y) { direction : output; function : \"!A\"; } }\n\
       cell (DFF) { ff (IQ, IQN) { clocked_on : \"CK\"; next_state : \"D\"; }\n\
         pin (CK) { direction : input; clock : true; } pin (D) { direction : input; }\n\
-        pin (Q) { direction : output; function : \"IQ\"; } }\n}\n";
+        pin (Q) { direction : output; function : \"IQ\"; } }\n\
+      cell (DFFQN) { ff (IQ, IQN) { clocked_on : \"CK\"; next_state : \"D\"; }\n\
+        pin (CK) { direction : input; clock : true; } pin (D) { direction : input; }\n\
+        pin (QN) { direction : output; function : \"IQN\"; } pin (Q) { direction : output; function : \"IQ\"; } }\n}\n";
 
     /// An elaborated netlist: registers `u1`, `u2` whose Q nets carry the RTL names `cnt[0]`,
     /// `cnt[1]`; a combinational cell `u3` on net `nx`.
@@ -920,6 +977,51 @@ mod tests {
     fn a_pin_query_without_a_pin_is_not_read_as_a_register() {
         let r = run("set_false_path -to [get_pins {cnt_reg[0]}]\n", &MAP);
         assert_eq!(r.unknown().count(), 1, "{r:?}");
+    }
+
+    /// The RTL view renames each register instance to the net on its stored-value output (`u1`
+    /// -> `cnt[0]`); a combinational cell keeps its name, and so does a register whose output
+    /// net another instance is already named (`name-taken`) or whose `IQ` output is unconnected.
+    #[test]
+    fn the_rtl_view_names_each_register_by_its_output_net() {
+        let lib = Lib::parse(LIB).unwrap();
+        let v = rtl_view(&crate::netlist::parse(ELAB).unwrap(), &lib);
+        let names: Vec<&str> = v.netlist.insts.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["u3", "cnt[0]", "cnt[1]", "u4"]);
+        assert_eq!((v.renamed, v.kept.len()), (2, 0));
+        let nl = "module t(clk,a,y);\ninput clk,a; output y;\nwire q, u9;\n\
+          DFF u1(.CK(clk),.D(a),.Q(u9));\nINV u9x(.A(u9),.Y(q));\nINV u9(.A(q),.Y(y));\nDFF u2(.CK(clk),.D(a));\nendmodule\n";
+        let v = rtl_view(&crate::netlist::parse(nl).unwrap(), &lib);
+        let names: Vec<&str> = v.netlist.insts.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["u1", "u9x", "u9", "u2"]);
+        assert_eq!(v.kept, [("u1".to_string(), "name-taken"), ("u2".to_string(), "no-stored-value-output")]);
+    }
+
+    /// A register is named by its STORED-VALUE output (`function : "IQ"`), not its complement:
+    /// `QN` connected first (`nq`) does not name it; `Q` (`r`) does. With only `QN` connected, it
+    /// has no stored-value output and keeps its instance name.
+    #[test]
+    fn the_rtl_view_names_a_register_by_q_not_qn() {
+        let lib = Lib::parse(LIB).unwrap();
+        let nl = "module t(clk,a,y,z);\ninput clk,a; output y,z;\nwire r, nq, nq2;\n\
+          DFFQN u1(.CK(clk),.D(a),.QN(nq),.Q(r));\nDFFQN u2(.CK(clk),.D(a),.QN(nq2));\n\
+          INV u3(.A(r),.Y(y));\nINV u4(.A(nq2),.Y(z));\nendmodule\n";
+        let v = rtl_view(&crate::netlist::parse(nl).unwrap(), &lib);
+        let names: Vec<&str> = v.netlist.insts.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["r", "u2", "u3", "u4"]);
+        assert_eq!(v.kept, [("u2".to_string(), "no-stored-value-output")]);
+    }
+
+    /// Two registers on one output net (a netlist the reader keeps) both keep their names: the
+    /// name would not be unique.
+    #[test]
+    fn a_name_two_registers_would_take_is_taken_by_neither() {
+        let lib = Lib::parse(LIB).unwrap();
+        let nl = "module t(clk,a,y);\ninput clk,a; output y;\nwire r;\n\
+          DFF u1(.CK(clk),.D(a),.Q(r));\nDFF u2(.CK(clk),.D(a),.Q(r));\nINV u3(.A(r),.Y(y));\nendmodule\n";
+        let v = rtl_view(&crate::netlist::parse(nl).unwrap(), &lib);
+        assert_eq!(v.renamed, 0);
+        assert_eq!(v.kept, [("u1".to_string(), "name-taken"), ("u2".to_string(), "name-taken")]);
     }
 }
 
