@@ -2203,13 +2203,92 @@ fn unevaluated_query(toks: &[String]) -> Option<String> {
     None
 }
 
-/// The first object query in `toks` (at any depth of `[...]`) whose `-filter` is the reference's
-/// error ([`crate::sdc_query::stops_the_read`]: a property it does not know for the objects, or a
-/// filter it cannot parse or evaluate): why. Only with a design in scope, as the reference always
-/// has one.
-fn filter_stop(toks: &[String]) -> Option<String> {
-    for t in toks {
-        let Some(inner) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else { continue };
+/// The command substitutions Tcl runs in `line`, outermost first, in order: each `[...]` not in
+/// a braced word (a `{` that begins a word is a literal to its matching `}`), in a quoted word
+/// too; a backslash escapes the next character.
+fn command_substitutions(line: &str) -> Vec<String> {
+    let cs: Vec<char> = line.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < cs.len() {
+        match cs[i] {
+            '\\' => i += 1,
+            '{' if i == 0 || cs[i - 1].is_whitespace() || cs[i - 1] == ';' => {
+                let mut depth = 0i32;
+                while i < cs.len() {
+                    match cs[i] {
+                        '\\' => i += 1,
+                        '{' => depth += 1,
+                        '}' => depth -= 1,
+                        _ => {}
+                    }
+                    if depth == 0 {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            '[' => {
+                let (start, mut depth, mut brace) = (i, 0i32, 0i32);
+                while i < cs.len() {
+                    match cs[i] {
+                        '\\' => i += 1,
+                        '{' => brace += 1,
+                        '}' => brace -= 1,
+                        '[' if brace <= 0 => depth += 1,
+                        ']' if brace <= 0 => depth -= 1,
+                        _ => {}
+                    }
+                    if depth == 0 {
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push(cs[start..(i + 1).min(cs.len())].iter().collect());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The command substitutions an `expr` condition (an `if`/`while` test, a braced `expr`
+/// argument) always runs: `expr` substitutes its own braced text left to right, and `&&`, `||`
+/// and `?:` evaluate their right side only when needed, so only those before the first of them
+/// (outside brackets, braces and quotes) are certain to run.
+fn evaluated_substitutions(cond: &str) -> Vec<String> {
+    let cs: Vec<char> = cond.chars().collect();
+    let (mut out, mut brace, mut quoted, mut i) = (Vec::new(), 0i32, false, 0usize);
+    while i < cs.len() {
+        let c = cs[i];
+        match c {
+            '\\' => i += 1,
+            '"' if brace == 0 => quoted = !quoted,
+            '{' => brace += 1,
+            '}' => brace -= 1,
+            '&' | '|' if brace == 0 && !quoted && cs.get(i + 1) == Some(&c) => break,
+            '?' if brace == 0 && !quoted => break,
+            '[' if brace == 0 => {
+                let sub = command_substitutions(&cs[i..].iter().collect::<String>()).into_iter().next().unwrap_or_default();
+                i += sub.chars().count().max(1) - 1;
+                out.push(sub);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The first object query `line` runs (each command substitution, at any depth) whose `-filter`
+/// is the reference's error ([`crate::sdc_query::stops_the_read`]: a property it does not know
+/// for the objects, or a filter it cannot parse or evaluate): why. A braced word runs nothing,
+/// except as `expr` reads it ([`condition_stop`]). Only with a design in scope, as the
+/// reference always has one.
+fn filter_stop(line: &str) -> Option<String> {
+    for sub in command_substitutions(line) {
+        let Some(inner) = sub.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else { continue };
         let parts = query_words(inner);
         if parts.first().is_some_and(|c| c.starts_with("get_")) && parts.iter().any(|p| p == "-filter" || p == "-of_objects") {
             if let Some(Err(why)) = with_design(|d| crate::sdc_query::eval(&parts, d)) {
@@ -2218,11 +2297,30 @@ fn filter_stop(toks: &[String]) -> Option<String> {
                 }
             }
         }
-        if let Some(why) = filter_stop(parts.get(1..).unwrap_or_default()) {
+        if parts.first().is_some_and(|c| c == "expr") {
+            if let Some(why) = condition_stop(&parts[1..].join(" "), &HashMap::new()) {
+                return Some(why);
+            }
+        }
+        if let Some(why) = filter_stop(inner) {
             return Some(why);
         }
     }
     None
+}
+
+/// [`filter_stop`] over what an `expr` condition always runs ([`evaluated_substitutions`]), the
+/// variables substituted in each first (`expr` would, before the query runs).
+fn condition_stop(cond: &str, vars: &HashMap<String, String>) -> Option<String> {
+    evaluated_substitutions(cond).iter().find_map(|sub| filter_stop(&subst_command_vars(sub, vars)))
+}
+
+/// The error the reader returns at a command whose query is the reference's error.
+fn filter_stop_error(why: &str, line: &str) -> SdcError {
+    SdcError(format!(
+        "{why} in `{}`: the reference stops reading the file at that command, so this file is not read",
+        line.trim()
+    ))
 }
 
 /// An every-port-but collection ([`all_ports_except`]) anywhere but as the ports of
@@ -2812,6 +2910,8 @@ enum Control {
     Refuse(String),
     /// Tcl's error, which stops the read (a condition reading an undefined variable).
     Error(String),
+    /// a query the condition or list runs is the reference's error ([`filter_stop`]): the stop
+    Stop(String),
     None,
 }
 
@@ -2845,6 +2945,11 @@ fn control(raw: &str, vars: &HashMap<String, String>, procs: &HashMap<String, Tc
                 if let Some(v) = undefined_in_condition(&toks[k], vars) {
                     return Control::Error(format!("{} in the condition `{}`", no_such_variable(&v), toks[k]));
                 }
+                // a query this condition is certain to run, the reference's error: the stop. Only
+                // this condition's: a later `elseif` runs only when this one is false.
+                if let Some(why) = condition_stop(&toks[k], vars) {
+                    return Control::Stop(why);
+                }
                 // `[dict exists …]`, `[a_proc …]` in the condition, answered first
                 let Ok(valued) = tcl::subst_values(&toks[k], vars, procs, &ReadOpts::default(), 0) else {
                     return Control::Refuse("if".into());
@@ -2871,6 +2976,10 @@ fn control(raw: &str, vars: &HashMap<String, String>, procs: &HashMap<String, Tc
             Control::Refuse("if".into())
         }
         "foreach" => {
+            // the list word runs before any pass (a braced body is not run here)
+            if let Some(why) = filter_stop(&subst_command_vars(raw, vars)) {
+                return Control::Stop(why);
+            }
             let toks = tokenize(raw);
             if toks.len() != 4 || toks[2].starts_with('[') {
                 return Control::Refuse("foreach".into());
@@ -3616,6 +3725,9 @@ impl Sdc {
                         l.cmd
                     )));
                 }
+                if let Some(why) = condition_stop(&l.cond, &vars) {
+                    return Err(filter_stop_error(&why, &format!("{} {{{}}}", l.cmd, l.cond)));
+                }
                 let cond = subst_vars(&subst_info_exists(&l.cond, &vars), &as_operands(&vars));
                 match eval_expr(&cond, &vars).and_then(|v| v.truthy()) {
                     Some(true) => {
@@ -3656,6 +3768,8 @@ impl Sdc {
                 Err(why) if why.contains(NO_SUCH_VARIABLE) => {
                     return Err(SdcError(format!("{why}: Tcl stops at a variable that is not defined, as the reference does, so this file is not read")));
                 }
+                // a proc called for its value ran a query that is the reference's error
+                Err(why) if crate::sdc_query::stops_the_read(&why) => return Err(filter_stop_error(&why, &raw)),
                 Err(why) => {
                     let cmd = raw.split_whitespace().next().unwrap_or("").to_string();
                     sdc.rejected.push(format!("{cmd}: {why}; not applied"));
@@ -3723,6 +3837,7 @@ impl Sdc {
                 Control::Error(why) => {
                     return Err(SdcError(format!("{why}: Tcl stops at a variable that is not defined, as the reference does, so this file is not read")));
                 }
+                Control::Stop(why) => return Err(filter_stop_error(&why, &raw)),
                 Control::None => {}
             }
             let line = dialect_queries(&canonical_queries(&subst_exprs(&subst_command_vars(&raw, &vars), &vars)));
@@ -3777,6 +3892,15 @@ impl Sdc {
                     line.trim()
                 )));
             }
+            // ⛔ A -filter PROPERTY THE REFERENCE DOES NOT KNOW, OR A FILTER IT CANNOT PARSE,
+            // STOPS THE READ, as it stops the reference's `read_sdc` (user 2026-11-08: keep its
+            // behaviour): the query throws, `include_file` stops at that command, and `read_sdc`
+            // errors. A `set` too: Tcl runs the query when it stores the value. Checked BEFORE the
+            // command's own words: Tcl substitutes them first, so an unknown option after the
+            // query never fails the command (the reference stopped at the query).
+            if let Some(why) = filter_stop(&line) {
+                return Err(filter_stop_error(&why, &line));
+            }
             // A word that cannot name what it appears to (`[get_ports a]0`, `{[get_ports a]}`): the
             // reference builds no constraint from it, so neither does this reader — said, not
             // approximated. A `set` stores its text; it is checked where the variable is used.
@@ -3790,16 +3914,6 @@ impl Sdc {
                     sdc.rejected.push(format!("{}: {why}; not applied", toks[0]));
                     continue;
                 }
-            }
-            // ⛔ A -filter PROPERTY THE REFERENCE DOES NOT KNOW, OR A FILTER IT CANNOT PARSE,
-            // STOPS THE READ, as it stops the reference's `read_sdc` (user 2026-11-08: keep its
-            // behaviour): the query throws, `include_file` stops at that command, and `read_sdc`
-            // errors. A `set` too: Tcl runs the query when it stores the value.
-            if let Some(why) = filter_stop(&toks) {
-                return Err(SdcError(format!(
-                    "{why} in `{}`: the reference stops reading the file at that command, so this file is not read",
-                    line.trim()
-                )));
             }
             // An object query this reader cannot evaluate: the command is NOT applied, and says
             // so (a `set` only stores the text; it is checked where the variable is used).
@@ -4618,7 +4732,11 @@ fn dialect(
             procs.insert(name.clone(), TclProc { params: ps, body: logical_lines(body) });
             Ok(Dialect::Done)
         }
-        "puts" | "echo" => Ok(Dialect::Done),
+        // Tcl substitutes the words before it prints them: a query there runs (and may stop)
+        "puts" | "echo" => match filter_stop(&subst_command_vars(raw, vars)) {
+            Some(why) => Err(filter_stop_error(&why, raw)),
+            None => Ok(Dialect::Done),
+        },
         // Tcl `for {init} {test} {next} {body}` and `while {test} {body}`: the test is evaluated
         // before each pass, with the variables as they are then (a queued test line, see the
         // read loop). `continue` ends the pass (the `next` and the test still run), `break` the loop.
@@ -5064,6 +5182,36 @@ fn reduce_exception_objects(objs: &[Objects]) -> (Vec<String>, Option<String>) {
         out.push("*".to_string()); // the flag was absent or named only a collection
     }
     (out, refused)
+}
+
+#[cfg(test)]
+mod substitution_tests {
+    use super::*;
+
+    /// Rule (Tcl's word substitution): a bracket runs, outermost first, unless it is in a word
+    /// that BEGINS with a brace (a literal to its matching brace); in quotes it runs; a backslash
+    /// escapes it; a brace inside a bracket does not end it.
+    #[test]
+    fn the_substitutions_tcl_runs() {
+        let subs = |s: &str| command_substitutions(s);
+        assert_eq!(subs("a [b [c]] \"x [d]\" {[e]} f\\[g] [h {]} ]"), ["[b [c]]", "[d]", "[h {]} ]"]);
+        assert_eq!(subs("a x{[b]}"), ["[b]"], "a brace inside a word is text");
+        assert_eq!(subs("a; {[b]}; [c]"), ["[c]"]);
+    }
+
+    /// Rule (`expr`): its braced text substitutes left to right, and `&&`, `||`, `?:` run their
+    /// right side only when needed, so what an `if`/`while` test always runs ends at the first
+    /// of them outside brackets, braces and quotes; a brace in `expr` is a string literal.
+    #[test]
+    fn what_a_condition_always_runs() {
+        let runs = |s: &str| evaluated_substitutions(s);
+        assert_eq!(runs("[a] + [b [c]] > 0 && [d]"), ["[a]", "[b [c]]"]);
+        assert_eq!(runs("[a] || [b]"), ["[a]"]);
+        assert_eq!(runs("[a] ? [b] : [c]"), ["[a]"]);
+        assert_eq!(runs("1 || [a]"), Vec::<String>::new());
+        assert_eq!(runs("\"x && [a]\" == [b]"), ["[a]", "[b]"], "an operator in quotes is text");
+        assert_eq!(runs("{[a] && x} == [b] | [c]"), ["[b]", "[c]"], "a brace is a literal; `|` is not lazy");
+    }
 }
 
 #[cfg(test)]

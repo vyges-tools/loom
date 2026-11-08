@@ -507,6 +507,8 @@ pub(super) fn proc_value(name: &str, args: &[String], caller: &HashMap<String, S
             }
             Control::Refuse(kw) => return Err(format!("{name}: its `{kw}` is not evaluated")),
             Control::Error(why) => return Err(format!("{name}: {why}")),
+            // the reference's query error: the caller stops the read on it (`stops_the_read`)
+            Control::Stop(why) => return Err(format!("{name}: {why}")),
             Control::None => {}
         }
         if matches!(head.as_str(), "puts" | "echo" | "expr") {

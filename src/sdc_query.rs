@@ -1215,6 +1215,63 @@ endmodule
         }
     }
 
+    /// Rule (Tcl, under `include_file`): a query stops the read wherever Tcl RUNS it, and only
+    /// there. A braced `if`/`while` test is `expr`'s, which substitutes it left to right and
+    /// runs the right side of `&&`, `||`, `?:` only when needed; a later `elseif` test only when
+    /// the earlier ones are false; a body only when taken; a `proc` body only when called; the
+    /// words of `puts`, a `foreach` list, a quoted word, an argument of `lindex`/`llength`/`expr`
+    /// always, and before the command checks its options. Every case is the reference's on the
+    /// probe (box `filter-followups-20261108T165629Z/ref-probe`, n1-n24): stopped is
+    /// `READ_SDC ERROR`, read on is `READ_SDC_OK` with the `y3` branch as it took it.
+    #[test]
+    fn a_query_stops_the_file_where_tcl_runs_it() {
+        let head = "create_clock -name c -period 10 [get_ports s]\nset_max_delay 3 -to [get_ports y1]\n";
+        let y3 = "set_max_delay 5 -to [get_ports y3]";
+        let read = |case: &str| crate::sdc::Sdc::parse_with(&format!("{head}{case}\nset_max_delay 4 -to [get_ports y2]\n"), &design());
+        for stop in [
+            format!("if {{[llength [get_cells -filter is_bogus *]]}} {{{y3}}}"),
+            format!("if {{[llength [get_cells -filter {{ref_name ~= x}} *]] > 0}} {{{y3}}}"),
+            format!("if {{0}} {{}} elseif {{[llength [get_cells -filter is_bogus *]]}} {{{y3}}}"),
+            "if {1} {set_false_path -to [get_cells -filter is_bogus *]}".into(),
+            "puts \"[get_cells -filter is_bogus *]\"".into(),
+            "set_false_path -to \"[get_cells -filter is_bogus *]\"".into(),
+            "set_false_path -to [lindex [get_cells -filter is_bogus *] 0]".into(),
+            "foreach x [get_cells -filter is_bogus *] {set_false_path -to $x}".into(),
+            "set n [expr {[llength [get_cells -filter is_bogus *]] + 1}]".into(),
+            "set_false_path -bogus_opt -to [get_cells -filter is_bogus *]".into(),
+            "while {[llength [get_cells -filter is_bogus *]] < 0} {}".into(),
+            "proc pp {} {set_false_path -to [get_cells -filter is_bogus *]}\npp".into(),
+            format!("if {{[get_cells -filter is_bogus *] != \"\"}} {{{y3}}}"),
+            "set_false_path -to [get_pins -of_objects [get_cells -filter {ref_name ~= x} *]]".into(),
+            format!("if {{[llength [get_cells -filter is_bogus *]] > 0 && 1}} {{{y3}}} else {{set_max_delay 6 -to [get_ports y3]}}"),
+            "set_max_delay [llength [get_cells -filter is_bogus *]] -to [get_ports y3]".into(),
+            // n25: a test inside a proc called for its value
+            "proc pv {} {\n  if {[llength [get_cells -filter is_bogus *]]} {return 1}\n  return 0\n}\nset_max_delay [expr 5 + [pv]] -to [get_ports y3]".into(),
+        ] {
+            let e = read(&stop).unwrap_err().0;
+            assert!(stops_the_read(&e) && e.contains("not read"), "{stop}: {e}");
+        }
+        // read on: (the case, the max delays then applied: y1 and y2, and y3 where taken)
+        for (on, delays) in [
+            (format!("if {{1}} {{{y3}}} elseif {{[llength [get_cells -filter is_bogus *]]}} {{}}"), 3),
+            ("if {0} {set_false_path -to [get_cells -filter is_bogus *]}".into(), 2),
+            (format!("if {{[llength [get_cells -quiet -filter is_bogus nomatch*]]}} {{{y3}}}"), 2),
+            ("proc pp {} {set_false_path -to [get_cells -filter is_bogus *]}".into(), 2),
+            (format!("if {{[llength [get_cells -filter {{ref_name == AND2}} *]] > 0}} {{{y3}}}"), 3),
+            (format!("if {{0 && [llength [get_cells -filter is_bogus *]]}} {{{y3}}}"), 2),
+            // n26: the same proc over no object, so y3 at 5
+            ("proc pv {} {\n  if {[llength [get_cells -quiet -filter is_bogus nomatch*]]} {return 1}\n  return 0\n}\nset_max_delay [expr 5 + [pv]] -to [get_ports y3]".into(), 3),
+        ] {
+            let r = read(&on).unwrap_or_else(|e| panic!("{on}: {}", e.0));
+            assert_eq!(r.path_delays.len(), delays, "{on}: {:?} {:?}", r.rejected, r.ignored);
+        }
+        // NOT the reference's: `1 || [query]` never runs the query there, so it takes the branch
+        // (y3 applied); this reader cannot evaluate a condition holding a query that fails, so it
+        // refuses the `if` (listed as ignored) and reads on: no stop, no branch.
+        let r = read(&format!("if {{1 || [llength [get_cells -filter is_bogus *]]}} {{{y3}}}")).unwrap();
+        assert!(r.path_delays.len() == 2 && r.ignored.iter().any(|i| i == "if"), "{:?}", r.ignored);
+    }
+
     /// The command is applied once a design is in scope, and still refused without one.
     #[test]
     fn a_constraint_file_read_against_the_design_applies_its_queries() {
