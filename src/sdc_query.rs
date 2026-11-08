@@ -36,6 +36,12 @@
 //! when the filter is applied to at least one object: the query fails, and `read_sdc` stops at
 //! that command (decided 2026-11-08: as the reference does). Its [`Err`] carries
 //! [`UNKNOWN_PROPERTY`], and the reader stops on it.
+//!
+//! A filter the reference cannot parse or evaluate (its errors 2600-2608: a character no token
+//! starts with, an extraneous `)`, an unmatched `(`, an operator short of operands, an empty
+//! expression, two sets left) is the same kind of error, under the same condition (at least one
+//! object), and stops the read the same way: its [`Err`] carries [`MALFORMED_FILTER`] (decided
+//! 2026-11-08). [`stops_the_read`] says which errors these are.
 
 use crate::liberty::{Dir, Lib};
 use crate::netlist::Netlist;
@@ -94,6 +100,21 @@ impl CellBools {
 /// Marks the [`Err`] of a filter naming a property the reference does not know for its objects;
 /// the reader stops the file on it ([`crate::sdc::Sdc::parse_with`]).
 pub(crate) const UNKNOWN_PROPERTY: &str = "a property the reference timer does not know";
+
+/// Marks the [`Err`] of a filter the reference cannot parse or evaluate (its STA-2600..2608); the
+/// reader stops the file on it, as on [`UNKNOWN_PROPERTY`].
+pub(crate) const MALFORMED_FILTER: &str = "a -filter the reference timer cannot read";
+
+/// Whether an [`eval`] error is one the reference raises as an error (so its `read_sdc` stops
+/// there), not a query this view cannot evaluate.
+pub(crate) fn stops_the_read(why: &str) -> bool {
+    why.contains(UNKNOWN_PROPERTY) || why.contains(MALFORMED_FILTER)
+}
+
+/// The reference's filter error `id` with its text.
+fn malformed(id: u32, text: &str) -> String {
+    format!("{text} (STA-{id}, {MALFORMED_FILTER})")
+}
 
 /// Whether the reference knows `prop` for the objects of `o` (`Properties::getProperty` per
 /// object type, at the pin, plus what OpenROAD registers: `src` on instances and pins), and the
@@ -666,7 +687,7 @@ fn lex(expr: &str) -> Result<Vec<FTok>, String> {
             (_, '!') => (FTok::Not, 1),
             (_, '(') => (FTok::LParen, 1),
             (_, ')') => (FTok::RParen, 1),
-            _ => return Err(format!("-filter parsing failed at '{rest}'")),
+            _ => return Err(malformed(2600, &format!("-filter parsing failed at '{rest}'."))),
         };
         out.push(t);
         i += n;
@@ -675,7 +696,8 @@ fn lex(expr: &str) -> Result<Vec<FTok>, String> {
 }
 
 /// The reference's shunting-yard: precedence `!` over `&&` over `||`; `defined`/`undefined` and
-/// `!` go on the operator stack.
+/// `!` go on the operator stack. Its errors as it raises them: a `)` with the operator stack empty
+/// is 2601, one that empties it before a `(` is found 2602, a `(` left at the end 2603.
 fn postfix(toks: Vec<FTok>) -> Result<Vec<FTok>, String> {
     let rank = |t: &FTok| match t {
         FTok::Or => 4,
@@ -698,23 +720,61 @@ fn postfix(toks: Vec<FTok>) -> Result<Vec<FTok>, String> {
             }
             FTok::Not | FTok::Defined(..) | FTok::LParen => ops.push(t),
             FTok::RParen => {
-                loop {
-                    match ops.pop() {
-                        Some(FTok::LParen) => break,
-                        Some(x) => out.push(x),
-                        None => return Err("-filter extraneous )".into()),
+                if ops.is_empty() {
+                    return Err(malformed(2601, "-filter extraneous )."));
+                }
+                while let Some(top) = ops.pop_if(|top| *top != FTok::LParen) {
+                    out.push(top);
+                    if ops.is_empty() {
+                        return Err(malformed(2602, "-filter extraneous )."));
                     }
                 }
+                ops.pop(); // the `(`
             }
         }
     }
     while let Some(t) = ops.pop() {
         if t == FTok::LParen {
-            return Err("-filter unmatched (".into());
+            return Err(malformed(2603, "-filter unmatched (."));
         }
         out.push(t);
     }
     Ok(out)
+}
+
+/// The errors the reference raises while it evaluates the postfix over at least one object, in
+/// its order (`filterObjects`): each predicate and `defined()` looks its property up on the
+/// objects, and one the object type lacks throws ([`known_property`]); `||` with fewer than two
+/// sets is 2604, `&&` 2605, `!` with none 2606; at the end no set is 2607, more than one 2608.
+/// Walked as the stack's depth, before evaluating, so an unknown property is found even after one
+/// this view cannot evaluate (which the reference evaluates fine).
+fn reference_errors(toks: &[FTok], base: &Objs) -> Result<(), String> {
+    let mut depth = 0usize;
+    for t in toks {
+        match t {
+            FTok::Pred(prop, ..) | FTok::Defined(prop, _) => {
+                if !known_property(base, prop) {
+                    return Err(unknown_property(base, prop));
+                }
+                depth += 1;
+            }
+            FTok::Or | FTok::And if depth < 2 => {
+                return Err(if *t == FTok::Or {
+                    malformed(2604, "-filter logical OR requires at least two operands.")
+                } else {
+                    malformed(2605, "-filter logical AND requires two operands.")
+                });
+            }
+            FTok::Or | FTok::And => depth -= 1,
+            FTok::Not if depth == 0 => return Err(malformed(2606, "-filter NOT missing operand.")),
+            FTok::Not | FTok::LParen | FTok::RParen => {}
+        }
+    }
+    match depth {
+        0 => Err(malformed(2607, "-filter expression is empty.")),
+        1 => Ok(()),
+        _ => Err(malformed(2608, "-filter expression evaluated to multiple sets.")),
+    }
 }
 
 fn apply_filter(expr: &str, base: Objs, d: &SdcDesign) -> Result<Objs, String> {
@@ -724,22 +784,16 @@ fn apply_filter(expr: &str, base: Objs, d: &SdcDesign) -> Result<Objs, String> {
         Objs::Nets(v) => v.len(),
         Objs::Clocks => 0,
     };
+    // Rule (SWIG `tclListSeqPtr` gives a null list for an empty one, and `filterObjects` runs
+    // only `if (objects)`): over NO object the filter is not even parsed, so neither a malformed
+    // filter nor an unknown property is an error there.
+    if n == 0 {
+        return Ok(base);
+    }
     let all: BTreeSet<usize> = (0..n).collect();
     let mut stack: Vec<BTreeSet<usize>> = Vec::new();
     let toks = postfix(lex(expr)?)?;
-    // Rule (`filterObjects`, `Properties::getProperty`): each predicate looks its property up on
-    // every object, in postfix order, and one the object type lacks throws; so a filter over NO
-    // object never errors, and an unknown property errors even after (or beside) one this view
-    // cannot evaluate, which the reference evaluates fine.
-    if n > 0 {
-        for t in &toks {
-            if let FTok::Pred(prop, ..) | FTok::Defined(prop, _) = t {
-                if !known_property(&base, prop) {
-                    return Err(unknown_property(&base, prop));
-                }
-            }
-        }
-    }
+    reference_errors(&toks, &base)?;
     for t in toks {
         match t {
             FTok::Pred(prop, op, mut arg) => {
@@ -777,18 +831,18 @@ fn apply_filter(expr: &str, base: Objs, d: &SdcDesign) -> Result<Objs, String> {
                 stack.push(set);
             }
             FTok::And | FTok::Or => {
-                let (Some(a), Some(b)) = (stack.pop(), stack.pop()) else { return Err("-filter operator needs two operands".into()) };
+                let (Some(a), Some(b)) = (stack.pop(), stack.pop()) else { return Err("-filter: operands checked by reference_errors".into()) };
                 stack.push(if t == FTok::And { a.intersection(&b).copied().collect() } else { a.union(&b).copied().collect() });
             }
             FTok::Not => {
-                let Some(a) = stack.pop() else { return Err("-filter NOT missing operand".into()) };
+                let Some(a) = stack.pop() else { return Err("-filter: operand checked by reference_errors".into()) };
                 stack.push(all.difference(&a).copied().collect());
             }
             FTok::LParen | FTok::RParen => {}
         }
     }
     if stack.len() != 1 {
-        return Err("-filter expression is empty or evaluated to several sets".into());
+        return Err("-filter: one set left, checked by reference_errors".into());
     }
     let keep = stack.pop().unwrap();
     // Sorted by name, as the reference returns a filtered list.
@@ -1083,6 +1137,82 @@ endmodule
         let unread = format!("{head}set_false_path -to [get_cells -filter liberty_cell *]\nset_max_delay 4 -to [get_ports y2]\n");
         let read = crate::sdc::Sdc::parse_with(&unread, &design()).unwrap();
         assert_eq!((read.path_delays.len(), read.unevaluated_queries.len()), (2, 1), "{:?}", read.rejected);
+    }
+
+    /// Rule (OpenSTA `FilterObjects.cc` at the 4155ac3 pin): `FilterExpr::lex` raises 2600 at a
+    /// character no token starts with; `shuntingYard` 2601 for a `)` with the operator stack
+    /// empty, 2602 for one that empties it, 2603 for a `(` left over; `filterObjects` evaluates the
+    /// postfix and raises 2604 (`||`), 2605 (`&&`), 2606 (`!`) short of operands, then 2607 for no
+    /// set and 2608 for more than one. Each is `Report::error`, which throws, so the query fails.
+    /// All of it runs only `if (objects)`, and SWIG's `tclListSeqPtr` gives a null list for an
+    /// empty one: over no object nothing is parsed. Predicates throw an unknown property in
+    /// postfix order, so `in put` is the unknown property `put`, not 2608. Every id below is the
+    /// reference's on the probe (box `filter-followups-20261108T165629Z/ref-probe`, `-threads 1`).
+    #[test]
+    fn a_malformed_filter_is_the_references_error() {
+        for (s, id) in [
+            ("get_cells -filter {ref_name ~= AND*} *", 2600),
+            ("get_pins -filter {direction ==} */*", 2600),
+            ("get_nets -filter {name =~ \"y*\"} *", 2600),
+            ("get_cells -filter {is_buffer)} *", 2601),
+            ("get_cells -filter {!is_buffer)} *", 2602),
+            ("get_cells -filter {(is_buffer} *", 2603),
+            ("get_pins -of_objects [get_cells -filter {(ref_name =~ AND*} *]", 2603),
+            ("get_cells -filter {is_buffer ||} *", 2604),
+            ("get_cells -filter {is_buffer &&} *", 2605),
+            ("get_cells -filter {!} *", 2606),
+            ("get_cells -filter {} *", 2607),
+            ("get_cells -filter {   } *", 2607),
+            ("get_cells -filter {is_buffer is_inverter} *", 2608),
+        ] {
+            let e = q(s).unwrap_err();
+            assert!(e.contains(&format!("STA-{id}")) && e.contains(MALFORMED_FILTER) && stops_the_read(&e), "{s}: {e}");
+        }
+        // the reference's order: lexed whole first, then the postfix with its property lookups
+        let e = q("get_ports -filter {direction == in put} *").unwrap_err();
+        assert!(e.contains(UNKNOWN_PROPERTY) && !e.contains(MALFORMED_FILTER), "{e}");
+        let e = q("get_cells -filter {is_bogus ~= x} *").unwrap_err();
+        assert!(e.contains("STA-2600"), "lexed before any lookup: {e}");
+        // over no object: not parsed, no error, nothing
+        for s in ["get_cells -quiet -filter {ref_name ~= x} nomatch*", "get_cells -quiet -filter {is_buffer &&} nomatch*"] {
+            assert_eq!(q(s).unwrap(), Vec::<String>::new(), "{s}");
+        }
+        // well formed (the probe's controls), and a property not evaluated is not a stop
+        assert_eq!(ok("get_cells -filter {ref_name==AND2} *"), "u1");
+        assert_eq!(ok("get_cells -filter {@ref_name=~*R2&&!is_buffer} *"), "u2 u4");
+        assert!(!stops_the_read(&q("get_cells -filter {liberty_cell == x} *").unwrap_err()));
+    }
+
+    /// Rule (`include_file`, as for an unknown property): a malformed filter's error ends the read
+    /// at that command and `read_sdc` errors; over no object it is no error, so the file reads on.
+    /// The reference on the probe: each of 2600-2608 mid-file kept the `set_max_delay` before and
+    /// not the one after (`READ_SDC ERROR`), a `set v [...]` and one inside `-of_objects`
+    /// stopped too; over `-quiet nomatch*` the next command was applied (`READ_SDC_OK`).
+    #[test]
+    fn a_malformed_filter_stops_the_file() {
+        let head = "create_clock -name c -period 10 [get_ports s]\nset_max_delay 3 -to [get_ports y1]\n";
+        for bad in [
+            "set_false_path -to [get_cells -filter {ref_name ~= AND*} *]",
+            "set_false_path -to [get_cells -filter {is_buffer)} *]",
+            "set_false_path -to [get_cells -filter {(is_buffer} *]",
+            "set_false_path -to [get_cells -filter {is_buffer &&} *]",
+            "set_false_path -to [get_cells -filter {} *]",
+            "set_false_path -to [get_cells -filter {is_buffer is_inverter} *]",
+            "set v [get_cells -filter {ref_name ~= x} *]",
+            "set_false_path -to [get_pins -of_objects [get_cells -filter {(ref_name =~ AND*} *]]",
+        ] {
+            let sdc = format!("{head}{bad}\nset_max_delay 4 -to [get_ports y2]\n");
+            let e = crate::sdc::Sdc::parse_with(&sdc, &design()).unwrap_err().0;
+            assert!(e.contains(MALFORMED_FILTER) && e.contains("not read"), "{bad}: {e}");
+        }
+        for none in [
+            "set_false_path -from [get_ports a] -to [get_cells -quiet -filter {ref_name ~= x} nomatch*]",
+            "set_false_path -from [get_ports a] -to [get_cells -quiet -filter {is_buffer &&} nomatch*]",
+        ] {
+            let sdc = format!("{head}{none}\nset_max_delay 4 -to [get_ports y2]\n");
+            let read = crate::sdc::Sdc::parse_with(&sdc, &design()).unwrap();
+            assert_eq!((read.path_delays.len(), read.unevaluated_queries.len()), (2, 0), "{none}: {:?}", read.rejected);
+        }
     }
 
     /// The command is applied once a design is in scope, and still refused without one.
