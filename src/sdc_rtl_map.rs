@@ -229,6 +229,88 @@ pub fn translate_bits(pattern: &str, ranges: &DeclaredRanges) -> BitIndex {
     BitIndex::Translated { to: format!("{base}[{}]{pin}", to.join(":")), declared: (left, right) }
 }
 
+/// The declared ranges as `vyges-syn sv-ranges` writes them, `{"ranges": {name: [left, right]}}`,
+/// or the bare object. Every value must be two integers; anything else is an error, not a guess.
+pub fn parse_ranges(text: &str) -> Result<DeclaredRanges, String> {
+    let v = crate::json::parse(text)?;
+    let obj = v.get("ranges").unwrap_or(&v).as_object().ok_or("expected a JSON object of name to [left, right]")?;
+    let mut out = DeclaredRanges::new();
+    for (k, r) in obj {
+        match r.as_array().map(|a| a.iter().map(crate::json::Value::as_int).collect::<Vec<_>>()).as_deref() {
+            Some([Some(l), Some(rt)]) => {
+                out.insert(k.clone(), (*l, *rt));
+            }
+            _ => return Err(format!("{k}: expected [left, right], integers")),
+        }
+    }
+    Ok(out)
+}
+
+/// [`parse_ranges`] of a file.
+pub fn load_ranges(path: &str) -> Result<DeclaredRanges, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    parse_ranges(&text).map_err(|e| format!("{path}: {e}"))
+}
+
+/// A netlist whose port bits keep the DECLARED numbering (`a[8]`..`a[11]` of `[11:8]`), as plain
+/// Yosys writes it, renumbered to the elaborated numbering [`translate_bits`] gives (`a[0]`..
+/// `a[3]`), and what was done.
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct PortRenumbering {
+    pub netlist: Netlist,
+    /// `(declared name, elaborated name)`, per port bit renamed.
+    pub translated: Vec<(String, String)>,
+    /// Port bits whose index lies outside their declared range: left as written.
+    pub out_of_range: Vec<(String, (i64, i64))>,
+    /// `(port bit, its elaborated name)` where another net already has that name: left as written.
+    pub name_taken: Vec<(String, String)>,
+}
+
+/// Renumber a netlist's PORT bits from their declared numbering to the elaborated one, every
+/// use of each net renamed alike (all at once, so an ascending range's swap `s[8]` <-> `s[11]`
+/// is a swap). Only ports are renamed: they are what two netlists of one design share by name.
+/// Nothing is guessed: an index outside its range, or a new name another net already has, is
+/// listed and that bit left as written.
+pub fn renumber_ports(nl: &Netlist, ranges: &DeclaredRanges) -> PortRenumbering {
+    let mut out = PortRenumbering { netlist: nl.clone(), translated: Vec::new(), out_of_range: Vec::new(), name_taken: Vec::new() };
+    let mut to: BTreeMap<String, String> = BTreeMap::new();
+    for p in nl.inputs.iter().chain(&nl.outputs).chain(&nl.inouts).chain(&nl.undirected) {
+        match translate_bits(p, ranges) {
+            BitIndex::Translated { to: t, .. } => {
+                to.insert(p.clone(), t);
+            }
+            BitIndex::OutOfRange { declared } => out.out_of_range.push((p.clone(), declared)),
+            BitIndex::Same => {}
+        }
+    }
+    let mut nets: BTreeSet<&str> = nl.inputs.iter().chain(&nl.outputs).chain(&nl.inouts).chain(&nl.undirected).map(String::as_str).collect();
+    nets.extend(nl.insts.iter().flat_map(|i| i.conns.iter().map(|(_, n)| n.as_str())));
+    nets.extend(nl.aliases.iter().flat_map(|(a, b)| [a.as_str(), b.as_str()]));
+    nets.extend(nl.constants.iter().map(|(n, _)| n.as_str()));
+    nets.extend(nl.canonical.values().map(String::as_str));
+    let taken: Vec<String> = to.iter().filter(|(_, t)| nets.contains(t.as_str()) && !to.contains_key(*t)).map(|(f, _)| f.clone()).collect();
+    for f in taken {
+        let t = to.remove(&f).unwrap_or_default();
+        out.name_taken.push((f, t));
+    }
+    let r = |n: &mut String| {
+        if let Some(t) = to.get(n.as_str()) {
+            *n = t.clone();
+        }
+    };
+    let n = &mut out.netlist;
+    n.inputs.iter_mut().chain(n.outputs.iter_mut()).chain(n.inouts.iter_mut()).for_each(r);
+    n.insts.iter_mut().flat_map(|i| i.conns.iter_mut().map(|(_, net)| net)).for_each(r);
+    n.aliases.iter_mut().flat_map(|(a, b)| [a, b]).for_each(r);
+    n.constants.iter_mut().map(|(c, _)| c).for_each(r);
+    n.canonical.values_mut().for_each(r);
+    n.undirected.iter_mut().for_each(r);
+    n.escaped_names = n.escaped_names.iter().map(|e| to.get(e).cloned().unwrap_or_else(|| e.clone())).collect();
+    out.translated = to.into_iter().collect();
+    out
+}
+
 /// An RTL register name's alias key: `/` read as `.`, the register name's `_reg` dropped (the
 /// last name, before its index), and the rules that changed it.
 fn alias_key(name: &str) -> (String, Vec<&'static str>) {
@@ -1023,5 +1105,54 @@ mod tests {
         assert_eq!(v.renamed, 0);
         assert_eq!(v.kept, [("u1".to_string(), "name-taken"), ("u2".to_string(), "name-taken")]);
     }
-}
 
+    /// A netlist that keeps declared port numbering is renumbered to the elaborated one: `a[8]`
+    /// of `[9:8]` is `a[0]` everywhere it is used, an ascending `[8:9]` port's bits swap
+    /// (`s[9]` <-> `s[8]` read as `s[0]`, `s[1]`), a bit outside its range and a new name some
+    /// other net already has are listed and left as written.
+    #[test]
+    fn port_bits_are_renumbered_by_the_declared_range() {
+        let nl = "module t(clk, \\a[8] , \\a[9] , \\s[8] , \\s[9] , \\q[8] , \\z[5] , \\w[1] );\n\
+          input clk, \\a[8] , \\a[9] , \\s[8] , \\s[9] ; output \\q[8] , \\z[5] , \\w[1] ;\nwire \\w[0] ;\n\
+          DFF u1(.CK(clk),.D(\\a[8] ),.Q(\\q[8] ));\nDFF u2(.CK(clk),.D(\\s[9] ),.Q(\\z[5] ));\n\
+          INV u3(.A(\\a[9] ),.Y(\\w[0] ));\nINV u4(.A(\\w[0] ),.Y(\\w[1] ));\nINV u5(.A(\\s[8] ),.Y(x));\nendmodule\n";
+        let ranges: DeclaredRanges = [("a", (9, 8)), ("s", (8, 9)), ("q", (8, 8)), ("z", (3, 0)), ("w", (2, 1)), ("c", (0, 1)), ("k", (8, 8)), ("o", (8, 8))].iter().map(|(n, r)| (n.to_string(), *r)).collect();
+        let r = renumber_ports(&crate::netlist::parse(nl).unwrap(), &ranges);
+        assert_eq!(r.netlist.inputs, ["clk", "a[0]", "a[1]", "s[1]", "s[0]"]);
+        assert_eq!(r.netlist.insts[0].conns.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>(), ["clk", "a[0]", "q[0]"]);
+        assert_eq!(r.netlist.insts[1].conns[1].1, "s[0]");
+        assert_eq!(r.out_of_range, [("z[5]".to_string(), (3, 0))]);
+        // w[1] of [2:1] is elaborated w[0], which an internal net already is
+        assert_eq!(r.name_taken, [("w[1]".to_string(), "w[0]".to_string())]);
+        assert!(r.netlist.outputs.contains(&"w[1]".to_string()));
+        assert_eq!(r.translated.len(), 5, "{:?}", r.translated);
+        assert!(r.netlist.escaped_names.contains("a[0]") && !r.netlist.escaped_names.contains("a[8]"));
+        // every place a port's name is held follows it: an `assign` (aliases, canonical), a
+        // supply (constants), and an ascending range's swap whose targets are themselves ports
+        let nl = "module t(\\c[0] , \\c[1] , \\k[8] , y, \\o[8] );\ninput \\c[0] , \\c[1] ; output \\k[8] , y, \\o[8] ;\n\
+          supply1 \\k[8] ;\nwire n, m;\nassign y = \\c[0] ;\nassign \\o[8] = m;\nINV u1(.A(\\c[1] ),.Y(n));\nINV u2(.A(n),.Y(m));\nendmodule\n";
+        let before = crate::netlist::parse(nl).unwrap();
+        let r = renumber_ports(&before, &ranges);
+        assert!(r.name_taken.is_empty(), "{:?}", r.name_taken);
+        assert_eq!(r.netlist.inputs, ["c[1]", "c[0]"]);
+        assert_eq!(r.netlist.insts[0].conns[0].1, "c[0]");
+        assert_eq!(r.netlist.constants, [("k[0]".to_string(), true)], "{:?}", before.constants);
+        let joined = format!("{:?}{:?}", r.netlist.aliases, r.netlist.canonical);
+        assert!(!before.aliases.is_empty() || !before.canonical.is_empty(), "{before:?}");
+        assert!(joined.contains("c[1]") && !joined.contains("c[0]"), "{joined} from {:?}{:?}", before.aliases, before.canonical);
+        // `assign o[8] = m`: the reader names m by the port, and records it; renumbered with it
+        assert!(before.canonical.values().any(|v| v == "o[8]"), "{:?}", before.canonical);
+        assert!(r.netlist.canonical.values().any(|v| v == "o[0]") && !r.netlist.canonical.values().any(|v| v == "o[8]"), "{:?}", r.netlist.canonical);
+    }
+
+    /// The ranges file as `sv-ranges` writes it, or the bare object; a malformed range is an error.
+    #[test]
+    fn ranges_are_read_from_either_form_and_never_guessed() {
+        let a = parse_ranges(r#"{"schema":"vyges-syn-ranges/1.0","ranges":{"r":[11,8]},"skipped":[]}"#).unwrap();
+        let b = parse_ranges(r#"{"r":[11,8]}"#).unwrap();
+        assert_eq!((a.clone(), a.get("r")), (b, Some(&(11, 8))));
+        assert!(parse_ranges(r#"{"r":[11]}"#).is_err());
+        assert!(parse_ranges(r#"{"r":[11.5,8]}"#).is_err());
+        assert!(parse_ranges("[1,2]").is_err());
+    }
+}
