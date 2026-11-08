@@ -1004,6 +1004,12 @@ endmodule
         ] {
             assert_eq!(f(e).as_deref(), Ok(want), "extension: {e}");
         }
+        // ⛔ A CLOCK GATE COUNTS AS SEQUENTIAL (user 2026-11-08, accepting the recommendation):
+        // the extension reads `Cell::is_seq`, the engine's one register notion, and an integrated
+        // clock gate built on a `statetable` holds state (its enable latch), so `cg` is in and
+        // `is_sequential && !is_clock_gate` is how a flow leaves it out. Not the reference's rule:
+        // it has no `is_sequential` on instances at all.
+        assert_eq!(f("is_sequential && is_clock_gate").as_deref(), Ok("cg"), "the statetable ICG holds state");
         // no library at all: not known, so not evaluated (never read as false)
         let bare = SdcDesign::from_netlist(&crate::netlist::parse(N).unwrap(), None);
         assert!(eval(&crate::sdc::query_words("get_cells -filter is_buffer *"), &bare).unwrap_err().contains("no library"));
