@@ -24,10 +24,27 @@ fst = ["dep:miniz_oxide"]
 # pure-Rust inflater).
 gzip = ["dep:miniz_oxide"]
 
+# The binary's allocator (see [dependencies]). Opt-in, so engines that link this library do not
+# build it; the builds that ship the binary pass `--features mimalloc`.
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
+
 [dependencies]
 miniz_oxide = { version = "0.8", optional = true }
 # `-regexp` object queries and `switch -regexp` (MIT / Apache-2.0)
 regex = "1"
+
+# The binary's global allocator. The reference build links tcmalloc for all of its code
+# (BUILD.bazel `malloc = @tcmalloc`), not the system allocator; mimalloc measured fastest and
+# smallest of tcmalloc / jemalloc / mimalloc on a like-for-like trial. Pinned exactly:
+# libmimalloc-sys 0.1.44 bundles mimalloc v2 by default (0.1.45 on default to v3).
+mimalloc = { version = "=0.1.48", default-features = false, optional = true }
+libmimalloc-sys = { version = "=0.1.44", default-features = false, optional = true }
+
+# On Linux the allocator also REPLACES malloc/free process-wide (`override`), so C++ code linked
+# into the binary allocates through it too, as the reference's statically linked tcmalloc does for
+# all of its code. Not on macOS, where the system zone allocator is left alone.
+[target.'cfg(target_os = "linux")'.dependencies]
+libmimalloc-sys = { version = "=0.1.44", default-features = false, features = ["override"], optional = true }
 
 [lib]
 name = "vyges_loom"
@@ -36,3 +53,9 @@ path = "src/lib.rs"
 [[bin]]
 name = "vyges-loom"
 path = "src/main.rs"
+
+# The reference is built -O3 with link-time optimisation (Bazel --config=release). LTO and one
+# codegen unit let calls inline across crates; by language rule neither changes a result.
+[profile.release]
+lto = "fat"
+codegen-units = 1

@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.100.0
       - name: Build
-        run: cargo build --locked --verbose
+        run: cargo build --locked --features mimalloc --verbose
       - name: Test
         # --all-features, not defaults: the fst/lz4 tests sit behind the non-default `fst`
         # feature, so a default-feature run compiled neither the code nor its tests and reported
