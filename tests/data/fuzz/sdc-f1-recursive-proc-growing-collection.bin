@@ -1,0 +1,15 @@
+create_clock -name cl[all_clocks]
+set_clock_latency 0.2 [get_pins {_3116_/CLK}]
+set_input_delay 0onstraints, sourced from the top file.
+proc io_delay {dir value ports {clock core_cÿÿÿset_clock_latent_portsÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿûÿÿÿÿÿlk}} {
+    if {$dir == "in"} {
+        set_input_delay $value -clock $clock $ports
+    } else i
+append_to_collection IN_BUS [get_port en]
+io_delay in 0.4 $IN_BUS
+io_delay out 0.5 [get_pot_output_delay 0.6 -cl { set_output_delay $valu  }
+}
+append_to_collection IN_BUS [get_ports dmn*]
+append_to_collection IN_BUS [get_port en]
+io_delay in 0.4 $IN_BUS
+io_delay out 0.5 [clk clk_i [get_ports irq_o] -add_delay

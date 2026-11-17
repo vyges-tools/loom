@@ -438,16 +438,23 @@ pub struct Objects {
 }
 
 impl Objects {
+    /// Each `[…]` level is tokenized once. A `[list …]` / `[concat …]` level's names are its
+    /// elements' names concatenated, which is what [`resolve_objs`] gives for it: resolving it
+    /// again here re-read the whole nest below every level, and a nest d deep cost d³ (F1: a
+    /// 2.7 KB file over 30 s). The reference's Tcl re-parses each nested script once per enclosing
+    /// level (`ParseTokens` runs `Tcl_ParseCommand` on it to find its `]`, then evaluates it), so
+    /// d² on the text, as this now is.
     pub(crate) fn of(tok: &str) -> Objects {
-        let accessor = tok.strip_prefix('[').and_then(|i| tokenize(i.trim_end_matches(']').trim()).into_iter().next()).unwrap_or_default();
-        let parts = tok
-            .strip_prefix('[')
-            .and_then(|i| i.strip_suffix(']'))
-            .map(|i| expand_abbreviations(tokenize(i.trim())))
-            .unwrap_or_default();
+        let accessor = tok.strip_prefix('[').and_then(|i| first_token(i.trim_end_matches(']').trim())).unwrap_or_default();
+        let raw = tok.strip_prefix('[').and_then(|i| i.strip_suffix(']')).map(|i| tokenize(i.trim()));
+        // `resolve_objs` reads the same text with this same first word as a list: the elements'
+        // names are its names (`expand_abbreviations` leaves `list`/`concat` and their words as
+        // they are: neither has options)
+        let list_names = matches!(accessor.as_str(), "list" | "concat") && raw.as_ref().and_then(|r| r.first()) == Some(&accessor);
+        let parts = raw.map(expand_abbreviations).unwrap_or_default();
         let (mut flags, mut keys_written, mut items) = (Vec::new(), Vec::new(), Vec::new());
         match accessor.as_str() {
-            "list" | "concat" => items = parts.iter().skip(1).map(|p| Objects::of(p)).collect(),
+            "list" | "concat" => items = parts.iter().skip(1).map(|p| Objects::of(p)).collect::<Vec<Objects>>(),
             _ if parts.iter().any(|p| p == "-filter" || p == "-of_objects") => {}
             _ => {
                 let keys = crate::sdc_flags::keys(&accessor);
@@ -468,7 +475,8 @@ impl Objects {
                 }
             }
         }
-        Objects { accessor, names: resolve_objs(tok), flags, keys: keys_written, items }
+        let names = if list_names { items.iter().flat_map(|o| o.names.iter().cloned()).collect() } else { resolve_objs(tok) };
+        Objects { accessor, names, flags, keys: keys_written, items }
     }
 }
 
@@ -1532,10 +1540,21 @@ pub(crate) fn logical_lines(text: &str) -> Vec<String> {
 /// (nesting-aware) and respecting `"..."`. Braces are stripped from the token;
 /// brackets are kept so accessors can be post-processed.
 pub(crate) fn tokenize(line: &str) -> Vec<String> {
+    tokenize_up_to(line, usize::MAX)
+}
+
+/// The first token of `line` as [`tokenize`] reads it, without reading the rest: an accessor's
+/// name, which [`Objects::of`] wants at every level of a `[list …]` nest.
+fn first_token(line: &str) -> Option<String> {
+    tokenize_up_to(line, 1).into_iter().next()
+}
+
+/// [`tokenize`], stopping once `max` tokens are read.
+fn tokenize_up_to(line: &str, max: usize) -> Vec<String> {
     let mut toks = Vec::new();
     let cs: Vec<char> = line.chars().collect();
     let mut i = 0;
-    while i < cs.len() {
+    while i < cs.len() && toks.len() < max {
         let c = cs[i];
         if c.is_whitespace() {
             i += 1;
@@ -3749,6 +3768,10 @@ impl Sdc {
                 }
                 continue;
             }
+            // ⛔ NESTING PAST TCL'S RECURSION LIMIT STOPS THE READ, as it stops the reference's.
+            if let Some(why) = too_deeply_nested(&raw, frames.len()) {
+                return Err(SdcError(format!("{why}; the reference stops reading at an error, so this file is not read")));
+            }
             // ⛔ AN UNDEFINED VARIABLE STOPS THE READ, as Tcl stops `source` there and so the
             // reference's `read_sdc` (user 2026-11-04): nothing after it is applied. Read on, `set
             // MAIN_CLK_PIN $MAIN_CLK_PIN` stored the text `$MAIN_CLK_PIN`, and a clock was made on
@@ -4676,6 +4699,52 @@ const PROC_RETURN: &str = "\u{1}proc-return";
 const SOURCE_END: &str = "\u{3}source-end";
 const MAX_PROC_DEPTH: usize = 64;
 const MAX_SOURCED: usize = 256;
+
+/// The deepest `[…]` a reference SDC constraint command (`set_false_path`, `set_load`, …) runs
+/// with, at the top level of a file `read_sdc` reads: one more is Tcl's "too many nested
+/// evaluations" (its interp recursion limit, 1000 levels, less the ones `read_sdc` itself uses).
+/// One fewer per proc call the command runs in. Measured on the reference (pin 4155ac31).
+const MAX_CONSTRAINT_NESTING: usize = 985;
+/// The same for any other command (a Tcl built-in such as `set` or `puts`, a query such as
+/// `get_ports`, a proc of the file's own): one more is Tcl's "too many nested compilations".
+const MAX_OTHER_NESTING: usize = 1245;
+
+/// The deepest nesting of `[…]` command substitutions in `line`, outside braces, as written:
+/// a value a variable holds is not evaluated again, so it adds nothing.
+fn substitution_depth(line: &str) -> usize {
+    let b = line.as_bytes();
+    let (mut brace, mut depth, mut deepest, mut i) = (0usize, 0usize, 0usize, 0usize);
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1,
+            b'{' => brace += 1,
+            b'}' => brace = brace.saturating_sub(1),
+            b'[' if brace == 0 => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b']' if brace == 0 => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    deepest
+}
+
+/// The reference's error for `line` when its `[…]` nest past Tcl's recursion limit, `frames` proc
+/// calls deep (see [`MAX_CONSTRAINT_NESTING`]).
+fn too_deeply_nested(line: &str, frames: usize) -> Option<String> {
+    let depth = substitution_depth(line);
+    if depth <= MAX_CONSTRAINT_NESTING.saturating_sub(frames) {
+        return None;
+    }
+    let word = first_token(line.trim()).unwrap_or_default();
+    let cmd = resolve_command(&word).unwrap_or(word);
+    let constraint = crate::sdc_flags::options(&cmd).is_some() && !cmd.starts_with("get_") && !cmd.starts_with("all_");
+    let (limit, what) = if constraint { (MAX_CONSTRAINT_NESTING, "evaluations") } else { (MAX_OTHER_NESTING, "compilations") };
+    (depth > limit.saturating_sub(frames))
+        .then(|| format!("`{cmd}`: {depth} levels of `[...]`: too many nested {what} (infinite loop?), Tcl's recursion limit"))
+}
 
 /// What a dialect command asks of the read.
 enum Dialect {
@@ -7163,5 +7232,115 @@ mod break_continue_tests {
         }
         // in a proc called from a loop body, the proc's frame ends the search: still an error
         assert!(Sdc::parse("proc p {} { break }\nforeach x {1 2} { p }\n").is_err());
+    }
+}
+
+/// F1 (formal pilot, fuzz `sdc_read`): `[list …]` / `[concat …]` nested deep, as written or grown
+/// by `append_to_collection`, read in time linear in depth per level; and nesting past the
+/// reference's Tcl recursion limit stops the read as it stops the reference's.
+#[cfg(test)]
+mod nesting_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// `[list [list … [get_ports p0] …] [get_ports pN]]`, `depth` levels of `[…]` in all.
+    fn nest(depth: usize) -> String {
+        let mut s = "[get_ports p0]".to_string();
+        for i in 1..depth {
+            s = format!("[list {s} [get_ports p{i}]]");
+        }
+        s
+    }
+
+    fn timed(text: &str) -> (Result<Sdc, SdcError>, Duration) {
+        let t = Instant::now();
+        let r = Sdc::parse(text);
+        (r, t.elapsed())
+    }
+
+    /// Each level's names are its elements' names in order, as `resolve_objs` reads the text: the
+    /// shortcut `Objects::of` takes for a list must never part from it.
+    #[test]
+    fn a_list_s_names_are_what_resolve_objs_reads() {
+        for tok in [
+            nest(1),
+            nest(7),
+            "[list]".into(),
+            "[list]]".into(),
+            "[list a b]".into(),
+            "[list [concat [get_ports a] b] {c d} [get_pins x/y]]".into(),
+            "[concat [list [get_ports {a[0]}]] [all_inputs]]".into(),
+            "[lis [get_ports a]]".into(),
+            "[list [get_ports a]".into(),
+            "[list -from [get_ports a]]".into(),
+        ] {
+            assert_eq!(Objects::of(&tok).names, resolve_objs(&tok), "{tok}");
+        }
+    }
+
+    /// 200 levels written out: under the cubic re-read this took seconds (a release build: 0.45 s;
+    /// the fuzz build 55 times that), now a few milliseconds. The bound is generous for a debug
+    /// build on a loaded machine; the names are the 200 ports, innermost first.
+    #[test]
+    fn a_deep_written_nest_reads_fast_and_names_every_port() {
+        let text = format!("create_clock -name c -period 1 [get_ports clk]\nset_false_path -from {}\n", nest(200));
+        let (r, took) = timed(&text);
+        let s = r.expect("200 levels is inside the reference's limit");
+        assert!(took < Duration::from_secs(10), "took {took:?}");
+        let want: Vec<String> = (0..200).map(|i| format!("p{i}")).collect();
+        let mut sorted = want.clone();
+        sorted.sort();
+        assert_eq!(s.exceptions[0].from, sorted, "the exception's set, sorted");
+        let from = &s.exceptions[0].args[0].1;
+        assert_eq!(from.names, want);
+        assert_eq!(from.accessor, "list");
+        assert_eq!(from.items.len(), 2);
+    }
+
+    /// The fuzz finding, minimised: a proc that calls itself, growing a collection each call, to
+    /// the 64-call limit. Over 30 s in the fuzz build (0.25 s release) before; the read still ends
+    /// in the recursive-proc error.
+    #[test]
+    fn the_f1_fuzz_input_ends_in_its_error_quickly() {
+        let text = String::from_utf8_lossy(include_bytes!("../tests/data/fuzz/sdc-f1-recursive-proc-growing-collection.bin"));
+        let (r, took) = timed(&text);
+        let e = r.expect_err("the proc recurses past the limit");
+        assert!(e.0.contains("proc calls nested deeper than"), "{}", e.0);
+        assert!(took < Duration::from_secs(10), "took {took:?}");
+    }
+
+    /// The reference (pin 4155ac31, `read_sdc` from a top-level script) runs `set_false_path` with
+    /// 985 levels of `[…]` and fails at 986 with Tcl's "too many nested evaluations (infinite
+    /// loop?)"; inside one proc call 984/985. `set`, `puts`, `get_ports` and a file's own proc run
+    /// to 1245 and fail at 1246 with "too many nested compilations"; in a proc 1244/1245.
+    ///
+    /// Run on a 64 MB stack: reading a nest this deep recurses once per level, more than a test
+    /// thread's 2 MB holds in a debug build.
+    #[test]
+    fn nesting_past_the_reference_s_limit_stops_the_read() {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(nesting_limits)
+            .expect("spawn a test thread")
+            .join()
+            .expect("the limit checks hold");
+    }
+
+    fn nesting_limits() {
+        let fp = |d: usize| format!("set_false_path -from {}\n", nest(d));
+        assert!(Sdc::parse(&fp(MAX_CONSTRAINT_NESTING)).is_ok());
+        let e = Sdc::parse(&fp(MAX_CONSTRAINT_NESTING + 1)).expect_err("986 levels");
+        assert!(e.0.contains("too many nested evaluations"), "{}", e.0);
+        let in_proc = |d: usize| format!("proc p {{}} {{ set_false_path -from {} }}\np\n", nest(d));
+        assert!(Sdc::parse(&in_proc(MAX_CONSTRAINT_NESTING - 1)).is_ok());
+        assert!(Sdc::parse(&in_proc(MAX_CONSTRAINT_NESTING)).is_err());
+        let set = |d: usize| format!("set B {}\n", nest(d));
+        assert!(Sdc::parse(&set(MAX_CONSTRAINT_NESTING + 1)).is_ok());
+        assert!(Sdc::parse(&set(MAX_OTHER_NESTING)).is_ok());
+        let e = Sdc::parse(&set(MAX_OTHER_NESTING + 1)).expect_err("1246 levels");
+        assert!(e.0.contains("too many nested compilations"), "{}", e.0);
+        // braces quote: nothing inside them is a substitution
+        assert_eq!(substitution_depth(&format!("set B {{{}}}", nest(2000))), 0);
+        assert_eq!(substitution_depth("set_load 1 [get_ports {a[0]}]"), 1);
     }
 }
