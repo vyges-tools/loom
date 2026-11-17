@@ -2177,15 +2177,70 @@ fn expand_abbreviations(mut toks: Vec<String>) -> Vec<String> {
     toks
 }
 
+/// A command's words as [`tokenize`] and [`expand_abbreviations`] read them, with each `[…]`
+/// word's own command read the same way, once, when a check first asks for it: every check of a
+/// command walks this one parse instead of re-reading each level of a nest for itself (F1: ten
+/// checks each re-reading a d-deep nest made a command cost ten times n·d).
+///
+/// A `[…]` word's parse is also kept by its text across commands ([`WORDS_SEEN`]): the value an
+/// `append_to_collection` grows is the previous value inside one more `[list …]`, so a chain of
+/// N appends would otherwise re-read N nests, each up to N deep.
+pub(crate) struct Words {
+    pub(crate) toks: Vec<String>,
+    subs: Vec<std::cell::OnceCell<Option<std::rc::Rc<Words>>>>,
+}
+
+thread_local! {
+    /// [`Words`] parses by the `[…]` text they came from. The parse depends on the text alone
+    /// (the abbreviation tables are fixed), so a hit is the parse a fresh read would make.
+    static WORDS_SEEN: std::cell::RefCell<(HashMap<String, std::rc::Rc<Words>>, usize)> = std::cell::RefCell::new((HashMap::new(), 0));
+}
+
+/// How much `[…]` text [`WORDS_SEEN`] keeps before it starts again: a bound on memory, not on
+/// what is read.
+const WORDS_SEEN_BYTES: usize = 64 << 20;
+
+impl Words {
+    pub(crate) fn new(toks: Vec<String>) -> Words {
+        let subs = toks.iter().map(|_| std::cell::OnceCell::new()).collect();
+        Words { toks, subs }
+    }
+
+    /// The parse of word `k` when it is a `[…]` word: `expand_abbreviations(tokenize(inner))`.
+    pub(crate) fn sub(&self, k: usize) -> Option<std::rc::Rc<Words>> {
+        let t = self.toks.get(k)?;
+        self.subs[k]
+            .get_or_init(|| {
+                let inner = t.strip_prefix('[').and_then(|s| s.strip_suffix(']'))?;
+                if let Some(w) = WORDS_SEEN.with(|m| m.borrow().0.get(t.as_str()).cloned()) {
+                    return Some(w);
+                }
+                let w = std::rc::Rc::new(Words::new(expand_abbreviations(tokenize(inner.trim()))));
+                WORDS_SEEN.with(|m| {
+                    let (seen, bytes) = &mut *m.borrow_mut();
+                    if *bytes + t.len() > WORDS_SEEN_BYTES {
+                        seen.clear();
+                        *bytes = 0;
+                    }
+                    *bytes += t.len();
+                    seen.insert(t.clone(), w.clone());
+                });
+                Some(w)
+            })
+            .clone()
+    }
+}
+
 /// The first object query in `toks` (at any depth of `[...]`) this reader cannot evaluate, as
 /// written: `-filter`, `-of_objects` and `-regexp` select objects by the design's properties and
 /// connectivity (and `-regexp` by a different pattern language), which needs the design. Matched
 /// as names they selected the wrong objects or none, silently; the caller refuses the command.
-fn unevaluated_query(toks: &[String]) -> Option<String> {
+fn unevaluated_query(w: &Words, from: usize) -> Option<String> {
     const NEEDS_DESIGN: [&str; 3] = ["-filter", "-of_objects", "-regexp"];
-    for t in toks {
+    for (k, t) in w.toks.iter().enumerate().skip(from) {
         let Some(inner) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else { continue };
-        let parts = expand_abbreviations(tokenize(inner.trim()));
+        let Some(sub) = w.sub(k) else { continue };
+        let parts = &sub.toks;
         let Some(cmd) = parts.first() else { continue };
         // ⛔ A COMMAND THIS READER DOES NOT KNOW is not a name. `[remove_from_collection [all_inputs]
         // {clk}]` (a synthesis tool's command, which the reference does not have either) was read as
@@ -2209,13 +2264,13 @@ fn unevaluated_query(toks: &[String]) -> Option<String> {
             }
         }
         if cmd.starts_with("get_") && parts.iter().any(|p| NEEDS_DESIGN.contains(&p.as_str())) {
-            match with_design(|d| crate::sdc_query::eval(&parts, d)) {
+            match with_design(|d| crate::sdc_query::eval(parts, d)) {
                 Some(Ok(_)) => continue,
                 Some(Err(why)) => return Some(format!("[{}] ({why})", inner.trim())),
                 None => return Some(format!("[{}] (needs the design)", inner.trim())),
             }
         }
-        if let Some(q) = unevaluated_query(&parts[1..]) {
+        if let Some(q) = unevaluated_query(&sub, 1) {
             return Some(q);
         }
     }
@@ -2346,20 +2401,22 @@ fn filter_stop_error(why: &str, line: &str) -> SdcError {
 /// `set_input_delay` / `set_output_delay`, the one place it is read: elsewhere its words were
 /// taken as object names (`-from [remove_from_collection [all_inputs] clk]` cut paths from a port
 /// called `remove_from_collection`).
-fn misplaced_except(toks: &[String]) -> Option<String> {
-    fn find(toks: &[String]) -> Option<String> {
-        toks.iter().find_map(|t| {
+fn misplaced_except(w: &Words) -> Option<String> {
+    // the words after each command word: `expand_abbreviations` changes only a command word and
+    // `-` options, never a `[…]` word, so its parse is the one this reads
+    fn find(w: &Words) -> Option<String> {
+        w.toks.iter().enumerate().skip(1).find_map(|(k, t)| {
             let inner = t.strip_prefix('[').and_then(|s| s.strip_suffix(']'))?;
             if all_ports_except(t).is_some() {
                 return Some(format!("[{}] (an every-port-but collection, read only as the ports of set_input_delay / set_output_delay)", inner.trim()));
             }
-            find(tokenize(inner.trim()).get(1..).unwrap_or_default())
+            find(&*w.sub(k)?)
         })
     }
-    if matches!(toks.first()?.as_str(), "set_input_delay" | "set_output_delay") {
+    if matches!(w.toks.first()?.as_str(), "set_input_delay" | "set_output_delay") {
         return None;
     }
-    find(&toks[1..])
+    find(w)
 }
 
 /// The clocks `patterns` name, as `get_clocks` matches them (`*`, `?`; an exact name always) in
@@ -2413,8 +2470,9 @@ fn clock_groups_ignored_words(toks: &[String]) -> Vec<String> {
 /// (`all_inputs -edge_triggered`, `set_driving_cell -clock`, `get_ports -hierarchical`:
 /// [`crate::sdc_flags::STANDARD_ONLY`]) are valid SDC and are accepted. A command whose parse
 /// passes unknown options on ([`PASSES_UNKNOWN`]), or that this table does not list, is not judged.
-fn unknown_option(toks: &[String]) -> Option<String> {
+fn unknown_option(w: &Words) -> Option<String> {
     use crate::sdc_flags::PASSES_UNKNOWN;
+    let toks = &w.toks;
     let is_option = |t: &str| t.len() >= 2 && t.starts_with('-') && t[1..].starts_with(|c: char| c.is_ascii_alphabetic());
     let cmd = toks.first()?.as_str();
     // The commands whose reference parse passes unknown options on parse their own lists after
@@ -2447,26 +2505,23 @@ fn unknown_option(toks: &[String]) -> Option<String> {
             k += 1;
         }
     }
-    toks[1..].iter().find_map(|t| {
-        let inner = t.strip_prefix('[').and_then(|s| s.strip_suffix(']'))?;
-        unknown_option(&expand_abbreviations(tokenize(inner.trim())))
-    })
+    (1..toks.len()).find_map(|k| unknown_option(&*w.sub(k)?))
 }
 
 /// The reference-timer extensions `toks` uses, at any depth of `[...]`: the command itself when no
 /// SDC version declares it, and each option of it no SDC version declares.
-fn extensions_in(toks: &[String]) -> Vec<String> {
+fn extensions_in(w: &Words) -> Vec<String> {
     let mut out = Vec::new();
-    let Some(cmd) = toks.first() else { return out };
+    let Some(cmd) = w.toks.first() else { return out };
     if crate::sdc_flags::EXTENSION_COMMANDS.contains(&cmd.as_str()) {
         out.push(cmd.clone());
     }
-    for t in &toks[1..] {
+    for (k, t) in w.toks.iter().enumerate().skip(1) {
         if crate::sdc_flags::EXTENSION_OPTIONS.iter().any(|(c, o)| c == cmd && o == t) {
             out.push(format!("{cmd} {t}"));
         }
-        if let Some(inner) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            out.extend(extensions_in(&expand_abbreviations(tokenize(inner.trim()))));
+        if let Some(sub) = w.sub(k) {
+            out.extend(extensions_in(&sub));
         }
     }
     out
@@ -2474,15 +2529,15 @@ fn extensions_in(toks: &[String]) -> Vec<String> {
 
 /// Each SDC option in `toks` (at any depth of `[...]`) that no consumer here applies
 /// ([`crate::sdc_flags::KEPT_OPTIONS`]), as `command -option`, in the order written.
-fn kept_options_in(toks: &[String]) -> Vec<String> {
+fn kept_options_in(w: &Words) -> Vec<String> {
     let mut out = Vec::new();
-    let Some(cmd) = toks.first() else { return out };
-    for t in &toks[1..] {
+    let Some(cmd) = w.toks.first() else { return out };
+    for (k, t) in w.toks.iter().enumerate().skip(1) {
         if crate::sdc_flags::KEPT_OPTIONS.iter().any(|(c, o)| c == cmd && o == t) {
             out.push(format!("{cmd} {t}"));
         }
-        if let Some(inner) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            out.extend(kept_options_in(&expand_abbreviations(tokenize(inner.trim()))));
+        if let Some(sub) = w.sub(k) {
+            out.extend(kept_options_in(&sub));
         }
     }
     out
@@ -2493,7 +2548,8 @@ fn kept_options_in(toks: &[String]) -> Vec<String> {
 /// `all_registers` options only (Error 564, "positional arguments not supported"; SDC gives
 /// `all_outputs` the options `-clock`, `-level_sensitive` and `-edge_triggered`, which the
 /// reference timer's lacks). `all_inputs` ignores a stray word, as the reference does.
-fn argument_fault(toks: &[String]) -> Option<String> {
+fn argument_fault(w: &Words) -> Option<String> {
+    let toks = &w.toks;
     let cmd = toks.first()?.as_str();
     let fault = match cmd {
         "all_clocks" => toks.len() > 1,
@@ -2518,10 +2574,7 @@ fn argument_fault(toks: &[String]) -> Option<String> {
     if fault {
         return Some(format!("`{}`: {cmd} takes no positional argument{}", toks.join(" "), if cmd == "all_clocks" { " or option" } else { "" }));
     }
-    toks[1..].iter().find_map(|t| {
-        let inner = t.strip_prefix('[').and_then(|s| s.strip_suffix(']'))?;
-        argument_fault(&expand_abbreviations(tokenize(inner.trim())))
-    })
+    (1..toks.len()).find_map(|k| argument_fault(&*w.sub(k)?))
 }
 
 /// Why the reference's `set_clock_uncertainty` fails on these arguments, in the order it checks:
@@ -3886,7 +3939,9 @@ impl Sdc {
             if toks.is_empty() {
                 continue;
             }
-            sdc.extensions.extend(extensions_in(&toks).into_iter().filter(|e| !sdc_spelling || *e != toks[0]));
+            // the command's words, each `[…]` in them parsed once for every check below
+            let words = Words::new(toks.clone());
+            sdc.extensions.extend(extensions_in(&words).into_iter().filter(|e| !sdc_spelling || *e != toks[0]));
             // A clock made INSIDE another command (`set_input_delay -clock [create_clock …] …`):
             // Tcl runs the substitution first, and the reference's `create_clock` returns nothing,
             // so the clock is made and the outer command sees an empty word.
@@ -3933,7 +3988,7 @@ impl Sdc {
                     continue;
                 }
                 // An option the command does not have fails it in the reference; so here.
-                if let Some(why) = unknown_option(&toks).or_else(|| argument_fault(&toks)) {
+                if let Some(why) = unknown_option(&words).or_else(|| argument_fault(&words)) {
                     sdc.rejected.push(format!("{}: {why}; not applied", toks[0]));
                     continue;
                 }
@@ -3941,7 +3996,7 @@ impl Sdc {
             // An object query this reader cannot evaluate: the command is NOT applied, and says
             // so (a `set` only stores the text; it is checked where the variable is used).
             if toks[0] != "set" {
-                if let Some(q) = unevaluated_query(&toks).or_else(|| misplaced_except(&toks)) {
+                if let Some(q) = unevaluated_query(&words, 0).or_else(|| misplaced_except(&words)) {
                     sdc.rejected.push(format!("{}: {q} not evaluated; not applied", toks[0]));
                     // a command no timer consults (`set_dont_touch [get_designs …]`) is listed as
                     // not applied, not with the queries every consumer refuses the file on
@@ -3956,7 +4011,7 @@ impl Sdc {
             // command is kept and written back — in its typed record where that carries the
             // option (an I/O delay's flags; a derate's flags, which then sets no design-wide
             // derate), else as written — and reported as kept-not-applied.
-            let options = kept_options_in(&toks);
+            let options = kept_options_in(&words);
             if !options.is_empty() {
                 // a design-rule limit kept with its option is still checked as one
                 if matches!(toks[0].as_str(), "set_max_capacitance" | "set_max_transition") {
@@ -7295,6 +7350,37 @@ mod nesting_tests {
         assert_eq!(from.names, want);
         assert_eq!(from.accessor, "list");
         assert_eq!(from.items.len(), 2);
+    }
+
+    /// A collection grown 400 times nests 400 deep in the reader's text, and each append's `set`
+    /// carries the whole value. Every check of a command walks one parse of it, and a value's
+    /// parse is kept by its text, so each append reads only its new level. Base (each check
+    /// re-reading every level, every append): 2.1 s for 400 in a release build, 35 s for 800.
+    #[test]
+    fn a_long_append_to_collection_chain_reads_fast() {
+        let mut text = String::from("create_clock -name c -period 1 [get_ports clk]\n");
+        for i in 0..400 {
+            text.push_str(&format!("append_to_collection B [get_ports a{i}]\n"));
+        }
+        text.push_str("set_false_path -from $B\n");
+        let (r, took) = timed(&text);
+        let s = r.expect("a grown collection has no nesting limit");
+        assert!(took < Duration::from_secs(20), "took {took:?}");
+        assert_eq!(s.exceptions[0].from.len(), 400);
+    }
+
+    /// A `[…]` word's parse kept from an earlier command is the parse a fresh read makes.
+    #[test]
+    fn a_kept_parse_is_the_fresh_parse() {
+        let t = "[list [get_ports -hier a*] [all_inputs -no_clocks]]".to_string();
+        let w = Words::new(vec!["set_false_path".into(), "-from".into(), t.clone()]);
+        let first = w.sub(2).expect("a [...] word");
+        let again = Words::new(vec!["x".into(), t.clone()]).sub(1).expect("a [...] word");
+        assert!(std::rc::Rc::ptr_eq(&first, &again), "the second read takes the kept parse");
+        let inner = t.strip_prefix('[').and_then(|i| i.strip_suffix(']')).expect("a [...] word");
+        let fresh = expand_abbreviations(tokenize(inner.trim()));
+        assert_eq!(again.toks, fresh);
+        assert_eq!(again.sub(1).map(|s| s.toks.clone()), Some(expand_abbreviations(tokenize("get_ports -hier a*"))));
     }
 
     /// The fuzz finding, minimised: a proc that calls itself, growing a collection each call, to
