@@ -1029,14 +1029,15 @@ impl CompactDesign {
                     let (base, rest) = s.rsplit_once('[')?;
                     Some((base.to_string(), rest.strip_suffix(']')?.parse().ok()?))
                 };
-                for k in inst.conns.0 as usize..inst.conns.1 as usize {
-                    if let Some((b, j)) = bit(pool.get(m.conn_table[k].0)) {
-                        groups.entry(b).or_default().push((true, k, j));
+                let (c0, t0) = (inst.conns.0 as usize, inst.ties.0 as usize);
+                for (o, c) in m.conn_table[c0..inst.conns.1 as usize].iter().enumerate() {
+                    if let Some((b, j)) = bit(pool.get(c.0)) {
+                        groups.entry(b).or_default().push((true, c0 + o, j));
                     }
                 }
-                for k in inst.ties.0 as usize..inst.ties.1 as usize {
-                    if let Some((b, j)) = bit(pool.get(m.tie_table[k].0)) {
-                        groups.entry(b).or_default().push((false, k, j));
+                for (o, t) in m.tie_table[t0..inst.ties.1 as usize].iter().enumerate() {
+                    if let Some((b, j)) = bit(pool.get(t.0)) {
+                        groups.entry(b).or_default().push((false, t0 + o, j));
                     }
                 }
                 let cell = pool.get(inst.cell).to_string();
