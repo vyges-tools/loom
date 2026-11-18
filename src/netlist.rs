@@ -807,6 +807,15 @@ pub struct CompactModule {
     /// `(pin, value)` of every instance — see [`Inst::ties`]
     tie_table: Vec<(Sym, bool)>,
     pub aliases: Vec<(Sym, Sym)>,
+    /// For each of [`CompactModule::aliases`], how many instances were written before its
+    /// `assign` (or `wire a = b;`): where the reference's `makeModuleInstBody` merges the two nets
+    /// among the instance statements, which decides the order of the merged net's pins. Empty when
+    /// the module was not read from a file (a flattened or converted module): positions unknown.
+    pub alias_at: Vec<u32>,
+    /// `(k, written)` for each connection `k` (in the module's connection order, ascending) whose
+    /// net the alias canonicalisation renamed (`assign port = net;` makes `net`'s connections say
+    /// `port`): the net name as the file wrote it. See [`CompactModule::conns_as_written`].
+    pub alias_written: Vec<(u32, Sym)>,
     /// see [`Netlist::skipped_assigns`]
     pub skipped_assigns: usize,
     /// see [`Netlist::unbound_pins`]
@@ -916,6 +925,19 @@ impl CompactModule {
     /// `inst`'s `(pin, net)` connections — see [`Inst::conns`].
     pub fn conns(&self, inst: &CompactInst) -> &[(Sym, Sym)] {
         &self.conn_table[inst.conns.0 as usize..inst.conns.1 as usize]
+    }
+
+    /// [`CompactModule::conns`] with each net as the file wrote it, before an `assign` alias
+    /// renamed it to the port's (or the right-hand side's) name — what a reader that merges the
+    /// nets itself, as the reference's `mergeAssignNet` does, connects.
+    pub fn conns_as_written(&self, inst: &CompactInst) -> Vec<(Sym, Sym)> {
+        let (c0, c1) = (inst.conns.0, inst.conns.1);
+        let mut out = self.conns(inst).to_vec();
+        let from = self.alias_written.partition_point(|(k, _)| *k < c0);
+        for &(k, written) in self.alias_written[from..].iter().take_while(|(k, _)| *k < c1) {
+            out[(k - c0) as usize].1 = written;
+        }
+        out
     }
 
     /// `inst`'s constant ties — see [`Inst::ties`].
@@ -1847,7 +1869,10 @@ impl ModuleReader {
                         i = j;
                         if !lhs.is_empty() && !rhs.is_empty() {
                             match assign_pairs(&lhs, &rhs, decl_range) {
-                                Some(pairs) => nl.aliases.extend(pairs.iter().map(|(a, b)| (pool.intern(a), pool.intern(b)))),
+                                Some(pairs) => {
+                                    nl.aliases.extend(pairs.iter().map(|(a, b)| (pool.intern(a), pool.intern(b))));
+                                    nl.alias_at.resize(nl.aliases.len(), nl.insts.len() as u32);
+                                }
                                 None => nl.skipped_assigns += 1,
                             }
                         }
@@ -1946,7 +1971,10 @@ impl ModuleReader {
                                 let rhs = read_conn_value(t, &mut i);
                                 if is_net && !rhs.is_empty() {
                                     match assign_pairs(&lhs, &rhs, decl_range) {
-                                        Some(pairs) => nl.aliases.extend(pairs.iter().map(|(a, b)| (pool.intern(a), pool.intern(b)))),
+                                        Some(pairs) => {
+                                            nl.aliases.extend(pairs.iter().map(|(a, b)| (pool.intern(a), pool.intern(b))));
+                                            nl.alias_at.resize(nl.aliases.len(), nl.insts.len() as u32);
+                                        }
                                         None => nl.skipped_assigns += 1,
                                     }
                                 }
@@ -2361,6 +2389,7 @@ impl ModuleReader {
             let net = nl.conn_table[k].1;
             if let Some(&p) = to_port.get(&net) {
                 nl.conn_table[k].1 = p;
+                nl.alias_written.push((k as u32, net));
                 continue;
             }
             let text = pool.get(net);
@@ -2882,6 +2911,27 @@ endmodule
         let both = "module top (y);\n  output y;\n  wand [1:0] a;\n  wor o;\n  B u0 (.A(a), .Y(y));\nendmodule";
         assert!(parse(both).unwrap_err().0.contains("'wand'"), "the first one is named");
         assert!(parse("module top (y);\n  output y;\n  wire w;\n  B u0 (.A(w), .Y(y));\nendmodule").is_ok());
+    }
+
+    /// Rule (the reference's `makeModuleInstBody`: statements are linked in the order written, an
+    /// instance's pins as it is reached and an `assign` merging its two nets where it stands): a
+    /// reader that merges nets itself needs each alias's place among the instances and each
+    /// connection's net as written, which the port canonicalisation replaces.
+    #[test]
+    fn an_alias_keeps_its_place_and_the_names_it_joined() {
+        let src = "module top (a, y);\n  input a;\n  output y;\n  wire n1, n2;\n  B u0 (.A(a), .Y(n1));\n  assign y = n1;\n  B u1 (.A(n1), .Y(n2));\n  wire w = n2;\n  B u2 (.A(w), .Y(n2));\nendmodule";
+        let d = parse_compact(src).unwrap();
+        let m = d.top();
+        let a: Vec<(&str, &str)> = m.aliases.iter().map(|(l, r)| (d.str(*l), d.str(*r))).collect();
+        assert_eq!(a, [("y", "n1"), ("w", "n2")]);
+        assert_eq!(m.alias_at, [1, 2], "after u0; after u1");
+        let as_read = |k: usize| m.conns(&m.insts[k]).iter().map(|(p, n)| format!("{}={}", d.str(*p), d.str(*n))).collect::<Vec<_>>().join(" ");
+        let written = |k: usize| m.conns_as_written(&m.insts[k]).iter().map(|(p, n)| format!("{}={}", d.str(*p), d.str(*n))).collect::<Vec<_>>().join(" ");
+        assert_eq!(as_read(0), "A=a Y=y", "n1 is read as the port it is assigned to");
+        assert_eq!(written(0), "A=a Y=n1");
+        assert_eq!((as_read(1), written(1)), ("A=y Y=n2".to_string(), "A=n1 Y=n2".to_string()));
+        assert_eq!((as_read(2), written(2)), ("A=n2 Y=n2".to_string(), "A=w Y=n2".to_string()));
+        assert_eq!(m.alias_written.len(), 3);
     }
 
     /// Rule (the reference's `mergeAssignNet`): an assignment merges its two sides BIT FOR BIT —
