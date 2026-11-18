@@ -192,6 +192,8 @@ pub struct ExceptionCmd {
     /// The flags without a value (`-setup`, `-hold`, `-rise`, `-fall`, `-default`).
     pub flags: Vec<String>,
     pub comment: Option<String>,
+    /// When the command made it, among every path exception — see [`super::Exception::seq`].
+    pub seq: Option<usize>,
 }
 
 /// `toks` split as the reference's `parse_key_args` splits them for `spec`: a key takes the next
@@ -452,7 +454,7 @@ pub(super) fn exception_cmd(toks: &[String]) -> Result<ExceptionCmd, String> {
     let (_, _, pos) = super::split_args(&rest, &super::EXC_VALUED);
     let comment = super::comment_of(toks);
     let none = !args.iter().any(|(k, _)| k.contains("from") || k.contains("through") || k.contains("to"));
-    let mut x = ExceptionCmd { cmd: toks[0].clone(), name: None, default: false, value: None, keys, args, flags: Vec::new(), comment };
+    let mut x = ExceptionCmd { cmd: toks[0].clone(), name: None, default: false, value: None, keys, args, flags: Vec::new(), comment, seq: None };
     if toks[0] == "group_path" {
         if !pos.is_empty() {
             return Err("positional arguments not supported (Error 392)".into());

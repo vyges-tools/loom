@@ -94,6 +94,12 @@ pub struct Exception {
     pub flags: Vec<String>,
     /// `-comment`, as written: the reference keeps it with the command and writes it back.
     pub comment: Option<String>,
+    /// When the command made it, among every path exception (`set_false_path`,
+    /// `set_multicycle_path`, `set_max_delay` / `set_min_delay`, `group_path`, `set_path_margin`):
+    /// the reference numbers its exceptions in that one order (`Sdc::recordException`, the id a
+    /// tag's states are ranked by). `None`: left by a `-reset_path` (the reference re-adds those
+    /// at the reset, and may merge them) or made by hand.
+    pub seq: Option<usize>,
 }
 
 /// Is `name` in an exception endpoint set? An empty set, or one holding `*`, matches anything;
@@ -494,6 +500,12 @@ pub struct PathDelayCmd {
     pub flags: Vec<String>,
     /// `-comment`, as written: the reference keeps it with the command and writes it back.
     pub comment: Option<String>,
+    /// When the command made it, among every path exception (`set_false_path`,
+    /// `set_multicycle_path`, `set_max_delay` / `set_min_delay`, `group_path`, `set_path_margin`):
+    /// the reference numbers its exceptions in that one order (`Sdc::recordException`, the id a
+    /// tag's states are ranked by). `None`: left by a `-reset_path` (the reference re-adds those
+    /// at the reset, and may merge them) or made by hand.
+    pub seq: Option<usize>,
 }
 
 /// A command's tokens split into flags with a value (from `valued`), flags without one, and
@@ -901,6 +913,9 @@ pub struct Sdc {
     /// Every `group_path` and `set_path_margin`, in file order: the reference's other path
     /// exceptions, which a reset reaches as it reaches a false path (still in [`Sdc::ignored`]).
     pub other_exceptions: Vec<ExceptionCmd>,
+    /// How many path exceptions the commands made, in the order made: the next one's
+    /// [`Exception::seq`] / [`PathDelayCmd::seq`] / [`ExceptionCmd::seq`].
+    pub exceptions_made: usize,
     /// Every command the reference reads that has no typed model here, kept as written, in file
     /// order — see [`KeptCmd`] (each still in [`Sdc::ignored`]).
     pub kept: Vec<KeptCmd>,
@@ -3683,6 +3698,12 @@ impl Sdc {
 
     /// An exception command's `-reset_path`: its reset runs first (see [`Sdc::reset_path`]); a
     /// reset only the design can decide is listed in [`Sdc::rejected`], the exception still made.
+    /// The next path exception's creation number (`++exception_id_`).
+    fn next_exception_seq(&mut self) -> Option<usize> {
+        self.exceptions_made += 1;
+        Some(self.exceptions_made)
+    }
+
     fn reset_path_first(&mut self, toks: &[String], args: &[(String, Objects)], flags: &[String], both_checks: bool) {
         if flags.iter().any(|f| f == "-reset_path") {
             if let Err(why) = self.reset_path(args, flags, both_checks) {
@@ -4389,12 +4410,14 @@ impl Sdc {
                     let value = pos.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(f64::NAN);
                     let objects: Vec<(String, Objects)> = with.iter().filter(|(k, _)| *k != "-comment").map(|(k, v)| (k.to_string(), Objects::of(v))).collect();
                     sdc.reset_path_first(&toks, &objects, &flags, true);
+                    let seq = sdc.next_exception_seq();
                     sdc.path_delays.push(PathDelayCmd {
                         max: toks[0] == "set_max_delay",
                         value,
                         objects,
                         flags,
                         comment: comment_of(&toks),
+                        seq,
                     });
                     sdc.ignored.push(toks[0].clone());
                 }
@@ -4601,7 +4624,8 @@ impl Sdc {
                     let (args, flags) = exception_args(&toks);
                     sdc.reset_path_first(&toks, &args, &flags, false);
                     sdc.exception_objects.push(exception_sides(&toks));
-                    sdc.exceptions.push(Exception { kind: ExcKind::FalsePath, from, to, refused, args, flags, comment: comment_of(&toks), ..Default::default() });
+                    let seq = sdc.next_exception_seq();
+                    sdc.exceptions.push(Exception { kind: ExcKind::FalsePath, from, to, refused, args, flags, comment: comment_of(&toks), seq, ..Default::default() });
                 }
                 "set_multicycle_path" => {
                     if let Some(why) = empty_exception_side(&toks) {
@@ -4627,6 +4651,7 @@ impl Sdc {
                     let (args, written_flags) = exception_args(&toks);
                     sdc.reset_path_first(&toks, &args, &written_flags, false);
                     sdc.exception_objects.push(exception_sides(&toks));
+                    let seq = sdc.next_exception_seq();
                     sdc.exceptions.push(Exception {
                         kind: ExcKind::Multicycle(n.unwrap_or(1)),
                         from,
@@ -4637,6 +4662,7 @@ impl Sdc {
                         args,
                         flags: written_flags,
                         comment: comment_of(&toks),
+                        seq,
                     });
                 }
                 cmd if kept::KEPT_COMMANDS.contains(&cmd) => {
@@ -4652,7 +4678,10 @@ impl Sdc {
                         continue;
                     }
                     match kept::exception_cmd(&toks) {
-                        Ok(x) => sdc.other_exceptions.push(x),
+                        Ok(mut x) => {
+                            x.seq = sdc.next_exception_seq();
+                            sdc.other_exceptions.push(x);
+                        }
                         Err(why) => sdc.rejected.push(format!("{cmd}: {why}; not applied")),
                     }
                     sdc.ignored.push(cmd.to_string());
@@ -6318,6 +6347,44 @@ mod exception_rule_tests {
 
     fn exc(cmd: &str) -> Exception {
         Sdc::parse(&format!("create_clock -name c -period 10 [get_ports clk]\n{cmd}\n")).unwrap().exceptions.remove(0)
+    }
+
+    /// Upstream rule (`Sdc::recordException`: `setId(++exception_id_)` for every exception, of
+    /// any type): path exceptions are numbered in ONE order, the order the commands make them —
+    /// a false path, a group path, a path delay and a multicycle path share the count. A command
+    /// whose side matches nothing makes none (Warning 471/473) and takes no number; an exception
+    /// left by `-reset_path` is re-added at the reset and carries none here.
+    #[test]
+    fn path_exceptions_are_numbered_in_one_creation_order_across_their_kinds() {
+        let s = Sdc::parse(
+            "create_clock -name c -period 10 [get_ports clk]\n\
+             group_path -name g1 -from [get_ports a]\n\
+             set_false_path -from [get_ports b]\n\
+             set_false_path -from [list]\n\
+             set_max_delay 3 -from [get_ports c]\n\
+             group_path -name g2 -to [get_ports d]\n\
+             set_multicycle_path 2 -from [get_ports e]\n",
+        )
+        .unwrap();
+        let groups: Vec<_> = s.other_exceptions.iter().map(|x| x.seq).collect();
+        assert_eq!(groups, [Some(1), Some(4)], "group paths");
+        let excs: Vec<_> = s.exceptions.iter().map(|e| e.seq).collect();
+        assert_eq!(excs, [Some(2), Some(5)], "false path, then multicycle (the empty one takes no number)");
+        assert_eq!(s.path_delays.iter().map(|p| p.seq).collect::<Vec<_>>(), [Some(3)], "path delay");
+        assert_eq!(s.exceptions_made, 5);
+    }
+
+    /// A `-reset_path` that leaves part of an exception: the part is re-made at the reset by the
+    /// reference (new ids, possibly merged), so its creation number is not claimed here.
+    #[test]
+    fn what_a_reset_leaves_carries_no_creation_number() {
+        let s = Sdc::parse(
+            "create_clock -name c -period 10 [get_ports clk]\n\
+             set_false_path -from [list [get_ports a] [get_ports b]]\n\
+             set_false_path -reset_path -from [get_ports a]\n",
+        )
+        .unwrap();
+        assert!(s.exceptions.iter().any(|e| e.seq.is_none()), "the residue of the first: {:?}", s.exceptions.iter().map(|e| (&e.from, e.seq)).collect::<Vec<_>>());
     }
 
     /// A `-through` list and a wildcard pin pattern cannot be expressed at instance level: they

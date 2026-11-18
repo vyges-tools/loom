@@ -1008,7 +1008,7 @@ fn exception_over(e: &Exception, args: Vec<(String, Objects)>) -> (Exception, [V
     let (from, rf) = reduce_exception_objects(&sides[0]);
     let (to, rt) = reduce_exception_objects(&sides[1]);
     let multiplier = e.refused.clone().filter(|r| r.starts_with("multiplier"));
-    let x = Exception { from, to, refused: refused.or(rf).or(rt).or(multiplier), args, ..e.clone() };
+    let x = Exception { from, to, refused: refused.or(rf).or(rt).or(multiplier), args, seq: None, ..e.clone() };
     (x, sides)
 }
 
@@ -1083,7 +1083,7 @@ impl Sdc {
             let min_max = if p.max { Both(true, false) } else { Both(false, true) };
             match reset_one(&shape_of(&p.objects, &p.flags, min_max))? {
                 None => path_delays.push(p.clone()),
-                Some(rest) => path_delays.extend(rest.iter().map(|s| PathDelayCmd { objects: shape_args(s), ..p.clone() })),
+                Some(rest) => path_delays.extend(rest.iter().map(|s| PathDelayCmd { objects: shape_args(s), seq: None, ..p.clone() })),
             }
         }
         // `group_path` (both checks) and `set_path_margin` (its own) are exceptions to a reset too
@@ -1092,7 +1092,7 @@ impl Sdc {
             let min_max = if x.cmd == "group_path" { Both::ALL } else { check_of(&x.flags) };
             match reset_one(&shape_of(&x.args, &x.flags, min_max))? {
                 None => others.push(x.clone()),
-                Some(rest) => others.extend(rest.iter().map(|s| super::ExceptionCmd { args: shape_args(s), ..x.clone() })),
+                Some(rest) => others.extend(rest.iter().map(|s| super::ExceptionCmd { args: shape_args(s), seq: None, ..x.clone() })),
             }
         }
         self.exceptions = exceptions;
