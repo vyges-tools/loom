@@ -276,42 +276,89 @@ fn keyword(t: &str) -> Option<&'static str> {
 
 /// The file's tokens: whitespace-separated, with `//` and `/* */` comments removed, a quoted
 /// string kept whole, and a backslash escaping the next character (so `a\ b` is one name).
-fn tokens(text: &str) -> Vec<&str> {
-    let b = text.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        let c = b[i];
-        if c.is_ascii_whitespace() {
-            i += 1;
-        } else if c == b'/' && b.get(i + 1) == Some(&b'/') {
-            while i < b.len() && b[i] != b'\n' {
+///
+/// Lexed on demand, a window at a time: the reader only moves forward and looks a few tokens
+/// ahead, so the tokens behind its cursor are dropped ([`Lexer::release`]). Collected up front,
+/// the whole file's token list was the largest thing the read held: 23 GB of `&str` for a
+/// 7 GB SPEF (CoralNPU, ASAP7), against 7 GB for the text itself.
+struct Lexer<'a> {
+    text: &'a str,
+    pos: usize,
+    /// tokens `base..base + win.len()`
+    win: std::collections::VecDeque<&'a str>,
+    base: usize,
+}
+
+impl<'a> Lexer<'a> {
+    fn new(text: &'a str) -> Self {
+        Lexer { text, pos: 0, win: std::collections::VecDeque::new(), base: 0 }
+    }
+
+    /// The next token after `pos`, or `None` at the end of the text.
+    fn lex(&mut self) -> Option<&'a str> {
+        let text = self.text;
+        let b = text.as_bytes();
+        let mut i = self.pos;
+        let tok = loop {
+            if i >= b.len() {
+                break None;
+            }
+            let c = b[i];
+            if c.is_ascii_whitespace() {
                 i += 1;
-            }
-        } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
-            i += 2;
-            while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+            } else if c == b'/' && b.get(i + 1) == Some(&b'/') {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+                i += 2;
+                while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+            } else if c == b'"' {
+                let s0 = i;
                 i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i = (i + 1).min(b.len());
+                break Some(&text[s0..i]);
+            } else {
+                let s0 = i;
+                while i < b.len() && !b[i].is_ascii_whitespace() {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i = i.min(b.len());
+                break Some(&text[s0..i]);
             }
-            i = (i + 2).min(b.len());
-        } else if c == b'"' {
-            let s0 = i;
-            i += 1;
-            while i < b.len() && b[i] != b'"' {
-                i += if b[i] == b'\\' { 2 } else { 1 };
+        };
+        self.pos = i;
+        tok
+    }
+
+    /// Token `idx` of the file. `idx` must not be behind the last [`Lexer::release`].
+    fn get(&mut self, idx: usize) -> Option<&'a str> {
+        debug_assert!(idx >= self.base, "token {idx} was released (window starts at {})", self.base);
+        while self.base + self.win.len() <= idx {
+            let t = self.lex()?;
+            self.win.push_back(t);
+        }
+        self.win.get(idx - self.base).copied()
+    }
+
+    /// Drop every token before `idx`: the reader will not look back.
+    fn release(&mut self, idx: usize) {
+        while self.base < idx && self.win.pop_front().is_some() {
+            self.base += 1;
+        }
+        // tokens skipped without being looked at were never lexed into the window
+        if self.base < idx && self.win.is_empty() {
+            while self.base < idx && self.lex().is_some() {
+                self.base += 1;
             }
-            i = (i + 1).min(b.len());
-            out.push(&text[s0..i]);
-        } else {
-            let s0 = i;
-            while i < b.len() && !b[i].is_ascii_whitespace() {
-                i += if b[i] == b'\\' { 2 } else { 1 };
-            }
-            i = i.min(b.len());
-            out.push(&text[s0..i]);
         }
     }
-    out
 }
 
 /// A value in this reader's units (fF, Ω), with the reference's PRECISION: the first field of a
@@ -868,8 +915,7 @@ impl Spef {
     /// `*CAP` section on one line, or a statement across several. Read line by line, a net whose
     /// header and pins shared a line lost its pins, and two caps on one line lost the second.
     pub fn parse(text: &str) -> Spef {
-        let toks = tokens(text);
-        let n = toks.len();
+        let mut toks = Lexer::new(text);
         // The reader's own state. `cur` is the net whose block we are in: (name, serial, rc).
         let mut c_scale = 1.0f64;
         let mut r_scale = 1.0f64;
@@ -906,8 +952,9 @@ impl Spef {
         };
 
         let mut i = 0;
-        while i < n {
-            let t = toks[i];
+        loop {
+            toks.release(i);
+            let Some(t) = toks.get(i) else { break };
             let kw = keyword(t);
             // Inside a block this reader does not model, only the block's end (or, leniently, the
             // start of another block) matters: its `*CONN`/`*CAP`/`*RC` must not be read as a
@@ -920,7 +967,7 @@ impl Spef {
                 i += 1;
                 match kw {
                     "*C_UNIT" | "*R_UNIT" | "*T_UNIT" | "*L_UNIT" => {
-                        let scale = toks.get(i).and_then(|v| parse_val(v)).unwrap_or(1.0) as f32 as f64;
+                        let scale = toks.get(i).and_then(parse_val).unwrap_or(1.0) as f32 as f64;
                         let unit = toks.get(i + 1).map(|u| u.to_ascii_uppercase()).unwrap_or_default();
                         // NF and MOHM are not SPEF units; the reference warns and keeps a scale of
                         // 1 — reading the values as farads and ohms. Scaling them is kept here as
@@ -952,8 +999,8 @@ impl Spef {
                     "*D_NET" => {
                         finish(&mut cur, &mut nets, &mut winner);
                         serial += 1;
-                        let idtok = toks.get(i).copied().unwrap_or("");
-                        let total = toks.get(i + 1).copied().unwrap_or("");
+                        let idtok = toks.get(i).unwrap_or("");
+                        let total = toks.get(i + 1).unwrap_or("");
                         triplets |= is_triplet(total);
                         i += 2;
                         match (resolve(idtok, &names), node_tok(idtok, &names, delim)) {
@@ -1034,13 +1081,13 @@ impl Spef {
                         i += 1;
                         continue;
                     }
-                    let node = toks.get(i + 1).copied().unwrap_or("");
+                    let node = toks.get(i + 1).unwrap_or("");
                     i += 2;
                     // `*N <node> *C x y` gives an internal node's coordinates: nothing to keep
                     let dir = if up == "*N" {
                         None
                     } else {
-                        match toks.get(i).copied() {
+                        match toks.get(i) {
                             Some(d @ ("I" | "O" | "B")) => {
                                 i += 1;
                                 Some(d)
@@ -1104,10 +1151,10 @@ impl Spef {
                         i += 1;
                         continue;
                     }
-                    let a = toks.get(i + 1).copied().unwrap_or("");
-                    let b = toks.get(i + 2).copied().unwrap_or("");
+                    let a = toks.get(i + 1).unwrap_or("");
+                    let b = toks.get(i + 2).unwrap_or("");
                     let grounded = sect == Sect::Cap && parse_val(b).is_some();
-                    let vt = if grounded { b } else { toks.get(i + 3).copied().unwrap_or("") };
+                    let vt = if grounded { b } else { toks.get(i + 3).unwrap_or("") };
                     i += if grounded { 3 } else { 4 };
                     let scale = if sect == Sect::Cap { c_scale } else { r_scale };
                     let Some(v) = read_scaled(vt, scale) else {
@@ -2273,3 +2320,77 @@ mod reference_rule_tests {
         assert!(Spef::parse(&format!("{HEAD}{BODY}").replace("*1 n1", "*1 \"n1\"")).nets.contains_key("n1"));
     }
 }
+
+#[cfg(test)]
+mod lexer_rule {
+    use super::Lexer;
+
+    /// The tokenizer as it was, collecting the whole file: the oracle the lexer must equal.
+    fn tokens(text: &str) -> Vec<&str> {
+        let b = text.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i];
+            if c.is_ascii_whitespace() {
+                i += 1;
+            } else if c == b'/' && b.get(i + 1) == Some(&b'/') {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+                i += 2;
+                while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+            } else if c == b'"' {
+                let s0 = i;
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i = (i + 1).min(b.len());
+                out.push(&text[s0..i]);
+            } else {
+                let s0 = i;
+                while i < b.len() && !b[i].is_ascii_whitespace() {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i = i.min(b.len());
+                out.push(&text[s0..i]);
+            }
+        }
+        out
+    }
+
+    const TRICKY: &str = "*SPEF \"IEEE 1481\" // a comment *D_NET x 1\n*NAME_MAP\n*1 a\\ b /* block\n comment */ *2 \"q \\\" s\"\n*D_NET *1 0.5\n*CONN *I *1:A I *C 1 2\n*CAP 1 *1:A 0.1\n*END\n  trailing\\";
+
+    /// Rule: the streaming lexer yields the SAME tokens, in order, as collecting the file did:
+    /// comments dropped, quoted strings whole, a backslash escaping the next character.
+    #[test]
+    fn the_lexer_yields_the_collected_tokens() {
+        let want = tokens(TRICKY);
+        let mut lx = Lexer::new(TRICKY);
+        let got: Vec<&str> = (0..).map_while(|k| lx.get(k)).collect();
+        assert_eq!(got, want);
+        assert!(want.len() > 20, "the fixture must exercise the lexer: {want:?}");
+    }
+
+    /// Rule: the reader only moves forward. Released tokens are dropped, including ones it
+    /// skipped without looking at, and a later index still names the same token.
+    #[test]
+    fn release_drops_the_tokens_behind_and_keeps_the_numbering() {
+        let want = tokens(TRICKY);
+        let mut lx = Lexer::new(TRICKY);
+        assert_eq!(lx.get(2), Some(want[2]));
+        lx.release(7); // past the window: tokens 3..7 are lexed and dropped unseen
+        assert_eq!(lx.win.len(), 0);
+        assert_eq!(lx.get(9), Some(want[9]));
+        assert_eq!(lx.get(7), Some(want[7]));
+        lx.release(9);
+        assert_eq!(lx.win.len(), 1);
+        assert_eq!(lx.get(want.len()), None);
+    }
+}
+
