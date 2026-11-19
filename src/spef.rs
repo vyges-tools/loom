@@ -426,7 +426,7 @@ fn escape(s: &str) -> String {
 /// (The reader does keep the node each capacitor came off — see `NetRc::coupling_nodes` — but
 /// the caller has already summed the window-overlapping aggressors by the time it gets here.
 /// Passing that through per node would be better still, and needs the caller to change too.)
-fn spread_xtalk<N: RcNet>(cap: &mut HashMap<N::K, f64>, net: &N, driver: N::K, xtalk_cap_ff: f64) {
+fn spread_xtalk<N: RcNet>(cap: &mut WalkMap<N::K, f64>, net: &N, driver: N::K, xtalk_cap_ff: f64) {
     if xtalk_cap_ff == 0.0 {
         return;
     }
@@ -440,6 +440,51 @@ fn spread_xtalk<N: RcNet>(cap: &mut HashMap<N::K, f64>, net: &N, driver: N::K, x
         *cap.entry(driver).or_default() += xtalk_cap_ff;
     }
 }
+
+/// The hasher of the delay walks' own maps (a net's nodes, its resistors). Those maps are only
+/// ever looked up, never iterated, so the hasher cannot reach a result; SipHash's resistance to
+/// chosen keys buys nothing on a file's node ids and was most of a walk's time. Fx-style: one
+/// rotate, xor and multiply per word.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct WalkHasher(u64);
+
+impl WalkHasher {
+    fn add(&mut self, w: u64) {
+        self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl std::hash::Hasher for WalkHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        let (words, rest) = bytes.as_chunks::<8>();
+        for w in words {
+            self.add(u64::from_le_bytes(*w));
+        }
+        if !rest.is_empty() {
+            let mut w = [0u8; 8];
+            w[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(w));
+        }
+    }
+    fn write_u8(&mut self, i: u8) {
+        self.add(i as u64);
+    }
+    fn write_u32(&mut self, i: u32) {
+        self.add(i as u64);
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+}
+
+type WalkMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<WalkHasher>>;
+type WalkSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<WalkHasher>>;
 
 /// The RC network of one net as the delay walks read it: grounded caps, resistors and coupling
 /// caps on this net's own nodes, each in file order, with nodes as `K` — a node NAME for
@@ -495,7 +540,7 @@ pub fn elmore_of<N: RcNet>(net: &N, driver: N::K, xtalk_cap_ff: f64, pin_cap: im
     let mut cap = node_caps_of(net, driver, xtalk_cap_ff, pin_cap)?;
     // Each node's resistors in file order, each resistor under both its ends, as the
     // reference's parasitic network lists them.
-    let mut rmap: HashMap<N::K, Vec<usize>> = HashMap::new();
+    let mut rmap: WalkMap<N::K, Vec<usize>> = WalkMap::default();
     for k in 0..net.n_res() {
         let (a, b, _) = net.res(k);
         rmap.entry(a).or_default().push(k);
@@ -519,12 +564,12 @@ pub fn elmore_of<N: RcNet>(net: &N, driver: N::K, xtalk_cap_ff: f64, pin_cap: im
     fn down<K: Copy + Eq + std::hash::Hash>(
         node: K,
         from: Option<usize>,
-        rmap: &HashMap<K, Vec<usize>>,
-        cap: &HashMap<K, f64>,
+        rmap: &WalkMap<K, Vec<usize>>,
+        cap: &WalkMap<K, f64>,
         other: &dyn Fn(usize, K) -> K,
-        on_path: &mut std::collections::HashSet<K>,
-        loops: &mut std::collections::HashSet<usize>,
-        dwn: &mut HashMap<K, f64>,
+        on_path: &mut WalkSet<K>,
+        loops: &mut WalkSet<usize>,
+        dwn: &mut WalkMap<K, f64>,
     ) -> f64 {
         let mut d = cap.get(&node).copied().unwrap_or(0.0);
         on_path.insert(node);
@@ -553,11 +598,11 @@ pub fn elmore_of<N: RcNet>(net: &N, driver: N::K, xtalk_cap_ff: f64, pin_cap: im
         from: Option<usize>,
         elmore: f64,
         res: &dyn Fn(usize) -> f64,
-        rmap: &HashMap<K, Vec<usize>>,
+        rmap: &WalkMap<K, Vec<usize>>,
         other: &dyn Fn(usize, K) -> K,
-        dwn: &HashMap<K, f64>,
-        loops: &std::collections::HashSet<usize>,
-        on_path: &mut std::collections::HashSet<K>,
+        dwn: &WalkMap<K, f64>,
+        loops: &WalkSet<usize>,
+        on_path: &mut WalkSet<K>,
         delay: &mut Vec<(K, f64)>,
     ) {
         delay.push((node, elmore));
@@ -577,7 +622,7 @@ pub fn elmore_of<N: RcNet>(net: &N, driver: N::K, xtalk_cap_ff: f64, pin_cap: im
         }
         on_path.remove(&node);
     }
-    let (mut on_path, mut loops, mut dwn) = (std::collections::HashSet::new(), std::collections::HashSet::new(), HashMap::new());
+    let (mut on_path, mut loops, mut dwn) = (WalkSet::default(), WalkSet::default(), WalkMap::default());
     down(driver, None, &rmap, &cap, &other, &mut on_path, &mut loops, &mut dwn);
     let mut delay: Vec<(N::K, f64)> = Vec::new();
     let res_of = |k: usize| net.res(k).2;
@@ -593,7 +638,7 @@ pub fn transient_of<N: RcNet>(net: &N, driver: N::K, driver_slew_ns: f64, xtalk_
     if net.n_res() == 0 {
         return None;
     }
-    let mut cap: HashMap<N::K, f64> = HashMap::new();
+    let mut cap: WalkMap<N::K, f64> = WalkMap::default();
     for i in 0..net.n_ground() {
         let (n, c) = net.ground(i);
         *cap.entry(n).or_default() += c;
@@ -733,7 +778,7 @@ pub fn transient_of<N: RcNet>(net: &N, driver: N::K, driver_slew_ns: f64, xtalk_
 /// [`NetRc::pi_reduce`] on any [`RcNet`].
 pub fn pi_reduce_of<N: RcNet>(net: &N, driver: N::K, xtalk_cap_ff: f64, pin_cap: impl Fn(N::K) -> Option<f64>) -> Option<(f64, f64, f64)> {
     let cap = node_caps_of(net, driver, xtalk_cap_ff, pin_cap)?;
-    let mut adj: HashMap<N::K, Vec<(N::K, f64)>> = HashMap::new();
+    let mut adj: WalkMap<N::K, Vec<(N::K, f64)>> = WalkMap::default();
     for k in 0..net.n_res() {
         let (a, b, r) = net.res(k);
         adj.entry(a).or_default().push((b, r));
@@ -754,9 +799,9 @@ pub fn pi_reduce_of<N: RcNet>(net: &N, driver: N::K, xtalk_cap_ff: f64, pin_cap:
     fn dfs<K: Copy + Eq + std::hash::Hash>(
         node: K,
         from: Option<K>,
-        adj: &HashMap<K, Vec<(K, f64)>>,
-        cap: &HashMap<K, f64>,
-        seen: &mut std::collections::HashSet<K>,
+        adj: &WalkMap<K, Vec<(K, f64)>>,
+        cap: &WalkMap<K, f64>,
+        seen: &mut WalkSet<K>,
     ) -> (f64, f64, f64) {
         let mut y1 = cap.get(&node).copied().unwrap_or(0.0);
         let (mut y2, mut y3) = (0.0f64, 0.0f64);
@@ -773,7 +818,7 @@ pub fn pi_reduce_of<N: RcNet>(net: &N, driver: N::K, xtalk_cap_ff: f64, pin_cap:
         }
         (y1, y2, y3)
     }
-    let mut seen: std::collections::HashSet<N::K> = std::collections::HashSet::new();
+    let mut seen: WalkSet<N::K> = WalkSet::default();
     seen.insert(driver);
     let (y1, y2, y3) = dfs(driver, None, &adj, &cap, &mut seen);
     // closed form, verbatim from `ReduceToPi::reduceToPi`; c1/c2/rpi are float outputs
@@ -791,8 +836,8 @@ pub fn pi_reduce_of<N: RcNet>(net: &N, driver: N::K, xtalk_cap_ff: f64, pin_cap:
 
 /// Each node's capacitance as the delay walks see it (see [`NetRc::elmore`]); `pin_cap` gives a
 /// load pin's receiver capacitance at its node.
-fn node_caps_of<N: RcNet>(net: &N, driver: N::K, xtalk_cap_ff: f64, pin_cap: impl Fn(N::K) -> Option<f64>) -> Option<HashMap<N::K, f64>> {
-    let mut cap: HashMap<N::K, f64> = HashMap::new();
+fn node_caps_of<N: RcNet>(net: &N, driver: N::K, xtalk_cap_ff: f64, pin_cap: impl Fn(N::K) -> Option<f64>) -> Option<WalkMap<N::K, f64>> {
+    let mut cap: WalkMap<N::K, f64> = WalkMap::default();
     for i in 0..net.n_ground() {
         let (node, c) = net.ground(i);
         *cap.entry(node).or_default() += c;
@@ -821,7 +866,7 @@ fn node_caps_of<N: RcNet>(net: &N, driver: N::K, xtalk_cap_ff: f64, pin_cap: imp
     }
     // each load pin's receiver cap, once, on a node the network holds (a grounded cap's or a
     // resistor end's)
-    let mut done: std::collections::HashSet<N::K> = std::collections::HashSet::new();
+    let mut done: WalkSet<N::K> = WalkSet::default();
     let nodes = (0..net.n_ground()).map(|i| net.ground(i).0).chain((0..net.n_res()).flat_map(|k| {
         let (a, b, _) = net.res(k);
         [a, b]
@@ -2394,3 +2439,28 @@ mod lexer_rule {
     }
 }
 
+
+#[cfg(test)]
+mod walk_hasher_rule {
+    use super::WalkHasher;
+    use std::hash::{BuildHasher, BuildHasherDefault};
+
+    /// The walks' maps take a file's node ids, which are dense and sequential. The hasher must
+    /// spread them over the table's control bits (the top 7) and its bucket bits (the low ones),
+    /// or every lookup degrades to a scan. Results cannot depend on it: the maps are never
+    /// iterated (see `WalkHasher`).
+    #[test]
+    fn sequential_node_ids_spread_over_the_top_and_low_bits() {
+        let b = BuildHasherDefault::<WalkHasher>::default();
+        let mut top = std::collections::HashSet::new();
+        let mut low = std::collections::HashSet::new();
+        for id in 0u32..4096 {
+            let h = b.hash_one(id);
+            top.insert(h >> 57);
+            low.insert(h & 0xfff);
+        }
+        assert_eq!(top.len(), 128, "all top-7-bit tags used");
+        assert!(low.len() > 2048, "low bits spread: {}", low.len());
+        assert_ne!(b.hash_one("n1"), b.hash_one("n2"));
+    }
+}
