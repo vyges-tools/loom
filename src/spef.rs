@@ -51,6 +51,9 @@
 use crate::names::unescape;
 use std::collections::{BTreeMap, HashMap};
 
+pub mod compact;
+pub use compact::{load_compact, parse_compact, CompactNet, CompactSpef};
+
 #[derive(Debug, Clone, Default)]
 pub struct NetRc {
     /// Total cap, grounded + coupling, as the caps SUM — the `*D_NET` total only for a net that
@@ -376,23 +379,414 @@ fn escape(s: &str) -> String {
 /// (The reader does keep the node each capacitor came off — see `NetRc::coupling_nodes` — but
 /// the caller has already summed the window-overlapping aggressors by the time it gets here.
 /// Passing that through per node would be better still, and needs the caller to change too.)
-fn spread_xtalk<'a>(
-    cap: &mut HashMap<&'a str, f64>,
-    ground: &'a [(String, f64)],
-    driver: &'a str,
-    xtalk_cap_ff: f64,
-) {
+fn spread_xtalk<N: RcNet>(cap: &mut HashMap<N::K, f64>, net: &N, driver: N::K, xtalk_cap_ff: f64) {
     if xtalk_cap_ff == 0.0 {
         return;
     }
-    let total: f64 = ground.iter().map(|(_, c)| *c).sum();
+    let total: f64 = (0..net.n_ground()).map(|i| net.ground(i).1).sum();
     if total > 0.0 {
-        for (n, c) in ground {
-            *cap.entry(n.as_str()).or_default() += xtalk_cap_ff * (c / total);
+        for i in 0..net.n_ground() {
+            let (n, c) = net.ground(i);
+            *cap.entry(n).or_default() += xtalk_cap_ff * (c / total);
         }
     } else {
         *cap.entry(driver).or_default() += xtalk_cap_ff;
     }
+}
+
+/// The RC network of one net as the delay walks read it: grounded caps, resistors and coupling
+/// caps on this net's own nodes, each in file order, with nodes as `K` — a node NAME for
+/// [`NetRc`], an interned id for [`compact::CompactNet`]. One implementation of each walk
+/// ([`elmore_of`], [`transient_of`], [`pi_reduce_of`]) serves both, so the two forms cannot
+/// drift apart: same nodes, same order, same arithmetic, the same bits.
+pub trait RcNet {
+    type K: Copy + Eq + std::hash::Hash;
+    fn n_ground(&self) -> usize;
+    fn ground(&self, i: usize) -> (Self::K, f64);
+    fn n_res(&self) -> usize;
+    fn res(&self, i: usize) -> (Self::K, Self::K, f64);
+    fn n_cc(&self) -> usize;
+    /// a coupling capacitor's node on THIS net and its value
+    fn cc_own(&self, i: usize) -> (Self::K, f64);
+}
+
+impl<'a> RcNet for &'a NetRc {
+    type K = &'a str;
+    fn n_ground(&self) -> usize {
+        self.ground.len()
+    }
+    fn ground(&self, i: usize) -> (&'a str, f64) {
+        let n: &'a NetRc = self;
+        (n.ground[i].0.as_str(), n.ground[i].1)
+    }
+    fn n_res(&self) -> usize {
+        self.res.len()
+    }
+    fn res(&self, i: usize) -> (&'a str, &'a str, f64) {
+        let n: &'a NetRc = self;
+        let (a, b, r) = &n.res[i];
+        (a.as_str(), b.as_str(), *r)
+    }
+    fn n_cc(&self) -> usize {
+        self.coupling_nodes.len()
+    }
+    fn cc_own(&self, i: usize) -> (&'a str, f64) {
+        let n: &'a NetRc = self;
+        (n.coupling_nodes[i].1.as_str(), n.coupling_nodes[i].3)
+    }
+}
+
+/// [`NetRc::elmore`] on any [`RcNet`]: each node's Elmore time constant in the walk's order (a node
+/// the walk reaches twice is listed twice; a map of it keeps the later value, as `elmore` does).
+pub fn elmore_of<N: RcNet>(net: &N, driver: N::K, xtalk_cap_ff: f64, pin_cap: impl Fn(N::K) -> Option<f64>) -> Option<Vec<(N::K, f64)>> {
+    if net.n_res() == 0 {
+        return None;
+    }
+    // node capacitances
+    // Same node capacitances the Pi reduction sees — one source, so the two walks
+    // cannot drift apart.
+    let mut cap = node_caps_of(net, driver, xtalk_cap_ff, pin_cap)?;
+    // Each node's resistors in file order, each resistor under both its ends, as the
+    // reference's parasitic network lists them.
+    let mut rmap: HashMap<N::K, Vec<usize>> = HashMap::new();
+    for k in 0..net.n_res() {
+        let (a, b, _) = net.res(k);
+        rmap.entry(a).or_default().push(k);
+        rmap.entry(b).or_default().push(k);
+        cap.entry(a).or_default();
+        cap.entry(b).or_default();
+    }
+    if !rmap.contains_key(&driver) {
+        return None;
+    }
+    let other = |k: usize, node: N::K| -> N::K {
+        let (a, b, _) = net.res(k);
+        if a == node { b } else { a }
+    };
+    // `ReduceToPi::reducePiDfs`, the part the delays need: depth first from the driver, each
+    // node's DOWNSTREAM capacitance; a resistor back to a node on the current path is a loop
+    // and is never walked again. A resistor whose two ends are one node (an extractor's — and
+    // every placement estimate's driver — self-resistor) and the one just come over are
+    // skipped. The walk is the reference's spanning tree, in its order.
+    #[allow(clippy::too_many_arguments)]
+    fn down<K: Copy + Eq + std::hash::Hash>(
+        node: K,
+        from: Option<usize>,
+        rmap: &HashMap<K, Vec<usize>>,
+        cap: &HashMap<K, f64>,
+        other: &dyn Fn(usize, K) -> K,
+        on_path: &mut std::collections::HashSet<K>,
+        loops: &mut std::collections::HashSet<usize>,
+        dwn: &mut HashMap<K, f64>,
+    ) -> f64 {
+        let mut d = cap.get(&node).copied().unwrap_or(0.0);
+        on_path.insert(node);
+        for &k in rmap.get(&node).map(|v| v.as_slice()).unwrap_or(&[]) {
+            if loops.contains(&k) {
+                continue;
+            }
+            let o = other(k, node);
+            if o != node && Some(k) != from {
+                if on_path.contains(&o) {
+                    loops.insert(k);
+                } else {
+                    d += down(o, Some(k), rmap, cap, other, on_path, loops, dwn);
+                }
+            }
+        }
+        dwn.insert(node, d);
+        on_path.remove(&node);
+        d
+    }
+    // `ReduceToPiElmore::reduceElmoreDfs`: the second walk, each node's Elmore delay from its
+    // parent's and the resistor times the node's downstream capacitance.
+    #[allow(clippy::too_many_arguments)]
+    fn elm<K: Copy + Eq + std::hash::Hash>(
+        node: K,
+        from: Option<usize>,
+        elmore: f64,
+        res: &dyn Fn(usize) -> f64,
+        rmap: &HashMap<K, Vec<usize>>,
+        other: &dyn Fn(usize, K) -> K,
+        dwn: &HashMap<K, f64>,
+        loops: &std::collections::HashSet<usize>,
+        on_path: &mut std::collections::HashSet<K>,
+        delay: &mut Vec<(K, f64)>,
+    ) {
+        delay.push((node, elmore));
+        on_path.insert(node);
+        for &k in rmap.get(&node).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let o = other(k, node);
+            if Some(k) != from && !on_path.contains(&o) && !loops.contains(&k) {
+                // ⛔ TYPES, from the reference (see `cpp-to-rust-numeric-reference.md` §1):
+                //   `double onode_elmore = elmore + r * downstreamCap(onode);`
+                // where BOTH `Parasitics::value(ParasiticResistor*)` and
+                // `ReduceToPi::downstreamCap` return **float**. So the per-step increment is
+                // an f32 multiply — about 7 significant digits — and only the running sum is
+                // double.
+                let inc = (res(k) as f32 * dwn[&o] as f32) as f64 * 1e-6; // R[Ω]·C[fF] -> ns
+                elm(o, Some(k), elmore + inc, res, rmap, other, dwn, loops, on_path, delay);
+            }
+        }
+        on_path.remove(&node);
+    }
+    let (mut on_path, mut loops, mut dwn) = (std::collections::HashSet::new(), std::collections::HashSet::new(), HashMap::new());
+    down(driver, None, &rmap, &cap, &other, &mut on_path, &mut loops, &mut dwn);
+    let mut delay: Vec<(N::K, f64)> = Vec::new();
+    let res_of = |k: usize| net.res(k).2;
+    elm(driver, None, 0.0, &res_of, &rmap, &other, &dwn, &loops, &mut on_path, &mut delay);
+    Some(delay)
+}
+
+/// Each node's (delay, slew), in the walk's order.
+pub type NodeWaves<K> = Vec<(K, (f64, f64))>;
+
+/// [`NetRc::transient`] on any [`RcNet`]: each node's (delay, slew) in the walk's order.
+pub fn transient_of<N: RcNet>(net: &N, driver: N::K, driver_slew_ns: f64, xtalk_cap_ff: f64, th: crate::liberty::Thresholds) -> Option<NodeWaves<N::K>> {
+    if net.n_res() == 0 {
+        return None;
+    }
+    let mut cap: HashMap<N::K, f64> = HashMap::new();
+    for i in 0..net.n_ground() {
+        let (n, c) = net.ground(i);
+        *cap.entry(n).or_default() += c;
+    }
+    spread_xtalk(&mut cap, net, driver, xtalk_cap_ff);
+    let mut adj: HashMap<N::K, Vec<(N::K, f64)>> = HashMap::new();
+    for k in 0..net.n_res() {
+        let (a, b, r) = net.res(k);
+        adj.entry(a).or_default().push((b, r));
+        adj.entry(b).or_default().push((a, r));
+        cap.entry(a).or_default();
+        cap.entry(b).or_default();
+    }
+    if !adj.contains_key(&driver) {
+        return None;
+    }
+    // rooted tree (BFS): parent + parent-edge R
+    let mut parent: HashMap<N::K, (N::K, f64)> = HashMap::new();
+    let mut order: Vec<N::K> = vec![driver];
+    let mut seen: std::collections::HashSet<N::K> = std::collections::HashSet::new();
+    seen.insert(driver);
+    let mut head = 0;
+    while head < order.len() {
+        let u = order[head];
+        head += 1;
+        for &(v, r) in adj.get(&u).map(|x| x.as_slice()).unwrap_or(&[]) {
+            if !seen.insert(v) {
+                if parent.get(&u).map(|p| p.0) != Some(v) {
+                    return None; // not a tree
+                }
+                continue;
+            }
+            parent.insert(v, (u, r));
+            order.push(v);
+        }
+    }
+    let nn = order.len();
+    let idx: HashMap<N::K, usize> = order.iter().enumerate().map(|(i, &n)| (n, i)).collect();
+    let cvec: Vec<f64> = order.iter().map(|&n| cap.get(&n).copied().unwrap_or(0.0)).collect();
+    let mut par_idx = vec![usize::MAX; nn];
+    let mut par_r = vec![0.0f64; nn];
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); nn];
+    for (i, &n) in order.iter().enumerate() {
+        if let Some(&(p, r)) = parent.get(&n) {
+            let pi = idx[&p];
+            par_idx[i] = pi;
+            par_r[i] = r;
+            children[pi].push(i);
+        }
+    }
+    // time grid: ramp + ~6 lumped time constants, fixed step count
+    let total_c: f64 = cvec.iter().sum();
+    let total_r: f64 = (0..net.n_res()).map(|k| net.res(k).2).sum();
+    let tau_lump = (total_r * total_c * 1e-6).max(1e-6); // ns
+    // A Liberty slew spans only `slew_span` of the full swing, so the 0→100 % ramp
+    // that produced it lasts proportionally longer.
+    let span = th.slew_span();
+    let tr = (driver_slew_ns / span).max(1e-4); // full 0->100% ramp duration
+    let nsteps = 800usize;
+    let dt = ((tr + 6.0 * tau_lump) / nsteps as f64).max(1e-7);
+    let vdrv = |t: f64| if t <= 0.0 { 0.0 } else if t >= tr { 1.0 } else { t / tr };
+
+    // measurement points, from the library (normalized rising edge: the tree is
+    // linear, so a falling edge is the mirror image and shares these spans)
+    let (v_lo, v_hi) = (th.slew_lower_rise, th.slew_upper_rise);
+    let (v_lo, v_hi) = if v_hi > v_lo { (v_lo, v_hi) } else { (0.2, 0.8) };
+    let v_mid = th.output_rise.clamp(0.01, 0.99);
+
+    let didx = idx[&driver];
+    let mut v = vec![0.0f64; nn];
+    let (mut t_lo, mut t_mid, mut t_hi) =
+        (vec![f64::INFINITY; nn], vec![f64::INFINITY; nn], vec![f64::INFINITY; nn]);
+    let mut a_co = vec![0.0f64; nn];
+    let mut b_co = vec![0.0f64; nn];
+    let mut vnew = vec![0.0f64; nn];
+    let mut t = 0.0;
+    for _ in 0..nsteps {
+        t += dt;
+        let vd = vdrv(t);
+        // up-sweep (leaves->root): V_i = a_co[i]*V_parent + b_co[i]
+        for &n in order.iter().rev() {
+            let i = idx[&n];
+            if i == didx {
+                continue;
+            }
+            let gc = cvec[i] * 1e-6 / dt; // cap conductance (scaled to S)
+            let gpar = 1.0 / par_r[i];
+            let mut diag = gc + gpar;
+            let mut rhs = gc * v[i];
+            for &c in &children[i] {
+                let gr = 1.0 / par_r[c];
+                diag += gr - gr * a_co[c];
+                rhs += gr * b_co[c];
+            }
+            a_co[i] = gpar / diag;
+            b_co[i] = rhs / diag;
+        }
+        // down-sweep (root forced)
+        vnew[didx] = vd;
+        for &n in &order {
+            let i = idx[&n];
+            if i != didx {
+                vnew[i] = a_co[i] * vnew[par_idx[i]] + b_co[i];
+            }
+        }
+        // record threshold crossings (linear interp within the step)
+        for i in 0..nn {
+            let cross = |thr: f64| (t - dt) + (thr - v[i]) / (vnew[i] - v[i]).max(1e-12) * dt;
+            if t_lo[i].is_infinite() && vnew[i] >= v_lo && v[i] < v_lo {
+                t_lo[i] = cross(v_lo);
+            }
+            if t_mid[i].is_infinite() && vnew[i] >= v_mid && v[i] < v_mid {
+                t_mid[i] = cross(v_mid);
+            }
+            if t_hi[i].is_infinite() && vnew[i] >= v_hi && v[i] < v_hi {
+                t_hi[i] = cross(v_hi);
+            }
+        }
+        std::mem::swap(&mut v, &mut vnew);
+    }
+    let td_mid = tr * v_mid; // the forced ramp crosses v_mid here, by construction
+    let mut out = Vec::with_capacity(order.len());
+    for (i, &n) in order.iter().enumerate() {
+        let d = if t_mid[i].is_finite() { (t_mid[i] - td_mid).max(0.0) } else { 0.0 };
+        // returned in the SAME convention as a Liberty slew (lower->upper), so the
+        // caller can feed it straight back into an NLDM index_1 lookup
+        let s = if t_hi[i].is_finite() && t_lo[i].is_finite() {
+            (t_hi[i] - t_lo[i]).max(0.0)
+        } else {
+            0.0
+        };
+        out.push((n, (d, s)));
+    }
+    Some(out)
+}
+
+/// [`NetRc::pi_reduce`] on any [`RcNet`].
+pub fn pi_reduce_of<N: RcNet>(net: &N, driver: N::K, xtalk_cap_ff: f64, pin_cap: impl Fn(N::K) -> Option<f64>) -> Option<(f64, f64, f64)> {
+    let cap = node_caps_of(net, driver, xtalk_cap_ff, pin_cap)?;
+    let mut adj: HashMap<N::K, Vec<(N::K, f64)>> = HashMap::new();
+    for k in 0..net.n_res() {
+        let (a, b, r) = net.res(k);
+        adj.entry(a).or_default().push((b, r));
+        adj.entry(b).or_default().push((a, r));
+    }
+    // A driver node with no resistor on it is still a network: `reducePiDfs` from it sees its
+    // own capacitance only (a purely capacitive load, `c1 = y1`) — what a net whose resistors
+    // were all dropped (a bare node) reduces to. A load pin not reached adds nothing, its pin
+    // capacitance included.
+    if !adj.contains_key(&driver) && !cap.contains_key(&driver) {
+        return None;
+    }
+    // `reducePiDfs`: y1/y2/y3 are the admittance moments, accumulated in DOUBLE while
+    // the resistor and capacitance values themselves are float in the reference.
+    //   y1 += yd1
+    //   y2 += yd2 - r*yd1^2
+    //   y3 += yd3 - 2*r*yd1*yd2 + r^2*yd1^3
+    fn dfs<K: Copy + Eq + std::hash::Hash>(
+        node: K,
+        from: Option<K>,
+        adj: &HashMap<K, Vec<(K, f64)>>,
+        cap: &HashMap<K, f64>,
+        seen: &mut std::collections::HashSet<K>,
+    ) -> (f64, f64, f64) {
+        let mut y1 = cap.get(&node).copied().unwrap_or(0.0);
+        let (mut y2, mut y3) = (0.0f64, 0.0f64);
+        for &(o, r) in adj.get(&node).map(|v| v.as_slice()).unwrap_or(&[]) {
+            // skip the edge we came in on, self loops, and resistor loops
+            if Some(o) == from || o == node || !seen.insert(o) {
+                continue;
+            }
+            let (yd1, yd2, yd3) = dfs(o, Some(node), adj, cap, seen);
+            let r = r as f32 as f64; // `value(ParasiticResistor*)` is float
+            y1 += yd1;
+            y2 += yd2 - r * yd1 * yd1;
+            y3 += yd3 - 2.0 * r * yd1 * yd2 + r * r * yd1 * yd1 * yd1;
+        }
+        (y1, y2, y3)
+    }
+    let mut seen: std::collections::HashSet<N::K> = std::collections::HashSet::new();
+    seen.insert(driver);
+    let (y1, y2, y3) = dfs(driver, None, &adj, &cap, &mut seen);
+    // closed form, verbatim from `ReduceToPi::reduceToPi`; c1/c2/rpi are float outputs
+    let (c2, rpi, c1) = if y2 == 0.0 && y3 == 0.0 {
+        (0.0, 0.0, y1) // purely capacitive load
+    } else {
+        (
+            (y1 - y2 * y2 / y3) as f32 as f64,
+            (-y3 * y3 / (y2 * y2 * y2)) as f32 as f64,
+            (y2 * y2 / y3) as f32 as f64,
+        )
+    };
+    Some((c2, rpi, c1))
+}
+
+/// Each node's capacitance as the delay walks see it (see [`NetRc::elmore`]); `pin_cap` gives a
+/// load pin's receiver capacitance at its node.
+fn node_caps_of<N: RcNet>(net: &N, driver: N::K, xtalk_cap_ff: f64, pin_cap: impl Fn(N::K) -> Option<f64>) -> Option<HashMap<N::K, f64>> {
+    let mut cap: HashMap<N::K, f64> = HashMap::new();
+    for i in 0..net.n_ground() {
+        let (node, c) = net.ground(i);
+        *cap.entry(node).or_default() += c;
+    }
+    // Each coupling capacitor grounded ON ITS OWN NODE: the reference's reader makes the
+    // two-node capacitor `incrCap(node, cap * couplingCapFactor())` on this net's node unless
+    // coupling is kept (`SpefReader::makeCapacitor`). Spread over the wire in proportion to its
+    // ground cap instead, the totals agree and the Pi does not: on one clock net Rpi came out
+    // 363 Ω against the reference's 456. Only a caller's extra beyond that (a Miller term) is
+    // spread.
+    let at_nodes: f64 = (0..net.n_cc()).map(|i| net.cc_own(i).1).sum();
+    let xtalk_cap_ff = if net.n_cc() > 0 && xtalk_cap_ff >= at_nodes * (1.0 - 1e-9) {
+        for i in 0..net.n_cc() {
+            let (own, c) = net.cc_own(i);
+            *cap.entry(own).or_default() += c;
+        }
+        xtalk_cap_ff - at_nodes
+    } else {
+        xtalk_cap_ff
+    };
+    spread_xtalk(&mut cap, net, driver, xtalk_cap_ff);
+    for k in 0..net.n_res() {
+        let (a, b, _) = net.res(k);
+        cap.entry(a).or_default();
+        cap.entry(b).or_default();
+    }
+    // each load pin's receiver cap, once, on a node the network holds (a grounded cap's or a
+    // resistor end's)
+    let mut done: std::collections::HashSet<N::K> = std::collections::HashSet::new();
+    let nodes = (0..net.n_ground()).map(|i| net.ground(i).0).chain((0..net.n_res()).flat_map(|k| {
+        let (a, b, _) = net.res(k);
+        [a, b]
+    }));
+    for node in nodes {
+        if done.insert(node) {
+            if let Some(c) = pin_cap(node) {
+                *cap.entry(node).or_default() += c;
+            }
+        }
+    }
+    Some(cap)
 }
 
 impl NetRc {
@@ -412,107 +806,9 @@ impl NetRc {
     /// (`read_spef -pin_cap_included`). Omitting it leaves every subtree capacitance short
     /// and the network too fast — measured on a fanout-298 net, tau came out 4.7x below
     /// the reference's.
-    pub fn elmore(
-        &self,
-        driver: &str,
-        xtalk_cap_ff: f64,
-        pin_cap_ff: &BTreeMap<String, f64>,
-    ) -> Option<BTreeMap<String, f64>> {
-        if self.res.is_empty() {
-            return None;
-        }
-        // node capacitances
-        // Same node capacitances the Pi reduction sees — one source, so the two walks
-        // cannot drift apart.
-        let mut cap = self.node_caps(driver, xtalk_cap_ff, pin_cap_ff)?;
-        // Each node's resistors in file order, each resistor under both its ends, as the
-        // reference's parasitic network lists them.
-        let mut rmap: HashMap<&str, Vec<usize>> = HashMap::new();
-        for (k, (a, b, _)) in self.res.iter().enumerate() {
-            rmap.entry(a).or_default().push(k);
-            rmap.entry(b).or_default().push(k);
-            cap.entry(a.as_str()).or_default();
-            cap.entry(b.as_str()).or_default();
-        }
-        if !rmap.contains_key(driver) {
-            return None;
-        }
-        let other = |k: usize, node: &str| -> &str {
-            let (a, b, _) = &self.res[k];
-            if a == node { b } else { a }
-        };
-        // `ReduceToPi::reducePiDfs`, the part the delays need: depth first from the driver, each
-        // node's DOWNSTREAM capacitance; a resistor back to a node on the current path is a loop
-        // and is never walked again. A resistor whose two ends are one node (an extractor's — and
-        // every placement estimate's driver — self-resistor) and the one just come over are
-        // skipped. The walk is the reference's spanning tree, in its order.
-        #[allow(clippy::too_many_arguments)]
-        fn down<'a>(
-            node: &'a str,
-            from: Option<usize>,
-            rmap: &HashMap<&'a str, Vec<usize>>,
-            cap: &HashMap<&'a str, f64>,
-            other: &dyn Fn(usize, &'a str) -> &'a str,
-            on_path: &mut std::collections::HashSet<&'a str>,
-            loops: &mut std::collections::HashSet<usize>,
-            dwn: &mut HashMap<&'a str, f64>,
-        ) -> f64 {
-            let mut d = cap.get(node).copied().unwrap_or(0.0);
-            on_path.insert(node);
-            for &k in rmap.get(node).map(|v| v.as_slice()).unwrap_or(&[]) {
-                if loops.contains(&k) {
-                    continue;
-                }
-                let o = other(k, node);
-                if o != node && Some(k) != from {
-                    if on_path.contains(o) {
-                        loops.insert(k);
-                    } else {
-                        d += down(o, Some(k), rmap, cap, other, on_path, loops, dwn);
-                    }
-                }
-            }
-            dwn.insert(node, d);
-            on_path.remove(node);
-            d
-        }
-        // `ReduceToPiElmore::reduceElmoreDfs`: the second walk, each node's Elmore delay from its
-        // parent's and the resistor times the node's downstream capacitance.
-        #[allow(clippy::too_many_arguments)]
-        fn elm<'a>(
-            node: &'a str,
-            from: Option<usize>,
-            elmore: f64,
-            res: &[(String, String, f64)],
-            rmap: &HashMap<&'a str, Vec<usize>>,
-            other: &dyn Fn(usize, &'a str) -> &'a str,
-            dwn: &HashMap<&'a str, f64>,
-            loops: &std::collections::HashSet<usize>,
-            on_path: &mut std::collections::HashSet<&'a str>,
-            delay: &mut BTreeMap<String, f64>,
-        ) {
-            delay.insert(node.to_string(), elmore);
-            on_path.insert(node);
-            for &k in rmap.get(node).map(|v| v.as_slice()).unwrap_or(&[]) {
-                let o = other(k, node);
-                if Some(k) != from && !on_path.contains(o) && !loops.contains(&k) {
-                    // ⛔ TYPES, from the reference (see `cpp-to-rust-numeric-reference.md` §1):
-                    //   `double onode_elmore = elmore + r * downstreamCap(onode);`
-                    // where BOTH `Parasitics::value(ParasiticResistor*)` and
-                    // `ReduceToPi::downstreamCap` return **float**. So the per-step increment is
-                    // an f32 multiply — about 7 significant digits — and only the running sum is
-                    // double.
-                    let inc = (res[k].2 as f32 * dwn[o] as f32) as f64 * 1e-6; // R[Ω]·C[fF] -> ns
-                    elm(o, Some(k), elmore + inc, res, rmap, other, dwn, loops, on_path, delay);
-                }
-            }
-            on_path.remove(node);
-        }
-        let (mut on_path, mut loops, mut dwn) = (std::collections::HashSet::new(), std::collections::HashSet::new(), HashMap::new());
-        down(driver, None, &rmap, &cap, &other, &mut on_path, &mut loops, &mut dwn);
-        let mut delay: BTreeMap<String, f64> = BTreeMap::new();
-        elm(driver, None, 0.0, &self.res, &rmap, &other, &dwn, &loops, &mut on_path, &mut delay);
-        Some(delay)
+    pub fn elmore(&self, driver: &str, xtalk_cap_ff: f64, pin_cap_ff: &BTreeMap<String, f64>) -> Option<BTreeMap<String, f64>> {
+        let d = elmore_of(&self, driver, xtalk_cap_ff, |k| pin_cap_ff.get(k).copied())?;
+        Some(d.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
     }
 
     /// Transient node response: drive the RC tree with the driver's output edge as a
@@ -532,149 +828,9 @@ impl NetRc {
     /// loaded net, so a sink looks *sharper* than its driver — which RC can never do.
     ///
     /// Returns node → (delay_ns, slew_ns), or None if not a tree from `driver`.
-    pub fn transient(
-        &self,
-        driver: &str,
-        driver_slew_ns: f64,
-        xtalk_cap_ff: f64,
-        th: crate::liberty::Thresholds,
-    ) -> Option<BTreeMap<String, (f64, f64)>> {
-        if self.res.is_empty() {
-            return None;
-        }
-        let mut cap: HashMap<&str, f64> = HashMap::new();
-        for (n, c) in &self.ground {
-            *cap.entry(n.as_str()).or_default() += c;
-        }
-        spread_xtalk(&mut cap, &self.ground, driver, xtalk_cap_ff);
-        let mut adj: HashMap<&str, Vec<(&str, f64)>> = HashMap::new();
-        for (a, b, r) in &self.res {
-            adj.entry(a).or_default().push((b, *r));
-            adj.entry(b).or_default().push((a, *r));
-            cap.entry(a.as_str()).or_default();
-            cap.entry(b.as_str()).or_default();
-        }
-        if !adj.contains_key(driver) {
-            return None;
-        }
-        // rooted tree (BFS): parent + parent-edge R
-        let mut parent: HashMap<&str, (&str, f64)> = HashMap::new();
-        let mut order: Vec<&str> = vec![driver];
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        seen.insert(driver);
-        let mut head = 0;
-        while head < order.len() {
-            let u = order[head];
-            head += 1;
-            for &(v, r) in adj.get(u).map(|x| x.as_slice()).unwrap_or(&[]) {
-                if !seen.insert(v) {
-                    if parent.get(u).map(|p| p.0) != Some(v) {
-                        return None; // not a tree
-                    }
-                    continue;
-                }
-                parent.insert(v, (u, r));
-                order.push(v);
-            }
-        }
-        let nn = order.len();
-        let idx: HashMap<&str, usize> = order.iter().enumerate().map(|(i, &n)| (n, i)).collect();
-        let cvec: Vec<f64> = order.iter().map(|&n| cap.get(n).copied().unwrap_or(0.0)).collect();
-        let mut par_idx = vec![usize::MAX; nn];
-        let mut par_r = vec![0.0f64; nn];
-        let mut children: Vec<Vec<usize>> = vec![Vec::new(); nn];
-        for (i, &n) in order.iter().enumerate() {
-            if let Some(&(p, r)) = parent.get(n) {
-                let pi = idx[p];
-                par_idx[i] = pi;
-                par_r[i] = r;
-                children[pi].push(i);
-            }
-        }
-        // time grid: ramp + ~6 lumped time constants, fixed step count
-        let total_c: f64 = cvec.iter().sum();
-        let total_r: f64 = self.res.iter().map(|(_, _, r)| r).sum();
-        let tau_lump = (total_r * total_c * 1e-6).max(1e-6); // ns
-        // A Liberty slew spans only `slew_span` of the full swing, so the 0→100 % ramp
-        // that produced it lasts proportionally longer.
-        let span = th.slew_span();
-        let tr = (driver_slew_ns / span).max(1e-4); // full 0->100% ramp duration
-        let nsteps = 800usize;
-        let dt = ((tr + 6.0 * tau_lump) / nsteps as f64).max(1e-7);
-        let vdrv = |t: f64| if t <= 0.0 { 0.0 } else if t >= tr { 1.0 } else { t / tr };
-
-        // measurement points, from the library (normalized rising edge: the tree is
-        // linear, so a falling edge is the mirror image and shares these spans)
-        let (v_lo, v_hi) = (th.slew_lower_rise, th.slew_upper_rise);
-        let (v_lo, v_hi) = if v_hi > v_lo { (v_lo, v_hi) } else { (0.2, 0.8) };
-        let v_mid = th.output_rise.clamp(0.01, 0.99);
-
-        let didx = idx[driver];
-        let mut v = vec![0.0f64; nn];
-        let (mut t_lo, mut t_mid, mut t_hi) =
-            (vec![f64::INFINITY; nn], vec![f64::INFINITY; nn], vec![f64::INFINITY; nn]);
-        let mut a_co = vec![0.0f64; nn];
-        let mut b_co = vec![0.0f64; nn];
-        let mut vnew = vec![0.0f64; nn];
-        let mut t = 0.0;
-        for _ in 0..nsteps {
-            t += dt;
-            let vd = vdrv(t);
-            // up-sweep (leaves->root): V_i = a_co[i]*V_parent + b_co[i]
-            for &n in order.iter().rev() {
-                let i = idx[n];
-                if i == didx {
-                    continue;
-                }
-                let gc = cvec[i] * 1e-6 / dt; // cap conductance (scaled to S)
-                let gpar = 1.0 / par_r[i];
-                let mut diag = gc + gpar;
-                let mut rhs = gc * v[i];
-                for &c in &children[i] {
-                    let gr = 1.0 / par_r[c];
-                    diag += gr - gr * a_co[c];
-                    rhs += gr * b_co[c];
-                }
-                a_co[i] = gpar / diag;
-                b_co[i] = rhs / diag;
-            }
-            // down-sweep (root forced)
-            vnew[didx] = vd;
-            for &n in &order {
-                let i = idx[n];
-                if i != didx {
-                    vnew[i] = a_co[i] * vnew[par_idx[i]] + b_co[i];
-                }
-            }
-            // record threshold crossings (linear interp within the step)
-            for i in 0..nn {
-                let cross = |thr: f64| (t - dt) + (thr - v[i]) / (vnew[i] - v[i]).max(1e-12) * dt;
-                if t_lo[i].is_infinite() && vnew[i] >= v_lo && v[i] < v_lo {
-                    t_lo[i] = cross(v_lo);
-                }
-                if t_mid[i].is_infinite() && vnew[i] >= v_mid && v[i] < v_mid {
-                    t_mid[i] = cross(v_mid);
-                }
-                if t_hi[i].is_infinite() && vnew[i] >= v_hi && v[i] < v_hi {
-                    t_hi[i] = cross(v_hi);
-                }
-            }
-            std::mem::swap(&mut v, &mut vnew);
-        }
-        let td_mid = tr * v_mid; // the forced ramp crosses v_mid here, by construction
-        let mut out = BTreeMap::new();
-        for (i, &n) in order.iter().enumerate() {
-            let d = if t_mid[i].is_finite() { (t_mid[i] - td_mid).max(0.0) } else { 0.0 };
-            // returned in the SAME convention as a Liberty slew (lower->upper), so the
-            // caller can feed it straight back into an NLDM index_1 lookup
-            let s = if t_hi[i].is_finite() && t_lo[i].is_finite() {
-                (t_hi[i] - t_lo[i]).max(0.0)
-            } else {
-                0.0
-            };
-            out.insert(n.to_string(), (d, s));
-        }
-        Some(out)
+    pub fn transient(&self, driver: &str, driver_slew_ns: f64, xtalk_cap_ff: f64, th: crate::liberty::Thresholds) -> Option<BTreeMap<String, (f64, f64)>> {
+        let d = transient_of(&self, driver, driver_slew_ns, xtalk_cap_ff, th)?;
+        Some(d.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
     }
 
     /// Reduce the net to (near cap C1 fF, shielding time constant τ ns) seen from
@@ -694,115 +850,9 @@ impl NetRc {
     /// `xtalk_cap_ff` and `pin_cap_ff` carry the same content as [`Spef::elmore`]: coupling
     /// grounded at the reference's `couplingCapFactor`, and the Liberty receiver caps that
     /// `ReduceToPi::pinCapacitance` adds. The moments are meaningless without them.
-    pub fn pi_reduce(
-        &self,
-        driver: &str,
-        xtalk_cap_ff: f64,
-        pin_cap_ff: &BTreeMap<String, f64>,
-    ) -> Option<(f64, f64, f64)> {
-        let cap = self.node_caps(driver, xtalk_cap_ff, pin_cap_ff)?;
-        let mut adj: HashMap<&str, Vec<(&str, f64)>> = HashMap::new();
-        for (a, b, r) in &self.res {
-            adj.entry(a).or_default().push((b, *r));
-            adj.entry(b).or_default().push((a, *r));
-        }
-        // A driver node with no resistor on it is still a network: `reducePiDfs` from it sees its
-        // own capacitance only (a purely capacitive load, `c1 = y1`) — what a net whose resistors
-        // were all dropped (a bare node) reduces to. A load pin not reached adds nothing, its pin
-        // capacitance included.
-        if !adj.contains_key(driver) && !cap.contains_key(driver) {
-            return None;
-        }
-        // `reducePiDfs`: y1/y2/y3 are the admittance moments, accumulated in DOUBLE while
-        // the resistor and capacitance values themselves are float in the reference.
-        //   y1 += yd1
-        //   y2 += yd2 - r*yd1^2
-        //   y3 += yd3 - 2*r*yd1*yd2 + r^2*yd1^3
-        fn dfs<'a>(
-            node: &'a str,
-            from: Option<&'a str>,
-            adj: &HashMap<&'a str, Vec<(&'a str, f64)>>,
-            cap: &HashMap<&'a str, f64>,
-            seen: &mut std::collections::HashSet<&'a str>,
-        ) -> (f64, f64, f64) {
-            let mut y1 = cap.get(node).copied().unwrap_or(0.0);
-            let (mut y2, mut y3) = (0.0f64, 0.0f64);
-            for &(o, r) in adj.get(node).map(|v| v.as_slice()).unwrap_or(&[]) {
-                // skip the edge we came in on, self loops, and resistor loops
-                if Some(o) == from || o == node || !seen.insert(o) {
-                    continue;
-                }
-                let (yd1, yd2, yd3) = dfs(o, Some(node), adj, cap, seen);
-                let r = r as f32 as f64; // `value(ParasiticResistor*)` is float
-                y1 += yd1;
-                y2 += yd2 - r * yd1 * yd1;
-                y3 += yd3 - 2.0 * r * yd1 * yd2 + r * r * yd1 * yd1 * yd1;
-            }
-            (y1, y2, y3)
-        }
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        seen.insert(driver);
-        let (y1, y2, y3) = dfs(driver, None, &adj, &cap, &mut seen);
-        // closed form, verbatim from `ReduceToPi::reduceToPi`; c1/c2/rpi are float outputs
-        let (c2, rpi, c1) = if y2 == 0.0 && y3 == 0.0 {
-            (0.0, 0.0, y1) // purely capacitive load
-        } else {
-            (
-                (y1 - y2 * y2 / y3) as f32 as f64,
-                (-y3 * y3 / (y2 * y2 * y2)) as f32 as f64,
-                (y2 * y2 / y3) as f32 as f64,
-            )
-        };
-        Some((c2, rpi, c1))
+    pub fn pi_reduce(&self, driver: &str, xtalk_cap_ff: f64, pin_cap_ff: &BTreeMap<String, f64>) -> Option<(f64, f64, f64)> {
+        pi_reduce_of(&self, driver, xtalk_cap_ff, |k| pin_cap_ff.get(k).copied())
     }
-
-    /// Node capacitances as the reference's reduction sees them: SPEF ground caps, plus
-    /// coupling grounded at `couplingCapFactor`, plus Liberty receiver capacitance.
-    /// Shared by [`Spef::elmore`] and [`Spef::pi_reduce`] so the two cannot drift apart.
-    fn node_caps<'a>(
-        &'a self,
-        driver: &'a str,
-        xtalk_cap_ff: f64,
-        pin_cap_ff: &BTreeMap<String, f64>,
-    ) -> Option<HashMap<&'a str, f64>> {
-        let mut cap: HashMap<&str, f64> = HashMap::new();
-        for (node, c) in &self.ground {
-            *cap.entry(node.as_str()).or_default() += c;
-        }
-        // Each coupling capacitor grounded ON ITS OWN NODE: the reference's reader makes the
-        // two-node capacitor `incrCap(node, cap * couplingCapFactor())` on this net's node unless
-        // coupling is kept (`SpefReader::makeCapacitor`). Spread over the wire in proportion to its
-        // ground cap instead, the totals agree and the Pi does not: on one clock net Rpi came out
-        // 363 Ω against the reference's 456. Only a caller's extra beyond that (a Miller term) is
-        // spread.
-        let at_nodes: f64 = self.coupling_nodes.iter().map(|(_, _, _, c)| *c).sum();
-        let xtalk_cap_ff = if !self.coupling_nodes.is_empty() && xtalk_cap_ff >= at_nodes * (1.0 - 1e-9) {
-            for (_, own, _, c) in &self.coupling_nodes {
-                *cap.entry(own.as_str()).or_default() += c;
-            }
-            xtalk_cap_ff - at_nodes
-        } else {
-            xtalk_cap_ff
-        };
-        spread_xtalk(&mut cap, &self.ground, driver, xtalk_cap_ff);
-        for (a, b, _) in &self.res {
-            cap.entry(a.as_str()).or_default();
-            cap.entry(b.as_str()).or_default();
-        }
-        for (node, c) in pin_cap_ff {
-            if let Some(k) = self
-                .ground
-                .iter()
-                .map(|(n, _)| n)
-                .chain(self.res.iter().flat_map(|(a, b, _)| [a, b]))
-                .find(|n| *n == node)
-            {
-                *cap.entry(k.as_str()).or_default() += *c;
-            }
-        }
-        Some(cap)
-    }
-
 
     /// SPEF node token for an instance pin, if present in `*CONN`.
     pub fn pin_node(&self, inst: &str, pin: &str) -> Option<&str> {
