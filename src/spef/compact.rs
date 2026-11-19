@@ -17,9 +17,14 @@ use std::collections::HashMap;
 /// An interned name: an index into [`CompactSpef::names`].
 pub type Name = u32;
 
+/// An id no name is given: a node a caller names that no net holds. It is never in a network,
+/// so a walk from it finds nothing and a capacitance keyed by it is never read, exactly as an
+/// unknown node NAME behaves in [`NetRc`]'s walks.
+pub const NO_NAME: Name = Name::MAX;
+
 /// One net's parasitics, names as [`Name`]s. Every vector keeps the file order of the [`NetRc`]
 /// it came from.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CompactNet {
     pub name: Name,
     /// as [`NetRc::cap_ff`]
@@ -41,7 +46,7 @@ pub struct CompactNet {
 }
 
 /// A whole file in the analysis form. Nets are in name order, as [`Spef::nets`] iterates them.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CompactSpef {
     /// every name, each once; ids are given in the order the nets, then each net's fields, are
     /// visited, so the same file gives the same ids
@@ -107,8 +112,7 @@ impl CompactSpef {
             if let Some(&i) = ids.get(&s) {
                 return i;
             }
-            let i = Name::try_from(names.len()).expect("more than 2^32 names in one SPEF");
-            names.push(s.clone().into_boxed_str());
+            let i = push_name(&mut names, &s);
             ids.insert(s, i);
             i
         };
@@ -125,6 +129,37 @@ impl CompactSpef {
             out.push(CompactNet { name, cap_ff, res_ohm, coupling_ff, coupling, cc_own, net_node, ground, res, pins });
         }
         CompactSpef { names, nets: out, skipped, unresolved, triplets, reduced, pnets }
+    }
+
+    /// [`CompactSpef::from_spef`] without consuming `spef`: the same ids, in the same order, for a
+    /// caller that keeps the [`Spef`] (to write it back) or only borrows it.
+    pub fn from_ref<'a>(spef: &'a Spef) -> CompactSpef {
+        let mut ids: HashMap<&'a str, Name> = HashMap::new();
+        let mut names: Vec<Box<str>> = Vec::new();
+        let mut nets = Vec::with_capacity(spef.nets.len());
+        for (name, rc) in &spef.nets {
+            let mut id = |s: &'a str| -> Name { *ids.entry(s).or_insert_with(|| push_name(&mut names, s)) };
+            let NetRc { cap_ff, res_ohm, coupling_ff, coupling, coupling_nodes, net_node, ground, res, pins, conns: _ } = rc;
+            let name = id(name);
+            let coupling = coupling.iter().map(|(a, c)| (id(a), *c)).collect();
+            let cc_own = coupling_nodes.iter().map(|(_, own, _, c)| (id(own), *c)).collect();
+            let net_node = id(net_node);
+            let ground = ground.iter().map(|(n, c)| (id(n), *c)).collect();
+            let res = res.iter().map(|(a, b, r)| (id(a), id(b), *r)).collect();
+            let pins = pins.iter().map(|(i, p, n)| (id(i), id(p), id(n))).collect();
+            nets.push(CompactNet { name, cap_ff: *cap_ff, res_ohm: *res_ohm, coupling_ff: *coupling_ff, coupling, cc_own, net_node, ground, res, pins });
+        }
+        CompactSpef { names, nets, skipped: spef.skipped, unresolved: spef.unresolved, triplets: spef.triplets, reduced: spef.reduced, pnets: spef.pnets }
+    }
+
+    /// The id of `name` as a node of `net` (a grounded cap's, a resistor end's, a coupling cap's
+    /// or a pin's), if the net has such a node: what [`NetRc`]'s walks match a node NAME against.
+    pub fn node(&self, net: &CompactNet, name: &str) -> Option<Name> {
+        let is = |id: &Name| self.name(*id) == name;
+        net.ground.iter().map(|g| g.0).find(is)
+            .or_else(|| net.res.iter().flat_map(|r| [r.0, r.1]).find(is))
+            .or_else(|| net.cc_own.iter().map(|c| c.0).find(is))
+            .or_else(|| net.pins.iter().map(|p| p.2).find(is))
     }
 
     /// The name an id stands for.
@@ -151,6 +186,13 @@ impl CompactSpef {
     pub fn net_delay_ns(&self, net: &str) -> f64 {
         self.net(net).map(|rc| rc.res_ohm * rc.cap_ff * 1e-6).unwrap_or(0.0)
     }
+}
+
+/// Append a name to the table; its id.
+fn push_name(names: &mut Vec<Box<str>>, s: &str) -> Name {
+    let i = Name::try_from(names.len()).ok().filter(|&i| i != NO_NAME).expect("more than 2^32 - 1 names in one SPEF");
+    names.push(s.into());
+    i
 }
 
 /// [`Spef::load`], then the analysis form. A caller that renames nets to the design
@@ -348,6 +390,16 @@ mod tests {
                 assert_eq!(bits(c.net_delay_ns(name)), bits(s.net_delay_ns(name)));
             }
             assert!(c.net("no such net").is_none());
+            // the borrowing conversion gives the same table and the same nets
+            assert!(CompactSpef::from_ref(&s) == c, "{what}: from_ref differs from from_spef");
+            // `node` finds every node of a net by name, and nothing that is not one
+            for (name, rc) in &s.nets {
+                let cn = c.net(name).unwrap();
+                for nm in rc.ground.iter().map(|g| &g.0).chain(rc.res.iter().flat_map(|r| [&r.0, &r.1])).chain(rc.coupling_nodes.iter().map(|x| &x.1)).chain(rc.pins.iter().map(|p| &p.2)) {
+                    assert_eq!(c.node(cn, nm).map(|i| c.name(i)), Some(nm.as_str()), "{what} {name} {nm}");
+                }
+                assert_eq!(c.node(cn, "no:such"), None);
+            }
             // each name once
             let mut seen = std::collections::HashSet::new();
             assert!(c.names.iter().all(|n| seen.insert(n.clone())), "{what}: a name interned twice");
