@@ -120,12 +120,15 @@ impl CompactSpef {
         for (name, rc) in nets {
             let NetRc { cap_ff, res_ohm, coupling_ff, coupling, coupling_nodes, net_node, ground, res, pins, conns: _ } = rc;
             let name = id(name);
-            let coupling = coupling.into_iter().map(|(a, c)| (id(a), c)).collect();
-            let cc_own = coupling_nodes.into_iter().map(|(_, own, _, c)| (id(own), c)).collect();
+            // ⛔ `exact`, not `collect`: collecting a `Vec`'s own `into_iter` reuses its buffer in
+            // place, so each field kept the String form's allocation (up to 5x its size) for as
+            // long as the analysis form lives.
+            let coupling = exact(coupling.into_iter().map(|(a, c)| (id(a), c)));
+            let cc_own = exact(coupling_nodes.into_iter().map(|(_, own, _, c)| (id(own), c)));
             let net_node = id(net_node);
-            let ground = ground.into_iter().map(|(n, c)| (id(n), c)).collect();
-            let res = res.into_iter().map(|(a, b, r)| (id(a), id(b), r)).collect();
-            let pins = pins.into_iter().map(|(i, p, n)| (id(i), id(p), id(n))).collect();
+            let ground = exact(ground.into_iter().map(|(n, c)| (id(n), c)));
+            let res = exact(res.into_iter().map(|(a, b, r)| (id(a), id(b), r)));
+            let pins = exact(pins.into_iter().map(|(i, p, n)| (id(i), id(p), id(n))));
             out.push(CompactNet { name, cap_ff, res_ohm, coupling_ff, coupling, cc_own, net_node, ground, res, pins });
         }
         CompactSpef { names, nets: out, skipped, unresolved, triplets, reduced, pnets }
@@ -188,6 +191,13 @@ impl CompactSpef {
     }
 }
 
+/// The items in a vector of exactly their number: a fresh allocation, never the source's.
+fn exact<T>(items: impl ExactSizeIterator<Item = T>) -> Vec<T> {
+    let mut v = Vec::with_capacity(items.len());
+    v.extend(items);
+    v
+}
+
 /// Append a name to the table; its id.
 fn push_name(names: &mut Vec<Box<str>>, s: &str) -> Name {
     let i = Name::try_from(names.len()).ok().filter(|&i| i != NO_NAME).expect("more than 2^32 - 1 names in one SPEF");
@@ -210,6 +220,22 @@ pub fn parse_compact(text: &str) -> CompactSpef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rule: the analysis form holds each field in an allocation of its own length. The
+    /// String form's buffers are several times larger per element, and reusing them (an
+    /// in-place collect) kept that size for the whole analysis.
+    #[test]
+    fn the_analysis_form_holds_each_field_at_its_own_length() {
+        let c = CompactSpef::from_spef(Spef::parse(SHAPES));
+        assert!(!c.nets.is_empty());
+        for n in &c.nets {
+            assert_eq!(n.coupling.capacity(), n.coupling.len());
+            assert_eq!(n.cc_own.capacity(), n.cc_own.len());
+            assert_eq!(n.ground.capacity(), n.ground.len());
+            assert_eq!(n.res.capacity(), n.res.len());
+            assert_eq!(n.pins.capacity(), n.pins.len());
+        }
+    }
     use std::collections::BTreeMap;
 
     /// A net per shape the walks branch on: a branching tree with coupling caps on internal
