@@ -192,7 +192,7 @@ impl CompactSpef {
 }
 
 /// The items in a vector of exactly their number: a fresh allocation, never the source's.
-fn exact<T>(items: impl ExactSizeIterator<Item = T>) -> Vec<T> {
+pub(crate) fn exact<T>(items: impl ExactSizeIterator<Item = T>) -> Vec<T> {
     let mut v = Vec::with_capacity(items.len());
     v.extend(items);
     v
@@ -205,16 +205,34 @@ fn push_name(names: &mut Vec<Box<str>>, s: &str) -> Name {
     i
 }
 
-/// [`Spef::load`], then the analysis form. A caller that renames nets to the design
-/// ([`Spef::rename_to_design`]) or writes the file back does that on the [`Spef`] and converts
-/// with [`CompactSpef::from_spef`] after.
+/// A SPEF file read straight into the analysis form, as [`CompactSpef::from_spef`] of
+/// [`Spef::load`] gives it (the same nets, values, names and ids) without ever holding the String
+/// form. A caller that writes the file back keeps a [`Spef`] instead.
 pub fn load_compact(path: &str) -> Result<CompactSpef, SpefError> {
-    Ok(CompactSpef::from_spef(Spef::load(path)?))
+    Ok(parse_compact(&read_text(path)?))
 }
 
-/// [`Spef::parse`], then the analysis form.
+/// [`load_compact`] with the nets renamed to the design first, as [`Spef::rename_to_design`]
+/// then [`CompactSpef::from_spef`] give it; also the number of nets moved.
+pub fn load_compact_for_design(path: &str, nl: &crate::netlist::Netlist) -> Result<(CompactSpef, usize), SpefError> {
+    Ok(parse_compact_for_design(&read_text(path)?, nl))
+}
+
+/// [`load_compact_for_design`] on a text.
+pub fn parse_compact_for_design(text: &str, nl: &crate::netlist::Netlist) -> (CompactSpef, usize) {
+    let mut r = super::read::Read::parse(text);
+    let moved = r.rename_to_design(nl);
+    (r.into_compact(), moved)
+}
+
+/// [`Spef::parse`] straight into the analysis form (see [`load_compact`]).
 pub fn parse_compact(text: &str) -> CompactSpef {
-    CompactSpef::from_spef(Spef::parse(text))
+    super::read::Read::parse(text).into_compact()
+}
+
+/// The file's text, as [`Spef::load`] reads it.
+fn read_text(path: &str) -> Result<String, SpefError> {
+    std::fs::read_to_string(path).map_err(|e| SpefError(format!("{path}: {e}")))
 }
 
 #[cfg(test)]
@@ -224,6 +242,25 @@ mod tests {
     /// The rule: the analysis form holds each field in an allocation of its own length. The
     /// String form's buffers are several times larger per element, and reusing them (an
     /// in-place collect) kept that size for the whole analysis.
+    /// The rule: reading straight into the analysis form gives exactly what converting the
+    /// String form gives (nets, values, names and the ids themselves), with and without the
+    /// rename to the design: a moved net, a net whose design name the file already has (not
+    /// moved), and a renamed aggressor.
+    #[test]
+    fn reading_straight_into_the_analysis_form_equals_converting_the_string_form() {
+        assert_eq!(parse_compact(SHAPES), CompactSpef::from_spef(Spef::parse(SHAPES)));
+        let mut nl = crate::netlist::Netlist::default();
+        nl.canonical.insert("tree".into(), "zz_tree".into());
+        nl.canonical.insert("loop".into(), "par".into());
+        nl.canonical.insert("par".into(), "a_par".into());
+        let mut s = Spef::parse(SHAPES);
+        let moved = s.rename_to_design(&nl);
+        let (direct, moved_direct) = parse_compact_for_design(SHAPES, &nl);
+        assert_eq!(moved_direct, moved);
+        assert!(moved >= 2, "the case moves nets: {moved}");
+        assert_eq!(direct, CompactSpef::from_spef(s));
+    }
+
     #[test]
     fn the_analysis_form_holds_each_field_at_its_own_length() {
         let c = CompactSpef::from_spef(Spef::parse(SHAPES));
