@@ -20,7 +20,7 @@
 //! domain knowledge is.
 use crate::liberty::{Dir, Lib};
 use crate::netlist::Netlist;
-use crate::spef::Spef;
+use crate::spef::{CompactSpef, Spef};
 use std::collections::BTreeSet;
 
 /// Instances split by whether the timer/analyser can do anything with them.
@@ -152,6 +152,20 @@ pub fn liberty(nl: &Netlist, lib: &Lib) -> LibertyCoverage {
     c
 }
 
+/// The design's nets as the SPEF checks name them: every instance connection and every port.
+fn design_nets(nl: &Netlist) -> BTreeSet<&str> {
+    let mut design: BTreeSet<&str> = BTreeSet::new();
+    for i in &nl.insts {
+        for (_pin, net) in &i.conns {
+            design.insert(net.as_str());
+        }
+    }
+    for p in nl.inputs.iter().chain(nl.outputs.iter()) {
+        design.insert(p.as_str());
+    }
+    design
+}
+
 /// How much of the design the parasitics describe.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SpefCoverage {
@@ -199,15 +213,7 @@ impl SpefCoverage {
 }
 
 pub fn spef(nl: &Netlist, sp: &Spef) -> SpefCoverage {
-    let mut design: BTreeSet<&str> = BTreeSet::new();
-    for i in &nl.insts {
-        for (_pin, net) in &i.conns {
-            design.insert(net.as_str());
-        }
-    }
-    for p in nl.inputs.iter().chain(nl.outputs.iter()) {
-        design.insert(p.as_str());
-    }
+    let design = design_nets(nl);
     let (mut coupling_refs, mut coupling_unresolved) = (0usize, 0usize);
     for rc in sp.nets.values() {
         for (agg, _) in &rc.coupling {
@@ -227,9 +233,49 @@ pub fn spef(nl: &Netlist, sp: &Spef) -> SpefCoverage {
     }
 }
 
+/// [`spef`] on the analysis form ([`CompactSpef`]): the same counts, read from the names.
+pub fn spef_compact(nl: &Netlist, sp: &CompactSpef) -> SpefCoverage {
+    let design = design_nets(nl);
+    let (mut coupling_refs, mut coupling_unresolved) = (0usize, 0usize);
+    for rc in &sp.nets {
+        for (agg, _) in &rc.coupling {
+            coupling_refs += 1;
+            if !design.contains(sp.name(*agg)) {
+                coupling_unresolved += 1;
+            }
+        }
+    }
+    let file: BTreeSet<&str> = sp.nets.iter().map(|n| sp.name(n.name)).collect();
+    SpefCoverage {
+        matched: design.iter().filter(|n| file.contains(**n)).count(),
+        design_nets: design.len(),
+        file_nets: sp.nets.len(),
+        file_nets_unmatched: file.iter().filter(|n| !design.contains(**n)).count(),
+        coupling_refs,
+        coupling_unresolved,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rule: the analysis form's SPEF coverage is the String form's, count for count.
+    #[test]
+    fn spef_coverage_on_the_analysis_form_equals_the_string_form() {
+        let text = "*SPEF \"IEEE 1481-1998\"\n*DIVIDER /\n*DELIMITER :\n*C_UNIT 1 FF\n*R_UNIT 1 OHM\n\
+                    *D_NET a 1.0\n*CONN\n*I u1:Y O\n*I u2:A I\n*CAP\n1 u1:Y 0.5\n2 a:1 b:1 0.25\n3 a:1 zz:1 0.125\n*RES\n1 u1:Y a:1 2.0\n2 a:1 u2:A 3.0\n*END\n\
+                    *D_NET b 1.0\n*CONN\n*I u2:Y O\n*CAP\n1 b:1 a:1 0.25\n*RES\n1 u2:Y b:1 1.0\n*END\n\
+                    *D_NET stray 1.0\n*CONN\n*I u3:Y O\n*CAP\n1 u3:Y 0.5\n*END\n";
+        let sp = Spef::parse(text);
+        let mut nl = Netlist::default();
+        nl.inputs.push("a".into());
+        nl.outputs.push("b".into());
+        nl.outputs.push("c".into());
+        let want = spef(&nl, &sp);
+        assert!(want.coupling_refs > 0 && want.file_nets_unmatched > 0 && want.matched > 0, "{want:?}");
+        assert_eq!(spef_compact(&nl, &CompactSpef::from_spef(sp)), want);
+    }
 
     #[test]
     fn power_pins_are_recognised_across_the_spellings_that_appear_in_practice() {
