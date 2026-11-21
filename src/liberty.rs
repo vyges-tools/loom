@@ -1982,9 +1982,12 @@ fn sequential_arcs(pins: &mut BTreeMap<String, Pin>, seqs: &[(String, String, St
     let expr = |body: &str, key: &str| simple_attr(body, key).and_then(|e| Func::parse_in(&e, |p| names.contains(p)));
     for pin in pins.values_mut() {
         let Some(Func::Port(out)) = pin.function.as_deref().and_then(|f| Func::parse_in(f, |_| true)) else { continue };
-        let Some((kw, _, body)) = seqs.iter().find(|(_, args, _)| args.split(',').any(|a| a.trim().trim_matches('"') == out)) else {
+        let Some((kw, args, body)) = seqs.iter().find(|(_, args, _)| args.split(',').any(|a| a.trim().trim_matches('"') == out)) else {
             continue;
         };
+        // the group's outputs, `(IQ, IQN)`
+        let mut outs = args.split(',').map(|a| a.trim().trim_matches('"'));
+        let (iq, iqn) = (outs.next(), outs.next());
         let clock = expr(body, if kw == "ff" { "clocked_on" } else { "enable" });
         let (clear, preset) = (expr(body, "clear"), expr(body, "preset"));
         let data = if kw == "latch" { expr(body, "data_in") } else { None };
@@ -2014,16 +2017,34 @@ fn sequential_arcs(pins: &mut BTreeMap<String, Pin>, seqs: &[(String, String, St
                     false
                 }
                 _ => {
-                    // a latch's D->Q (`makeLatchDtoQArcs`): its edges follow the sense of `data_in`
-                    // at `from`, whatever the group or the output (an inverted IQN among them) says
+                    // a latch's D->Q (`makeLatchDtoQArcs`, OpenSTA 102fc163 #556, in the f11b4276
+                    // pin): the group's own `timing_sense` when it states one; else the sense of
+                    // `data_in` at `from`, OPPOSITE when the output is the latch's inverted output
+                    // (IQN). (At 4155ac31 the `data_in` sense always, whatever the group or the
+                    // output said.)
                     if let Some(d) = data.as_ref().filter(|d| d.has_port(from)) {
                         a.kind = "latch_d_to_q".into();
-                        a.sense = match d.port_timing_sense(from) {
-                            Sense::Positive => "positive_unate",
-                            Sense::Negative => "negative_unate",
-                            _ => "non_unate",
+                        if a.sense.is_empty() {
+                            let q = d.port_timing_sense(from);
+                            let sense = if iq == Some(out.as_str()) {
+                                q
+                            } else if iqn == Some(out.as_str()) {
+                                match q {
+                                    Sense::Positive => Sense::Negative,
+                                    Sense::Negative => Sense::Positive,
+                                    s => s,
+                                }
+                            } else {
+                                // Warning 1320: the sense cannot be determined; edges pair like.
+                                Sense::Unknown
+                            };
+                            a.sense = match sense {
+                                Sense::Positive => "positive_unate",
+                                Sense::Negative => "negative_unate",
+                                _ => "non_unate",
+                            }
+                            .into();
                         }
-                        .into();
                     }
                     true
                 }
@@ -4512,10 +4533,12 @@ mod dont_use_cells {
         assert!(back.cells["INV_X2"].dont_use && !back.cells["INV_X4"].dont_use);
     }
 
-    /// Reference rule (`makeLatchDtoQArcs`): a latch's D->Q arc pairs edges by the sense of the
-    /// latch's `data_in` at D — negative pairs opposite edges, anything else like edges — whatever
-    /// the timing group declares and whichever of IQ / IQN the output is. So sky130 `dlrbn`'s
-    /// D->Q_N, declared negative_unate, is timed D rise -> Q_N rise. The edges survive the cache.
+    /// Reference rule (`makeLatchDtoQArcs`, OpenSTA 102fc163 #556, in the f11b4276 pin): a latch's
+    /// D->Q arc pairs edges by its group's `timing_sense` when the group states one; else by the
+    /// sense of the latch's `data_in` at D, opposite when the output is the inverted IQN —
+    /// negative pairs opposite edges, anything else like edges. So sky130 `dlrbn`'s D->Q_N,
+    /// declared negative_unate, is now timed D rise -> Q_N FALL (at 4155ac31 it was D rise -> Q_N
+    /// rise: the data_in sense alone). The edges survive the cache.
     #[test]
     fn a_latch_d_to_q_arc_pairs_edges_by_the_data_in_sense() {
         let l = Lib::parse(
@@ -4528,6 +4551,14 @@ mod dont_use_cells {
       timing () { related_pin : "D"; timing_sense : positive_unate; cell_rise (scalar) { values ("1"); } cell_fall (scalar) { values ("2"); } } }
     pin (QN) { direction : output; function : "IQN";
       timing () { related_pin : "D"; timing_sense : negative_unate; cell_rise (scalar) { values ("1"); } cell_fall (scalar) { values ("2"); } } } }
+  cell (LATN) { area : 1.0;
+    latch (IQ, IQN) { enable : "G"; data_in : "D"; }
+    pin (D) { direction : input; capacitance : 0.001; }
+    pin (G) { direction : input; capacitance : 0.001; }
+    pin (Q) { direction : output; function : "IQ";
+      timing () { related_pin : "D"; timing_sense : negative_unate; cell_rise (scalar) { values ("1"); } cell_fall (scalar) { values ("2"); } } }
+    pin (QN) { direction : output; function : "IQN";
+      timing () { related_pin : "D"; cell_rise (scalar) { values ("1"); } cell_fall (scalar) { values ("2"); } } } }
   cell (LATI) { area : 1.0;
     latch (IQ, IQN) { enable : "G"; data_in : "!D"; }
     pin (D) { direction : input; capacitance : 0.001; }
@@ -4557,7 +4588,9 @@ mod dont_use_cells {
         let back = crate::libcache::decode(&crate::libcache::encode(&l)).unwrap();
         for lib in [&l, &back] {
             assert_eq!(pairs(lib, "LAT", "Q"), like);
-            assert_eq!(pairs(lib, "LAT", "QN"), like, "data_in D is positive: the IQN output does not invert it");
+            assert_eq!(pairs(lib, "LAT", "QN"), opposite, "the group's declared negative_unate stands");
+            assert_eq!(pairs(lib, "LATN", "Q"), opposite, "declared negative_unate on IQ, whatever data_in says");
+            assert_eq!(pairs(lib, "LATN", "QN"), opposite, "undeclared on IQN: data_in D's positive sense, inverted");
             assert_eq!(pairs(lib, "LATI", "Q"), opposite, "data_in !D is negative");
             assert_eq!(pairs(lib, "LATX", "Q"), like, "a NON-unate data_in still pairs like edges only");
             assert_eq!(pairs(lib, "INV", "Y"), opposite, "a plain arc keeps its function's sense");

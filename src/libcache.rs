@@ -19,7 +19,10 @@ use crate::liberty::{Arc, Cell, ClkEdge, Constraint, Dir, Lib, LibGroups, Lvf, O
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 4] = b"VLCO"; // Vyges Liberty Cache — bump the trailing digit on any format change
+const MAGIC: &[u8; 4] = b"VLCP"; // Vyges Liberty Cache — bump the trailing digit on any format change
+                                 // VLCP: no layout change; a latch D->Q arc's sense is read as the
+                                 //       f11b4276 reference reads it (declared, else data_in by IQ/IQN),
+                                 //       so entries parsed under the old rule must not be read back.
                                  // VLCO: Cell gained `is_memory`, `is_pad`, `is_level_shifter`.
                                  // VLCN: Lib gained `libraries` (name + operating_conditions, wire_load, wire_load_selection names).
                                  // VLCM: LVF early/late sigma and moments (Arc, Constraint).
