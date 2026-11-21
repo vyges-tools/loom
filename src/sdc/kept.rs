@@ -7,8 +7,9 @@
 //! objects with the accessor that named them, its values as words, and written again.
 //!
 //! - **Exceptions** — `group_path` and `set_path_margin` are path exceptions in the reference
-//!   (`Sdc::exceptions_`), so `unset_path_exceptions` and `-reset_path` reach them: they are kept
-//!   as [`ExceptionCmd`], in [`Sdc::other_exceptions`], next to the false paths.
+//!   (`Sdc::exceptions_`), kept as [`ExceptionCmd`], in [`Sdc::other_exceptions`], next to the
+//!   false paths. `unset_path_exceptions` and `-reset_path` reach a path margin; never a group
+//!   path (`GroupPath::resetMatch` is false since OpenSTA 865551f).
 //! - **Everything else** ([`KEPT_COMMANDS`]) is a [`KeptCmd`] in [`Sdc::kept`].
 //!
 //! Each is still listed in [`Sdc::ignored`]: kept is not modelled, and a consumer that does not
@@ -621,15 +622,17 @@ mod tests {
         assert_eq!(s.input_delays[0].clock, None);
     }
 
-    /// Rule (`Sdc::resetPath` over `exceptions_`): group paths and path margins are exceptions, so
-    /// a reset takes them; a group path holds for both checks, so a `-setup` reset does not.
+    /// Rule (`Sdc::resetPath` over `exceptions_`): a path margin is an exception, so a reset takes
+    /// it; a group path is held with them but `GroupPath::resetMatch` is false (OpenSTA 865551f,
+    /// #572): neither `unset_path_exceptions` nor `-reset_path` takes or splits one.
     #[test]
-    fn group_path_is_an_exception_to_a_reset() {
+    fn group_path_is_never_taken_by_a_reset() {
         let s = read("group_path -name g -from [get_ports {a b}]\nunset_path_exceptions -from [get_ports a]\n");
         assert_eq!(s.other_exceptions.len(), 1);
-        assert_eq!(s.other_exceptions[0].args[0].1.names, ["b"]);
-        let s = read("group_path -name g -from [get_ports a]\nunset_path_exceptions -setup -from [get_ports a]\n");
-        assert_eq!(s.other_exceptions.len(), 1, "min_max all is not max");
+        assert_eq!(s.other_exceptions[0].args[0].1.names, ["a", "b"]);
+        let s = read("group_path -name g1 -from [get_ports a]\ngroup_path -name g2 -from [get_ports b]\nset_false_path -reset_path -from [get_ports b]\n");
+        assert_eq!(s.other_exceptions.len(), 2, "-reset_path leaves group paths");
+        assert_eq!(s.exceptions.len(), 1);
         let s = read("set_path_margin -setup -from [get_ports a] 0.2\nunset_path_exceptions -setup -from [get_ports a]\n");
         assert!(s.other_exceptions.is_empty());
         let w = read("group_path -name g -weight 2 -from [get_ports a] -through [get_pins u/Z]\n").write(&Default::default());

@@ -845,8 +845,21 @@ fn and(a: Hit, b: Hit) -> Hit {
 /// any exception whose from intersects it, however specific; each kind of point the reset names,
 /// the exception must have (and none it does not name); thrus pairwise over the shorter list; and
 /// the check: the reset's (`-setup` / `-hold`) is all, or the exception's exactly.
+///
+/// A reset whose to is only an edge (`-rise` / `-fall`, no objects) matches by the exception's end
+/// edge (both edges when it has no to), and is then matched as a reset with no to (OpenSTA
+/// 865551f, #572; before it, an edge-only reset matched nothing). [`edge_only_to_dropped`] gives
+/// that reset; both this and [`residue`] take it.
 fn reset_match(reset: &ExcShape, held: &ExcShape, clocks: &[SdcClock]) -> Hit {
     if !(reset.min_max == Both::ALL || reset.min_max == held.min_max) {
+        return Hit::No;
+    }
+    if reset.to.as_ref().is_some_and(|t| t.points.is_empty()) && reset.end != held.end {
+        return Hit::No;
+    }
+    let reset = &edge_only_to_dropped(reset);
+    // with its edge-only to dropped, a reset may name no point at all: it matches nothing
+    if reset.from.is_none() && reset.thrus.is_empty() && reset.to.is_none() {
         return Hit::No;
     }
     let mut hit = Hit::Yes;
@@ -876,12 +889,24 @@ fn reset_match(reset: &ExcShape, held: &ExcShape, clocks: &[SdcClock]) -> Hit {
     hit
 }
 
+/// The reset as `ExceptionPath::resetMatch` goes on to match it: a to with no objects (an edge
+/// only) is dropped once its edge has been checked against the exception's.
+fn edge_only_to_dropped(reset: &ExcShape) -> ExcShape {
+    let mut r = reset.clone();
+    if r.to.as_ref().is_some_and(|t| t.points.is_empty()) {
+        r.to = None;
+    }
+    r
+}
+
 /// What survives a reset of `held`, as `Sdc::resetPath` leaves it — WITHOUT enumerating its
 /// expansion.
 ///
 /// The reference expands a matched exception to one point per side (`ExpandedExceptionVisitor`:
-/// every from point × every point of each thru × every to point; a side with no points, a to that
-/// is only `-rise`, yields none) and keeps the expansions the reset does not match. An expansion
+/// every from point × every point of each thru × every to point; a side with no points yields
+/// none) and keeps the expansions the reset does not match. A to that is only an edge (`-rise`,
+/// no objects) is not a side: every expansion carries it as it is (OpenSTA 865551f, #572; before
+/// it the expansion skipped such a to and the rest of the exception was lost). An expansion
 /// is matched exactly when, in EVERY dimension the reset names, its point intersects the reset's
 /// (the edge and check tests are the same for all of them). So the matched expansions are the
 /// product of the matching points `M_d` of those dimensions, and what survives is the full
@@ -890,6 +915,7 @@ fn reset_match(reset: &ExcShape, held: &ExcShape, clocks: &[SdcClock]) -> Hit {
 /// linear in the points; enumerating the product is not (10 000 from points × 10 000 to points is
 /// 10^8 expansions, on a large design routine).
 fn residue(reset: &ExcShape, held: &ExcShape, clocks: &[SdcClock]) -> Result<Vec<ExcShape>, String> {
+    let reset = &edge_only_to_dropped(reset);
     // (reset side, held side) per named dimension, by position: 0 from, 1.. thrus, last to
     let mut named: Vec<(usize, &Side, &Side)> = Vec::new();
     if let (Some(r), Some(h)) = (&reset.from, &held.from) {
@@ -937,10 +963,12 @@ fn residue(reset: &ExcShape, held: &ExcShape, clocks: &[SdcClock]) -> Result<Vec
             set(&mut e, *at_j, hit_j.clone());
         }
         set(&mut e, *at, rest.clone());
-        // a side with no points makes an empty product: nothing of it survives
+        // a side with no points makes an empty product: nothing of it survives — but a to that
+        // held no points to begin with is an edge, carried by every expansion
+        let held_edge_to = held.to.as_ref().is_some_and(|t| t.points.is_empty());
         let empty = e.from.as_ref().is_some_and(|f| f.points.is_empty())
             || e.thrus.iter().any(|t| t.points.is_empty())
-            || e.to.as_ref().is_some_and(|t| t.points.is_empty());
+            || (!held_edge_to && e.to.as_ref().is_some_and(|t| t.points.is_empty()));
         if !empty {
             out.push(e);
         }
@@ -961,7 +989,8 @@ fn shape_args(s: &ExcShape) -> Vec<(String, Objects)> {
     let mut out = Vec::new();
     out.extend(s.from.iter().map(|f| (f.key.clone(), objects_of(&f.points))));
     out.extend(s.thrus.iter().map(|t| (t.key.clone(), objects_of(&t.points))));
-    out.extend(s.to.iter().map(|t| (t.key.clone(), objects_of(&t.points))));
+    // a to with no points is the endpoint edge from `-rise` / `-fall` ([`shape_of`]): it stays a flag
+    out.extend(s.to.iter().filter(|t| !t.points.is_empty()).map(|t| (t.key.clone(), objects_of(&t.points))));
     out
 }
 
@@ -1017,7 +1046,8 @@ impl Sdc {
     /// (`unset_path_exceptions_cmd`, `Sdc::resetPath`). A from, through or to is required (449),
     /// no other word (448). Each exception the reset matches ([`reset_match`]) keeps what its
     /// expansion keeps ([`residue`]). False paths, multicycles and `set_max_delay` / `set_min_delay` are all
-    /// exceptions here, and so are `group_path` and `set_path_margin` ([`super::ExceptionCmd`]).
+    /// exceptions here, and so is `set_path_margin` ([`super::ExceptionCmd`]); a `group_path` is held
+    /// with them but no reset takes it.
     fn unset_path_exceptions(&mut self, toks: &[String]) -> Result<(), String> {
         let a = key_args(toks, &[&FROM_KEYS[..], &TO_KEYS[..], &THRU_KEYS[..]].concat(), &["-setup", "-hold", "-rise", "-fall"])?;
         if !a.pos.is_empty() {
@@ -1086,10 +1116,15 @@ impl Sdc {
                 Some(rest) => path_delays.extend(rest.iter().map(|s| PathDelayCmd { objects: shape_args(s), seq: None, ..p.clone() })),
             }
         }
-        // `group_path` (both checks) and `set_path_margin` (its own) are exceptions to a reset too
+        // `set_path_margin` (its own check) is an exception to a reset too; a `group_path` never is
+        // (`GroupPath::resetMatch` is false, OpenSTA 865551f, #572; before it a reset took group paths)
         let mut others = Vec::with_capacity(self.other_exceptions.len());
         for x in &self.other_exceptions {
-            let min_max = if x.cmd == "group_path" { Both::ALL } else { check_of(&x.flags) };
+            if x.cmd == "group_path" {
+                others.push(x.clone());
+                continue;
+            }
+            let min_max = check_of(&x.flags);
             match reset_one(&shape_of(&x.args, &x.flags, min_max))? {
                 None => others.push(x.clone()),
                 Some(rest) => others.extend(rest.iter().map(|s| super::ExceptionCmd { args: shape_args(s), seq: None, ..x.clone() })),
@@ -1309,6 +1344,25 @@ mod tests {
         assert_eq!(s.exceptions[0].args[0].1.names.len(), 9_999);
         assert_eq!(s.exceptions[0].args[1].1.names.len(), 10_000);
         assert!(t0.elapsed().as_secs() < 5, "took {:?}", t0.elapsed());
+    }
+
+    /// Rule (`ExceptionPath::resetMatch` + `ExpandedExceptionVisitor::expandTo`, OpenSTA 865551f,
+    /// #572): a reset that is only an edge to (`-rise` / `-fall`, no objects) matches an exception
+    /// by its end edge, then as a reset with no to; an exception whose to is only an edge keeps
+    /// that edge in every expansion, so a partial reset leaves the rest of it. Before #572 the
+    /// edge-only reset matched nothing and the partial reset left nothing. The reference's own
+    /// test is `unset_path_exceptions.tcl`.
+    #[test]
+    fn an_edge_only_to_matches_by_end_edge_and_survives_a_partial_reset() {
+        let fp = |s: &Sdc| s.exceptions.iter().map(|e| (e.args.iter().map(|(k, o)| format!("{k} {:?}", o.names)).collect::<Vec<_>>(), e.flags.clone())).collect::<Vec<_>>();
+        let s = read("set_false_path -rise -from [get_cells r1]\nunset_path_exceptions -fall -from [get_cells r1]\n");
+        assert_eq!(s.exceptions.len(), 1, "a -fall reset does not take a -rise false path: {:?}", fp(&s));
+        let s = read("set_false_path -rise -from [get_cells r1]\nunset_path_exceptions -rise -from [get_cells r1]\n");
+        assert!(s.exceptions.is_empty(), "the -rise reset takes it: {:?}", fp(&s));
+        let s = read("set_false_path -fall -from [get_cells {r1 r2}]\nunset_path_exceptions -from [get_cells r1]\n");
+        assert_eq!(fp(&s), [(vec!["-from [\"r2\"]".to_string()], vec!["-fall".to_string()])], "r2 keeps its -fall");
+        let s = read("set_false_path -rise -from [get_cells r1]\nunset_path_exceptions -rise\n");
+        assert_eq!(s.exceptions.len(), 1, "an edge alone names no point and matches nothing");
     }
 
     /// Rule (`-reset_path`): `set_max_delay` / `set_min_delay` reset over their own points for
