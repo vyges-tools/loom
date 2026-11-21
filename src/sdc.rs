@@ -1870,7 +1870,7 @@ pub(crate) fn generate(master: &SdcClock, g: &GeneratedClock) -> Option<(f64, Ve
 }
 
 /// The commands the reference knows where `read_sdc` evaluates a file, observed on the pinned
-/// reference (`info commands`, 2026-10-31): `resolve.txt` is what a command word resolves against
+/// reference (`info commands`; regenerated at the f11b4276 pin on 2026-11-21): `resolve.txt` is what a command word resolves against
 /// (the file runs in namespace `sta`: its commands, then global), `global.txt` the global
 /// namespace alone, which is all the reference's abbreviation fallback searches. Regenerate on a
 /// repin.
@@ -5364,6 +5364,21 @@ mod substitution_tests {
         assert_eq!(runs("1 || [a]"), Vec::<String>::new());
         assert_eq!(runs("\"x && [a]\" == [b]"), ["[a]", "[b]"], "an operator in quotes is text");
         assert_eq!(runs("{[a] && x} == [b] | [c]"), ["[b]", "[c]"], "a brace is a literal; `|` is not lazy");
+    }
+}
+
+#[cfg(test)]
+mod known_command_tests {
+    use super::*;
+
+    /// Observed (`info commands` at the f11b4276 pin): the scene commands are known and
+    /// `define_corners` / `read_power_activities` are gone, so a file using them stops the read
+    /// as `invalid command name`; a word still resolves as the one global command it begins.
+    #[test]
+    fn the_pins_commands_are_the_ones_known() {
+        assert!(is_command("define_scene") && is_command("set_scene"));
+        assert!(!is_command("define_corners") && !is_command("read_power_activities"));
+        assert_eq!(resolve_command("set_max_trans").as_deref(), Ok("set_max_transition"));
     }
 }
 

@@ -286,6 +286,9 @@ Vertex_tag_group_index
 Wireload
 WireloadSelection
 add_3dblox_alignment_marker_rule
+add_field_solver_box
+add_field_solver_nets
+add_field_solver_rect
 add_global_connection
 add_label
 add_pdn_connect
@@ -311,6 +314,7 @@ analysis_corner_sdc
 analysis_corner_spef_max
 analysis_corner_spef_min
 analyze_power_grid
+annotate_noise_delays
 append
 apply
 apply_corner_sdc_bundle
@@ -337,6 +341,7 @@ binary
 block_macro_channels
 break
 buffer_ports
+build_pex_model
 capacitance_range_str
 capacitance_sta_ui
 capacitance_ui_sta
@@ -380,6 +385,7 @@ check_setup_cmd
 check_timing_cmd
 check_unit
 check_unit_scale
+clear_field_solver
 clear_global_connect
 clear_io_pin_constraints
 clear_labels
@@ -411,6 +417,7 @@ cmd_opt_group_is_aliases
 cmd_scene
 cmd_synopsis_options
 cmd_usage_error
+compare_pex_fsv
 concat
 cond_default_arcs_enabled
 configure_cts_characterization
@@ -460,7 +467,6 @@ define_clock_layer_range
 define_cmd_alias
 define_cmd_args
 define_common_arg_help
-define_corners
 define_hidden_cmd_args
 define_layer_range
 define_pdn_grid
@@ -474,7 +480,6 @@ define_rcx_corners
 define_scene
 define_scene_base
 define_scene_cmd
-define_scenes_cmd
 define_var_help
 delay_calc_names
 delays_invalid
@@ -494,6 +499,7 @@ delete_label
 delete_net
 delete_net_cmd
 delete_objects_from_list_cmd
+delete_parasitics
 delete_physical_cluster
 delete_voltage_domain
 density_fill
@@ -524,6 +530,7 @@ disable_timing_arc_set
 disabled_edges_sorted
 disconnect_pin
 disconnect_pin_cmd
+display_timing_cone
 distance_sta_ui
 distance_ui_sta
 draw_route_segments
@@ -557,6 +564,7 @@ execute_dft_plan
 exit
 expr
 extract_parasitics
+extract_pex
 fall_short_name
 fblocked
 fconfigure
@@ -631,6 +639,7 @@ find_timing_cmd
 find_timing_paths
 find_timing_paths_cmd
 flush
+focus_net
 for
 foreach
 format
@@ -702,6 +711,8 @@ get_port_pin_arg
 get_port_pin_error
 get_port_pin_warn
 get_port_pins_error
+get_port_pins_warn
+get_port_pins_warn_error
 get_ports
 get_ports_error
 get_ports_or_pins
@@ -728,6 +739,7 @@ global_route_debug
 group_path
 group_path_corner_scope_base
 group_path_names
+has_congestion
 help
 hier_pins_above
 hier_pins_crossed_by_edge
@@ -765,6 +777,8 @@ lassign
 leaf_instance_iterator
 ledit
 levelize
+liberty_binary_header_cmd
+liberty_binary_info
 liberty_cell_property
 liberty_libraries_exist
 liberty_library_iterator
@@ -844,6 +858,9 @@ max_slew_violation_count
 md_help_to_text
 memory_usage
 mode_property
+move_instance_constraints_cmd
+move_net_constraints_cmd
+move_pin_constraints_cmd
 multi_scene
 name_cmp
 namespace
@@ -965,6 +982,7 @@ port_members
 port_property
 port_regexp
 port_regexp_hsc
+power_arg_sta
 power_find_nan
 power_sta_ui
 power_ui_sta
@@ -986,11 +1004,12 @@ read_db
 read_def
 read_global_route_segments
 read_guides
+read_itf
 read_lef
 read_liberty
 read_liberty_cmd
 read_partitioning
-read_power_activities
+read_pex_model
 read_saif
 read_saif_file
 read_sdc
@@ -1039,6 +1058,7 @@ replace_hier_module_cmd
 report_3dic_summary
 report_activity_annotation
 report_activity_annotation_cmd
+report_aggressors
 report_annotated_check
 report_annotated_check_cmd
 report_annotated_delay
@@ -1050,6 +1070,7 @@ report_buffers
 report_capacitance_checks
 report_cell_usage
 report_cell_usage_cmd
+report_chain_metrics
 report_check_types
 report_checks
 report_clk_infos
@@ -1061,6 +1082,7 @@ report_clock_min_period
 report_clock_properties
 report_clock_skew
 report_clock_skew_metric
+report_congestion
 report_constant
 report_cts
 report_cts_config
@@ -1068,6 +1090,7 @@ report_dcalc
 report_dcalc_cmd
 report_delay_calc_cmd
 report_delay_estimator_accuracy
+report_delay_estimator_accuracy_for_rebuffering
 report_design_area
 report_design_area_metrics
 report_dft_config
@@ -1088,6 +1111,7 @@ report_file_error
 report_file_warn
 report_floating_nets
 report_fmax_metric
+report_gate_noise_delays
 report_global_connect
 report_global_sizing_config
 report_group
@@ -1117,9 +1141,11 @@ report_net
 report_net1
 report_net_cap
 report_net_caps
+report_net_detours
 report_net_other_pins
 report_net_pin
 report_net_pins
+report_noise_delays
 report_object_full_names
 report_object_names
 report_opt_config
@@ -1135,6 +1161,7 @@ report_path_ends
 report_physical_clusters
 report_pin_
 report_pin_constant
+report_place_config
 report_power
 report_power_design
 report_power_design_json
@@ -1161,7 +1188,9 @@ report_tns
 report_tns_metric
 report_units
 report_units_metric
+report_victim_nets
 report_voltage_domains
+report_vt_usage
 report_warn
 report_wire_length
 report_wns
@@ -1174,6 +1203,7 @@ reset_dont_use
 reset_global_sizing_config
 reset_opt_config
 reset_path_cmd
+reset_place_config
 resistance_sta_ui
 resistance_ui_sta
 restore_display_controls
@@ -1191,7 +1221,9 @@ run_load_balancer
 run_worker
 same_clk_group
 save_animated_gif
+save_clocktree_image
 save_display_controls
+save_histogram_image
 save_image
 scan
 scan_opt
@@ -1202,6 +1234,7 @@ scenes
 sdc_file_line
 sdc_filename
 seek
+select
 set
 set_analysis_corner_property_cmd
 set_analysis_type_cmd
@@ -1296,6 +1329,7 @@ set_false_path_corner_scope_base
 set_fanout_limit
 set_fanout_load
 set_fanout_load_corner_scope_base
+set_field_solver_permittivity
 set_gated_clk_checks_enabled
 set_global_routing_layer_adjustment
 set_global_routing_random
@@ -1399,6 +1433,7 @@ set_pin_capacitance_limit
 set_pin_length
 set_pin_length_extension
 set_pin_thick_multiplier
+set_place_config
 set_placement_padding
 set_pocv_mode
 set_pocv_quantile
@@ -1426,6 +1461,7 @@ set_propagated_clock_pin_cmd
 set_property
 set_property_cmd
 set_property_corner_base
+set_psm_interchip_resistance
 set_pvt
 set_pvt_corner_scope_base
 set_pvt_min_max
@@ -1487,6 +1523,7 @@ show_warranty
 simulated_annealing_debug
 slow_drivers
 socket
+solve_capacitance
 sort_by_full_name
 sort_by_name
 source
@@ -1553,6 +1590,7 @@ trace_propagate_all_clocks
 trace_propagate_gated_clock_enable
 trace_recovery_removal_checks_enabled
 trace_report_default_digits
+trim_traceback
 triton_part_design
 triton_part_hypergraph
 try
@@ -1656,6 +1694,7 @@ vertex_worst_slack_path
 voltage_sta_ui
 voltage_ui_sta
 vwait
+web_load_chiplet_heatmap
 web_save_report
 web_server
 while
@@ -1675,17 +1714,24 @@ write_artnet_spec
 write_cdl
 write_db
 write_def
+write_delay_noise_case
 write_gate_gnuplot
+write_gate_gnuplot_cmd
 write_gate_spice
+write_gate_spice_cmd
 write_global_route_segments
 write_guides
 write_lef
 write_liberty
+write_liberty_binary
+write_liberty_binary_cmd
 write_liberty_cmd
 write_macro_placement
 write_partition_verilog
+write_path_gnuplot_cmd
 write_path_spice
 write_path_spice_cmd
+write_pex_spef
 write_pg_spice
 write_pin_placement
 write_rules

@@ -1,4 +1,7 @@
 add_3dblox_alignment_marker_rule
+add_field_solver_box
+add_field_solver_nets
+add_field_solver_rect
 add_global_connection
 add_label
 add_pdn_connect
@@ -15,6 +18,7 @@ all_outputs
 all_pins_placed
 all_registers
 analyze_power_grid
+annotate_noise_delays
 append
 apply
 array
@@ -36,6 +40,7 @@ binary
 block_macro_channels
 break
 buffer_ports
+build_pex_model
 catch
 cd
 chan
@@ -46,6 +51,7 @@ check_ip
 check_placement
 check_power_grid
 check_setup
+clear_field_solver
 clear_global_connect
 clear_io_pin_constraints
 clear_labels
@@ -55,6 +61,7 @@ clock_gating
 clock_tree_synthesis
 close
 cluster_flops
+compare_pex_fsv
 concat
 configure_cts_characterization
 connect_by_abutment
@@ -85,7 +92,6 @@ current_instance
 cut_rows
 define_analysis_corner
 define_clock_layer_range
-define_corners
 define_layer_range
 define_pdn_grid
 define_pin_shape_pattern
@@ -117,6 +123,7 @@ detailed_route_worker_debug
 dict
 diff_spef
 disconnect_pin
+display_timing_cone
 draw_route_segments
 elapsed_run_time
 eliminate_dead_logic
@@ -136,6 +143,7 @@ execute_dft_plan
 exit
 expr
 extract_parasitics
+extract_pex
 fblocked
 fconfigure
 fcopy
@@ -144,6 +152,7 @@ fileevent
 filler_placement
 find_timing_paths
 flush
+focus_net
 for
 foreach
 format
@@ -191,6 +200,7 @@ global_placement_debug
 global_route
 global_route_debug
 group_path
+has_congestion
 help
 history
 if
@@ -208,6 +218,7 @@ join
 lappend
 lassign
 ledit
+liberty_binary_info
 lindex
 link_design
 linsert
@@ -273,10 +284,11 @@ read_db
 read_def
 read_global_route_segments
 read_guides
+read_itf
 read_lef
 read_liberty
 read_partitioning
-read_power_activities
+read_pex_model
 read_saif
 read_sdc
 read_sdf
@@ -308,11 +320,13 @@ replace_design
 replace_hier_module
 report_3dic_summary
 report_activity_annotation
+report_aggressors
 report_annotated_check
 report_annotated_delay
 report_arrival
 report_buffers
 report_cell_usage
+report_chain_metrics
 report_check_types
 report_checks
 report_clock_latency
@@ -320,11 +334,13 @@ report_clock_min_period
 report_clock_properties
 report_clock_skew
 report_clock_skew_metric
+report_congestion
 report_constant
 report_cts
 report_cts_config
 report_dcalc
 report_delay_estimator_accuracy
+report_delay_estimator_accuracy_for_rebuffering
 report_design_area
 report_design_area_metrics
 report_dft_config
@@ -337,6 +353,7 @@ report_equiv_cells
 report_erc_metrics
 report_floating_nets
 report_fmax_metric
+report_gate_noise_delays
 report_global_connect
 report_global_sizing_config
 report_group
@@ -346,6 +363,8 @@ report_lib_cell
 report_logic_depth_histogram
 report_long_wires
 report_net
+report_net_detours
+report_noise_delays
 report_object_full_names
 report_object_names
 report_opt_config
@@ -353,6 +372,7 @@ report_overdriven_nets
 report_parasitic_annotation
 report_path
 report_physical_clusters
+report_place_config
 report_power
 report_power_metric
 report_required
@@ -364,7 +384,9 @@ report_tns
 report_tns_metric
 report_units
 report_units_metric
+report_victim_nets
 report_voltage_domains
+report_vt_usage
 report_wire_length
 report_wns
 report_worst_negative_slack_metric
@@ -374,6 +396,7 @@ reset_cts_config
 reset_dont_use
 reset_global_sizing_config
 reset_opt_config
+reset_place_config
 restore_display_controls
 restructure
 resynth
@@ -384,12 +407,15 @@ rtl_macro_placer
 run_load_balancer
 run_worker
 save_animated_gif
+save_clocktree_image
 save_display_controls
+save_histogram_image
 save_image
 scan
 scan_opt
 scan_replace
 seek
+select
 set
 set_assigned_check
 set_assigned_delay
@@ -422,6 +448,7 @@ set_driving_cell
 set_extraction_rules_file
 set_false_path
 set_fanout_load
+set_field_solver_permittivity
 set_global_routing_layer_adjustment
 set_global_routing_random
 set_global_routing_region_adjustment
@@ -475,11 +502,13 @@ set_pdnsim_source_settings
 set_pin_length
 set_pin_length_extension
 set_pin_thick_multiplier
+set_place_config
 set_placement_padding
 set_port_fanout_number
 set_power_activity
 set_propagated_clock
 set_property
+set_psm_interchip_resistance
 set_pvt
 set_resistance
 set_routing_alpha
@@ -506,6 +535,7 @@ show_splash
 show_warranty
 simulated_annealing_debug
 socket
+solve_capacitance
 source
 split
 sta_unknown
@@ -562,6 +592,7 @@ user_run_time
 variable
 verify_watermark
 vwait
+web_load_chiplet_heatmap
 web_save_report
 web_server
 while
@@ -576,14 +607,17 @@ write_artnet_spec
 write_cdl
 write_db
 write_def
+write_delay_noise_case
 write_gate_gnuplot
 write_gate_spice
 write_global_route_segments
 write_guides
 write_lef
+write_liberty_binary
 write_macro_placement
 write_partition_verilog
 write_path_spice
+write_pex_spef
 write_pg_spice
 write_pin_placement
 write_rules
